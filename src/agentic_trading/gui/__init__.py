@@ -1,0 +1,1 @@
+from agentic_trading.gui.dashboard import render_dashboard as render_dashboard

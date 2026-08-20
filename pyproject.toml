@@ -5,15 +5,78 @@ description = "Agentig trading project"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "pandas>=3.0.5",
+    "pandas-stubs>=3.0.5.260730",
+    "pydantic>=2.13.4",
     "quantcore",
+    "streamlit>=1.62.0",
+    "typer>=0.27.1",
+    "yfinance>=1.6.0",
 ]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+package = true
+
+[project.scripts]
+agentic-trading = "agentic_trading.main:main"
+agentic-trading-cli = "agentic_trading.cli:main"
 
 [tool.uv.sources]
 quantcore = { git = "https://github.com/hampustalhandske/quantcore.git" }
 
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [dependency-groups]
 dev = [
-    "mypy>=2.3.1",
-    "pytest>=9.1.1",
-    "ruff>=0.16.3",
+    "mypy>=1.11",
+    "pytest>=8.3",
+    "ruff>=0.6",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "RUF", # Ruff-specific rules
+]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = "agentic_trading.*"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = ["quantcore.*", "yfinance.*"]
+ignore_missing_imports = true
