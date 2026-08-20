@@ -57,9 +57,7 @@ class Hedge(WeightingStrategy):
             return {}
 
         cumulative_returns = {
-            source_id: scoreboard.cumulative_return(
-                source_id, as_of_date, self.lookback_days
-            )
+            source_id: scoreboard.cumulative_return(source_id, as_of_date, self.lookback_days)
             for source_id in source_ids
         }
         raw_weights = {
@@ -67,6 +65,4 @@ class Hedge(WeightingStrategy):
             for source_id, cumulative_return in cumulative_returns.items()
         }
         average_weight = sum(raw_weights.values()) / len(raw_weights)
-        return {
-            source_id: weight / average_weight for source_id, weight in raw_weights.items()
-        }
+        return {source_id: weight / average_weight for source_id, weight in raw_weights.items()}

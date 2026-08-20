@@ -1,1 +1,0 @@
-"""Mirror of src/agentic_trading/__init__.py."""

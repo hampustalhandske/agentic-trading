@@ -63,8 +63,8 @@ class Commander:
             target_weight = 0.0
             for signal in contributed_signals:
                 direction_sign = {"long": 1.0, "short": -1.0, "flat": 0.0}[signal.direction]
-                target_weight += direction_sign * signal.confidence * manager_weights.get(
-                    signal.manager_id, 1.0
+                target_weight += (
+                    direction_sign * signal.confidence * manager_weights.get(signal.manager_id, 1.0)
                 )
 
             decisions.append(
