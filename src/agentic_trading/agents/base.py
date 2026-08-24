@@ -1,5 +1,8 @@
+"""
 # base.py
-
+-----------
+Contains the abstract base classes for all agents in the system, both analysts and managers.
+"""
 from abc import ABC, abstractmethod
 from typing import Literal
 
@@ -13,39 +16,22 @@ from agentic_trading.scoring.weighting import WeightingStrategy
 
 logger = get_logger(__name__)
 
-# The safe fallback for any agent that fails to produce a real decision —
-# whether because it crashed (see collect_signals()/evaluate() below) or
-# because it's genuinely unimplemented (e.g. NewsSentimentAnalyst, which has
-# no real news feed wired in yet). "flat" + confidence 0.0 means this
-# source contributes exactly zero to Commander.decide()'s target_weight —
-# neither buying nor selling — which is the trading-safe default: an agent
-# with no real view should abstain, not force a stance it can't back.
+# The safe fallback for any agent that fails to produce a real decision
 SAFE_FALLBACK_DIRECTION: Literal["flat"] = "flat"
 SAFE_FALLBACK_CONFIDENCE = 0.0
 
 
 class Agent(BaseModel, ABC):
-    """Shared base for every agent in the system — analysts and managers alike.
-
-    Making this a BaseModel (not just an ABC) is what lets ManagerAgent
-    hold `managed_analysts: list[AnalystAgent]` as a normal, validated
-    Pydantic field, since AnalystAgent instances are themselves BaseModel
-    instances. This is the same principle as the schemas: uniform data
-    contracts, applied here to the agents themselves.
-    """
+    """Shared base for every agent in the system — analysts and managers alike"""
 
     agent_id: str
 
     model_config = {"arbitrary_types_allowed": True}
     # Needed for concrete subclasses that will eventually hold non-Pydantic
-    # objects as attributes (e.g. a fitted GARCH model, an sklearn object)
-    # — without this, Pydantic rejects any field type it doesn't recognize.
 
 
 class AnalystAgent(Agent):
-    """Every Layer-1 analyst implements this. Internally can be anything —
-    GARCH-driven, valuation-driven, eventually news/text-driven — as long
-    as it honors this one contract."""
+    """Layer-1 analyst agent scaffold, every concrete analyst implements this"""
 
     @abstractmethod
     def generate_signal(
@@ -54,30 +40,14 @@ class AnalystAgent(Agent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> "AgentSignal":
-        """Produce one directional view for one asset, using only data
-        available as of `as_of_date` — the caller (a Manager) is
-        responsible for ensuring `market_data` has already been
-        point-in-time sliced (see data/point_in_time.py); this method must
-        not assume it can safely see rows beyond `as_of_date`.
-        """
+        """Produce one directional view for one asset, using data available as of `as_of_date`"""
 
 
 class ManagerAgent(Agent):
-    """Every Layer-2 manager implements this. A manager owns a specific
-    group of analysts and scales their raw signals — it does not decide
-    direction itself, only how much weight a proposed direction deserves.
-
-    scale_factor() and weighting_strategy are two distinct, multiplicative
-    adjustments applied to the same signal, not redundant with each other:
-    scale_factor() is this manager's own domain judgment (e.g. a
-    RiskManager dampening confidence for an asset with elevated GARCH
-    volatility), while weighting_strategy reflects each analyst's trailing
-    track record (see scoring/). The same WeightingStrategy abstraction is
-    used one level up by Commander, to weight its managers rather than
-    their analysts.
-    """
-
+    """Layer-2 manager agent scaffold, every concrete manager implements this"""
+    # The list of analysts this manager owns and scales for
     managed_analysts: list[AnalystAgent]
+    # The weighting strategy this manager uses to scale each analyst's signal confidence
     weighting_strategy: WeightingStrategy
 
     def collect_signals(
@@ -86,15 +56,7 @@ class ManagerAgent(Agent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> list["AgentSignal"]:
-        """Gathers one AgentSignal from every analyst this manager owns.
-        Concrete managers should not need to override this — it's the same
-        mechanism regardless of what the manager is scaling for.
-
-        An analyst that raises is not allowed to take down the whole
-        backtest over one bad day: its exception is caught, logged as a
-        WARNING (never silent), and replaced with a safe flat/0-confidence
-        signal for that asset/day — the trading-safe default of abstaining
-        rather than forcing a stance from a component that just failed."""
+        """Gathers one AgentSignal from every analyst this manager owns"""
         signals = []
         for analyst in self.managed_analysts:
             try:
@@ -127,12 +89,7 @@ class ManagerAgent(Agent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> float:
-        """The multiplier this manager applies to one analyst's signal
-        confidence. A RiskManager might return a low factor (e.g. 0.2) for
-        a signal on an asset with elevated GARCH volatility, and closer to
-        1.0 for a calm asset. Must be >= 0 — a manager can dampen a
-        signal toward zero confidence, but does not flip its direction.
-        """
+        """The multiplier this manager applies to one analyst's signal confidence"""
 
     def evaluate(
         self,
