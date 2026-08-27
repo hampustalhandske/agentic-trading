@@ -85,9 +85,7 @@ def _prompt_by_asset_class() -> list[str]:
     for i, entry in enumerate(entries, start=1):
         typer.echo(f"  {i:>2}. {entry.symbol:<10} {entry.name}")
     typer.echo()
-    raw = typer.prompt(
-        "Pick one or more (comma-separated numbers, e.g. 1,3,5 — or 'all')"
-    )
+    raw = typer.prompt("Pick one or more (comma-separated numbers, e.g. 1,3,5 — or 'all')")
     if raw.strip().lower() == "all":
         return [entry.symbol for entry in entries]
 
