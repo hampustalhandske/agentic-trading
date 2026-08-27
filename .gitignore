@@ -97,3 +97,9 @@ CLAUDE.md
 # agentic_trading runtime log (see src/agentic_trading/logging_config.py)
 log/
 
+# agentic_trading on-disk data cache (see src/agentic_trading/data/cache.py)
+src/agentic_trading/data/.cache/
+
+# Mac
+.DS_Store
+

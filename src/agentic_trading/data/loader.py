@@ -5,6 +5,7 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
+import pandas_datareader.data as pdr
 import yfinance as yf
 
 from agentic_trading.logging_config import get_logger
@@ -34,6 +35,39 @@ def _reshape_single_ticker(raw: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _reshape_stooq_frame(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw.empty:
+        raise ValueError("Stooq returned no data for the requested ticker/date range")
+    # Stooq returns rows in descending date order, unlike yfinance.
+    ordered = raw.sort_index()
+    result = pd.DataFrame({"close": ordered["Close"]})
+    result["log_return"] = np.log(result["close"] / result["close"].shift(1))
+    return result
+
+
+def _yfinance_result_is_usable(raw: pd.DataFrame) -> bool:
+    return not raw.empty and not raw["Close"].isna().all()
+
+
+def _load_single_ticker(ticker: str, start: date | None, end: date | None) -> pd.DataFrame:
+    # yfinance 1.6.0 defaults multi_level_index=True, which returns
+    # MultiIndex (Price, Ticker) columns even for a single ticker. Force
+    # flat columns so raw["Close"] yields a Series, not a one-column
+    # DataFrame. progress=False suppresses yfinance's own "N of M completed"
+    # progress bar, which it prints straight to stdout regardless of any
+    # logging configuration.
+    raw = yf.download(ticker, start=start, end=end, multi_level_index=False, progress=False)
+    if _yfinance_result_is_usable(raw):
+        logger.info("Loaded price history for %s from yfinance", ticker)
+        return _reshape_single_ticker(raw)
+
+    logger.info("yfinance had no usable data for %s — trying Stooq fallback", ticker)
+    stooq_raw = pdr.DataReader(ticker, "stooq", start, end)
+    result = _reshape_stooq_frame(stooq_raw)
+    logger.info("Loaded price history for %s from Stooq", ticker)
+    return result
+
+
 def load_price_history(
     asset: str | list[str] | None = None,
     start: date | None = None,
@@ -50,24 +84,21 @@ def load_price_history(
     multiple tickers return a frame with a MultiIndex on columns, keyed
     (ticker, field). `start`/`end` follow yfinance's own convention of
     None meaning an unbounded end of the range.
+
+    Tries yfinance first for each ticker; if it raises, comes back empty,
+    or comes back all-NaN, falls through to Stooq (an independent, no-key
+    source) before giving up. Only `load_price_history_with_fallback`'s
+    synthetic generator kicks in if both real sources fail.
     """
     tickers = _resolve_tickers(asset)
     logger.debug("Loading price history for %s (%s to %s)", tickers, start, end)
 
     if len(tickers) == 1:
-        # yfinance 1.6.0 defaults multi_level_index=True, which returns
-        # MultiIndex (Price, Ticker) columns even for a single ticker.
-        # Force flat columns so raw["Close"] yields a Series, not a
-        # one-column DataFrame. progress=False suppresses yfinance's own
-        # "N of M completed" progress bar, which it prints straight to
-        # stdout regardless of any logging configuration.
-        raw = yf.download(tickers[0], start=start, end=end, multi_level_index=False, progress=False)
-        return _reshape_single_ticker(raw)
+        return _load_single_ticker(tickers[0], start, end)
 
     frames: dict[str, pd.DataFrame] = {}
     for ticker in tickers:
-        raw = yf.download(ticker, start=start, end=end, multi_level_index=False, progress=False)
-        frames[ticker] = _reshape_single_ticker(raw)
+        frames[ticker] = _load_single_ticker(ticker, start, end)
     return pd.concat(frames, axis=1)
 
 

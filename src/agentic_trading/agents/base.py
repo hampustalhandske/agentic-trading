@@ -3,6 +3,7 @@
 -----------
 Contains the abstract base classes for all agents in the system, both analysts and managers.
 """
+
 from abc import ABC, abstractmethod
 from typing import Literal
 
@@ -45,6 +46,7 @@ class AnalystAgent(Agent):
 
 class ManagerAgent(Agent):
     """Layer-2 manager agent scaffold, every concrete manager implements this"""
+
     # The list of analysts this manager owns and scales for
     managed_analysts: list[AnalystAgent]
     # The weighting strategy this manager uses to scale each analyst's signal confidence

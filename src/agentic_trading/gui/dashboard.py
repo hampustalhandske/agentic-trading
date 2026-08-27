@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 from typing import cast
@@ -11,8 +12,25 @@ import streamlit as st
 
 from agentic_trading.agents.base import AnalystAgent, ManagerAgent
 from agentic_trading.agents.commander import Commander
-from agentic_trading.agents.managers import CVaRManager, RiskManager
-from agentic_trading.agents.roster import build_default_analysts, build_default_managers
+from agentic_trading.agents.managers import (
+    CVaRManager,
+    EventCreditManager,
+    FactorManager,
+    MacroRatesManager,
+    RiskManager,
+    StatArbManager,
+)
+from agentic_trading.agents.portfolio_construction import PortfolioConstructor
+from agentic_trading.agents.roster import (
+    CVAR_MANAGER_ANALYST_IDS,
+    EVENT_CREDIT_MANAGER_ANALYST_IDS,
+    FACTOR_MANAGER_ANALYST_IDS,
+    MACRO_RATES_MANAGER_ANALYST_IDS,
+    RISK_MANAGER_ANALYST_IDS,
+    STAT_ARB_MANAGER_ANALYST_IDS,
+    build_default_analysts,
+    build_default_managers,
+)
 from agentic_trading.agents.schemas import BacktestResult, PortfolioDecision, TradeRecord
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
@@ -50,6 +68,7 @@ class DeskRun:
     backtest_result: BacktestResult
     track_record: TrackRecord
     scoreboard: PerformanceScoreboard
+    portfolio_construction_method: str | None = None
     sp500_benchmark: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     basket_benchmark: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
 
@@ -108,17 +127,55 @@ def _build_analysts() -> list[AnalystAgent]:
     return build_default_analysts()
 
 
+ALL_PODS_MODE = "All 6 pods"
+
+# Single-pod modes: each hands its manager only the analysts belonging to
+# its own pod (via roster.py's *_ANALYST_IDS), the same filtering
+# build_default_managers() does — not the full roster, since a single pod
+# is meant to isolate that pod's own signals for inspection.
+_SINGLE_POD_MANAGERS: dict[
+    str, tuple[Callable[[list[AnalystAgent]], ManagerAgent], frozenset[str]]
+] = {
+    "Risk Manager": (
+        lambda owned: RiskManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        RISK_MANAGER_ANALYST_IDS,
+    ),
+    "CVaR Manager": (
+        lambda owned: CVaRManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        CVAR_MANAGER_ANALYST_IDS,
+    ),
+    "StatArb Manager": (
+        lambda owned: StatArbManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        STAT_ARB_MANAGER_ANALYST_IDS,
+    ),
+    "Macro/Rates Manager": (
+        lambda owned: MacroRatesManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        MACRO_RATES_MANAGER_ANALYST_IDS,
+    ),
+    "Factor Manager": (
+        lambda owned: FactorManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        FACTOR_MANAGER_ANALYST_IDS,
+    ),
+    "Event/Credit Manager": (
+        lambda owned: EventCreditManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        EVENT_CREDIT_MANAGER_ANALYST_IDS,
+    ),
+}
+MANAGER_MODES: tuple[str, ...] = (*_SINGLE_POD_MANAGERS, ALL_PODS_MODE)
+
+
 def _build_managers(manager_mode: str, analysts: list[AnalystAgent]) -> list[ManagerAgent]:
-    """The Dual stack mode splits ownership of `analysts` across RiskManager
-    and CVaRManager (see agents/roster.py) rather than duplicating every
-    analyst under both — that would double-count each signal in
-    Commander.decide(). The single-manager modes hand that one manager the
-    full roster, since there's no second manager to split against."""
-    if manager_mode == "CVaR Manager":
-        return [CVaRManager(managed_analysts=analysts, weighting_strategy=Hedge())]
-    if manager_mode == "Dual stack":
+    """`ALL_PODS_MODE` wires up the full 6-pod roster (see
+    agents/roster.py), splitting ownership of `analysts` across all six
+    managers rather than duplicating every analyst under each — that would
+    double-count each signal in Commander.decide(). Every other mode
+    isolates a single pod, handing its manager only that pod's own
+    analysts filtered out of the full roster."""
+    if manager_mode == ALL_PODS_MODE:
         return build_default_managers(analysts)
-    return [RiskManager(managed_analysts=analysts, weighting_strategy=Hedge())]
+    build_manager, analyst_ids = _SINGLE_POD_MANAGERS[manager_mode]
+    owned = [analyst for analyst in analysts if analyst.agent_id in analyst_ids]
+    return [build_manager(owned)]
 
 
 def _load_basket_data(tickers: tuple[str, ...], start: date, end: date) -> tuple[pd.DataFrame, str]:
@@ -345,6 +402,7 @@ def _simulate_desk(
     end: date,
     initial_cash: float,
     manager_mode: str,
+    portfolio_construction_method: str | None = None,
     on_day_complete: object = None,
 ) -> DeskRun:
     """Runs the desk via `BacktestEngine` — the same class the CLI calls,
@@ -352,7 +410,12 @@ def _simulate_desk(
     fetches fresh market data and runs a fresh backtest for whatever
     tickers/dates/manager mode are currently selected. `on_day_complete`, if
     given, is forwarded straight to `BacktestEngine.run()` to drive a live
-    progress display — see `_run_simulation_with_progress()`."""
+    progress display — see `_run_simulation_with_progress()`.
+
+    `portfolio_construction_method`, if given, enables the optional
+    post-Commander `PortfolioConstructor` stage with that risk-budget
+    method — mirroring the CLI's `--portfolio-construction` flag, off by
+    default (`None`) so existing runs are unaffected."""
     if start > end:
         start, end = end, start
 
@@ -362,6 +425,11 @@ def _simulate_desk(
     portfolio = Portfolio(cash=initial_cash, positions={})
     track_record = TrackRecord()
     market_data, source_label = _load_basket_data(tuple(tickers), start, end)
+    portfolio_constructor = (
+        PortfolioConstructor(enabled=True, method=portfolio_construction_method)
+        if portfolio_construction_method is not None
+        else None
+    )
 
     engine = BacktestEngine(
         commander=commander,
@@ -371,6 +439,7 @@ def _simulate_desk(
         start_date=start,
         end_date=end,
         assets=tickers,
+        portfolio_constructor=portfolio_constructor,
     )
     backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
 
@@ -381,6 +450,7 @@ def _simulate_desk(
         source_label=source_label,
         manager_ids=[manager.agent_id for manager in managers],
         analyst_ids=[analyst.agent_id for analyst in analysts],
+        portfolio_construction_method=portfolio_construction_method,
         price_history=market_data,
         trade_blotter=_build_trade_blotter(
             backtest_result.trade_log, backtest_result.decisions_by_day
@@ -400,6 +470,7 @@ def _run_simulation_with_progress(
     end: date,
     initial_cash: float,
     manager_mode: str,
+    portfolio_construction_method: str | None = None,
 ) -> DeskRun:
     """Runs the desk behind a live, center-of-screen progress display.
     `st.status()` streams each day's update to the browser as it happens,
@@ -428,6 +499,7 @@ def _run_simulation_with_progress(
             end,
             initial_cash,
             manager_mode,
+            portfolio_construction_method=portfolio_construction_method,
             on_day_complete=_on_day_complete,
         )
         status.update(
@@ -1059,9 +1131,25 @@ def render_dashboard() -> None:
         st.markdown("#### Desk configuration")
         manager_mode = st.radio(
             "Manager stack",
-            options=("Risk Manager", "CVaR Manager", "Dual stack"),
+            options=MANAGER_MODES,
             index=0,
             key="manager_mode",
+        )
+
+        portfolio_construction_enabled = st.checkbox(
+            "Portfolio construction (Layer 4)",
+            value=False,
+            key="portfolio_construction_enabled",
+            help="Optional post-Commander stage: Black-Litterman views from the Commander's "
+            "own decisions, a risk-budget optimizer, then Kelly leverage scaling. Off by "
+            "default, same as the CLI's --portfolio-construction flag.",
+        )
+        portfolio_construction_method = st.selectbox(
+            "Risk budget method",
+            options=("risk_parity", "min_variance", "mean_variance"),
+            index=0,
+            key="portfolio_construction_method",
+            disabled=not portfolio_construction_enabled,
         )
 
         st.divider()
@@ -1093,7 +1181,15 @@ def render_dashboard() -> None:
             manager_mode,
         )
         new_run = _run_simulation_with_progress(
-            tickers, selected_group.name, start_date, end_date, float(initial_cash), manager_mode
+            tickers,
+            selected_group.name,
+            start_date,
+            end_date,
+            float(initial_cash),
+            manager_mode,
+            portfolio_construction_method=(
+                portfolio_construction_method if portfolio_construction_enabled else None
+            ),
         )
         st.session_state["desk_run"] = new_run
         st.session_state["backtest_result"] = new_run.backtest_result
@@ -1104,8 +1200,14 @@ def render_dashboard() -> None:
     desk_run: DeskRun | None = st.session_state.get("desk_run")
 
     if desk_run is not None:
+        portfolio_construction_caption = (
+            f"Portfolio construction: {desk_run.portfolio_construction_method} "
+            if desk_run.portfolio_construction_method
+            else "Portfolio construction: off "
+        )
         st.caption(
             f"Simulation source: {desk_run.source_label} • Manager stack: {desk_run.manager_mode} "
+            f"• {portfolio_construction_caption}"
             f"• Basket: {desk_run.group_name}"
         )
 

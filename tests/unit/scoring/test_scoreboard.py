@@ -8,7 +8,9 @@ import math
 import statistics
 from datetime import date, timedelta
 
+import numpy as np
 import pytest
+from quantcore.performance.metrics import calmar_ratio, sortino_ratio
 
 from agentic_trading.agents.schemas import PerformanceRecord
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
@@ -69,6 +71,44 @@ def test_sharpe_ratio_raises_on_a_single_data_point() -> None:
     # silently returning 0.0/NaN, since a NaN would otherwise propagate silently into Hedge weights.
     with pytest.raises(ValueError):
         scoreboard.sharpe_ratio("analyst-a", start, lookback_days=10)
+
+
+def test_sortino_ratio_matches_quantcore_directly() -> None:
+    start = date(2024, 1, 1)
+    returns = [0.01, 0.03, -0.01, 0.02, 0.0]
+    scoreboard = _seed("analyst-a", start, returns)
+    expected = float(sortino_ratio(np.array(returns)))
+
+    result = scoreboard.sortino_ratio("analyst-a", start + timedelta(days=4), lookback_days=10)
+
+    assert result == pytest.approx(expected)
+
+
+def test_sortino_ratio_raises_on_a_single_data_point() -> None:
+    start = date(2024, 1, 1)
+    scoreboard = _seed("analyst-a", start, [0.01])
+
+    with pytest.raises(ValueError):
+        scoreboard.sortino_ratio("analyst-a", start, lookback_days=10)
+
+
+def test_calmar_ratio_matches_quantcore_directly() -> None:
+    start = date(2024, 1, 1)
+    returns = [0.05, 0.03, -0.10, -0.02, 0.04]
+    scoreboard = _seed("analyst-a", start, returns)
+    expected = float(calmar_ratio(np.array(returns)))
+
+    result = scoreboard.calmar_ratio("analyst-a", start + timedelta(days=4), lookback_days=10)
+
+    assert result == pytest.approx(expected)
+
+
+def test_calmar_ratio_raises_on_a_single_data_point() -> None:
+    start = date(2024, 1, 1)
+    scoreboard = _seed("analyst-a", start, [0.01])
+
+    with pytest.raises(ValueError):
+        scoreboard.calmar_ratio("analyst-a", start, lookback_days=10)
 
 
 def test_max_drawdown_matches_known_peak_to_trough_decline() -> None:

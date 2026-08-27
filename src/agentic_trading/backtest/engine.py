@@ -7,9 +7,19 @@ from collections.abc import Callable
 from datetime import date
 from typing import cast
 
+import numpy as np
 import pandas as pd
+from quantcore.performance.metrics import (
+    calmar_ratio,
+    hit_rate,
+    maximum_drawdown,
+    profit_factor,
+    sharpe_ratio,
+    sortino_ratio,
+)
 
 from agentic_trading.agents.commander import Commander
+from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.schemas import (
     BacktestResult,
     PerformanceRecord,
@@ -55,6 +65,7 @@ class BacktestEngine:
         start_date: date,
         end_date: date,
         assets: list[str] | None = None,
+        portfolio_constructor: PortfolioConstructor | None = None,
     ) -> None:
         self.commander = commander
         self.portfolio = portfolio
@@ -63,6 +74,38 @@ class BacktestEngine:
         self.start_date = start_date
         self.end_date = end_date
         self.assets = assets or ["AAPL"]
+        # Optional Layer-4 stage after the Commander — None (the default)
+        # means no portfolio construction runs at all, matching every
+        # existing backtest's behavior exactly.
+        self.portfolio_constructor = portfolio_constructor
+
+    def _apply_portfolio_construction(
+        self,
+        decisions: list[PortfolioDecision],
+        market_data: pd.DataFrame,
+        as_of_timestamp: pd.Timestamp,
+    ) -> list[PortfolioDecision]:
+        """Builds the wide, point-in-time-sliced returns frame
+        PortfolioConstructor needs from the same `market_data` the
+        Commander was already given for this day, plus an equal-weighted
+        market_weights proxy — this project has no market-cap data
+        source, so equal weighting is the documented stand-in for the
+        Black-Litterman equilibrium prior's market portfolio."""
+        assets = [decision.asset for decision in decisions]
+        if isinstance(market_data.columns, pd.MultiIndex):
+            returns_history = pd.concat(
+                {asset: market_data[asset]["log_return"] for asset in assets}, axis=1
+            )
+        else:
+            returns_history = market_data[["log_return"]].rename(columns={"log_return": assets[0]})
+        returns_history = returns_history.dropna()
+        market_weights = dict.fromkeys(assets, 1.0 / len(assets)) if assets else {}
+        return self.portfolio_constructor.construct(  # type: ignore[union-attr]
+            decisions=decisions,
+            returns_history=returns_history,
+            market_weights=market_weights,
+            as_of_date=as_of_timestamp,
+        )
 
     def run(self, on_day_complete: DayCompleteCallback | None = None) -> BacktestResult:
         """Steps through every simulated day from start_date to end_date,
@@ -97,6 +140,10 @@ class BacktestEngine:
                 portfolio_value_history=[],
                 final_sharpe_ratio=0.0,
                 final_max_drawdown=0.0,
+                final_sortino_ratio=0.0,
+                final_calmar_ratio=0.0,
+                final_hit_rate=0.0,
+                final_profit_factor=0.0,
             )
 
         days = [
@@ -121,6 +168,10 @@ class BacktestEngine:
                 len(self.assets),
                 (time.perf_counter() - day_started_at) * 1000,
             )
+            if self.portfolio_constructor is not None:
+                decisions = self._apply_portfolio_construction(
+                    decisions, market_data, as_of_timestamp
+                )
             decisions_by_day[as_of_timestamp.date()] = decisions
 
             if isinstance(raw_market_data.columns, pd.MultiIndex):
@@ -196,30 +247,54 @@ class BacktestEngine:
                 on_day_complete(day_index, len(days), as_of_timestamp.date(), portfolio_value)
 
         if len(portfolio_values) < 2:
-            final_sharpe_ratio = 0.0
+            daily_returns: list[float] = []
         else:
             daily_returns = [
                 (current - previous) / previous if previous != 0 else 0.0
                 for previous, current in itertools.pairwise(portfolio_values)
             ]
-            if len(daily_returns) < 2:
-                final_sharpe_ratio = 0.0
-            else:
-                mean_return = sum(daily_returns) / len(daily_returns)
-                variance = sum((value - mean_return) ** 2 for value in daily_returns) / (
-                    len(daily_returns) - 1
-                )
-                if variance == 0:
-                    final_sharpe_ratio = 0.0
-                else:
-                    final_sharpe_ratio = mean_return / math.sqrt(variance) * math.sqrt(252)
 
-        running_peak = -math.inf
-        final_max_drawdown = 0.0
-        for value in portfolio_values:
-            running_peak = max(running_peak, value)
-            if running_peak != -math.inf:
-                final_max_drawdown = min(final_max_drawdown, value - running_peak)
+        if len(daily_returns) < 2 or float(np.std(daily_returns, ddof=1)) == 0.0:
+            # A flat (zero-variance) return series makes every ratio here
+            # undefined (division by zero) rather than merely large — 0.0
+            # is the same "nothing to report" default used for a too-short
+            # window.
+            final_sharpe_ratio = 0.0
+            final_sortino_ratio = 0.0
+            final_calmar_ratio = 0.0
+            final_max_drawdown = 0.0
+            final_hit_rate = 0.0
+            final_profit_factor = 0.0
+        else:
+            returns_array = np.array(daily_returns, dtype=np.float64)
+            try:
+                final_sharpe_ratio = float(sharpe_ratio(returns_array))
+                final_sortino_ratio = float(sortino_ratio(returns_array))
+                final_calmar_ratio = float(calmar_ratio(returns_array))
+                final_max_drawdown = float(maximum_drawdown(returns_array))
+                final_hit_rate = float(hit_rate(returns_array))
+                final_profit_factor = float(profit_factor(returns_array))
+            except ZeroDivisionError:
+                # A degenerate edge case (e.g. no downside deviation at
+                # all) that the zero-variance guard above didn't catch —
+                # same "nothing to report" default rather than crashing
+                # the run over a performance-summary metric.
+                logger.debug(
+                    "Performance metric computation hit a zero-division edge case — "
+                    "defaulting the run's summary ratios to 0.0.",
+                    exc_info=True,
+                )
+                final_sharpe_ratio = 0.0
+                final_sortino_ratio = 0.0
+                final_calmar_ratio = 0.0
+                final_max_drawdown = 0.0
+                final_hit_rate = 0.0
+                final_profit_factor = 0.0
+
+        # No benchmark is configured for this engine, so information_ratio
+        # (which requires one) is left None rather than computed against an
+        # arbitrary stand-in.
+        final_information_ratio: float | None = None
 
         logger.info(
             "Backtest complete: %d days simulated in %.1fs — final Sharpe=%.3f, max drawdown=%.2f",
@@ -234,6 +309,11 @@ class BacktestEngine:
             portfolio_value_history=portfolio_value_history,
             final_sharpe_ratio=final_sharpe_ratio,
             final_max_drawdown=final_max_drawdown,
+            final_sortino_ratio=final_sortino_ratio,
+            final_calmar_ratio=final_calmar_ratio,
+            final_information_ratio=final_information_ratio,
+            final_hit_rate=final_hit_rate,
+            final_profit_factor=final_profit_factor,
             decisions_by_day=decisions_by_day,
             trade_log=trade_log,
         )

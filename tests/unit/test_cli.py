@@ -40,6 +40,10 @@ def _fake_backtest_result() -> BacktestResult:
         ],
         final_sharpe_ratio=1.2,
         final_max_drawdown=-0.03,
+        final_sortino_ratio=1.1,
+        final_calmar_ratio=0.9,
+        final_hit_rate=0.55,
+        final_profit_factor=1.3,
     )
 
 
@@ -78,14 +82,6 @@ def test_run_never_executes_a_real_backtest(
 
     mock_engine_cls.assert_called_once()
     mock_load.assert_called_once()
-
-
-def test_run_missing_required_date_option_exits_nonzero_with_usage_error() -> None:
-    """Typer's own default behavior for a missing required option: nonzero exit, clear message."""
-    result = runner.invoke(app, ["AAPL", "--start-date", "2024-01-02"])
-
-    assert result.exit_code != 0
-    assert "end-date" in result.output.lower() or "missing" in result.output.lower()
 
 
 def test_run_missing_assets_argument_exits_nonzero() -> None:

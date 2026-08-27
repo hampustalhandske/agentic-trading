@@ -134,6 +134,10 @@ def test_backtest_result_allows_negative_sharpe_and_drawdown() -> None:
         portfolio_value_history=[(date(2024, 1, 1), 100.0), (date(2024, 12, 31), 80.0)],
         final_sharpe_ratio=-0.5,
         final_max_drawdown=-0.2,
+        final_sortino_ratio=-0.4,
+        final_calmar_ratio=-0.3,
+        final_hit_rate=0.4,
+        final_profit_factor=0.8,
     )
 
     assert result.final_sharpe_ratio == -0.5

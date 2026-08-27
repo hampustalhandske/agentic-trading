@@ -5,10 +5,14 @@ description = "Agentig trading project"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fredapi>=0.5",
     "pandas>=3.0.5",
+    "pandas-datareader>=0.10",
     "pandas-stubs>=3.0.5.260730",
     "pydantic>=2.13.4",
+    "python-dotenv>=1.0",
     "quantcore",
+    "requests>=2.32",
     "streamlit>=1.62.0",
     "typer>=0.27.1",
     "yfinance>=1.6.0",
@@ -78,5 +82,5 @@ module = "agentic_trading.*"
 disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
-module = ["quantcore.*", "yfinance.*"]
+module = ["quantcore.*", "yfinance.*", "pandas_datareader.*", "fredapi.*", "scipy.*"]
 ignore_missing_imports = true

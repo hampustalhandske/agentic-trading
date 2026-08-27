@@ -4,6 +4,10 @@ import math
 import statistics
 from datetime import date
 
+import numpy as np
+from quantcore.performance.metrics import calmar_ratio as quantcore_calmar_ratio
+from quantcore.performance.metrics import sortino_ratio as quantcore_sortino_ratio
+
 from agentic_trading.scoring.track_record import TrackRecord
 
 DEFAULT_LOOKBACK_DAYS = 30
@@ -43,6 +47,36 @@ class PerformanceScoreboard:
             return 0.0
         mean = statistics.mean(returns)
         return mean / stdev * math.sqrt(252)
+
+    def sortino_ratio(
+        self,
+        source_id: str,
+        as_of_date: date,
+        lookback_days: int,
+    ) -> float:
+        """Trailing Sortino ratio for `source_id` over the lookback window
+        ending at `as_of_date`, via quantcore.performance.metrics — same
+        undefined-on-fewer-than-two-observations behavior as sharpe_ratio."""
+        history = self.track_record.history_for(source_id, as_of_date, lookback_days)
+        returns = [entry.attributable_return for entry in history]
+        if len(returns) < 2:
+            raise ValueError("sortino_ratio requires at least two observations")
+        return float(quantcore_sortino_ratio(np.array(returns, dtype=np.float64)))
+
+    def calmar_ratio(
+        self,
+        source_id: str,
+        as_of_date: date,
+        lookback_days: int,
+    ) -> float:
+        """Trailing Calmar ratio for `source_id` over the lookback window
+        ending at `as_of_date`, via quantcore.performance.metrics — same
+        undefined-on-fewer-than-two-observations behavior as sharpe_ratio."""
+        history = self.track_record.history_for(source_id, as_of_date, lookback_days)
+        returns = [entry.attributable_return for entry in history]
+        if len(returns) < 2:
+            raise ValueError("calmar_ratio requires at least two observations")
+        return float(quantcore_calmar_ratio(np.array(returns, dtype=np.float64)))
 
     def max_drawdown(
         self,

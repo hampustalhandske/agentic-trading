@@ -123,5 +123,10 @@ class BacktestResult(BaseModel):
     portfolio_value_history: list[tuple[date, float]]
     final_sharpe_ratio: float
     final_max_drawdown: float
+    final_sortino_ratio: float
+    final_calmar_ratio: float
+    final_information_ratio: float | None = None
+    final_hit_rate: float
+    final_profit_factor: float
     decisions_by_day: dict[date, list[PortfolioDecision]] = Field(default_factory=dict)
     trade_log: list[TradeRecord] = Field(default_factory=list)
