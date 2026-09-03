@@ -1,78 +1,184 @@
 # agentic-trading
 
-A multi-agent backtesting framework for portfolio risk management, built on
-top of `quantcore` (option pricing, GARCH volatility, VaR/CVaR).
+A multi-agent **backtesting** framework for portfolio risk management.
+It is not a live trading system and does not place real orders — it
+simulates, day by day, how a committee of heterogeneous quant "analysts"
+would have argued about an asset, how risk-aware "managers" would have
+capped their conviction, and how a final "commander" would have turned
+that into one position size, then scores every agent's hypothetical
+track record along the way.
 
-## Architecture
+All actual numerical finance — option pricing, GARCH-family volatility
+models, VaR/CVaR, factor regressions, portfolio optimization — comes from
+`quantcore`, a separate dependency. This repo does not reimplement
+quantitative math; it **orchestrates** it through a layered multi-agent
+architecture and turns the output into position decisions and a backtest
+result. If a calculation this project needs is missing from `quantcore`,
+that's a `quantcore` task, not something to patch in here.
 
-Three layers, following the standard structure used across published
-multi-agent trading research (TradingAgents, FinCon, ai-hedge-fund):
+## Why this exists
 
-- **Layer 1 — Analyst agents**: heterogeneous, run in parallel, no
-  authority. Each proposes a directional view on an asset. Internally
-  wildly different (quant/numeric vs. news/text-based); externally, all
-  conform to the same `AgentSignal` schema.
-- **Layer 2 — Managers**: translate raw risk metrics (GARCH regime, VaR/CVaR
-  from `quantcore`) into hard position-size constraints. Do not decide
-  direction, only how much is allowed. Currently two managers, each owning a
-  distinct subset of the Layer 1 analysts (see `agents/roster.py`):
-  `RiskManager` (VaR-based dampening) over the directional/sentiment
-  analysts, `CVaRManager` (tail-risk dampening) over the valuation analysts.
-  More managers and a richer ownership/communication structure will be
-  layered on later.
-- **Layer 3 — Commander (Portfolio Manager)**: holds portfolio state,
-  combines Layer 1 signals weighted by each agent's trailing track record,
-  respects Layer 2's constraints, emits the final decision.
+Real trading desks don't make decisions from a single model — they run
+many analysts with different, sometimes contradictory views, a risk desk
+that caps how much any one view is allowed to bet, and a portfolio
+manager who allocates capital based on who has actually been right
+lately, not who shouts loudest. This project simulates that structure
+mechanically and reproducibly, so different quantitative strategies can
+be compared, combined, and backtested under one deterministic execution
+engine — with every intermediate signal, constraint, and decision
+inspectable, not just the final trade.
 
-A separate, non-agent **scoring system** tracks each Layer 1 agent's
-hypothetical attributable performance daily and converts trailing track
-record into portfolio-allocation weight — this is what the Commander
-actually uses to decide "who gets how much say."
+## Architecture — four layers, one deterministic engine
 
-The backtest execution engine (order fills, portfolio accounting) is
-deterministic plain code, not an LLM agent — correctness there is
-non-negotiable.
-
-## Status
-
-Active development — see CLAUDE.md for current conventions and command
-defaults.
-
-## Setup
-
-```bash
-uv sync --locked --group dev
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src/
-uv run pytest
 ```
+Layer 1: Analysts (22)  →  Layer 2: Managers (6 pods)  →  Layer 3: Commander  →  (optional) Layer 4: Portfolio construction
+                                                                  ↓
+                                                    Backtest engine (fills, accounting)
+                                                                  ↓
+                                                       Scoring / track record
+                                                     (feeds back into Layer 3's weights)
+```
+
+- **Layer 1 — Analyst agents** (`agents/analysts/`): heterogeneous,
+  run independently in parallel, have no authority over each other. Each
+  proposes a directional view (`AgentSignal`: direction, confidence,
+  rationale) on an asset for the current simulated day. Internally each
+  analyst can be built on a totally different quantitative technique —
+  option pricing, time-series econometrics, cointegration, factor
+  regression, sentiment — but externally every analyst implements the
+  same interface (`agents/base.py`) and emits the same schema, so the
+  layers above never need to know which technique produced a signal.
+- **Layer 2 — Managers** (`agents/managers/`): each manager owns a themed
+  subset ("pod") of Layer 1 analysts and turns raw risk metrics (GARCH
+  regime, VaR/CVaR, spread volatility, event severity, factor
+  significance...) into a hard *dampening* of that analyst's confidence.
+  Managers never flip direction and never invent conviction — they can
+  only scale it down. See "The six pods" below.
+- **Layer 3 — Commander** (`agents/commander.py`): the final allocation
+  authority. Holds portfolio state, combines every manager-adjusted
+  signal weighted by that analyst's *trailing track record* (not its
+  type, not a hardcoded prior — see Scoring below), and emits one
+  `PortfolioDecision` per asset per day.
+- **Layer 4 — Portfolio construction** (`agents/portfolio_construction.py`,
+  optional, off by default / no-op unless enabled): a post-Commander
+  stage that takes the Commander's per-asset decisions as Black-Litterman
+  *views*, blends them with a market-implied equilibrium prior, shrinks
+  the covariance estimate (Ledoit-Wolf), runs a risk-budgeting optimizer
+  (min-variance / mean-variance / risk-parity, selectable), scales the
+  result by a Kelly fraction, and logs a component-VaR risk report. Exists
+  for going from "22 independent per-asset opinions" to "one
+  coherent, risk-budgeted multi-asset portfolio," without being required
+  for the simpler single-asset desk-simulation use case.
+
+Two non-agent, always-deterministic components sit underneath all of
+this:
+
+- **`backtest/engine.py`** — order fills and portfolio accounting. No
+  LLM calls, no randomness beyond what's explicitly seeded, fully
+  testable in isolation. This is the part where correctness is
+  non-negotiable, because everything above it is only as trustworthy as
+  the fills and P&L it's scored against.
+- **`data/point_in_time.py`** — a hard architectural boundary: on
+  simulated day *t*, no agent can access data from day *t+1* onward.
+  Enforced structurally by the data-loading layer (agents physically
+  cannot reach future rows), not just documented as a rule, because a
+  look-ahead bug here would silently invalidate any backtest result
+  without producing an error.
+
+## The six pods
+
+`agents/roster.py` is the single place that wires up the default
+22-analyst / 6-manager roster; it's the file to change when adding more
+analysts or managers. Each pod is themed around one coherent family of
+quant strategy, so the Commander gets six genuinely different risk
+overlays rather than six relabelings of the same signal:
+
+| Pod | Manager | Analysts | What ties them together |
+|---|---|---|---|
+| **Risk** | `RiskManager` | `risk_minimizing`, `risk_maximizing`, `gbm_momentum` | Directional views built straight off volatility/return characteristics — favor low-VaR assets, favor high-GARCH-vol assets, or simulate a GBM forward path to see if it lands above today's price. `RiskManager` dampens confidence for elevated quantcore VaR. |
+| **CVaR** | `CVaRManager` | `black_scholes_valuation`, `monte_carlo_valuation`, `greeks_delta_hedge`, `heston_vol_surface` | Options-valuation analysts. Since no free source has historical options chains, these price *theoretical/synthetic* options off model-estimated vol rather than live chains (`_theoretical_options.py`) — Black-Scholes closed form, Monte Carlo real-world-drift projection, a gamma-exposure proxy from the Greeks, and a two-regime Heston stochastic-vol comparison. `CVaRManager` dampens confidence for elevated tail-loss (CVaR). |
+| **StatArb** | `StatArbManager` | `ou_mean_reversion`, `pairs_cointegration`, `kalman_hedge_ratio`, `regime_hmm` | Classic statistical arbitrage: an Ornstein-Uhlenbeck mean-reversion spread, Engle-Granger/Johansen cointegration against candidate partner tickers, a Kalman-filtered *time-varying* hedge ratio version of the same idea, and a Gaussian HMM regime detector. `StatArbManager` dampens confidence for elevated spread volatility. |
+| **Macro/Rates** | `MacroRatesManager` | `egarch_asymmetric_vol`, `gjr_garch_crash_risk`, `arima_forecast`, `macro_var_spillover`, `cir_rate_regime` | Volatility-regime and macro-driven signals: EGARCH/GJR-GARCH asymmetric-volatility ("leverage effect") reads, an ARIMA return forecast, a small VAR system relating the asset to FRED macro series (VIX, yield curve), and a CIR short-rate regime read. GARCH-family parameters here are documented, fixed, honest approximations, not MLE-fitted — `quantcore` has no EGARCH/GJR-GARCH fitter yet. |
+| **Factor** | `FactorManager` | `fama_french_factor`, `fama_macbeth`, `newey_west_significance` | Cross-sectional/regression analysts: a Fama-French factor-tilt regression, a genuine Fama-MacBeth two-pass estimate (the one analyst that needs more than one ticker's data), and a general "does X actually predict this asset" Newey-West-robust significance test against a configurable lagged predictor. |
+| **Event/Credit** | `EventCreditManager` | `news_sentiment`, `sec_fundamentals`, `short_interest_squeeze` | Event-driven, mostly text/filings-based rather than pure price math: Finnhub news sentiment, an OLS trend over trailing SEC EDGAR filing values, and a short-interest days-to-cover squeeze z-score from FINRA data. `EventCreditManager` dampens confidence as event/filing severity rises. |
+
+## Scoring — how the Commander decides who to trust
+
+`scoring/` is a separate, non-agent system: it tracks each Layer 1
+analyst's daily hypothetical attributable performance
+(`TrackRecord`/`PerformanceRecord`) and converts trailing track record
+into an allocation weight (`WeightingStrategy`, e.g. `Hedge`) via
+`PerformanceScoreboard`. This — not agent type, not a hardcoded trust
+table — is what `Commander.decide()` and each `ManagerAgent.evaluate()`
+actually use to decide how much say a given analyst gets today. An
+analyst that's been wrong lately loses influence automatically; one
+that's been right gains it.
+
+## Data sources
+
+All external data funnels through `data/cache.py` — a local on-disk
+parquet cache keyed by `(source, identifier, as_of_date)`, so re-running
+a backtest never re-hits a rate-limited free API. Point-in-time gating
+differs by source (see `data/point_in_time.py` and CLAUDE.md for the
+exact rules — e.g. SEC filings gate on filed date, not fiscal period end;
+FRED series gate on release/vintage date, not the observation period).
+
+| Source | Used for | Key required |
+|---|---|---|
+| `yfinance` (primary), Stooq (fallback), synthetic (last resort) | Daily price history | No |
+| `yfinance` option chains | Live-mode options snapshots only — **not usable by backtest-driving analysts**, since no free source has historical chains | No |
+| FRED | Macro/rates/VIX series | `FRED_API_KEY` |
+| Ken French Data Library | Fama-French factor returns | No |
+| SEC EDGAR | Company fundamentals (filed-date gated) | No (needs `SEC_EDGAR_USER_AGENT` contact header) |
+| FINRA | Biweekly short-interest | No |
+| Finnhub | News/sentiment | `FINNHUB_API_KEY` |
+
+## Conventions worth knowing before touching the code
+
+- **Every cross-component data structure is a Pydantic `BaseModel`** —
+  no raw dicts or dataclasses cross a module boundary. This is what
+  keeps 22 wildly different analyst implementations interchangeable from
+  every layer above them.
+- **Two date types, two layers, do not mix them.** Market-data code
+  (`_market_math.py`, `point_in_time.py`, every analyst's
+  `generate_signal`/`scale_factor`) works in `pd.Timestamp`. Everything
+  performance-tracking (`scoring/`) works in plain `datetime.date`.
+  `Commander.decide()` and `ManagerAgent.evaluate()` are the one place
+  that converts between them (`.date()`), right before calling into
+  `scoring/`.
+- `logging_config.py` is the project's only logging setup —
+  `get_logger(__name__)` at import time everywhere, `configure_logging()`
+  called once by an entry point. See CLAUDE.md for the one Streamlit
+  `__name__` trap already hit here.
+- `quantcore` is a dependency, never something to fork or patch from
+  this repo.
 
 ## Running it
 
-Two console scripts are installed with the package:
-
 ```bash
-uv run agentic-trading        # launches the Streamlit dashboard
-uv run agentic-trading-cli <assets> --start-date <date> --end-date <date>  # headless backtest, prints a BacktestResult
+uv sync --locked --group dev              # install deps
+
+uv run agentic-trading                    # launch the Streamlit dashboard
+uv run agentic-trading-cli <assets> --start-date <date> --end-date <date>   # headless backtest
+
+uv run pytest                             # tests
+uv run ruff check . && uv run ruff format --check .
+uv run mypy src/
 ```
 
-Equivalently, without the installed scripts:
+The dashboard (`gui/dashboard.py`) is a visualization layer, not part of
+the backtest engine itself: a single-asset "trading desk" view with
+day-by-day playback (step forward/backward, a day-scrubber slider,
+autoplay), a per-day breakdown of every contributing analyst/manager
+signal behind that day's decision (not just the net trade), holdings/
+blotter views, and a scoreboard.
 
-```bash
-uv run src/agentic_trading/main.py                                              # dashboard
-uv run src/agentic_trading/main.py cli <assets> --start-date <date> --end-date <date>  # headless backtest
-```
+See `CLAUDE.md` for the full command reference, coding conventions, and
+current architectural rules — it takes precedence over this file for
+anything that conflicts.
 
-The dashboard can also be launched directly with Streamlit:
+## Status
 
-```bash
-uv run streamlit run src/agentic_trading/gui/dashboard.py
-```
-
-It uses a dark theme and defaults to a single-asset desk simulation so you
-can inspect analysts, managers, trades, and the portfolio curve in one
-place — with day-by-day playback (step forward/backward, a day-scrubber
-slider, and autoplay) and a per-day signal breakdown showing every
-contributing analyst/manager signal behind that day's decision, not just
-the net trade.
+Active development. `agents/roster.py` is the place to extend the
+analyst/manager roster; `agents/portfolio_construction.py` is the place
+to extend Layer 4 once single-asset behavior is stable.
