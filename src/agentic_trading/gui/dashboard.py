@@ -13,6 +13,8 @@ import streamlit as st
 from agentic_trading.agents.base import AnalystAgent, ManagerAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.managers import (
+    AltDataManager,
+    AnomalyNetworkManager,
     CVaRManager,
     EventCreditManager,
     FactorManager,
@@ -22,6 +24,8 @@ from agentic_trading.agents.managers import (
 )
 from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.roster import (
+    ALT_DATA_MANAGER_ANALYST_IDS,
+    ANOMALY_NETWORK_MANAGER_ANALYST_IDS,
     CVAR_MANAGER_ANALYST_IDS,
     EVENT_CREDIT_MANAGER_ANALYST_IDS,
     FACTOR_MANAGER_ANALYST_IDS,
@@ -31,9 +35,16 @@ from agentic_trading.agents.roster import (
     build_default_analysts,
     build_default_managers,
 )
-from agentic_trading.agents.schemas import BacktestResult, PortfolioDecision, TradeRecord
+from agentic_trading.agents.schemas import (
+    BacktestResult,
+    ManagerSignal,
+    PortfolioDecision,
+    TradeRecord,
+)
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
+from agentic_trading.data.cache import CACHE_ROOT
+from agentic_trading.data.db import read_fetch_log
 from agentic_trading.data.loader import load_price_history_with_fallback
 from agentic_trading.data.ticker_catalog import TICKER_GROUPS, TickerGroup, tickers_by_asset_class
 from agentic_trading.logging_config import configure_logging, get_logger
@@ -117,6 +128,70 @@ def _inject_styles() -> None:
                 font-size: 0.95rem;
                 font-weight: 600;
             }
+
+            .flow-layer-label {
+                color: #94a3b8;
+                font-size: 0.78rem;
+                font-weight: 700;
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+                margin-bottom: 0.35rem;
+            }
+
+            .agent-node {
+                display: block;
+                border-radius: 8px;
+                padding: 0.35rem 0.55rem;
+                margin-bottom: 0.4rem;
+                font-size: 0.8rem;
+                border: 1px solid rgba(148, 163, 184, 0.25);
+            }
+            .agent-node-name {
+                font-weight: 600;
+                display: block;
+            }
+            .agent-node-agree {
+                background: rgba(34, 197, 94, 0.12);
+                border-color: rgba(34, 197, 94, 0.45);
+            }
+            .agent-node-disagree {
+                background: rgba(239, 68, 68, 0.10);
+                border-color: rgba(239, 68, 68, 0.4);
+            }
+            .agent-node-flat {
+                background: rgba(100, 116, 139, 0.12);
+                border-color: rgba(100, 116, 139, 0.35);
+            }
+
+            .status-pill {
+                display: inline-block;
+                border-radius: 999px;
+                padding: 0.15rem 0.6rem;
+                margin: 0.15rem 0.3rem 0.15rem 0;
+                font-size: 0.76rem;
+                font-weight: 600;
+                border: 1px solid rgba(148, 163, 184, 0.3);
+            }
+            .status-pill-live {
+                background: rgba(34, 197, 94, 0.14);
+                color: #4ade80;
+                border-color: rgba(34, 197, 94, 0.4);
+            }
+            .status-pill-cached {
+                background: rgba(59, 130, 246, 0.14);
+                color: #60a5fa;
+                border-color: rgba(59, 130, 246, 0.4);
+            }
+            .status-pill-fallback {
+                background: rgba(234, 179, 8, 0.14);
+                color: #facc15;
+                border-color: rgba(234, 179, 8, 0.4);
+            }
+            .status-pill-unused {
+                background: rgba(100, 116, 139, 0.10);
+                color: #94a3b8;
+                border-color: rgba(100, 116, 139, 0.3);
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -127,7 +202,7 @@ def _build_analysts() -> list[AnalystAgent]:
     return build_default_analysts()
 
 
-ALL_PODS_MODE = "All 6 pods"
+ALL_PODS_MODE = "All 8 pods"
 
 # Single-pod modes: each hands its manager only the analysts belonging to
 # its own pod (via roster.py's *_ANALYST_IDS), the same filtering
@@ -160,13 +235,21 @@ _SINGLE_POD_MANAGERS: dict[
         lambda owned: EventCreditManager(managed_analysts=owned, weighting_strategy=Hedge()),
         EVENT_CREDIT_MANAGER_ANALYST_IDS,
     ),
+    "Alt-Data Manager": (
+        lambda owned: AltDataManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        ALT_DATA_MANAGER_ANALYST_IDS,
+    ),
+    "Anomaly/Network Manager": (
+        lambda owned: AnomalyNetworkManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        ANOMALY_NETWORK_MANAGER_ANALYST_IDS,
+    ),
 }
 MANAGER_MODES: tuple[str, ...] = (*_SINGLE_POD_MANAGERS, ALL_PODS_MODE)
 
 
 def _build_managers(manager_mode: str, analysts: list[AnalystAgent]) -> list[ManagerAgent]:
-    """`ALL_PODS_MODE` wires up the full 6-pod roster (see
-    agents/roster.py), splitting ownership of `analysts` across all six
+    """`ALL_PODS_MODE` wires up the full 8-pod roster (see
+    agents/roster.py), splitting ownership of `analysts` across all eight
     managers rather than duplicating every analyst under each — that would
     double-count each signal in Commander.decide(). Every other mode
     isolates a single pod, handing its manager only that pod's own
@@ -716,6 +799,339 @@ def _source_summary_frame(
     return pd.DataFrame(rows)
 
 
+def _majority_direction(directions: list[str]) -> str:
+    """The most common direction among `directions`, "flat" for an empty
+    or perfectly-tied input — the reference point every node in the
+    agent-flow view is colored agree/disagree against."""
+    if not directions:
+        return "flat"
+    counts = {direction: directions.count(direction) for direction in set(directions)}
+    top_count = max(counts.values())
+    tied = sorted(direction for direction, count in counts.items() if count == top_count)
+    return tied[0] if len(tied) > 1 else next(iter(tied))
+
+
+@dataclass(slots=True)
+class AgentFlowNode:
+    """One node in the agent-flow diagram: a name, its current
+    direction/confidence output, and whether that direction agrees with
+    the day's majority-vote direction (used purely for the node's color)."""
+
+    name: str
+    direction: str
+    confidence: float
+    agrees_with_majority: bool
+
+
+@dataclass(slots=True)
+class AgentFlowSnapshot:
+    """The four-layer pipeline's state for one asset on one day: every
+    contributing analyst signal, every manager's aggregated read across
+    the analysts it owns, and the Commander's final call — everything the
+    agent-flow view renders, computed once so the render function stays a
+    thin loop over already-shaped data."""
+
+    analysts: list[AgentFlowNode]
+    managers: list[AgentFlowNode]
+    commander: AgentFlowNode | None
+    majority_direction: str
+
+
+def _build_agent_flow_snapshot(
+    decisions_by_day: dict[date, list[PortfolioDecision]],
+    asset: str,
+    as_of_date: date,
+) -> AgentFlowSnapshot:
+    """Reshapes one day's already-recorded `ManagerSignal`s for `asset`
+    into the three-layer node structure `_render_agent_flow_view` draws.
+    Analyst-layer confidence is each `ManagerSignal`'s confidence — already
+    dampened by its owning manager, since a bare `AgentSignal` (pre-
+    dampening) is never persisted past `ManagerAgent.evaluate()` — labeled
+    accordingly in the UI rather than implying it's the analyst's raw
+    output. The manager layer aggregates by mean confidence and majority
+    direction across the analysts each manager owns for this asset/day."""
+    decisions = [
+        decision for decision in decisions_by_day.get(as_of_date, []) if decision.asset == asset
+    ]
+    signals: list[ManagerSignal] = [
+        signal for decision in decisions for signal in decision.contributing_signals
+    ]
+    if not signals:
+        return AgentFlowSnapshot(
+            analysts=[], managers=[], commander=None, majority_direction="flat"
+        )
+
+    majority = _majority_direction([signal.direction for signal in signals])
+
+    analyst_nodes = [
+        AgentFlowNode(
+            name=signal.source_agent_id,
+            direction=signal.direction,
+            confidence=signal.confidence,
+            agrees_with_majority=signal.direction == majority,
+        )
+        for signal in sorted(signals, key=lambda s: s.source_agent_id)
+    ]
+
+    by_manager: dict[str, list[ManagerSignal]] = {}
+    for signal in signals:
+        by_manager.setdefault(signal.manager_id, []).append(signal)
+    manager_nodes = [
+        AgentFlowNode(
+            name=manager_id,
+            direction=_majority_direction([s.direction for s in owned]),
+            confidence=sum(s.confidence for s in owned) / len(owned),
+            agrees_with_majority=_majority_direction([s.direction for s in owned]) == majority,
+        )
+        for manager_id, owned in sorted(by_manager.items())
+    ]
+
+    commander_node = None
+    if decisions:
+        target_weight = decisions[0].target_weight
+        commander_direction = (
+            "long" if target_weight > 0 else "short" if target_weight < 0 else "flat"
+        )
+        commander_node = AgentFlowNode(
+            name="Commander",
+            direction=commander_direction,
+            confidence=min(abs(target_weight), 1.0),
+            agrees_with_majority=commander_direction == majority,
+        )
+
+    return AgentFlowSnapshot(
+        analysts=analyst_nodes,
+        managers=manager_nodes,
+        commander=commander_node,
+        majority_direction=majority,
+    )
+
+
+def _node_css_class(node: AgentFlowNode) -> str:
+    if node.direction == "flat":
+        return "agent-node-flat"
+    return "agent-node-agree" if node.agrees_with_majority else "agent-node-disagree"
+
+
+def _render_flow_node(node: AgentFlowNode) -> None:
+    st.markdown(
+        f'<div class="agent-node {_node_css_class(node)}">'
+        f'<span class="agent-node-name">{node.name}</span>'
+        f"{node.direction.upper()} · {node.confidence:.2f}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_agent_flow_view(desk_run: DeskRun, as_of_date: date) -> None:
+    """The four-layer pipeline (Analysts → Pod Managers → Commander →
+    optional Portfolio Construction) for one asset on the current playback
+    day, each node colored by whether it agrees with that day's
+    majority-vote direction — this is what makes "many heterogeneous
+    agents debating" visible rather than just asserted in prose."""
+    st.markdown("### Agent flow")
+    st.markdown(
+        '<div class="section-caption">Every contributing signal for one asset, on the '
+        "currently-selected playback day, grouped by pipeline layer. A node's color shows "
+        "whether it agrees with that day's majority-vote direction across every analyst "
+        "signal for this asset — not a claim about which side is actually right."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    if not desk_run.tickers:
+        st.info("No tickers in this run.")
+        return
+    asset = st.selectbox("Asset", options=desk_run.tickers, key="agent_flow_asset")
+    snapshot = _build_agent_flow_snapshot(desk_run.decisions_by_day, asset, as_of_date)
+    if not snapshot.analysts:
+        st.info(f"No contributing signals recorded for {asset} on {as_of_date.isoformat()}.")
+        return
+
+    col_analysts, col_managers, col_commander, col_l4 = st.columns(4)
+    with col_analysts:
+        st.markdown(
+            '<div class="flow-layer-label">Layer 1 · Analysts</div>', unsafe_allow_html=True
+        )
+        for node in snapshot.analysts:
+            _render_flow_node(node)
+    with col_managers:
+        st.markdown(
+            '<div class="flow-layer-label">Layer 2 · Pod managers</div>', unsafe_allow_html=True
+        )
+        for node in snapshot.managers:
+            _render_flow_node(node)
+    with col_commander:
+        st.markdown(
+            '<div class="flow-layer-label">Layer 3 · Commander</div>', unsafe_allow_html=True
+        )
+        if snapshot.commander is not None:
+            _render_flow_node(snapshot.commander)
+    with col_l4:
+        st.markdown(
+            '<div class="flow-layer-label">Layer 4 · Portfolio construction</div>',
+            unsafe_allow_html=True,
+        )
+        if desk_run.portfolio_construction_method is not None:
+            st.markdown(
+                '<div class="agent-node agent-node-flat">'
+                f'<span class="agent-node-name">{desk_run.portfolio_construction_method}'
+                "</span>enabled — reshapes weights across the whole basket, not just "
+                f"{asset}</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="agent-node agent-node-flat">'
+                '<span class="agent-node-name">Off</span>Commander\'s decision passes '
+                "through unchanged</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def _trust_panel_frame(desk_run: DeskRun, source_ids: list[str], as_of_date: date) -> pd.DataFrame:
+    """One row per analyst/manager: trailing Sharpe and cumulative
+    contribution from `scoring/scoreboard.py`, side by side with its
+    current scoring-derived portfolio weight from the same `Hedge`
+    weighting strategy `ManagerAgent.evaluate()`/`Commander.decide()`
+    actually use — so the panel shows the same weight the backtest itself
+    applied, not a separately-reconstructed approximation of it."""
+    if not source_ids:
+        return pd.DataFrame(columns=["source", "weight", "sharpe_30d", "contribution_%"])
+
+    weights = Hedge().get_weights(desk_run.scoreboard, source_ids, as_of_date)
+    rows = []
+    for source_id in source_ids:
+        try:
+            sharpe = desk_run.scoreboard.sharpe_ratio(source_id, as_of_date, 30)
+        except ValueError:
+            sharpe = 0.0
+        series = _cumulative_pct_series(desk_run.track_record, source_id)
+        as_of_series = _clip_series_to_date(series, as_of_date)
+        contribution_pct = float(as_of_series.iloc[-1]) if not as_of_series.empty else 0.0
+        rows.append(
+            {
+                "source": source_id,
+                "weight": weights.get(source_id, 1.0),
+                "sharpe_30d": sharpe,
+                "contribution_%": contribution_pct,
+            }
+        )
+    return pd.DataFrame(rows).sort_values("weight", ascending=False).reset_index(drop=True)
+
+
+def _render_trust_panel(
+    desk_run: DeskRun, source_ids: list[str], as_of_date: date, label_plural: str
+) -> None:
+    """Trailing performance next to current scoring-derived weight, for
+    every source in `source_ids` — makes it visually obvious that trust in
+    this project is earned from a measured track record, never hardcoded
+    by agent type (see `scoring/weighting.py`)."""
+    st.markdown(f"#### {label_plural} trust panel")
+    st.markdown(
+        '<div class="section-caption">Trailing 30-day Sharpe and contribution next to the '
+        "same scoring-derived weight this backtest actually applied that day — weight "
+        "1.0 is average; above/below reflects out/underperformance relative to peers."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    frame = _trust_panel_frame(desk_run, source_ids, as_of_date)
+    if frame.empty:
+        st.info("No track record yet for this source group.")
+        return
+    st.dataframe(
+        frame,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "weight": st.column_config.ProgressColumn(
+                "Weight",
+                min_value=0.0,
+                max_value=max(2.0, float(frame["weight"].max())),
+                format="%.2f",
+            ),
+            "sharpe_30d": st.column_config.NumberColumn("Sharpe (30d)", format="%.2f"),
+            "contribution_%": st.column_config.NumberColumn("Contribution %", format="%.2f"),
+        },
+    )
+
+
+_KNOWN_DATA_SOURCES: tuple[str, ...] = (
+    "fred",
+    "finnhub_news",
+    "sec_edgar",
+    "sec_fulltext",
+    "finra_short_interest",
+    "fama_french",
+    "tiingo",
+    "alpha_vantage",
+    "fmp",
+    "google_trends",
+    "wikimedia_pageviews",
+    "reddit",
+    "congress_trading",
+    "cboe",
+)
+
+
+def _data_source_status_rows(
+    fetch_log: pd.DataFrame, known_sources: tuple[str, ...], today: date
+) -> list[dict[str, str]]:
+    """Per-source status for the strip: "live" if that source's most
+    recent recorded fetch happened today (real wall-clock date, matching
+    how `data/cache.py` keys most of these sources), "cached" if it has a
+    fetch on record from an earlier day, "unused" if this run never
+    touched it at all. Pure function over an already-loaded fetch log
+    frame so it's testable without a real SQLite file."""
+    latest_by_source: dict[str, str] = {}
+    if not fetch_log.empty:
+        for source, group in fetch_log.groupby("source"):
+            latest_by_source[str(source)] = str(group["as_of_date"].max())
+
+    rows = []
+    for source in known_sources:
+        latest = latest_by_source.get(source)
+        if latest is None:
+            status = "unused"
+        elif latest == today.isoformat():
+            status = "live"
+        else:
+            status = "cached"
+        rows.append({"source": source, "status": status, "last_fetched": latest or "—"})
+    return rows
+
+
+def _render_data_source_status_strip(desk_run: DeskRun) -> None:
+    """Which external sources this run actually touched, and whether each
+    was a fresh live fetch today or served from an earlier cache entry —
+    surfaces the multi-source data layer (Task 1) at a glance instead of
+    leaving it implicit in the README."""
+    st.markdown("#### Data sources")
+    price_status = "live" if "live" in desk_run.source_label else "fallback"
+    price_class = {"live": "status-pill-live", "fallback": "status-pill-fallback"}[price_status]
+    st.markdown(
+        f'<span class="status-pill {price_class}">market data: {desk_run.source_label}</span>',
+        unsafe_allow_html=True,
+    )
+
+    try:
+        fetch_log = read_fetch_log(CACHE_ROOT / "fetch_log.db")
+    except Exception:
+        logger.debug("Could not read the fetch log for the data-source status strip", exc_info=True)
+        fetch_log = pd.DataFrame(columns=["source", "identifier", "as_of_date"])
+
+    rows = _data_source_status_rows(fetch_log, _KNOWN_DATA_SOURCES, date.today())
+    pill_class = {
+        "live": "status-pill-live",
+        "cached": "status-pill-cached",
+        "unused": "status-pill-unused",
+    }
+    badges = "".join(
+        f'<span class="status-pill {pill_class[row["status"]]}" '
+        f'title="last fetched: {row["last_fetched"]}">{row["source"]}: {row["status"]}</span>'
+        for row in rows
+    )
+    st.markdown(badges, unsafe_allow_html=True)
+
+
 @st.dialog("Signal & trade history", width="large")
 def _show_source_history_dialog(source_id: str, id_field: str, label_singular: str) -> None:
     """Drill-down modal: every signal `source_id` produced, split into one
@@ -849,6 +1265,12 @@ def _render_overview_tab() -> None:
                 label_visibility="collapsed",
             )
 
+    with st.container(border=True):
+        _render_data_source_status_strip(desk_run)
+
+    with st.container(border=True):
+        _render_agent_flow_view(desk_run, current_date)
+
     st.markdown("### Portfolio vs. benchmarks")
     st.markdown(
         '<div class="section-caption">Cumulative % return since the start of the window — '
@@ -971,6 +1393,15 @@ def _render_performance_tab(
         "not an absolute return.</div>",
         unsafe_allow_html=True,
     )
+
+    current_date_for_trust = _current_playback_date()
+    with st.expander(f"{label_plural} trust panel", expanded=True):
+        _render_trust_panel(
+            desk_run,
+            source_ids,
+            current_date_for_trust if current_date_for_trust is not None else date.today(),
+            label_plural,
+        )
 
     all_series = {sid: _cumulative_pct_series(desk_run.track_record, sid) for sid in source_ids}
 

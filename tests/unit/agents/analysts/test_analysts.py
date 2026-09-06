@@ -1,7 +1,9 @@
 from agentic_trading.agents.analysts import (
     ARIMAForecastAnalyst,
     BlackScholesValuationAnalyst,
+    CalendarSeasonalityAnalyst,
     CIRRateRegimeAnalyst,
+    CongressionalTradingAnalyst,
     EGARCHAsymmetricVolAnalyst,
     FamaFrenchFactorAnalyst,
     FamaMacbethAnalyst,
@@ -9,18 +11,24 @@ from agentic_trading.agents.analysts import (
     GJRGARCHCrashRiskAnalyst,
     GreeksDeltaHedgeAnalyst,
     HestonVolSurfaceAnalyst,
+    InsiderClusterBuyingAnalyst,
     KalmanHedgeRatioAnalyst,
+    LeadLagNetworkCentralityAnalyst,
     MacroVarSpilloverAnalyst,
     MonteCarloValuationAnalyst,
     NeweyWestSignificanceAnalyst,
     NewsSentimentAnalyst,
+    OptionsSkewSentimentAnalyst,
     OUMeanReversionAnalyst,
     PairsCointegrationAnalyst,
+    RedditSentimentAnalyst,
     RegimeHMMAnalyst,
+    RetailAttentionAnalyst,
     RiskMaximizingAnalyst,
     RiskMinimizingAnalyst,
     SecFundamentalsAnalyst,
     ShortInterestSqueezeAnalyst,
+    WikipediaPageviewsAnalyst,
 )
 from agentic_trading.agents.base import AnalystAgent
 
@@ -47,6 +55,14 @@ ALL_ANALYST_CLASSES = (
     NeweyWestSignificanceAnalyst,
     SecFundamentalsAnalyst,
     ShortInterestSqueezeAnalyst,
+    CongressionalTradingAnalyst,
+    InsiderClusterBuyingAnalyst,
+    RetailAttentionAnalyst,
+    WikipediaPageviewsAnalyst,
+    RedditSentimentAnalyst,
+    CalendarSeasonalityAnalyst,
+    LeadLagNetworkCentralityAnalyst,
+    OptionsSkewSentimentAnalyst,
 )
 
 

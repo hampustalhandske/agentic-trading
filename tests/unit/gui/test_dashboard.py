@@ -399,6 +399,108 @@ def test_load_basket_data_wraps_single_ticker_into_multiindex() -> None:
     assert "SYNTH_ONLY" in frame.columns.get_level_values(0)
 
 
+def test_majority_direction_picks_the_most_common_direction() -> None:
+    assert dashboard_module._majority_direction(["long", "long", "short"]) == "long"
+
+
+def test_majority_direction_breaks_ties_deterministically() -> None:
+    assert dashboard_module._majority_direction(["short", "long"]) == "long"
+
+
+def test_majority_direction_empty_input_is_flat() -> None:
+    assert dashboard_module._majority_direction([]) == "flat"
+
+
+def _flow_signal(manager_id: str, source_agent_id: str, direction: str, confidence: float = 0.6):
+    return ManagerSignal(
+        manager_id=manager_id,
+        source_agent_id=source_agent_id,
+        asset="AAA",
+        as_of_date=date(2024, 1, 2),
+        direction=direction,
+        confidence=confidence,
+        scale_applied=1.0,
+        rationale="test rationale",
+    )
+
+
+def test_build_agent_flow_snapshot_colors_nodes_by_majority_agreement() -> None:
+    decisions_by_day = {
+        date(2024, 1, 2): [
+            PortfolioDecision(
+                asset="AAA",
+                as_of_date=date(2024, 1, 2),
+                target_weight=0.5,
+                contributing_signals=[
+                    _flow_signal("manager-1", "analyst-1", "long"),
+                    _flow_signal("manager-1", "analyst-2", "long"),
+                    _flow_signal("manager-2", "analyst-3", "short"),
+                ],
+            )
+        ]
+    }
+
+    snapshot = dashboard_module._build_agent_flow_snapshot(
+        decisions_by_day, "AAA", date(2024, 1, 2)
+    )
+
+    assert snapshot.majority_direction == "long"
+    by_name = {node.name: node for node in snapshot.analysts}
+    assert by_name["analyst-1"].agrees_with_majority is True
+    assert by_name["analyst-3"].agrees_with_majority is False
+    assert {node.name for node in snapshot.managers} == {"manager-1", "manager-2"}
+    assert snapshot.commander is not None
+    assert snapshot.commander.direction == "long"
+
+
+def test_build_agent_flow_snapshot_empty_for_unmatched_asset() -> None:
+    decisions_by_day = {
+        date(2024, 1, 2): [
+            PortfolioDecision(
+                asset="AAA",
+                as_of_date=date(2024, 1, 2),
+                target_weight=0.5,
+                contributing_signals=[_flow_signal("manager-1", "analyst-1", "long")],
+            )
+        ]
+    }
+
+    snapshot = dashboard_module._build_agent_flow_snapshot(
+        decisions_by_day, "ZZZ", date(2024, 1, 2)
+    )
+
+    assert snapshot.analysts == []
+    assert snapshot.commander is None
+    assert snapshot.majority_direction == "flat"
+
+
+def test_data_source_status_rows_classifies_live_cached_and_unused() -> None:
+    today = date(2024, 6, 10)
+    fetch_log = pd.DataFrame(
+        {
+            "source": ["fred", "fred", "cboe"],
+            "identifier": ["DGS3MO", "DGS3MO", "put_call"],
+            "as_of_date": ["2024-06-09", "2024-06-10", "2024-06-01"],
+            "fetched_at": ["x", "y", "z"],
+            "row_count": [1, 1, 1],
+        }
+    )
+
+    rows = dashboard_module._data_source_status_rows(fetch_log, ("fred", "cboe", "reddit"), today)
+    by_source = {row["source"]: row["status"] for row in rows}
+
+    assert by_source["fred"] == "live"
+    assert by_source["cboe"] == "cached"
+    assert by_source["reddit"] == "unused"
+
+
+def test_data_source_status_rows_all_unused_for_empty_log() -> None:
+    rows = dashboard_module._data_source_status_rows(
+        pd.DataFrame(columns=["source", "identifier", "as_of_date"]), ("fred",), date(2024, 6, 10)
+    )
+    assert rows == [{"source": "fred", "status": "unused", "last_fetched": "—"}]
+
+
 # ---------------------------------------------------------------------------
 # AppTest integration tests
 # ---------------------------------------------------------------------------
@@ -612,6 +714,41 @@ def test_desks_and_analysts_tabs_render_without_exception() -> None:
     assert "Show desks" in multiselect_labels
     assert "Show analysts" in multiselect_labels
     assert len(at.dataframe) >= 2
+
+
+def test_agent_flow_view_renders_without_exception() -> None:
+    """The Overview tab's agent-flow diagram (the new highest-value panel)
+    must render for a seeded run without raising, and must expose the
+    per-asset selector it's built around."""
+    at = _seeded_app().run(timeout=30)
+
+    assert not at.exception
+    flow_selectboxes = [box for box in at.selectbox if box.key == "agent_flow_asset"]
+    assert len(flow_selectboxes) == 1
+    assert set(flow_selectboxes[0].options) == set(_TICKERS)
+
+
+def test_trust_panel_renders_without_exception() -> None:
+    """The Desks/Analysts trust panels must render for a seeded run
+    without raising, surfacing both tabs' scoring-derived weight tables."""
+    at = _seeded_app().run(timeout=30)
+
+    assert not at.exception
+    markdown_texts = " ".join(md.value for md in at.markdown)
+    assert "Desks trust panel" in markdown_texts
+    assert "Analysts trust panel" in markdown_texts
+
+
+def test_data_source_status_strip_renders_without_exception() -> None:
+    """The Overview tab's data-source status strip must render for a
+    seeded run without raising, even against whatever fetch log (or lack
+    of one) happens to exist on this machine."""
+    at = _seeded_app().run(timeout=30)
+
+    assert not at.exception
+    markdown_texts = " ".join(md.value for md in at.markdown)
+    assert "status-pill" in markdown_texts
+    assert "market data:" in markdown_texts
 
 
 def test_stepping_forward_advances_current_day_index_that_every_chart_clips_by() -> None:

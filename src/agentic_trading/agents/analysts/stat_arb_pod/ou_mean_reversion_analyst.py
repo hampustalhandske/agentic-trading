@@ -67,7 +67,24 @@ class OUMeanReversionAnalyst(AnalystAgent):
                 rationale="insufficient history to build an OU spread",
             )
 
-        half_life = max(float(ou_half_life(spread)), MIN_HALF_LIFE_DAYS)
+        try:
+            raw_half_life = float(ou_half_life(spread))
+        except ValueError as exc:
+            logger.debug(
+                "%s: spread for %s does not exhibit mean reversion (%s) — holding.",
+                self.agent_id,
+                asset,
+                exc,
+            )
+            return AgentSignal(
+                agent_id=self.agent_id,
+                asset=asset,
+                as_of_date=as_of_date.date(),
+                direction="flat",
+                confidence=0.0,
+                rationale="spread is not mean-reverting over the current window — holding",
+            )
+        half_life = max(raw_half_life, MIN_HALF_LIFE_DAYS)
         z_window = int(min(max(round(4 * half_life), 5), MAX_ZSCORE_WINDOW, spread.size))
         z_scores = spread_zscore(spread, z_window)
         current_z = float(z_scores[-1])

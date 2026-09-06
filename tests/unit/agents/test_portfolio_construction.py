@@ -76,6 +76,27 @@ def test_enabled_constructor_skips_gracefully_with_too_few_observations() -> Non
         assert result == decisions
 
 
+def test_enabled_constructor_skips_when_observations_equal_asset_count() -> None:
+    """quantcore's ledoit_wolf_shrinkage requires strictly more observations
+    (T) than assets (k) — a basket of 5 assets (the project's
+    DEFAULT_BASKET) with exactly 5 days of returns history is a real case
+    hit in an actual run: T=5, k=5 fails T > k even though 5 observations
+    clears the flat MIN_OBSERVATIONS_FOR_COVARIANCE floor. Must degrade to
+    a no-op, not raise."""
+    assets = ["AAPL", "MSFT", "GOOGL", "AMZN", "JPM"]
+    constructor = PortfolioConstructor(enabled=True)
+    decisions = [_decision(asset, 0.1) for asset in assets]
+
+    result = constructor.construct(
+        decisions=decisions,
+        returns_history=_returns_history(assets, periods=5),
+        market_weights={asset: 0.2 for asset in assets},
+        as_of_date=pd.Timestamp("2024-06-01"),
+    )
+
+    assert result == decisions
+
+
 def test_enabled_constructor_supports_min_variance_and_mean_variance() -> None:
     assets = ["AAPL", "MSFT"]
     decisions = [_decision("AAPL", 0.4), _decision("MSFT", 0.2)]

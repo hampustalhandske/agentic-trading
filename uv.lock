@@ -24,6 +24,7 @@ dependencies = [
     { name = "pandas-stubs" },
     { name = "pydantic" },
     { name = "python-dotenv" },
+    { name = "pytrends" },
     { name = "quantcore" },
     { name = "requests" },
     { name = "streamlit" },
@@ -46,6 +47,7 @@ requires-dist = [
     { name = "pandas-stubs", specifier = ">=3.0.5.260730" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "python-dotenv", specifier = ">=1.0" },
+    { name = "pytrends", specifier = ">=4.9.2" },
     { name = "quantcore", git = "https://github.com/hampustalhandske/quantcore.git" },
     { name = "requests", specifier = ">=2.32" },
     { name = "streamlit", specifier = ">=1.62.0" },
@@ -1511,6 +1513,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/5b/42/55c32bb9b12693c092ad250a0e82edb5b31ddeda6eb772de5f308b3804ad/python_multipart-0.0.32.tar.gz", hash = "sha256:be54b7f3fa167bb83e4fcd936b887b708f4e57fe75911c02aebf53efaf8d938e", size = 46881, upload-time = "2026-06-04T16:18:58.647Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e1/04/e8135ebd1ad02c56ec633277529b2602ff99ff634be76cdba5744cf554fd/python_multipart-0.0.32-py3-none-any.whl", hash = "sha256:ff6d3f776f16878c894e52e107296ffc890e913c611b1a4ec6c44e2821fe2e23", size = 30042, upload-time = "2026-06-04T16:18:57.319Z" },
+]
+
+[[package]]
+name = "pytrends"
+version = "4.9.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "lxml" },
+    { name = "pandas" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e9/65/a242fd8fbe98c11bd51f0b57d4752905396a99c42c91c3213c3f44e741c8/pytrends-4.9.2.tar.gz", hash = "sha256:691c6e36b1aeaa4754f3692bdbad0dff446e528ffb052eee2e7f139aaa2c6989", size = 247162, upload-time = "2023-04-13T23:17:21.313Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/68/ba/7a24a3723c790000faf880505ff1cc46f4d29f46dd353037938a070c4d23/pytrends-4.9.2-py3-none-any.whl", hash = "sha256:d7d0ee956be2f6e3e9fc09376c4615efb9347039d6d1f46e6f4326a5b7a14f67", size = 15352, upload-time = "2023-04-13T23:17:18.88Z" },
 ]
 
 [[package]]

@@ -1,5 +1,7 @@
 from agentic_trading.agents.base import ManagerAgent
 from agentic_trading.agents.managers import (
+    AltDataManager,
+    AnomalyNetworkManager,
     ConditionalValueAtRiskManager,
     CVaRManager,
     EventCreditManager,
@@ -18,6 +20,8 @@ ALL_MANAGER_CLASSES = (
     MacroRatesManager,
     FactorManager,
     EventCreditManager,
+    AltDataManager,
+    AnomalyNetworkManager,
 )
 
 
@@ -29,6 +33,8 @@ def test_managers_imports() -> None:
     assert MacroRatesManager.__name__ == "MacroRatesManager"
     assert FactorManager.__name__ == "FactorManager"
     assert EventCreditManager.__name__ == "EventCreditManager"
+    assert AltDataManager.__name__ == "AltDataManager"
+    assert AnomalyNetworkManager.__name__ == "AnomalyNetworkManager"
 
 
 def test_managers_can_be_constructed_with_defaults() -> None:

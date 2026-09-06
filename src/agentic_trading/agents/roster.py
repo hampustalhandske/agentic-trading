@@ -2,10 +2,10 @@
 
 """Default analyst/manager roster shared by the CLI and GUI entry points.
 
-Splits 22 analysts across 6 pod managers, each pod themed around a
-coherent quant strategy family, so the Commander sees six genuinely
+Splits 30 analysts across 8 pod managers, each pod themed around a
+coherent quant strategy family, so the Commander sees eight genuinely
 different risk overlays rather than duplicate coverage of the same
-signals under six names:
+signals under eight names:
 
 - **Risk pod** (RiskManager): directional/volatility analysts
   (risk_minimizing, risk_maximizing, gbm_momentum).
@@ -21,6 +21,12 @@ signals under six names:
   (fama_french_factor, fama_macbeth, newey_west_significance).
 - **Event/Credit pod** (EventCreditManager): event-driven analysts
   (news_sentiment, sec_fundamentals, short_interest_squeeze).
+- **Alt-Data/Crowd Attention pod** (AltDataManager): alt-data/behavioral
+  analysts (congressional_trading, insider_cluster_buying,
+  retail_attention, wikipedia_pageviews, reddit_sentiment).
+- **Anomaly/Network pod** (AnomalyNetworkManager): calendar-anomaly and
+  network-science analysts (calendar_seasonality,
+  lead_lag_network_centrality, options_skew_sentiment).
 """
 
 from __future__ import annotations
@@ -28,7 +34,9 @@ from __future__ import annotations
 from agentic_trading.agents.analysts import (
     ARIMAForecastAnalyst,
     BlackScholesValuationAnalyst,
+    CalendarSeasonalityAnalyst,
     CIRRateRegimeAnalyst,
+    CongressionalTradingAnalyst,
     EGARCHAsymmetricVolAnalyst,
     FamaFrenchFactorAnalyst,
     FamaMacbethAnalyst,
@@ -36,21 +44,29 @@ from agentic_trading.agents.analysts import (
     GJRGARCHCrashRiskAnalyst,
     GreeksDeltaHedgeAnalyst,
     HestonVolSurfaceAnalyst,
+    InsiderClusterBuyingAnalyst,
     KalmanHedgeRatioAnalyst,
+    LeadLagNetworkCentralityAnalyst,
     MacroVarSpilloverAnalyst,
     MonteCarloValuationAnalyst,
     NeweyWestSignificanceAnalyst,
     NewsSentimentAnalyst,
+    OptionsSkewSentimentAnalyst,
     OUMeanReversionAnalyst,
     PairsCointegrationAnalyst,
+    RedditSentimentAnalyst,
     RegimeHMMAnalyst,
+    RetailAttentionAnalyst,
     RiskMaximizingAnalyst,
     RiskMinimizingAnalyst,
     SecFundamentalsAnalyst,
     ShortInterestSqueezeAnalyst,
+    WikipediaPageviewsAnalyst,
 )
 from agentic_trading.agents.base import AnalystAgent, ManagerAgent
 from agentic_trading.agents.managers import (
+    AltDataManager,
+    AnomalyNetworkManager,
     CVaRManager,
     EventCreditManager,
     FactorManager,
@@ -106,11 +122,27 @@ EVENT_CREDIT_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
         "short_interest_squeeze_analyst",
     }
 )
+ALT_DATA_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
+    {
+        "congressional_trading_analyst",
+        "insider_cluster_buying_analyst",
+        "retail_attention_analyst",
+        "wikipedia_pageviews_analyst",
+        "reddit_sentiment_analyst",
+    }
+)
+ANOMALY_NETWORK_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
+    {
+        "calendar_seasonality_analyst",
+        "lead_lag_network_centrality_analyst",
+        "options_skew_sentiment_analyst",
+    }
+)
 
 
 def build_default_analysts() -> list[AnalystAgent]:
-    """The full 22-analyst Layer-1 roster, in a stable, deterministic
-    order: the original five first, then the 17 new ones grouped by pod in
+    """The full 30-analyst Layer-1 roster, in a stable, deterministic
+    order: the original five first, then the 25 new ones grouped by pod in
     the same order the pods are described above."""
     return [
         # Original five
@@ -142,11 +174,21 @@ def build_default_analysts() -> list[AnalystAgent]:
         # Event/Credit pod
         SecFundamentalsAnalyst(),
         ShortInterestSqueezeAnalyst(),
+        # Alt-Data/Crowd Attention pod
+        CongressionalTradingAnalyst(),
+        InsiderClusterBuyingAnalyst(),
+        RetailAttentionAnalyst(),
+        WikipediaPageviewsAnalyst(),
+        RedditSentimentAnalyst(),
+        # Anomaly/Network pod
+        CalendarSeasonalityAnalyst(),
+        LeadLagNetworkCentralityAnalyst(),
+        OptionsSkewSentimentAnalyst(),
     ]
 
 
 def build_default_managers(analysts: list[AnalystAgent] | None = None) -> list[ManagerAgent]:
-    """All 6 pod managers, each `managed_analysts` filtered from `analysts`
+    """All 8 pod managers, each `managed_analysts` filtered from `analysts`
     (defaults to build_default_analysts()) via its own `_ANALYST_IDS`
     frozenset."""
     analysts = analysts if analysts is not None else build_default_analysts()
@@ -168,5 +210,11 @@ def build_default_managers(analysts: list[AnalystAgent] | None = None) -> list[M
         ),
         EventCreditManager(
             managed_analysts=owned(EVENT_CREDIT_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()
+        ),
+        AltDataManager(
+            managed_analysts=owned(ALT_DATA_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()
+        ),
+        AnomalyNetworkManager(
+            managed_analysts=owned(ANOMALY_NETWORK_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()
         ),
     ]

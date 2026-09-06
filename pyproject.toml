@@ -11,6 +11,7 @@ dependencies = [
     "pandas-stubs>=3.0.5.260730",
     "pydantic>=2.13.4",
     "python-dotenv>=1.0",
+    "pytrends>=4.9.2",
     "quantcore",
     "requests>=2.32",
     "streamlit>=1.62.0",
@@ -82,5 +83,5 @@ module = "agentic_trading.*"
 disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
-module = ["quantcore.*", "yfinance.*", "pandas_datareader.*", "fredapi.*", "scipy.*"]
+module = ["quantcore.*", "yfinance.*", "pandas_datareader.*", "fredapi.*", "scipy.*", "pytrends.*"]
 ignore_missing_imports = true

@@ -31,7 +31,7 @@ inspectable, not just the final trade.
 ## Architecture — four layers, one deterministic engine
 
 ```
-Layer 1: Analysts (22)  →  Layer 2: Managers (6 pods)  →  Layer 3: Commander  →  (optional) Layer 4: Portfolio construction
+Layer 1: Analysts (30)  →  Layer 2: Managers (8 pods)  →  Layer 3: Commander  →  (optional) Layer 4: Portfolio construction
                                                                   ↓
                                                     Backtest engine (fills, accounting)
                                                                   ↓
@@ -53,7 +53,7 @@ Layer 1: Analysts (22)  →  Layer 2: Managers (6 pods)  →  Layer 3: Commander
   regime, VaR/CVaR, spread volatility, event severity, factor
   significance...) into a hard *dampening* of that analyst's confidence.
   Managers never flip direction and never invent conviction — they can
-  only scale it down. See "The six pods" below.
+  only scale it down. See "The eight pods" below.
 - **Layer 3 — Commander** (`agents/commander.py`): the final allocation
   authority. Holds portfolio state, combines every manager-adjusted
   signal weighted by that analyst's *trailing track record* (not its
@@ -66,7 +66,7 @@ Layer 1: Analysts (22)  →  Layer 2: Managers (6 pods)  →  Layer 3: Commander
   the covariance estimate (Ledoit-Wolf), runs a risk-budgeting optimizer
   (min-variance / mean-variance / risk-parity, selectable), scales the
   result by a Kelly fraction, and logs a component-VaR risk report. Exists
-  for going from "22 independent per-asset opinions" to "one
+  for going from "30 independent per-asset opinions" to "one
   coherent, risk-budgeted multi-asset portfolio," without being required
   for the simpler single-asset desk-simulation use case.
 
@@ -85,13 +85,13 @@ this:
   look-ahead bug here would silently invalidate any backtest result
   without producing an error.
 
-## The six pods
+## The eight pods
 
 `agents/roster.py` is the single place that wires up the default
-22-analyst / 6-manager roster; it's the file to change when adding more
+30-analyst / 8-manager roster; it's the file to change when adding more
 analysts or managers. Each pod is themed around one coherent family of
-quant strategy, so the Commander gets six genuinely different risk
-overlays rather than six relabelings of the same signal:
+quant strategy, so the Commander gets eight genuinely different risk
+overlays rather than eight relabelings of the same signal:
 
 | Pod | Manager | Analysts | What ties them together |
 |---|---|---|---|
@@ -101,6 +101,8 @@ overlays rather than six relabelings of the same signal:
 | **Macro/Rates** | `MacroRatesManager` | `egarch_asymmetric_vol`, `gjr_garch_crash_risk`, `arima_forecast`, `macro_var_spillover`, `cir_rate_regime` | Volatility-regime and macro-driven signals: EGARCH/GJR-GARCH asymmetric-volatility ("leverage effect") reads, an ARIMA return forecast, a small VAR system relating the asset to FRED macro series (VIX, yield curve), and a CIR short-rate regime read. GARCH-family parameters here are documented, fixed, honest approximations, not MLE-fitted — `quantcore` has no EGARCH/GJR-GARCH fitter yet. |
 | **Factor** | `FactorManager` | `fama_french_factor`, `fama_macbeth`, `newey_west_significance` | Cross-sectional/regression analysts: a Fama-French factor-tilt regression, a genuine Fama-MacBeth two-pass estimate (the one analyst that needs more than one ticker's data), and a general "does X actually predict this asset" Newey-West-robust significance test against a configurable lagged predictor. |
 | **Event/Credit** | `EventCreditManager` | `news_sentiment`, `sec_fundamentals`, `short_interest_squeeze` | Event-driven, mostly text/filings-based rather than pure price math: Finnhub news sentiment, an OLS trend over trailing SEC EDGAR filing values, and a short-interest days-to-cover squeeze z-score from FINRA data. `EventCreditManager` dampens confidence as event/filing severity rises. |
+| **Alt-Data/Crowd Attention** | `AltDataManager` | `congressional_trading`, `insider_cluster_buying`, `retail_attention`, `wikipedia_pageviews`, `reddit_sentiment` | Methodologically distinct from every pod above: alt-data/behavioral signals rather than price or filing math — Senate/House Stock Watcher disclosure imbalance, SEC Form 4 insider-filing clustering, Google Trends and Wikipedia pageview attention spikes (two independent attention proxies, kept both for cross-validation — see `wikipedia_pageviews_analyst`'s docstring), and Reddit community-score sentiment. `AltDataManager` dampens confidence for both staleness and thin sample sizes (`[source_as_of=...]` / `[sample_count=...]` rationale tags). |
+| **Anomaly/Network** | `AnomalyNetworkManager` | `calendar_seasonality`, `lead_lag_network_centrality`, `options_skew_sentiment` | Documented-anomaly and graph/network-science analysts, distinct from the factor_pod regressions: day-of-week/turn-of-month/January/Santa-rally calendar effects computed straight from price history, a lead-lag cross-correlation network centrality read across a configurable ticker universe (the second analyst, after `fama_macbeth`, that needs more than one ticker's data), and the CBOE aggregate put/call ratio as a real market-wide positioning read. `AnomalyNetworkManager` dampens confidence for low sample counts outside each analyst's well-studied regime. |
 
 ## Scoring — how the Commander decides who to trust
 
@@ -118,10 +120,14 @@ that's been right gains it.
 
 All external data funnels through `data/cache.py` — a local on-disk
 parquet cache keyed by `(source, identifier, as_of_date)`, so re-running
-a backtest never re-hits a rate-limited free API. Point-in-time gating
-differs by source (see `data/point_in_time.py` and CLAUDE.md for the
-exact rules — e.g. SEC filings gate on filed date, not fiscal period end;
-FRED series gate on release/vintage date, not the observation period).
+a backtest never re-hits a rate-limited free API. Every cache-miss fetch
+is also recorded, write-once, in a local SQLite database (`data/db.py`)
+alongside the parquet cache — a durable, queryable log of every fetch
+this project has ever made, independent of the per-file cache layout.
+Point-in-time gating differs by source (see `data/point_in_time.py` and
+CLAUDE.md for the exact rules — e.g. SEC filings gate on filed date, not
+fiscal period end; FRED series gate on release/vintage date, not the
+observation period).
 
 | Source | Used for | Key required |
 |---|---|---|
@@ -130,14 +136,35 @@ FRED series gate on release/vintage date, not the observation period).
 | FRED | Macro/rates/VIX series | `FRED_API_KEY` |
 | Ken French Data Library | Fama-French factor returns | No |
 | SEC EDGAR | Company fundamentals (filed-date gated) | No (needs `SEC_EDGAR_USER_AGENT` contact header) |
+| SEC EDGAR full-text search | Form 4 insider-transaction and 10-K/10-Q filing metadata (filed-date gated) | No (same `SEC_EDGAR_USER_AGENT` header) |
 | FINRA | Biweekly short-interest | No |
 | Finnhub | News/sentiment | `FINNHUB_API_KEY` |
+| Tiingo | IEX-sourced EOD price cross-check against the primary yfinance/Stooq series (divergence is a data-quality signal, not just a gap-filler) | `TIINGO_API_KEY` |
+| Alpha Vantage | Low-volume alternative EOD price source (~25 req/day free tier) for gaps in the other sources | `ALPHAVANTAGE_API_KEY` |
+| Financial Modeling Prep | Fundamentals alternative/supplement to SEC EDGAR (~250 req/day free tier) | `FMP_API_KEY` |
+| Google Trends (`pytrends`) | Search-interest attention proxy (provisional `isPartial` points dropped) | No |
+| Wikimedia Pageviews | Wikipedia page-view attention proxy (gated on a ~24-48h publication lag) | No |
+| Reddit | Mention-volume in finance subreddits (recent-history window only — the free search API doesn't expose a full historical archive) | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` |
+| Senate/House Stock Watcher | Congressional trading disclosures, gated on disclosure date, never the trade date (30-45 day STOCK Act reporting lag) | No |
+| CBOE | Total put/call ratio — aggregate market-wide options positioning, distinct from the CVaR pod's per-name theoretical pricing | No |
+
+**Historical options data remains a documented limitation.** Databento and
+Polygon.io were investigated as the highest-value potential addition (it
+would let the CVaR pod price real historical options instead of a
+theoretical/synthetic model). Neither has a genuinely free ongoing tier
+for it: Polygon's free "Basic" plan excludes options data entirely (options
+access starts on a paid plan); Databento has no standing free tier, only a
+one-time signup credit applied against its usage-based billing. Since
+neither amounts to a free, repeatable historical-options source, the
+CVaR-pod analysts still price theoretical/synthetic options with
+model-estimated volatility (`agents/analysts/cvar_pod/_theoretical_options.py`)
+rather than pretending otherwise.
 
 ## Conventions worth knowing before touching the code
 
 - **Every cross-component data structure is a Pydantic `BaseModel`** —
   no raw dicts or dataclasses cross a module boundary. This is what
-  keeps 22 wildly different analyst implementations interchangeable from
+  keeps 30 wildly different analyst implementations interchangeable from
   every layer above them.
 - **Two date types, two layers, do not mix them.** Market-data code
   (`_market_math.py`, `point_in_time.py`, every analyst's
@@ -167,11 +194,21 @@ uv run mypy src/
 ```
 
 The dashboard (`gui/dashboard.py`) is a visualization layer, not part of
-the backtest engine itself: a single-asset "trading desk" view with
-day-by-day playback (step forward/backward, a day-scrubber slider,
-autoplay), a per-day breakdown of every contributing analyst/manager
-signal behind that day's decision (not just the net trade), holdings/
-blotter views, and a scoreboard.
+the backtest engine itself: a multi-asset "trading desk" view, tabbed
+(Overview / Desks / Analysts) to fit on one page, with day-by-day playback
+(step forward/backward, a day-scrubber slider, autoplay). The Overview tab
+leads with an **agent-flow view** — the Analysts → Pod Managers →
+Commander → (optional) Portfolio Construction pipeline rendered live for
+the current playback day and selected asset, each node colored by whether
+it agrees with that day's majority-vote direction, so the roster's
+heterogeneous agents debating is visible rather than just asserted — and a
+**data-source status strip** showing which external sources this run
+actually hit live vs. served from cache vs. never touched. The Desks and
+Analysts tabs each add a **trust panel**: trailing Sharpe/contribution
+next to the same scoring-derived weight the backtest itself applied, so
+it's visually obvious trust is earned, not hardcoded. All of the original
+per-day signal breakdown, holdings/blotter views, and scoreboard are still
+there.
 
 See `CLAUDE.md` for the full command reference, coding conventions, and
 current architectural rules — it takes precedence over this file for

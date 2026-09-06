@@ -1,3 +1,27 @@
+from agentic_trading.agents.analysts.alt_data_pod.congressional_trading_analyst import (
+    CongressionalTradingAnalyst,
+)
+from agentic_trading.agents.analysts.alt_data_pod.insider_cluster_buying_analyst import (
+    InsiderClusterBuyingAnalyst,
+)
+from agentic_trading.agents.analysts.alt_data_pod.reddit_sentiment_analyst import (
+    RedditSentimentAnalyst,
+)
+from agentic_trading.agents.analysts.alt_data_pod.retail_attention_analyst import (
+    RetailAttentionAnalyst,
+)
+from agentic_trading.agents.analysts.alt_data_pod.wikipedia_pageviews_analyst import (
+    WikipediaPageviewsAnalyst,
+)
+from agentic_trading.agents.analysts.anomaly_network_pod.calendar_seasonality_analyst import (
+    CalendarSeasonalityAnalyst,
+)
+from agentic_trading.agents.analysts.anomaly_network_pod.network_centrality_analyst import (
+    LeadLagNetworkCentralityAnalyst,
+)
+from agentic_trading.agents.analysts.anomaly_network_pod.options_skew_sentiment_analyst import (
+    OptionsSkewSentimentAnalyst,
+)
 from agentic_trading.agents.analysts.cvar_pod.black_scholes_valuation_analyst import (
     BlackScholesValuationAnalyst,
 )
@@ -57,6 +81,8 @@ __all__ = [
     "ARIMAForecastAnalyst",
     "BlackScholesValuationAnalyst",
     "CIRRateRegimeAnalyst",
+    "CalendarSeasonalityAnalyst",
+    "CongressionalTradingAnalyst",
     "EGARCHAsymmetricVolAnalyst",
     "FamaFrenchFactorAnalyst",
     "FamaMacbethAnalyst",
@@ -64,16 +90,22 @@ __all__ = [
     "GJRGARCHCrashRiskAnalyst",
     "GreeksDeltaHedgeAnalyst",
     "HestonVolSurfaceAnalyst",
+    "InsiderClusterBuyingAnalyst",
     "KalmanHedgeRatioAnalyst",
+    "LeadLagNetworkCentralityAnalyst",
     "MacroVarSpilloverAnalyst",
     "MonteCarloValuationAnalyst",
     "NeweyWestSignificanceAnalyst",
     "NewsSentimentAnalyst",
     "OUMeanReversionAnalyst",
+    "OptionsSkewSentimentAnalyst",
     "PairsCointegrationAnalyst",
+    "RedditSentimentAnalyst",
     "RegimeHMMAnalyst",
+    "RetailAttentionAnalyst",
     "RiskMaximizingAnalyst",
     "RiskMinimizingAnalyst",
     "SecFundamentalsAnalyst",
     "ShortInterestSqueezeAnalyst",
+    "WikipediaPageviewsAnalyst",
 ]

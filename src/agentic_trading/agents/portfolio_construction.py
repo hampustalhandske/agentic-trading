@@ -92,13 +92,22 @@ class PortfolioConstructor:
             )
             return decisions
 
-        if len(returns_history) < MIN_OBSERVATIONS_FOR_COVARIANCE:
+        # ledoit_wolf_shrinkage requires strictly more observations (T) than
+        # assets (k) — MIN_OBSERVATIONS_FOR_COVARIANCE alone is only a
+        # statistical-reasonableness floor for small baskets; for a basket
+        # of k >= MIN_OBSERVATIONS_FOR_COVARIANCE assets it understates the
+        # true requirement (T=5 observations with k=5 assets still fails
+        # quantcore's T > k check), so the actual threshold is whichever of
+        # the two is larger.
+        min_observations = max(MIN_OBSERVATIONS_FOR_COVARIANCE, len(assets) + 1)
+        if len(returns_history) < min_observations:
             logger.debug(
-                "PortfolioConstructor: only %d observation(s) as of %s (need >= %d) — "
-                "skipping portfolio construction for this day.",
+                "PortfolioConstructor: only %d observation(s) as of %s (need >= %d for %d "
+                "assets) — skipping portfolio construction for this day.",
                 len(returns_history),
                 as_of_date.date(),
-                MIN_OBSERVATIONS_FOR_COVARIANCE,
+                min_observations,
+                len(assets),
             )
             return decisions
 
