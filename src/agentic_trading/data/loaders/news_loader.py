@@ -9,6 +9,7 @@ from datetime import timedelta
 import pandas as pd
 import requests
 
+from agentic_trading.data.cache import cached_fetch
 from agentic_trading.data.loaders._env import require_env
 from agentic_trading.logging_config import get_logger
 
@@ -18,13 +19,9 @@ _BASE_URL = "https://finnhub.io/api/v1"
 DEFAULT_LOOKBACK_DAYS = 30
 
 
-def load_news_sentiment(
-    ticker: str, as_of_date: pd.Timestamp, lookback_days: int = DEFAULT_LOOKBACK_DAYS
+def _fetch_news_sentiment(
+    ticker: str, as_of_date: pd.Timestamp, lookback_days: int
 ) -> pd.DataFrame:
-    """Recent news headlines for `ticker` up to `as_of_date`, each tagged
-    with Finnhub's aggregate company sentiment score (per-article sentiment
-    isn't available on Finnhub's free tier, so every row shares the same
-    aggregate score). Returns `datetime, headline, sentiment_score`."""
     token = require_env("FINNHUB_API_KEY")
     to_date = as_of_date.date()
     from_date = to_date - timedelta(days=lookback_days)
@@ -61,4 +58,19 @@ def load_news_sentiment(
             "headline": [article["headline"] for article in articles],
             "sentiment_score": aggregate_score,
         }
+    )
+
+
+def load_news_sentiment(
+    ticker: str, as_of_date: pd.Timestamp, lookback_days: int = DEFAULT_LOOKBACK_DAYS
+) -> pd.DataFrame:
+    """Recent news headlines for `ticker` up to `as_of_date`, each tagged
+    with Finnhub's aggregate company sentiment score (per-article sentiment
+    isn't available on Finnhub's free tier, so every row shares the same
+    aggregate score). Returns `datetime, headline, sentiment_score`."""
+    return cached_fetch(
+        source="finnhub_news",
+        identifier=f"{ticker.upper()}_{lookback_days}d",
+        as_of_date=as_of_date.date(),
+        fetch_fn=lambda: _fetch_news_sentiment(ticker, as_of_date, lookback_days),
     )

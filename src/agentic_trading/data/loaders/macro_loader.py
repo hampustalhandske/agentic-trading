@@ -11,6 +11,7 @@ logic by hand.
 import pandas as pd
 from fredapi import Fred
 
+from agentic_trading.data.cache import cached_fetch
 from agentic_trading.data.loaders._env import require_env
 from agentic_trading.logging_config import get_logger
 
@@ -25,6 +26,13 @@ CPIAUCSL = "CPIAUCSL"
 SUPPORTED_SERIES: frozenset[str] = frozenset({DGS3MO, DGS2, DGS10, VIXCLS, CPIAUCSL})
 
 
+def _fetch_fred_series(series_id: str, as_of_date: pd.Timestamp) -> pd.DataFrame:
+    fred = Fred(api_key=require_env("FRED_API_KEY"))
+    logger.debug("Loading FRED series %s as of %s", series_id, as_of_date.date())
+    series: pd.Series = fred.get_series(series_id, realtime_end=as_of_date.date())
+    return series.to_frame(name="value")
+
+
 def load_fred_series(series_id: str, as_of_date: pd.Timestamp) -> pd.Series:
     """Returns the FRED series `series_id`, restricted to the vintage that
     existed as of `as_of_date` (via FRED's `realtime_end`)."""
@@ -33,7 +41,10 @@ def load_fred_series(series_id: str, as_of_date: pd.Timestamp) -> pd.Series:
             f"Unsupported FRED series {series_id!r}; supported: {sorted(SUPPORTED_SERIES)}"
         )
 
-    fred = Fred(api_key=require_env("FRED_API_KEY"))
-    logger.debug("Loading FRED series %s as of %s", series_id, as_of_date.date())
-    series: pd.Series = fred.get_series(series_id, realtime_end=as_of_date.date())
-    return series
+    frame = cached_fetch(
+        source="fred",
+        identifier=series_id,
+        as_of_date=as_of_date.date(),
+        fetch_fn=lambda: _fetch_fred_series(series_id, as_of_date),
+    )
+    return frame["value"]
