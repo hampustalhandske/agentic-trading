@@ -21,10 +21,11 @@ MAX_ARTICLE_COUNT_FOR_CONFIDENCE = 20
 
 class NewsSentimentAnalyst(AnalystAgent):
     """Wired to Finnhub via `data/loaders/news_loader.py`: direction from
-    the aggregate sentiment score's sign, confidence from the score's
-    magnitude and article count (more articles → more confidence, up to a
-    cap). Appends `[source_as_of=...]` to `rationale` using the most recent
-    article's date, per EventCreditManager's staleness convention."""
+    the mean per-headline sentiment score's sign, confidence from the
+    score's magnitude and article count (more articles → more confidence,
+    up to a cap). Appends `[source_as_of=...]` to `rationale` using the
+    most recent article's date, per EventCreditManager's staleness
+    convention."""
 
     agent_id: str = "news_sentiment_analyst"
 
@@ -59,7 +60,7 @@ class NewsSentimentAnalyst(AnalystAgent):
                 rationale="no recent news found — holding.",
             )
 
-        sentiment_score = float(news["sentiment_score"].iloc[0])
+        sentiment_score = float(news["sentiment_score"].mean())
         article_count = len(news)
         latest_article_date = news["datetime"].max().date()
 
@@ -82,7 +83,7 @@ class NewsSentimentAnalyst(AnalystAgent):
             direction=direction,
             confidence=clamp(confidence),
             rationale=(
-                f"Finnhub aggregate sentiment={sentiment_score:.3f} across "
+                f"mean headline sentiment={sentiment_score:.3f} across "
                 f"{article_count} articles "
                 f"[source_as_of={latest_article_date.isoformat()}]"
             ),

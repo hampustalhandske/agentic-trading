@@ -11,6 +11,10 @@ from agentic_trading.data.loaders.macro_loader import DGS3MO, load_fred_series
 def test_load_fred_series_passes_realtime_end_for_point_in_time(
     mock_fred_cls: MagicMock, mock_require_env: MagicMock, tmp_path, monkeypatch
 ) -> None:
+    """realtime_start is pinned to the same date as realtime_end — leaving
+    it at fredapi's default (1776-07-04) exceeds FRED's 2000-vintage cap
+    for a daily series, and a single-vintage query is also the correct
+    point-in-time semantics: the value as it was known as of as_of_date."""
     monkeypatch.setattr("agentic_trading.data.cache.CACHE_ROOT", tmp_path)
     mock_fred = mock_fred_cls.return_value
     mock_fred.get_series.return_value = pd.Series([5.0, 5.1])
@@ -18,7 +22,9 @@ def test_load_fred_series_passes_realtime_end_for_point_in_time(
     as_of_date = pd.Timestamp("2024-06-01")
     load_fred_series(DGS3MO, as_of_date)
 
-    mock_fred.get_series.assert_called_once_with(DGS3MO, realtime_end=as_of_date.date())
+    mock_fred.get_series.assert_called_once_with(
+        DGS3MO, realtime_start=as_of_date.date(), realtime_end=as_of_date.date()
+    )
 
 
 @patch("agentic_trading.data.loaders.macro_loader.require_env", return_value="fake-key")

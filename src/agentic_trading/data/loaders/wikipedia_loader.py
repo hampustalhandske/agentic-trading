@@ -10,7 +10,7 @@ available on D+1 in practice; this loader gates on that availability date
 Fetches through the real wall-clock date, not `as_of_date`, and caches
 under that real date rather than the simulated one — the same "fetch the
 bulk series once per real day, filter by simulated date after" pattern
-`congress_trading_loader.py` uses. A backtest calls this once per
+`tiingo_loader.py` uses. A backtest calls this once per
 simulated day per ticker; keying the cache on `as_of_date` the way
 FRED/SEC do (where the *query result itself* legitimately differs by
 as_of_date) would re-hit Wikimedia on every single simulated day for a

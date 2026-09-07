@@ -31,7 +31,7 @@ inspectable, not just the final trade.
 ## Architecture — four layers, one deterministic engine
 
 ```
-Layer 1: Analysts (30)  →  Layer 2: Managers (8 pods)  →  Layer 3: Commander  →  (optional) Layer 4: Portfolio construction
+Layer 1: Analysts (29)  →  Layer 2: Managers (8 pods)  →  Layer 3: Commander  →  (optional) Layer 4: Portfolio construction
                                                                   ↓
                                                     Backtest engine (fills, accounting)
                                                                   ↓
@@ -88,7 +88,7 @@ this:
 ## The eight pods
 
 `agents/roster.py` is the single place that wires up the default
-30-analyst / 8-manager roster; it's the file to change when adding more
+29-analyst / 8-manager roster; it's the file to change when adding more
 analysts or managers. Each pod is themed around one coherent family of
 quant strategy, so the Commander gets eight genuinely different risk
 overlays rather than eight relabelings of the same signal:
@@ -100,8 +100,8 @@ overlays rather than eight relabelings of the same signal:
 | **StatArb** | `StatArbManager` | `ou_mean_reversion`, `pairs_cointegration`, `kalman_hedge_ratio`, `regime_hmm` | Classic statistical arbitrage: an Ornstein-Uhlenbeck mean-reversion spread, Engle-Granger/Johansen cointegration against candidate partner tickers, a Kalman-filtered *time-varying* hedge ratio version of the same idea, and a Gaussian HMM regime detector. `StatArbManager` dampens confidence for elevated spread volatility. |
 | **Macro/Rates** | `MacroRatesManager` | `egarch_asymmetric_vol`, `gjr_garch_crash_risk`, `arima_forecast`, `macro_var_spillover`, `cir_rate_regime` | Volatility-regime and macro-driven signals: EGARCH/GJR-GARCH asymmetric-volatility ("leverage effect") reads, an ARIMA return forecast, a small VAR system relating the asset to FRED macro series (VIX, yield curve), and a CIR short-rate regime read. GARCH-family parameters here are documented, fixed, honest approximations, not MLE-fitted — `quantcore` has no EGARCH/GJR-GARCH fitter yet. |
 | **Factor** | `FactorManager` | `fama_french_factor`, `fama_macbeth`, `newey_west_significance` | Cross-sectional/regression analysts: a Fama-French factor-tilt regression, a genuine Fama-MacBeth two-pass estimate (the one analyst that needs more than one ticker's data), and a general "does X actually predict this asset" Newey-West-robust significance test against a configurable lagged predictor. |
-| **Event/Credit** | `EventCreditManager` | `news_sentiment`, `sec_fundamentals`, `short_interest_squeeze` | Event-driven, mostly text/filings-based rather than pure price math: Finnhub news sentiment, an OLS trend over trailing SEC EDGAR filing values, and a short-interest days-to-cover squeeze z-score from FINRA data. `EventCreditManager` dampens confidence as event/filing severity rises. |
-| **Alt-Data/Crowd Attention** | `AltDataManager` | `congressional_trading`, `insider_cluster_buying`, `retail_attention`, `wikipedia_pageviews`, `reddit_sentiment` | Methodologically distinct from every pod above: alt-data/behavioral signals rather than price or filing math — Senate/House Stock Watcher disclosure imbalance, SEC Form 4 insider-filing clustering, Google Trends and Wikipedia pageview attention spikes (two independent attention proxies, kept both for cross-validation — see `wikipedia_pageviews_analyst`'s docstring), and Reddit community-score sentiment. `AltDataManager` dampens confidence for both staleness and thin sample sizes (`[source_as_of=...]` / `[sample_count=...]` rationale tags). |
+| **Event/Credit** | `EventCreditManager` | `news_sentiment`, `sec_fundamentals`, `short_interest_squeeze` | Event-driven, mostly text/filings-based rather than pure price math: Finnhub headline news scored by a local keyword-sentiment lexicon (Finnhub's own aggregate `news-sentiment` endpoint is paid-tier-only and 403s on a free key, so per-headline sentiment is computed here instead), an OLS trend over trailing SEC EDGAR filing values (falling back to Financial Modeling Prep for a handful of overlapping concepts if SEC EDGAR has too few filings), and a short-interest days-to-cover squeeze z-score from FINRA data. `EventCreditManager` dampens confidence as event/filing severity rises. |
+| **Alt-Data/Crowd Attention** | `AltDataManager` | `insider_cluster_buying`, `retail_attention`, `wikipedia_pageviews`, `reddit_sentiment` | Methodologically distinct from every pod above: alt-data/behavioral signals rather than price or filing math — SEC Form 4 insider-filing clustering, Google Trends and Wikipedia pageview attention spikes (two independent attention proxies, kept both for cross-validation — see `wikipedia_pageviews_analyst`'s docstring), and Reddit community-score sentiment. `AltDataManager` dampens confidence for both staleness and thin sample sizes (`[source_as_of=...]` / `[sample_count=...]` rationale tags). A `congressional_trading` analyst previously covered Senate/House Stock Watcher disclosures; both buckets' public S3 endpoints now permanently return 403 (bucket policy, not a code/key issue), so it was removed rather than left silently dead. |
 | **Anomaly/Network** | `AnomalyNetworkManager` | `calendar_seasonality`, `lead_lag_network_centrality`, `options_skew_sentiment` | Documented-anomaly and graph/network-science analysts, distinct from the factor_pod regressions: day-of-week/turn-of-month/January/Santa-rally calendar effects computed straight from price history, a lead-lag cross-correlation network centrality read across a configurable ticker universe (the second analyst, after `fama_macbeth`, that needs more than one ticker's data), and the CBOE aggregate put/call ratio as a real market-wide positioning read. `AnomalyNetworkManager` dampens confidence for low sample counts outside each analyst's well-studied regime. |
 
 ## Scoring — how the Commander decides who to trust
@@ -131,21 +131,20 @@ observation period).
 
 | Source | Used for | Key required |
 |---|---|---|
-| `yfinance` (primary), Stooq (fallback), synthetic (last resort) | Daily price history | No |
+| `yfinance` (primary), Stooq (2nd fallback), Alpha Vantage (3rd, last-resort), synthetic (final fallback) | Daily price history | No (Alpha Vantage tier: `ALPHAVANTAGE_API_KEY`, only reached once yfinance and Stooq have both failed) |
 | `yfinance` option chains | Live-mode options snapshots only — **not usable by backtest-driving analysts**, since no free source has historical chains | No |
 | FRED | Macro/rates/VIX series | `FRED_API_KEY` |
 | Ken French Data Library | Fama-French factor returns | No |
-| SEC EDGAR | Company fundamentals (filed-date gated) | No (needs `SEC_EDGAR_USER_AGENT` contact header) |
+| SEC EDGAR | Company fundamentals (filed-date gated), primary source; falls back to Financial Modeling Prep for overlapping concepts (revenue, assets, liabilities, equity — not diluted EPS) when a filing history is too thin | No (needs `SEC_EDGAR_USER_AGENT` contact header) |
 | SEC EDGAR full-text search | Form 4 insider-transaction and 10-K/10-Q filing metadata (filed-date gated) | No (same `SEC_EDGAR_USER_AGENT` header) |
-| FINRA | Biweekly short-interest | No |
-| Finnhub | News/sentiment | `FINNHUB_API_KEY` |
-| Tiingo | IEX-sourced EOD price cross-check against the primary yfinance/Stooq series (divergence is a data-quality signal, not just a gap-filler) | `TIINGO_API_KEY` |
-| Alpha Vantage | Low-volume alternative EOD price source (~25 req/day free tier) for gaps in the other sources | `ALPHAVANTAGE_API_KEY` |
-| Financial Modeling Prep | Fundamentals alternative/supplement to SEC EDGAR (~250 req/day free tier) | `FMP_API_KEY` |
+| FINRA | Biweekly short-interest (CSV response, not JSON — dissemination date is estimated as settlement date + 8 business days, since the API doesn't return that field directly) | No |
+| Finnhub | Company news headlines, scored locally with a keyword-sentiment lexicon (the paid-tier-only `news-sentiment` aggregate endpoint 403s on a free key, so this loader never calls it) | `FINNHUB_API_KEY` |
+| Tiingo | IEX-sourced EOD price cross-check against the primary yfinance/Stooq series — feeds `RiskManager`'s divergence-dampening factor, not another price fallback | `TIINGO_API_KEY` |
+| Alpha Vantage | Last-resort price fallback tier in `data/loader.py` (~25 req/day free tier; only reached once yfinance and Stooq have both failed, so it isn't burned on the common path) | `ALPHAVANTAGE_API_KEY` |
+| Financial Modeling Prep | Fundamentals fallback for `sec_fundamentals_analyst` when SEC EDGAR's filing history is too thin (~250 req/day free tier) | `FMP_API_KEY` |
 | Google Trends (`pytrends`) | Search-interest attention proxy (provisional `isPartial` points dropped) | No |
 | Wikimedia Pageviews | Wikipedia page-view attention proxy (gated on a ~24-48h publication lag) | No |
 | Reddit | Mention-volume in finance subreddits (recent-history window only — the free search API doesn't expose a full historical archive) | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` |
-| Senate/House Stock Watcher | Congressional trading disclosures, gated on disclosure date, never the trade date (30-45 day STOCK Act reporting lag) | No |
 | CBOE | Total put/call ratio — aggregate market-wide options positioning, distinct from the CVaR pod's per-name theoretical pricing | No |
 
 **Historical options data remains a documented limitation.** Databento and

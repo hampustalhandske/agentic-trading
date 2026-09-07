@@ -8,6 +8,7 @@ import pandas as pd
 import pandas_datareader.data as pdr
 import yfinance as yf
 
+from agentic_trading.data.loaders.alpha_vantage_loader import load_alpha_vantage_price_history
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -62,9 +63,32 @@ def _load_single_ticker(ticker: str, start: date | None, end: date | None) -> pd
         return _reshape_single_ticker(raw)
 
     logger.info("yfinance had no usable data for %s — trying Stooq fallback", ticker)
-    stooq_raw = pdr.DataReader(ticker, "stooq", start, end)
-    result = _reshape_stooq_frame(stooq_raw)
-    logger.info("Loaded price history for %s from Stooq", ticker)
+    try:
+        stooq_raw = pdr.DataReader(ticker, "stooq", start, end)
+        result = _reshape_stooq_frame(stooq_raw)
+        logger.info("Loaded price history for %s from Stooq", ticker)
+        return result
+    except Exception as stooq_exc:
+        logger.info(
+            "Stooq also had no usable data for %s (%s) — trying Alpha Vantage fallback "
+            "(free tier, ~25 requests/day — this tier only fires when both yfinance and "
+            "Stooq have already failed, so it isn't burned on the common path)",
+            ticker,
+            stooq_exc,
+        )
+        return _load_alpha_vantage_fallback(ticker, start, end)
+
+
+def _load_alpha_vantage_fallback(ticker: str, start: date | None, end: date | None) -> pd.DataFrame:
+    as_of = pd.Timestamp(end) if end is not None else pd.Timestamp.today()
+    raw = load_alpha_vantage_price_history(ticker, as_of)
+    if start is not None:
+        raw = raw.loc[raw.index >= pd.Timestamp(start)]
+    if raw.empty:
+        raise ValueError(f"Alpha Vantage returned no usable data for {ticker!r} either")
+    result = pd.DataFrame({"close": raw["close"]})
+    result["log_return"] = np.log(result["close"] / result["close"].shift(1))
+    logger.info("Loaded price history for %s from Alpha Vantage", ticker)
     return result
 
 
@@ -87,8 +111,10 @@ def load_price_history(
 
     Tries yfinance first for each ticker; if it raises, comes back empty,
     or comes back all-NaN, falls through to Stooq (an independent, no-key
-    source) before giving up. Only `load_price_history_with_fallback`'s
-    synthetic generator kicks in if both real sources fail.
+    source), then to Alpha Vantage (rate-limited, so only reached once
+    both of the above have already failed) before giving up. Only
+    `load_price_history_with_fallback`'s synthetic generator kicks in if
+    all three real sources fail.
     """
     tickers = _resolve_tickers(asset)
     logger.debug("Loading price history for %s (%s to %s)", tickers, start, end)

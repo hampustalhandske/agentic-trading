@@ -25,9 +25,9 @@ class AltDataManager(ManagerAgent):
     EventCreditManager's `[source_as_of=...]` convention, with a shorter
     half-life since attention/disclosure signals go stale faster than
     filings; sparsity is a new `[sample_count=...]` tag — e.g. distinct
-    congressional filers, distinct insider filings, or data points behind
-    a z-score). Alt-data sources are noisier per-observation than priced
-    markets, so a thin sample is dampened regardless of how strong its
+    insider filings, or data points behind a z-score). Alt-data sources
+    are noisier per-observation than priced markets, so a thin sample is
+    dampened regardless of how strong its
     point estimate looks. A missing tag defaults to no dampening on that
     axis rather than raising, matching EventCreditManager's convention
     that a formatting slip in an analyst's rationale must never crash a

@@ -2,7 +2,7 @@
 
 """Default analyst/manager roster shared by the CLI and GUI entry points.
 
-Splits 30 analysts across 8 pod managers, each pod themed around a
+Splits 29 analysts across 8 pod managers, each pod themed around a
 coherent quant strategy family, so the Commander sees eight genuinely
 different risk overlays rather than duplicate coverage of the same
 signals under eight names:
@@ -22,8 +22,8 @@ signals under eight names:
 - **Event/Credit pod** (EventCreditManager): event-driven analysts
   (news_sentiment, sec_fundamentals, short_interest_squeeze).
 - **Alt-Data/Crowd Attention pod** (AltDataManager): alt-data/behavioral
-  analysts (congressional_trading, insider_cluster_buying,
-  retail_attention, wikipedia_pageviews, reddit_sentiment).
+  analysts (insider_cluster_buying, retail_attention, wikipedia_pageviews,
+  reddit_sentiment).
 - **Anomaly/Network pod** (AnomalyNetworkManager): calendar-anomaly and
   network-science analysts (calendar_seasonality,
   lead_lag_network_centrality, options_skew_sentiment).
@@ -36,7 +36,6 @@ from agentic_trading.agents.analysts import (
     BlackScholesValuationAnalyst,
     CalendarSeasonalityAnalyst,
     CIRRateRegimeAnalyst,
-    CongressionalTradingAnalyst,
     EGARCHAsymmetricVolAnalyst,
     FamaFrenchFactorAnalyst,
     FamaMacbethAnalyst,
@@ -124,7 +123,6 @@ EVENT_CREDIT_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
 )
 ALT_DATA_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
     {
-        "congressional_trading_analyst",
         "insider_cluster_buying_analyst",
         "retail_attention_analyst",
         "wikipedia_pageviews_analyst",
@@ -141,9 +139,9 @@ ANOMALY_NETWORK_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
 
 
 def build_default_analysts() -> list[AnalystAgent]:
-    """The full 30-analyst Layer-1 roster, in a stable, deterministic
-    order: the original five first, then the 25 new ones grouped by pod in
-    the same order the pods are described above."""
+    """The full 29-analyst Layer-1 roster, in a stable, deterministic
+    order: the original five first, then the rest grouped by pod in the
+    same order the pods are described above."""
     return [
         # Original five
         RiskMinimizingAnalyst(),
@@ -175,7 +173,6 @@ def build_default_analysts() -> list[AnalystAgent]:
         SecFundamentalsAnalyst(),
         ShortInterestSqueezeAnalyst(),
         # Alt-Data/Crowd Attention pod
-        CongressionalTradingAnalyst(),
         InsiderClusterBuyingAnalyst(),
         RetailAttentionAnalyst(),
         WikipediaPageviewsAnalyst(),

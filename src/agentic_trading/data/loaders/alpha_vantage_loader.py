@@ -2,10 +2,14 @@
 
 """Alpha Vantage daily EOD prices — a documented alternative price source
 for names where Stooq/Tiingo have gaps. Free tier is heavily rate-limited
-(~25 requests/day), so this is deliberately not part of the default
-fallback chain in `data/loader.py`; call it explicitly, and rely on the
-on-disk cache (`data/cache.py`) to avoid burning the daily quota on repeat
-runs.
+(~25 requests/day), so `data/loader.py` only reaches this as its last-resort
+tier, after both yfinance and Stooq have already failed for a ticker —
+common-path runs never touch it, and the on-disk cache (`data/cache.py`)
+keeps a repeat run of the same failing ticker from re-spending quota.
+
+The free tier's `outputsize=full` still returns the entire available daily
+history in one call, so a single request captures as much usable data as
+the API allows rather than a short recent window.
 
 Gates on the bar's own date: the full daily series is fetched once and
 filtered to `<= as_of_date`, the same bulk-then-filter pattern

@@ -1067,7 +1067,6 @@ _KNOWN_DATA_SOURCES: tuple[str, ...] = (
     "google_trends",
     "wikimedia_pageviews",
     "reddit",
-    "congress_trading",
     "cboe",
 )
 

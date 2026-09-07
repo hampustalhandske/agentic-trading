@@ -98,15 +98,17 @@ def test_first_row_log_return_is_nan_and_row_is_kept(mock_download: MagicMock) -
     assert result.index[0] == pd.Timestamp("2024-01-02")
 
 
+@patch("agentic_trading.data.loader.load_alpha_vantage_price_history")
 @patch("agentic_trading.data.loader.pdr.DataReader")
 @patch("agentic_trading.data.loader.yf.download")
 def test_empty_yfinance_response_raises_value_error(
-    mock_download: MagicMock, mock_stooq: MagicMock
+    mock_download: MagicMock, mock_stooq: MagicMock, mock_alpha_vantage: MagicMock
 ) -> None:
-    """An invalid ticker yields an empty frame from both yfinance and its
-    Stooq fallback; this must raise, not pass through."""
+    """An invalid ticker yields an empty frame from yfinance, Stooq, and
+    Alpha Vantage alike; this must raise, not pass through."""
     mock_download.return_value = pd.DataFrame()
     mock_stooq.return_value = pd.DataFrame()
+    mock_alpha_vantage.side_effect = ValueError("Alpha Vantage returned no data either")
 
     with pytest.raises(ValueError):
         load_price_history("NOT_A_REAL_TICKER", date(2024, 1, 2), date(2024, 1, 4))
@@ -129,13 +131,15 @@ def test_with_fallback_returns_multiindex_for_a_single_ticker(
     assert source_label == "live yfinance data"
 
 
+@patch("agentic_trading.data.loader.load_alpha_vantage_price_history")
 @patch("agentic_trading.data.loader.pdr.DataReader")
 @patch("agentic_trading.data.loader.yf.download")
 def test_with_fallback_uses_synthetic_data_when_yfinance_raises(
-    mock_download: MagicMock, mock_stooq: MagicMock
+    mock_download: MagicMock, mock_stooq: MagicMock, mock_alpha_vantage: MagicMock
 ) -> None:
     mock_download.side_effect = ConnectionError("simulated network failure")
     mock_stooq.side_effect = ConnectionError("simulated network failure")
+    mock_alpha_vantage.side_effect = ConnectionError("simulated network failure")
 
     frame, source_label = load_price_history_with_fallback(
         ["AAPL", "MSFT"], date(2024, 1, 2), date(2024, 1, 12)
@@ -147,13 +151,15 @@ def test_with_fallback_uses_synthetic_data_when_yfinance_raises(
     assert not frame.empty
 
 
+@patch("agentic_trading.data.loader.load_alpha_vantage_price_history")
 @patch("agentic_trading.data.loader.pdr.DataReader")
 @patch("agentic_trading.data.loader.yf.download")
 def test_with_fallback_uses_synthetic_data_when_yfinance_returns_empty(
-    mock_download: MagicMock, mock_stooq: MagicMock
+    mock_download: MagicMock, mock_stooq: MagicMock, mock_alpha_vantage: MagicMock
 ) -> None:
     mock_download.return_value = pd.DataFrame()
     mock_stooq.return_value = pd.DataFrame()
+    mock_alpha_vantage.side_effect = ValueError("Alpha Vantage returned no data either")
 
     frame, source_label = load_price_history_with_fallback(
         ["AAPL"], date(2024, 1, 2), date(2024, 1, 12)
@@ -161,6 +167,29 @@ def test_with_fallback_uses_synthetic_data_when_yfinance_returns_empty(
 
     assert source_label == "synthetic fallback data"
     assert not frame.empty
+
+
+@patch("agentic_trading.data.loader.load_alpha_vantage_price_history")
+@patch("agentic_trading.data.loader.pdr.DataReader")
+@patch("agentic_trading.data.loader.yf.download")
+def test_alpha_vantage_fallback_used_when_yfinance_and_stooq_both_empty(
+    mock_download: MagicMock, mock_stooq: MagicMock, mock_alpha_vantage: MagicMock
+) -> None:
+    """When both yfinance and Stooq come back empty but Alpha Vantage has
+    data, that data is used directly rather than falling all the way
+    through to the synthetic generator."""
+    mock_download.return_value = pd.DataFrame()
+    mock_stooq.return_value = pd.DataFrame()
+    alpha_vantage_index = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"])
+    mock_alpha_vantage.return_value = pd.DataFrame(
+        {"close": [100.0, 105.0, 102.9]}, index=alpha_vantage_index
+    )
+
+    result = load_price_history("AAPL", date(2024, 1, 2), date(2024, 1, 4))
+
+    assert list(result.index) == list(alpha_vantage_index)
+    assert result["close"].iloc[0] == pytest.approx(100.0)
+    assert result["close"].iloc[-1] == pytest.approx(102.9)
 
 
 @patch("agentic_trading.data.loader.pdr.DataReader")

@@ -9,11 +9,12 @@ data-quality signal in its own right, not just another way to fill a gap.
 Fetches through the real wall-clock date and caches under that real date,
 then filters to `<= as_of_date` locally — the same "fetch the bulk series
 once per real day, filter by simulated date after" pattern
-`congress_trading_loader.py` uses. Still structurally incapable of
-returning a row dated after `as_of_date`, since that filter is the only
-way a row reaches the caller; caching on the real date rather than the
-simulated one is what keeps a multi-day backtest from re-downloading the
-ticker's full history from Tiingo on every simulated day."""
+`wikipedia_loader.py`/`trends_loader.py` use. Still structurally
+incapable of returning a row dated after `as_of_date`, since that filter
+is the only way a row reaches the caller; caching on the real date rather
+than the simulated one is what keeps a multi-day backtest from
+re-downloading the ticker's full history from Tiingo on every simulated
+day."""
 
 from datetime import date
 

@@ -1,6 +1,3 @@
-from agentic_trading.agents.analysts.alt_data_pod.congressional_trading_analyst import (
-    CongressionalTradingAnalyst,
-)
 from agentic_trading.agents.analysts.alt_data_pod.insider_cluster_buying_analyst import (
     InsiderClusterBuyingAnalyst,
 )
@@ -82,7 +79,6 @@ __all__ = [
     "BlackScholesValuationAnalyst",
     "CIRRateRegimeAnalyst",
     "CalendarSeasonalityAnalyst",
-    "CongressionalTradingAnalyst",
     "EGARCHAsymmetricVolAnalyst",
     "FamaFrenchFactorAnalyst",
     "FamaMacbethAnalyst",

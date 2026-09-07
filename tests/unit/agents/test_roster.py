@@ -98,5 +98,5 @@ def test_build_default_managers_defaults_to_build_default_analysts() -> None:
 def test_build_default_analysts_returns_thirty_uniquely_identified_analysts() -> None:
     analysts = build_default_analysts()
 
-    assert len(analysts) == 30
-    assert len({a.agent_id for a in analysts}) == 30
+    assert len(analysts) == 29
+    assert len({a.agent_id for a in analysts}) == 29

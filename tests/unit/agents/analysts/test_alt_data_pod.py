@@ -2,9 +2,6 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from agentic_trading.agents.analysts.alt_data_pod.congressional_trading_analyst import (
-    CongressionalTradingAnalyst,
-)
 from agentic_trading.agents.analysts.alt_data_pod.insider_cluster_buying_analyst import (
     InsiderClusterBuyingAnalyst,
 )
@@ -19,40 +16,6 @@ from agentic_trading.agents.analysts.alt_data_pod.wikipedia_pageviews_analyst im
 )
 
 AS_OF = pd.Timestamp("2024-06-20")
-
-
-@patch(
-    "agentic_trading.agents.analysts.alt_data_pod.congressional_trading_analyst.load_congressional_trades"
-)
-def test_congressional_trading_analyst_long_on_purchase_imbalance(mock_load) -> None:
-    mock_load.return_value = pd.DataFrame(
-        {
-            "ticker": ["GME"] * 3,
-            "filer": ["A", "B", "C"],
-            "disclosure_date": pd.to_datetime(["2024-06-01", "2024-06-05", "2024-06-10"]),
-            "transaction_type": ["Purchase", "Purchase", "Sale (Full)"],
-        }
-    )
-
-    signal = CongressionalTradingAnalyst().generate_signal("GME", pd.DataFrame(), AS_OF)
-
-    assert signal.direction == "long"
-    assert signal.confidence > 0.0
-    assert "[sample_count=3]" in signal.rationale
-
-
-@patch(
-    "agentic_trading.agents.analysts.alt_data_pod.congressional_trading_analyst.load_congressional_trades"
-)
-def test_congressional_trading_analyst_flat_with_no_disclosures(mock_load) -> None:
-    mock_load.return_value = pd.DataFrame(
-        columns=["ticker", "filer", "disclosure_date", "transaction_type"]
-    )
-
-    signal = CongressionalTradingAnalyst().generate_signal("GME", pd.DataFrame(), AS_OF)
-
-    assert signal.direction == "flat"
-    assert signal.confidence == 0.0
 
 
 @patch("agentic_trading.agents.analysts.alt_data_pod.insider_cluster_buying_analyst.load_filings")

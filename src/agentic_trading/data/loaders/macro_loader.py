@@ -29,7 +29,14 @@ SUPPORTED_SERIES: frozenset[str] = frozenset({DGS3MO, DGS2, DGS10, VIXCLS, CPIAU
 def _fetch_fred_series(series_id: str, as_of_date: pd.Timestamp) -> pd.DataFrame:
     fred = Fred(api_key=require_env("FRED_API_KEY"))
     logger.debug("Loading FRED series %s as of %s", series_id, as_of_date.date())
-    series: pd.Series = fred.get_series(series_id, realtime_end=as_of_date.date())
+    # realtime_start defaults to 1776-07-04 if omitted, which for a daily
+    # series exceeds FRED's 2000-vintage-per-request cap. Pinning it to the
+    # same date as realtime_end asks for exactly the one vintage that
+    # existed as of as_of_date, which is also the semantically correct
+    # point-in-time query.
+    series: pd.Series = fred.get_series(
+        series_id, realtime_start=as_of_date.date(), realtime_end=as_of_date.date()
+    )
     return series.to_frame(name="value")
 
 

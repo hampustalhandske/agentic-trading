@@ -15,18 +15,16 @@ def test_query_is_bounded_by_as_of_date(
     monkeypatch.setattr("agentic_trading.data.cache.CACHE_ROOT", tmp_path)
     news_response = MagicMock()
     news_response.json.return_value = [
-        {"datetime": 1717200000, "headline": "Some headline"},
+        {"datetime": 1717200000, "headline": "Company beats earnings estimates"},
     ]
-    sentiment_response = MagicMock()
-    sentiment_response.json.return_value = {"companyNewsScore": 0.42}
-    mock_get.side_effect = [news_response, sentiment_response]
+    mock_get.return_value = news_response
 
     as_of_date = pd.Timestamp("2024-06-01")
     result = load_news_sentiment("AAPL", as_of_date)
 
     news_call_kwargs = mock_get.call_args_list[0].kwargs
     assert news_call_kwargs["params"]["to"] == "2024-06-01"
-    assert result.iloc[0]["sentiment_score"] == 0.42
+    assert result.iloc[0]["sentiment_score"] > 0.0
 
 
 @patch("agentic_trading.data.loaders.news_loader.require_env", return_value="fake-token")
@@ -37,9 +35,7 @@ def test_no_articles_returns_empty_frame_with_expected_columns(
     monkeypatch.setattr("agentic_trading.data.cache.CACHE_ROOT", tmp_path)
     news_response = MagicMock()
     news_response.json.return_value = []
-    sentiment_response = MagicMock()
-    sentiment_response.json.return_value = {"companyNewsScore": 0.0}
-    mock_get.side_effect = [news_response, sentiment_response]
+    mock_get.return_value = news_response
 
     result = load_news_sentiment("AAPL", pd.Timestamp("2024-06-01"))
 
@@ -60,12 +56,10 @@ def test_second_call_for_same_as_of_date_is_cached(
     news_response.json.return_value = [
         {"datetime": 1717200000, "headline": "Some headline"},
     ]
-    sentiment_response = MagicMock()
-    sentiment_response.json.return_value = {"companyNewsScore": 0.42}
-    mock_get.side_effect = [news_response, sentiment_response]
+    mock_get.return_value = news_response
 
     as_of_date = pd.Timestamp("2024-06-01")
     load_news_sentiment("AAPL", as_of_date)
     load_news_sentiment("AAPL", as_of_date)
 
-    assert mock_get.call_count == 2
+    assert mock_get.call_count == 1
