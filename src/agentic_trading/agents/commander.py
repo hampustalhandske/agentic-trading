@@ -6,7 +6,7 @@ from typing import Literal
 import pandas as pd
 
 from agentic_trading.agents.base import ManagerAgent
-from agentic_trading.agents.schemas import PortfolioDecision
+from agentic_trading.agents.schemas import AgentSignal, PortfolioDecision
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.weighting import WeightingStrategy
 
@@ -16,7 +16,7 @@ def _collect_manager_signals(
     asset: str,
     market_data: pd.DataFrame,
     as_of_date: pd.Timestamp,
-) -> tuple[str, list]:
+) -> tuple[str, list[AgentSignal]]:
     return manager.agent_id, manager.collect_signals(asset, market_data, as_of_date)
 
 

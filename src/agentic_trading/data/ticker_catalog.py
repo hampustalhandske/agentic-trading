@@ -34,13 +34,19 @@ from typing import Literal
 import yfinance as yf
 from pydantic import BaseModel
 
-AssetClass = Literal["stock"]
+AssetClass = Literal["stock", "index", "commodity", "forex", "crypto"]
 
 # yfinance's Ticker.info["quoteType"] values, as observed for each class in
 # this catalog, mapped to our five asset classes. Any quoteType not listed
 # here (e.g. "OPTION", "MUTUALFUND") has no home in this catalog — see the
 # module docstring for why options specifically are excluded.
-_QUOTE_TYPE_TO_ASSET_CLASS: dict[str, AssetClass] = {"EQUITY": "stock"}
+_QUOTE_TYPE_TO_ASSET_CLASS: dict[str, AssetClass] = {
+    "EQUITY": "stock",
+    "INDEX": "index",
+    "FUTURE": "commodity",
+    "CURRENCY": "forex",
+    "CRYPTOCURRENCY": "crypto",
+}
 
 
 class TickerInfo(BaseModel):
@@ -172,6 +178,30 @@ CATALOG: tuple[TickerInfo, ...] = (
     TickerInfo(symbol="V", name="Visa Inc.", asset_class="stock", quote_type="EQUITY"),
     TickerInfo(
         symbol="MA", name="Mastercard Incorporated", asset_class="stock", quote_type="EQUITY"
+    ),
+    # --- index (quoteType: INDEX) ---
+    TickerInfo(symbol="^GSPC", name="S&P 500", asset_class="index", quote_type="INDEX"),
+    TickerInfo(symbol="^RUT", name="Russell 2000", asset_class="index", quote_type="INDEX"),
+    # --- commodity (quoteType: FUTURE) ---
+    TickerInfo(symbol="GC=F", name="Gold Futures", asset_class="commodity", quote_type="FUTURE"),
+    TickerInfo(
+        symbol="CL=F", name="Crude Oil Futures", asset_class="commodity", quote_type="FUTURE"
+    ),
+    TickerInfo(symbol="SI=F", name="Silver Futures", asset_class="commodity", quote_type="FUTURE"),
+    TickerInfo(
+        symbol="NG=F", name="Natural Gas Futures", asset_class="commodity", quote_type="FUTURE"
+    ),
+    # --- forex (quoteType: CURRENCY) ---
+    TickerInfo(symbol="EURUSD=X", name="EUR/USD", asset_class="forex", quote_type="CURRENCY"),
+    TickerInfo(symbol="GBPUSD=X", name="GBP/USD", asset_class="forex", quote_type="CURRENCY"),
+    TickerInfo(symbol="JPY=X", name="USD/JPY", asset_class="forex", quote_type="CURRENCY"),
+    TickerInfo(symbol="AUDUSD=X", name="AUD/USD", asset_class="forex", quote_type="CURRENCY"),
+    # --- crypto (quoteType: CRYPTOCURRENCY) ---
+    TickerInfo(
+        symbol="BTC-USD", name="Bitcoin USD", asset_class="crypto", quote_type="CRYPTOCURRENCY"
+    ),
+    TickerInfo(
+        symbol="ETH-USD", name="Ethereum USD", asset_class="crypto", quote_type="CRYPTOCURRENCY"
     ),
 )
 

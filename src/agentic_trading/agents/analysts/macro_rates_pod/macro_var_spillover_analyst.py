@@ -83,7 +83,7 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
             if asset not in history.columns.get_level_values(0):
                 asset_history = pd.DataFrame()
             else:
-                asset_history = history.xs(asset, axis=1, level=0)
+                asset_history = pd.DataFrame(history.xs(asset, axis=1, level=0))
         else:
             asset_history = history
 
@@ -97,9 +97,11 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                 rationale="no asset return history for a VAR spillover read",
             )
 
-        aligned = pd.concat(
-            [asset_history["log_return"], *macro_series], axis=1, join="inner"
-        ).replace([np.inf, -np.inf], np.nan).dropna()
+        aligned = (
+            pd.concat([asset_history["log_return"], *macro_series], axis=1, join="inner")
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
         system = aligned.to_numpy(dtype=np.float64)
         if system.shape[0] < 4 * self.n_lags + 10:
             return AgentSignal(
@@ -129,9 +131,7 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
 
             impulse = impulse_response(coef_matrix, sigma_u, self.n_lags, n_periods=1)
             impact_magnitude = (
-                float(np.abs(impulse[0, 0, 1]))
-                if impulse.ndim == 3
-                else float(np.abs(impulse[0]))
+                float(np.abs(impulse[0, 0, 1])) if impulse.ndim == 3 else float(np.abs(impulse[0]))
             )
         except (np.linalg.LinAlgError, RuntimeError, ValueError) as exc:
             logger.debug(

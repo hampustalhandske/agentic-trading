@@ -443,9 +443,7 @@ def experiment(
             market_data_source=source_label,
             execution_lag_days=execution_lag_days,
             checkpoint_path=(
-                calibration_checkpoint
-                if start == parsed_train_start
-                else test_checkpoint
+                calibration_checkpoint if start == parsed_train_start else test_checkpoint
             ),
             resume=resume,
         )
@@ -455,8 +453,7 @@ def experiment(
             day_index: int, total_days: int, as_of_date: date, value: float
         ) -> None:
             typer.echo(
-                f"{label}: day {day_index + 1}/{total_days} ({as_of_date}) "
-                f"portfolio=${value:,.2f}",
+                f"{label}: day {day_index + 1}/{total_days} ({as_of_date}) portfolio=${value:,.2f}",
                 err=True,
             )
 

@@ -66,7 +66,7 @@ class BaselineCommander:
             values = market_data[asset]["log_return"].dropna()
         else:
             values = market_data["log_return"].dropna()
-        return values.to_numpy(dtype=np.float64)
+        return np.asarray(values.to_numpy(dtype=np.float64), dtype=np.float64)
 
 
 class SingleAnalystCommander:

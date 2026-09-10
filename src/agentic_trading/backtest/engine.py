@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from datetime import date
 from pathlib import Path
-from typing import cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -20,7 +20,6 @@ from quantcore.performance.metrics import (
     sortino_ratio,
 )
 
-from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.schemas import (
     BacktestResult,
@@ -44,6 +43,21 @@ logger = get_logger(__name__)
 DayCompleteCallback = Callable[[int, int, date, float], None]
 
 
+class CommanderLike(Protocol):
+    """What `BacktestEngine` actually needs from a commander — satisfied by
+    `Commander` and by `backtest/baselines.py`'s `BaselineCommander`/
+    `SingleAnalystCommander`, which exist to run simple benchmark/diagnostic
+    strategies through this same engine without becoming `Commander`
+    subclasses."""
+
+    def decide(
+        self,
+        market_data: pd.DataFrame,
+        as_of_date: pd.Timestamp,
+        scoreboard: PerformanceScoreboard,
+    ) -> list[PortfolioDecision]: ...
+
+
 class BacktestEngine:
     """Deterministic order fills and portfolio accounting. NOT an agent —
     this class contains NO LLM calls and NO unseeded randomness. Every
@@ -60,7 +74,7 @@ class BacktestEngine:
 
     def __init__(
         self,
-        commander: Commander,
+        commander: CommanderLike,
         portfolio: Portfolio,
         track_record: TrackRecord,
         data_loader: Callable[[list[str], date, date], pd.DataFrame],
@@ -91,20 +105,18 @@ class BacktestEngine:
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
         self.resume = resume
 
-    def _write_checkpoint(self, payload: dict[str, object]) -> None:
+    def _write_checkpoint(self, payload: dict[str, Any]) -> None:
         if self.checkpoint_path is None:
             return
         self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = self.checkpoint_path.with_suffix(
-            f"{self.checkpoint_path.suffix}.tmp"
-        )
+        temporary_path = self.checkpoint_path.with_suffix(f"{self.checkpoint_path.suffix}.tmp")
         temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         temporary_path.replace(self.checkpoint_path)
 
-    def _restore_checkpoint(self) -> dict[str, object] | None:
+    def _restore_checkpoint(self) -> dict[str, Any] | None:
         if not self.resume or self.checkpoint_path is None or not self.checkpoint_path.exists():
             return None
-        payload = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+        payload = cast(dict[str, Any], json.loads(self.checkpoint_path.read_text(encoding="utf-8")))
         expected = {
             "start_date": self.start_date.isoformat(),
             "end_date": self.end_date.isoformat(),
@@ -307,7 +319,9 @@ class BacktestEngine:
                 }
                 execution_prices = (
                     {
-                        asset: float(raw_market_data.loc[as_of_timestamp, (asset, "open")])
+                        asset: float(
+                            cast(float, raw_market_data.loc[as_of_timestamp, (asset, "open")])
+                        )
                         for asset in self.assets
                     }
                     if self.execution_lag_days
@@ -323,7 +337,11 @@ class BacktestEngine:
                     for asset in self.assets
                 }
                 execution_prices = (
-                    {self.assets[0]: float(raw_market_data.loc[as_of_timestamp, "open"])}
+                    {
+                        self.assets[0]: float(
+                            cast(float, raw_market_data.loc[as_of_timestamp, "open"])
+                        )
+                    }
                     if self.execution_lag_days
                     else prices
                 )
@@ -386,22 +404,24 @@ class BacktestEngine:
             if self.checkpoint_path is not None:
                 self._write_checkpoint(
                     {
-                    "config": {
-                        "start_date": self.start_date.isoformat(),
-                        "end_date": self.end_date.isoformat(),
-                        "assets": self.assets,
-                    },
-                    "next_day_index": day_index + 1,
-                    "portfolio": self.portfolio.model_dump(),
-                    "track_record": [entry.model_dump() for entry in self.track_record.entries],
-                    "portfolio_value_history": portfolio_value_history,
-                    "decisions_by_day": {
-                        day.isoformat(): [decision.model_dump() for decision in decisions]
-                        for day, decisions in decisions_by_day.items()
-                    },
-                    "trade_log": [trade.model_dump() for trade in trade_log],
-                    "signal_health": signal_health,
-                    "pending_decisions": [decision.model_dump() for decision in pending_decisions],
+                        "config": {
+                            "start_date": self.start_date.isoformat(),
+                            "end_date": self.end_date.isoformat(),
+                            "assets": self.assets,
+                        },
+                        "next_day_index": day_index + 1,
+                        "portfolio": self.portfolio.model_dump(),
+                        "track_record": [entry.model_dump() for entry in self.track_record.entries],
+                        "portfolio_value_history": portfolio_value_history,
+                        "decisions_by_day": {
+                            day.isoformat(): [decision.model_dump() for decision in decisions]
+                            for day, decisions in decisions_by_day.items()
+                        },
+                        "trade_log": [trade.model_dump() for trade in trade_log],
+                        "signal_health": signal_health,
+                        "pending_decisions": [
+                            decision.model_dump() for decision in pending_decisions
+                        ],
                     }
                 )
 
