@@ -1,10 +1,12 @@
 # engine.py
 
 import itertools
+import json
 import math
 import time
 from collections.abc import Callable
 from datetime import date
+from pathlib import Path
 from typing import cast
 
 import numpy as np
@@ -66,6 +68,10 @@ class BacktestEngine:
         end_date: date,
         assets: list[str] | None = None,
         portfolio_constructor: PortfolioConstructor | None = None,
+        market_data_source: str | None = None,
+        execution_lag_days: int = 0,
+        checkpoint_path: str | Path | None = None,
+        resume: bool = False,
     ) -> None:
         self.commander = commander
         self.portfolio = portfolio
@@ -78,6 +84,35 @@ class BacktestEngine:
         # means no portfolio construction runs at all, matching every
         # existing backtest's behavior exactly.
         self.portfolio_constructor = portfolio_constructor
+        self.market_data_source = market_data_source
+        if execution_lag_days not in {0, 1}:
+            raise ValueError("execution_lag_days must be 0 or 1")
+        self.execution_lag_days = execution_lag_days
+        self.checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+        self.resume = resume
+
+    def _write_checkpoint(self, payload: dict[str, object]) -> None:
+        if self.checkpoint_path is None:
+            return
+        self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.checkpoint_path.with_suffix(
+            f"{self.checkpoint_path.suffix}.tmp"
+        )
+        temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temporary_path.replace(self.checkpoint_path)
+
+    def _restore_checkpoint(self) -> dict[str, object] | None:
+        if not self.resume or self.checkpoint_path is None or not self.checkpoint_path.exists():
+            return None
+        payload = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+        expected = {
+            "start_date": self.start_date.isoformat(),
+            "end_date": self.end_date.isoformat(),
+            "assets": self.assets,
+        }
+        if payload.get("config") != expected:
+            raise ValueError("checkpoint configuration does not match this backtest")
+        return payload
 
     def _apply_portfolio_construction(
         self,
@@ -106,6 +141,35 @@ class BacktestEngine:
             market_weights=market_weights,
             as_of_date=as_of_timestamp,
         )
+
+    def _source_performance(self) -> dict[str, dict[str, float]]:
+        entries_by_source: dict[str, list[PerformanceRecord]] = {}
+        entries = getattr(self.track_record, "_entries", None)
+        if entries is None:
+            entries = getattr(self.track_record, "entries", [])
+        for entry in entries:
+            if self.start_date <= entry.as_of_date <= self.end_date:
+                entries_by_source.setdefault(entry.source_id, []).append(entry)
+
+        performance: dict[str, dict[str, float]] = {}
+        for source_id, entries in entries_by_source.items():
+            returns = np.asarray([entry.attributable_return for entry in entries], dtype=float)
+            cumulative = np.cumsum(returns)
+            running_peak = np.maximum.accumulate(cumulative)
+            drawdown = float(np.min(cumulative - running_peak)) if cumulative.size else 0.0
+            standard_deviation = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+            sharpe = (
+                float(np.mean(returns) / standard_deviation * np.sqrt(252))
+                if standard_deviation > 0.0
+                else 0.0
+            )
+            performance[source_id] = {
+                "cumulative_return": float(np.sum(returns)),
+                "sharpe_ratio": sharpe,
+                "max_drawdown": drawdown,
+                "observations": float(len(entries)),
+            }
+        return performance
 
     def run(self, on_day_complete: DayCompleteCallback | None = None) -> BacktestResult:
         """Steps through every simulated day from start_date to end_date,
@@ -152,13 +216,54 @@ class BacktestEngine:
             if self.start_date <= pd.Timestamp(day).date() <= self.end_date
         ]
 
-        scoreboard = PerformanceScoreboard(self.track_record)
-        portfolio_value_history: list[tuple[date, float]] = []
-        portfolio_values: list[float] = []
-        decisions_by_day: dict[date, list[PortfolioDecision]] = {}
-        trade_log: list[TradeRecord] = []
+        checkpoint = self._restore_checkpoint()
+        start_day_index = int(checkpoint.get("next_day_index", 0)) if checkpoint else 0
 
-        for day_index, as_of_timestamp in enumerate(days):
+        scoreboard = PerformanceScoreboard(self.track_record)
+        portfolio_value_history: list[tuple[date, float]] = (
+            [
+                (date.fromisoformat(day), value)
+                for day, value in checkpoint["portfolio_value_history"]
+            ]
+            if checkpoint
+            else []
+        )
+        portfolio_values = [value for _, value in portfolio_value_history]
+        decisions_by_day: dict[date, list[PortfolioDecision]] = (
+            {
+                date.fromisoformat(day): [
+                    PortfolioDecision.model_validate(decision) for decision in decisions
+                ]
+                for day, decisions in checkpoint["decisions_by_day"].items()
+            }
+            if checkpoint
+            else {}
+        )
+        trade_log = (
+            [TradeRecord.model_validate(trade) for trade in checkpoint["trade_log"]]
+            if checkpoint
+            else []
+        )
+        signal_health = checkpoint.get("signal_health", {}) if checkpoint else {}
+        pending_decisions = (
+            [
+                PortfolioDecision.model_validate(decision)
+                for decision in checkpoint["pending_decisions"]
+            ]
+            if checkpoint
+            else []
+        )
+        if checkpoint:
+            portfolio_state = checkpoint["portfolio"]
+            self.portfolio.cash = float(portfolio_state["cash"])
+            self.portfolio.positions = {
+                asset: float(quantity) for asset, quantity in portfolio_state["positions"].items()
+            }
+            self.track_record.restore(
+                [PerformanceRecord.model_validate(entry) for entry in checkpoint["track_record"]]
+            )
+
+        for day_index, as_of_timestamp in enumerate(days[start_day_index:], start=start_day_index):
             day_started_at = time.perf_counter()
             market_data = get_point_in_time_data(raw_market_data, as_of_timestamp)
             decisions = self.commander.decide(market_data, as_of_timestamp, scoreboard)
@@ -174,6 +279,19 @@ class BacktestEngine:
                 )
             decisions_by_day[as_of_timestamp.date()] = decisions
 
+            for decision in decisions:
+                for signal in decision.contributing_signals:
+                    source_health = signal_health.setdefault(
+                        signal.source_agent_id,
+                        {"active": 0, "unavailable": 0, "error": 0},
+                    )
+                    source_health[signal.status] += 1
+                    manager_health = signal_health.setdefault(
+                        signal.manager_id,
+                        {"active": 0, "unavailable": 0, "error": 0},
+                    )
+                    manager_health[signal.status] += 1
+
             if isinstance(raw_market_data.columns, pd.MultiIndex):
                 prices = {
                     asset: float(
@@ -187,6 +305,14 @@ class BacktestEngine:
                     )
                     for asset in self.assets
                 }
+                execution_prices = (
+                    {
+                        asset: float(raw_market_data.loc[as_of_timestamp, (asset, "open")])
+                        for asset in self.assets
+                    }
+                    if self.execution_lag_days
+                    else prices
+                )
             else:
                 prices = {
                     asset: float(cast(float, raw_market_data.loc[as_of_timestamp, "close"]))
@@ -196,6 +322,11 @@ class BacktestEngine:
                     asset: float(cast(float, raw_market_data.loc[as_of_timestamp, "log_return"]))
                     for asset in self.assets
                 }
+                execution_prices = (
+                    {self.assets[0]: float(raw_market_data.loc[as_of_timestamp, "open"])}
+                    if self.execution_lag_days
+                    else prices
+                )
             portfolio_value = self.portfolio.total_value(prices)
             portfolio_values.append(portfolio_value)
             portfolio_value_history.append((as_of_timestamp.date(), portfolio_value))
@@ -208,9 +339,15 @@ class BacktestEngine:
                 portfolio_value,
             )
 
-            for decision in decisions:
+            decisions_to_execute = pending_decisions if self.execution_lag_days else decisions
+            for decision in decisions_to_execute:
+                fill_price = (
+                    execution_prices[decision.asset]
+                    if self.execution_lag_days
+                    else prices[decision.asset]
+                )
                 trade_log.append(
-                    self.portfolio.apply_decision(decision, prices[decision.asset], portfolio_value)
+                    self.portfolio.apply_decision(decision, fill_price, portfolio_value)
                 )
                 realized_return = log_returns[decision.asset]
                 # The first simulated day has a NaN log_return (no prior close
@@ -219,6 +356,8 @@ class BacktestEngine:
                 if math.isnan(realized_return):
                     realized_return = 0.0
                 for signal in decision.contributing_signals:
+                    if signal.status != "active":
+                        continue
                     direction_sign = {"long": 1.0, "short": -1.0, "flat": 0.0}[signal.direction]
                     attributable_return = direction_sign * signal.confidence * realized_return
                     # Both analyst- and manager-level attribution: the
@@ -242,6 +381,29 @@ class BacktestEngine:
                             attributable_return=attributable_return,
                         )
                     )
+
+            pending_decisions = decisions
+            if self.checkpoint_path is not None:
+                self._write_checkpoint(
+                    {
+                    "config": {
+                        "start_date": self.start_date.isoformat(),
+                        "end_date": self.end_date.isoformat(),
+                        "assets": self.assets,
+                    },
+                    "next_day_index": day_index + 1,
+                    "portfolio": self.portfolio.model_dump(),
+                    "track_record": [entry.model_dump() for entry in self.track_record.entries],
+                    "portfolio_value_history": portfolio_value_history,
+                    "decisions_by_day": {
+                        day.isoformat(): [decision.model_dump() for decision in decisions]
+                        for day, decisions in decisions_by_day.items()
+                    },
+                    "trade_log": [trade.model_dump() for trade in trade_log],
+                    "signal_health": signal_health,
+                    "pending_decisions": [decision.model_dump() for decision in pending_decisions],
+                    }
+                )
 
             if on_day_complete is not None:
                 on_day_complete(day_index, len(days), as_of_timestamp.date(), portfolio_value)
@@ -303,6 +465,9 @@ class BacktestEngine:
             final_sharpe_ratio,
             final_max_drawdown,
         )
+        close_commander = getattr(self.commander, "close", None)
+        if close_commander is not None:
+            close_commander()
         return BacktestResult(
             start_date=self.start_date,
             end_date=self.end_date,
@@ -316,4 +481,8 @@ class BacktestEngine:
             final_profit_factor=final_profit_factor,
             decisions_by_day=decisions_by_day,
             trade_log=trade_log,
+            signal_health=signal_health,
+            market_data_source=self.market_data_source,
+            synthetic_market_data_used=self.market_data_source == "synthetic fallback data",
+            source_performance=self._source_performance(),
         )

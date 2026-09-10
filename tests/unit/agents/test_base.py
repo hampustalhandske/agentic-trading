@@ -78,6 +78,7 @@ def test_collect_signals_defaults_a_crashing_analyst_to_a_hold_signal() -> None:
     crashed_signal = next(s for s in signals if s.agent_id == "crashing_analyst")
     assert crashed_signal.direction == SAFE_FALLBACK_DIRECTION
     assert crashed_signal.confidence == SAFE_FALLBACK_CONFIDENCE
+    assert crashed_signal.status == "error"
     assert crashed_signal.asset == "AAPL"
     assert crashed_signal.as_of_date == AS_OF.date()
 
@@ -127,6 +128,7 @@ def test_evaluate_defaults_a_crashing_scale_factor_to_zero_contribution() -> Non
     assert len(scaled) == 1
     assert scaled[0].scale_applied == pytest.approx(0.0)
     assert scaled[0].confidence == pytest.approx(0.0)
+    assert scaled[0].status == "error"
     # direction is preserved (a manager dampens, never flips) even though
     # this manager's own scale_factor crashed and contributed nothing.
     assert scaled[0].direction == "long"

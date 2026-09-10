@@ -45,7 +45,10 @@ from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
 from agentic_trading.data.cache import CACHE_ROOT
 from agentic_trading.data.db import read_fetch_log
-from agentic_trading.data.loader import load_price_history_with_fallback
+from agentic_trading.data.loader import (
+    DEFAULT_BACKTEST_WARMUP_DAYS,
+    load_price_history_with_fallback,
+)
 from agentic_trading.data.ticker_catalog import TICKER_GROUPS, TickerGroup, tickers_by_asset_class
 from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
@@ -162,6 +165,14 @@ def _inject_styles() -> None:
                 background: rgba(100, 116, 139, 0.12);
                 border-color: rgba(100, 116, 139, 0.35);
             }
+            .agent-node-unavailable {
+                background: rgba(245, 158, 11, 0.12);
+                border-color: rgba(245, 158, 11, 0.45);
+            }
+            .agent-node-error {
+                background: rgba(239, 68, 68, 0.12);
+                border-color: rgba(239, 68, 68, 0.55);
+            }
 
             .status-pill {
                 display: inline-block;
@@ -261,14 +272,26 @@ def _build_managers(manager_mode: str, analysts: list[AnalystAgent]) -> list[Man
     return [build_manager(owned)]
 
 
-def _load_basket_data(tickers: tuple[str, ...], start: date, end: date) -> tuple[pd.DataFrame, str]:
+def _load_basket_data(
+    tickers: tuple[str, ...],
+    start: date,
+    end: date,
+    warmup_days: int = 0,
+    allow_synthetic_fallback: bool = True,
+) -> tuple[pd.DataFrame, str]:
     """Thin wrapper around the shared `data.loader.load_price_history_with_fallback`
     — the exact same function the CLI uses, so both front ends fall back to
     synthetic data (and log the same WARNING) identically on a live-data
     failure. Deliberately uncached: every run fetches fresh from yfinance for
     whatever tickers/date range the user has currently selected, rather than
     silently serving a stale result from an earlier selection."""
-    return load_price_history_with_fallback(list(tickers), start, end)
+    return load_price_history_with_fallback(
+        list(tickers),
+        start,
+        end,
+        warmup_days=warmup_days,
+        allow_synthetic_fallback=allow_synthetic_fallback,
+    )
 
 
 def _normalized_return_pct(close: pd.Series) -> pd.Series:
@@ -286,10 +309,17 @@ def _sp500_benchmark(start: date, end: date) -> pd.Series:
     return _normalized_return_pct(frame[SP500_TICKER]["close"])
 
 
-def _basket_index_benchmark(price_history: pd.DataFrame, tickers: list[str]) -> pd.Series:
+def _basket_index_benchmark(
+    price_history: pd.DataFrame, tickers: list[str], start: date | None = None
+) -> pd.Series:
     """An equal-weighted, buy-and-hold index of `tickers` — "if I'd just
     bought and held this basket" rather than run the desk on it."""
-    per_ticker = [_normalized_return_pct(price_history[ticker]["close"]) for ticker in tickers]
+    per_ticker = []
+    for ticker in tickers:
+        close = price_history[ticker]["close"]
+        if start is not None:
+            close = close.loc[close.index >= pd.Timestamp(start)]
+        per_ticker.append(_normalized_return_pct(close))
     per_ticker = [series for series in per_ticker if not series.empty]
     if not per_ticker:
         return pd.Series(dtype=float)
@@ -504,10 +534,16 @@ def _simulate_desk(
 
     analysts = _build_analysts()
     managers = _build_managers(manager_mode, analysts)
-    commander = Commander(managers=managers, weighting_strategy=Hedge())
+    commander = Commander(managers=managers, weighting_strategy=Hedge(), parallel_workers=4)
     portfolio = Portfolio(cash=initial_cash, positions={})
     track_record = TrackRecord()
-    market_data, source_label = _load_basket_data(tuple(tickers), start, end)
+    market_data, source_label = _load_basket_data(
+        tuple(tickers),
+        start,
+        end,
+        warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+        allow_synthetic_fallback=False,
+    )
     portfolio_constructor = (
         PortfolioConstructor(enabled=True, method=portfolio_construction_method)
         if portfolio_construction_method is not None
@@ -523,6 +559,7 @@ def _simulate_desk(
         end_date=end,
         assets=tickers,
         portfolio_constructor=portfolio_constructor,
+        market_data_source=source_label,
     )
     backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
 
@@ -542,7 +579,7 @@ def _simulate_desk(
         track_record=track_record,
         scoreboard=PerformanceScoreboard(track_record),
         sp500_benchmark=_sp500_benchmark(start, end),
-        basket_benchmark=_basket_index_benchmark(market_data, tickers),
+        basket_benchmark=_basket_index_benchmark(market_data, tickers, start),
     )
 
 
@@ -748,6 +785,7 @@ def _signal_history_rows(
                         "manager": signal.manager_id,
                         "analyst": signal.source_agent_id,
                         "direction": signal.direction,
+                        "status": signal.status,
                         "confidence": signal.confidence,
                         "scale_applied": signal.scale_applied,
                         "target_weight": decision.target_weight,
@@ -783,6 +821,9 @@ def _source_summary_frame(
                     "signals": 0,
                     "avg_confidence": 0.0,
                     "last_direction": "—",
+                    "active": 0,
+                    "unavailable": 0,
+                    "errors": 0,
                 }
             )
             continue
@@ -794,6 +835,9 @@ def _source_summary_frame(
                 "signals": len(history),
                 "avg_confidence": float(history["confidence"].mean()),
                 "last_direction": f"{last_row['direction']} ({last_row['asset']})",
+                "active": int((history["status"] == "active").sum()),
+                "unavailable": int((history["status"] == "unavailable").sum()),
+                "errors": int((history["status"] == "error").sum()),
             }
         )
     return pd.DataFrame(rows)
@@ -821,6 +865,7 @@ class AgentFlowNode:
     direction: str
     confidence: float
     agrees_with_majority: bool
+    status: str = "active"
 
 
 @dataclass(slots=True)
@@ -869,6 +914,7 @@ def _build_agent_flow_snapshot(
             direction=signal.direction,
             confidence=signal.confidence,
             agrees_with_majority=signal.direction == majority,
+            status=signal.status,
         )
         for signal in sorted(signals, key=lambda s: s.source_agent_id)
     ]
@@ -882,6 +928,13 @@ def _build_agent_flow_snapshot(
             direction=_majority_direction([s.direction for s in owned]),
             confidence=sum(s.confidence for s in owned) / len(owned),
             agrees_with_majority=_majority_direction([s.direction for s in owned]) == majority,
+            status=(
+                "error"
+                if any(s.status == "error" for s in owned)
+                else "unavailable"
+                if any(s.status == "unavailable" for s in owned)
+                else "active"
+            ),
         )
         for manager_id, owned in sorted(by_manager.items())
     ]
@@ -908,6 +961,10 @@ def _build_agent_flow_snapshot(
 
 
 def _node_css_class(node: AgentFlowNode) -> str:
+    if node.status == "error":
+        return "agent-node-error"
+    if node.status == "unavailable":
+        return "agent-node-unavailable"
     if node.direction == "flat":
         return "agent-node-flat"
     return "agent-node-agree" if node.agrees_with_majority else "agent-node-disagree"
@@ -917,7 +974,7 @@ def _render_flow_node(node: AgentFlowNode) -> None:
     st.markdown(
         f'<div class="agent-node {_node_css_class(node)}">'
         f'<span class="agent-node-name">{node.name}</span>'
-        f"{node.direction.upper()} · {node.confidence:.2f}</div>",
+        f"{node.direction.upper()} · {node.confidence:.2f} · {node.status}</div>",
         unsafe_allow_html=True,
     )
 

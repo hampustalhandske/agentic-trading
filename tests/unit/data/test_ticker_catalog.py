@@ -61,12 +61,12 @@ def test_options_are_not_a_represented_asset_class() -> None:
 
 
 def test_ticker_groups_are_non_empty_and_reference_stock_symbols() -> None:
-    stock_symbols = {entry.symbol for entry in tickers_by_asset_class("stock")}
+    catalog_symbols = {entry.symbol for entry in CATALOG}
 
     assert len(TICKER_GROUPS) > 0
     for group in TICKER_GROUPS:
         assert group.symbols
-        assert set(group.symbols) <= stock_symbols
+        assert set(group.symbols) <= catalog_symbols
 
 
 @patch("agentic_trading.data.ticker_catalog.yf.Ticker")

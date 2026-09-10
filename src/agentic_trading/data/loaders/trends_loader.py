@@ -51,7 +51,7 @@ def load_search_interest(
     start = (as_of_date - pd.Timedelta(days=lookback_days)).date()
     frame = cached_fetch(
         source="google_trends",
-        identifier=f"{keyword}_{lookback_days}d",
+        identifier=f"{keyword}_{start.isoformat()}_{today.isoformat()}",
         as_of_date=today,
         fetch_fn=lambda: _fetch_trends(keyword, start, today),
     )

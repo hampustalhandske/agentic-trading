@@ -24,6 +24,15 @@ class TrackRecord:
         as_of_date — that is the caller's responsibility."""
         self._entries.append(entry)
 
+    @property
+    def entries(self) -> list[PerformanceRecord]:
+        """Chronological storage view used by durable backtest checkpoints."""
+        return list(self._entries)
+
+    def restore(self, entries: list[PerformanceRecord]) -> None:
+        """Replace in-memory history from a validated checkpoint payload."""
+        self._entries = list(entries)
+
     def history_for(
         self,
         source_id: str,

@@ -388,9 +388,16 @@ def test_long_format_chart_frame_drops_rows_with_nan_values() -> None:
     assert result.iloc[0]["value"] == pytest.approx(1.0)
 
 
-def test_load_basket_data_wraps_single_ticker_into_multiindex() -> None:
+def test_load_basket_data_wraps_single_ticker_into_multiindex(tmp_path, monkeypatch) -> None:
     """_load_basket_data always returns MultiIndex columns, even for a
-    one-ticker basket, so every downstream consumer only handles one shape."""
+    one-ticker basket, so every downstream consumer only handles one shape.
+
+    "SYNTH_ONLY" isn't a real ticker, so yfinance/Stooq/Alpha Vantage all
+    genuinely fail and this exercises the real synthetic fallback path —
+    which now also means it exercises price loading's on-disk cache, so
+    CACHE_ROOT must be isolated here too, the same as every price-loader
+    test in test_loader.py."""
+    monkeypatch.setattr("agentic_trading.data.cache.CACHE_ROOT", tmp_path)
     frame, _ = dashboard_module._load_basket_data(
         ("SYNTH_ONLY",), date(2024, 1, 2), date(2024, 1, 5)
     )
@@ -797,12 +804,20 @@ def test_ticker_multiselect_changes_the_basket_that_runs(
     change the resolved ticker list the desk actually runs on"""
     monkeypatch.setattr("agentic_trading.agents.roster.build_default_analysts", lambda: [])
 
-    def _raise_to_force_synthetic_fallback(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("network disabled in tests")
+    def _explicit_test_data(
+        tickers: tuple[str, ...], start: date, end: date, **_kwargs: object
+    ) -> tuple[pd.DataFrame, str]:
+        from agentic_trading.data.loader import _synthetic_price_history
 
-    monkeypatch.setattr(
-        "agentic_trading.data.loader.load_price_history", _raise_to_force_synthetic_fallback
-    )
+        return (
+            pd.concat(
+                {ticker: _synthetic_price_history(ticker, start, end) for ticker in tickers},
+                axis=1,
+            ),
+            "explicit test fixture",
+        )
+
+    monkeypatch.setattr(dashboard_module, "_load_basket_data", _explicit_test_data)
 
     at = AppTest.from_file(dashboard_module.__file__)
     at.run(timeout=30)

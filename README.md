@@ -13,8 +13,7 @@ models, VaR/CVaR, factor regressions, portfolio optimization — comes from
 `quantcore`, a separate dependency. This repo does not reimplement
 quantitative math; it **orchestrates** it through a layered multi-agent
 architecture and turns the output into position decisions and a backtest
-result. If a calculation this project needs is missing from `quantcore`,
-that's a `quantcore` task, not something to patch in here.
+result.
 
 ## Why this exists
 
@@ -27,6 +26,30 @@ mechanically and reproducibly, so different quantitative strategies can
 be compared, combined, and backtested under one deterministic execution
 engine — with every intermediate signal, constraint, and decision
 inspectable, not just the final trade.
+
+## Tech stack
+
+| Tool | Role |
+|---|---|
+| Python 3.12+ | Language |
+| [uv](https://docs.astral.sh/uv/) | Dependency management, venv, build, running scripts |
+| [Typer](https://typer.tiangolo.com/) | CLI (`agentic-trading-cli`, `agentic-trading-experiment`) |
+| [Streamlit](https://streamlit.io/) | GUI dashboard (`agentic-trading`) |
+| [Pydantic](https://docs.pydantic.dev/) v2 | All cross-component schemas (`AgentSignal`, `PortfolioDecision`, ...) |
+| [pandas](https://pandas.pydata.org/) | Time-series data handling throughout |
+| `quantcore` (private git dep) | All numerical finance — pricing, GARCH, VaR/CVaR, factor math |
+| `yfinance`, `pandas-datareader` | Price history |
+| `fredapi` | FRED macro/rates/VIX series |
+| `pytrends` | Google Trends attention data |
+| `requests` | Direct HTTP calls to Stooq/SEC/FINRA/Finnhub/Tiingo/etc. |
+| `python-dotenv` | Loads `.env` for API keys |
+| [pytest](https://docs.pytest.org/) | Tests |
+| [ruff](https://docs.astral.sh/ruff/) | Lint + format |
+| [mypy](https://mypy-lang.org/) (`strict`) | Type checking |
+
+`quantcore` is the one dependency this project doesn't own the math of —
+if a calculation is missing, that's a `quantcore` task, not something to
+patch in here.
 
 ## Architecture — four layers, one deterministic engine
 
@@ -58,51 +81,50 @@ Layer 1: Analysts (29)  →  Layer 2: Managers (8 pods)  →  Layer 3: Commander
   authority. Holds portfolio state, combines every manager-adjusted
   signal weighted by that analyst's *trailing track record* (not its
   type, not a hardcoded prior — see Scoring below), and emits one
-  `PortfolioDecision` per asset per day.
+  `PortfolioDecision` per asset per day. Can fan out manager evaluation
+  across a thread or process pool (`parallel_workers`/`parallel_backend`)
+  for multi-asset runs.
 - **Layer 4 — Portfolio construction** (`agents/portfolio_construction.py`,
   optional, off by default / no-op unless enabled): a post-Commander
   stage that takes the Commander's per-asset decisions as Black-Litterman
   *views*, blends them with a market-implied equilibrium prior, shrinks
   the covariance estimate (Ledoit-Wolf), runs a risk-budgeting optimizer
   (min-variance / mean-variance / risk-parity, selectable), scales the
-  result by a Kelly fraction, and logs a component-VaR risk report. Exists
-  for going from "30 independent per-asset opinions" to "one
-  coherent, risk-budgeted multi-asset portfolio," without being required
-  for the simpler single-asset desk-simulation use case.
+  result by a Kelly fraction, and logs a component-VaR risk report.
 
 Two non-agent, always-deterministic components sit underneath all of
 this:
 
 - **`backtest/engine.py`** — order fills and portfolio accounting. No
   LLM calls, no randomness beyond what's explicitly seeded, fully
-  testable in isolation. This is the part where correctness is
-  non-negotiable, because everything above it is only as trustworthy as
-  the fills and P&L it's scored against.
+  testable in isolation.
 - **`data/point_in_time.py`** — a hard architectural boundary: on
   simulated day *t*, no agent can access data from day *t+1* onward.
-  Enforced structurally by the data-loading layer (agents physically
-  cannot reach future rows), not just documented as a rule, because a
-  look-ahead bug here would silently invalidate any backtest result
-  without producing an error.
+  Enforced structurally by the data-loading layer, not just documented,
+  because a look-ahead bug here would silently invalidate any backtest
+  result without producing an error.
 
 ## The eight pods
 
-`agents/roster.py` is the single place that wires up the default
-29-analyst / 8-manager roster; it's the file to change when adding more
-analysts or managers. Each pod is themed around one coherent family of
-quant strategy, so the Commander gets eight genuinely different risk
-overlays rather than eight relabelings of the same signal:
+`agents/roster.py` wires up the default 29-analyst / 8-manager roster;
+it's the file to change when adding more analysts or managers. Each pod
+is themed around one coherent family of quant strategy:
 
 | Pod | Manager | Analysts | What ties them together |
 |---|---|---|---|
-| **Risk** | `RiskManager` | `risk_minimizing`, `risk_maximizing`, `gbm_momentum` | Directional views built straight off volatility/return characteristics — favor low-VaR assets, favor high-GARCH-vol assets, or simulate a GBM forward path to see if it lands above today's price. `RiskManager` dampens confidence for elevated quantcore VaR. |
-| **CVaR** | `CVaRManager` | `black_scholes_valuation`, `monte_carlo_valuation`, `greeks_delta_hedge`, `heston_vol_surface` | Options-valuation analysts. Since no free source has historical options chains, these price *theoretical/synthetic* options off model-estimated vol rather than live chains (`_theoretical_options.py`) — Black-Scholes closed form, Monte Carlo real-world-drift projection, a gamma-exposure proxy from the Greeks, and a two-regime Heston stochastic-vol comparison. `CVaRManager` dampens confidence for elevated tail-loss (CVaR). |
-| **StatArb** | `StatArbManager` | `ou_mean_reversion`, `pairs_cointegration`, `kalman_hedge_ratio`, `regime_hmm` | Classic statistical arbitrage: an Ornstein-Uhlenbeck mean-reversion spread, Engle-Granger/Johansen cointegration against candidate partner tickers, a Kalman-filtered *time-varying* hedge ratio version of the same idea, and a Gaussian HMM regime detector. `StatArbManager` dampens confidence for elevated spread volatility. |
-| **Macro/Rates** | `MacroRatesManager` | `egarch_asymmetric_vol`, `gjr_garch_crash_risk`, `arima_forecast`, `macro_var_spillover`, `cir_rate_regime` | Volatility-regime and macro-driven signals: EGARCH/GJR-GARCH asymmetric-volatility ("leverage effect") reads, an ARIMA return forecast, a small VAR system relating the asset to FRED macro series (VIX, yield curve), and a CIR short-rate regime read. GARCH-family parameters here are documented, fixed, honest approximations, not MLE-fitted — `quantcore` has no EGARCH/GJR-GARCH fitter yet. |
-| **Factor** | `FactorManager` | `fama_french_factor`, `fama_macbeth`, `newey_west_significance` | Cross-sectional/regression analysts: a Fama-French factor-tilt regression, a genuine Fama-MacBeth two-pass estimate (the one analyst that needs more than one ticker's data), and a general "does X actually predict this asset" Newey-West-robust significance test against a configurable lagged predictor. |
-| **Event/Credit** | `EventCreditManager` | `news_sentiment`, `sec_fundamentals`, `short_interest_squeeze` | Event-driven, mostly text/filings-based rather than pure price math: Finnhub headline news scored by a local keyword-sentiment lexicon (Finnhub's own aggregate `news-sentiment` endpoint is paid-tier-only and 403s on a free key, so per-headline sentiment is computed here instead), an OLS trend over trailing SEC EDGAR filing values (falling back to Financial Modeling Prep for a handful of overlapping concepts if SEC EDGAR has too few filings), and a short-interest days-to-cover squeeze z-score from FINRA data. `EventCreditManager` dampens confidence as event/filing severity rises. |
-| **Alt-Data/Crowd Attention** | `AltDataManager` | `insider_cluster_buying`, `retail_attention`, `wikipedia_pageviews`, `reddit_sentiment` | Methodologically distinct from every pod above: alt-data/behavioral signals rather than price or filing math — SEC Form 4 insider-filing clustering, Google Trends and Wikipedia pageview attention spikes (two independent attention proxies, kept both for cross-validation — see `wikipedia_pageviews_analyst`'s docstring), and Reddit community-score sentiment. `AltDataManager` dampens confidence for both staleness and thin sample sizes (`[source_as_of=...]` / `[sample_count=...]` rationale tags). A `congressional_trading` analyst previously covered Senate/House Stock Watcher disclosures; both buckets' public S3 endpoints now permanently return 403 (bucket policy, not a code/key issue), so it was removed rather than left silently dead. |
-| **Anomaly/Network** | `AnomalyNetworkManager` | `calendar_seasonality`, `lead_lag_network_centrality`, `options_skew_sentiment` | Documented-anomaly and graph/network-science analysts, distinct from the factor_pod regressions: day-of-week/turn-of-month/January/Santa-rally calendar effects computed straight from price history, a lead-lag cross-correlation network centrality read across a configurable ticker universe (the second analyst, after `fama_macbeth`, that needs more than one ticker's data), and the CBOE aggregate put/call ratio as a real market-wide positioning read. `AnomalyNetworkManager` dampens confidence for low sample counts outside each analyst's well-studied regime. |
+| **Risk** | `RiskManager` | `risk_minimizing`, `risk_maximizing`, `gbm_momentum` | Directional views off volatility/return characteristics. Dampens confidence for elevated quantcore VaR. |
+| **CVaR** | `CVaRManager` | `black_scholes_valuation`, `monte_carlo_valuation`, `greeks_delta_hedge`, `heston_vol_surface` | Options-valuation analysts pricing *theoretical/synthetic* options off model-estimated vol (no free source has historical chains). Dampens confidence for elevated tail-loss (CVaR). |
+| **StatArb** | `StatArbManager` | `ou_mean_reversion`, `pairs_cointegration`, `kalman_hedge_ratio`, `regime_hmm` | Classic statistical arbitrage: OU mean-reversion, cointegration, a Kalman-filtered hedge ratio, a Gaussian HMM regime detector. Dampens confidence for elevated spread volatility. |
+| **Macro/Rates** | `MacroRatesManager` | `egarch_asymmetric_vol`, `gjr_garch_crash_risk`, `arima_forecast`, `macro_var_spillover`, `cir_rate_regime` | Volatility-regime and macro-driven signals, including a VAR system against FRED series (VIX, yield curve) and a CIR short-rate regime read. |
+| **Factor** | `FactorManager` | `fama_french_factor`, `fama_macbeth`, `newey_west_significance` | Cross-sectional/regression analysts: Fama-French tilt, a two-pass Fama-MacBeth estimate, a Newey-West-robust predictor significance test. |
+| **Event/Credit** | `EventCreditManager` | `news_sentiment`, `sec_fundamentals`, `short_interest_squeeze` | Text/filings-driven: Finnhub headlines scored by a local keyword lexicon, an OLS trend over SEC EDGAR filings (FMP fallback), a FINRA short-interest squeeze z-score. |
+| **Alt-Data/Crowd Attention** | `AltDataManager` | `insider_cluster_buying`, `retail_attention`, `wikipedia_pageviews`, `reddit_sentiment` | Alt-data/behavioral signals: SEC Form 4 insider clustering, Google Trends + Wikipedia attention spikes, Reddit sentiment. Dampens confidence for staleness/thin samples. |
+| **Anomaly/Network** | `AnomalyNetworkManager` | `calendar_seasonality`, `lead_lag_network_centrality`, `options_skew_sentiment` | Documented calendar anomalies, a lead-lag cross-correlation network centrality read, and the CBOE put/call ratio. |
+
+A `congressional_trading` analyst previously covered Senate/House Stock
+Watcher disclosures; both chambers' public S3 buckets now permanently
+return 403 (a provider-side bucket-policy change, not a code/key issue),
+so it was removed rather than left silently dead.
 
 ## Scoring — how the Commander decides who to trust
 
@@ -112,102 +134,131 @@ analyst's daily hypothetical attributable performance
 into an allocation weight (`WeightingStrategy`, e.g. `Hedge`) via
 `PerformanceScoreboard`. This — not agent type, not a hardcoded trust
 table — is what `Commander.decide()` and each `ManagerAgent.evaluate()`
-actually use to decide how much say a given analyst gets today. An
-analyst that's been wrong lately loses influence automatically; one
-that's been right gains it.
+use to decide how much say a given analyst gets today.
 
 ## Data sources
 
 All external data funnels through `data/cache.py` — a local on-disk
 parquet cache keyed by `(source, identifier, as_of_date)`, so re-running
 a backtest never re-hits a rate-limited free API. Every cache-miss fetch
-is also recorded, write-once, in a local SQLite database (`data/db.py`)
-alongside the parquet cache — a durable, queryable log of every fetch
-this project has ever made, independent of the per-file cache layout.
-Point-in-time gating differs by source (see `data/point_in_time.py` and
-CLAUDE.md for the exact rules — e.g. SEC filings gate on filed date, not
-fiscal period end; FRED series gate on release/vintage date, not the
-observation period).
+is also recorded, write-once, in a local SQLite database (`data/db.py`).
+Point-in-time gating differs by source — see `data/point_in_time.py` and
+`CLAUDE.md` for the exact rules.
 
 | Source | Used for | Key required |
 |---|---|---|
-| `yfinance` (primary), Stooq (2nd fallback), Alpha Vantage (3rd, last-resort), synthetic (final fallback) | Daily price history | No (Alpha Vantage tier: `ALPHAVANTAGE_API_KEY`, only reached once yfinance and Stooq have both failed) |
-| `yfinance` option chains | Live-mode options snapshots only — **not usable by backtest-driving analysts**, since no free source has historical chains | No |
+| `yfinance` → Stooq → Alpha Vantage → synthetic | Daily price history (fallback chain, in order) | Alpha Vantage only: `ALPHAVANTAGE_API_KEY` |
+| `yfinance` option chains | Live-mode options snapshots only — not usable by backtest-driving analysts | No |
 | FRED | Macro/rates/VIX series | `FRED_API_KEY` |
 | Ken French Data Library | Fama-French factor returns | No |
-| SEC EDGAR | Company fundamentals (filed-date gated), primary source; falls back to Financial Modeling Prep for overlapping concepts (revenue, assets, liabilities, equity — not diluted EPS) when a filing history is too thin | No (needs `SEC_EDGAR_USER_AGENT` contact header) |
-| SEC EDGAR full-text search | Form 4 insider-transaction and 10-K/10-Q filing metadata (filed-date gated) | No (same `SEC_EDGAR_USER_AGENT` header) |
-| FINRA | Biweekly short-interest (CSV response, not JSON — dissemination date is estimated as settlement date + 8 business days, since the API doesn't return that field directly) | No |
-| Finnhub | Company news headlines, scored locally with a keyword-sentiment lexicon (the paid-tier-only `news-sentiment` aggregate endpoint 403s on a free key, so this loader never calls it) | `FINNHUB_API_KEY` |
-| Tiingo | IEX-sourced EOD price cross-check against the primary yfinance/Stooq series — feeds `RiskManager`'s divergence-dampening factor, not another price fallback | `TIINGO_API_KEY` |
-| Alpha Vantage | Last-resort price fallback tier in `data/loader.py` (~25 req/day free tier; only reached once yfinance and Stooq have both failed, so it isn't burned on the common path) | `ALPHAVANTAGE_API_KEY` |
-| Financial Modeling Prep | Fundamentals fallback for `sec_fundamentals_analyst` when SEC EDGAR's filing history is too thin (~250 req/day free tier) | `FMP_API_KEY` |
-| Google Trends (`pytrends`) | Search-interest attention proxy (provisional `isPartial` points dropped) | No |
-| Wikimedia Pageviews | Wikipedia page-view attention proxy (gated on a ~24-48h publication lag) | No |
-| Reddit | Mention-volume in finance subreddits (recent-history window only — the free search API doesn't expose a full historical archive) | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` |
-| CBOE | Total put/call ratio — aggregate market-wide options positioning, distinct from the CVaR pod's per-name theoretical pricing | No |
+| SEC EDGAR | Fundamentals (filed-date gated); falls back to Financial Modeling Prep | No (`SEC_EDGAR_USER_AGENT` header) |
+| SEC EDGAR full-text search | Form 4 insider transactions, 10-K/10-Q metadata | No (same header) |
+| FINRA | Biweekly short interest | No |
+| Finnhub | News headlines, scored locally (no paid sentiment endpoint) | `FINNHUB_API_KEY` |
+| Tiingo | EOD price cross-check / divergence signal, not a price fallback | `TIINGO_API_KEY` |
+| Financial Modeling Prep | Fundamentals fallback | `FMP_API_KEY` |
+| Google Trends (`pytrends`) | Search-interest attention | No |
+| Wikimedia Pageviews | Wikipedia attention | No |
+| Reddit | Mention-volume in finance subreddits | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` |
+| CBOE | Market-wide put/call ratio | No |
 
-**Historical options data remains a documented limitation.** Databento and
-Polygon.io were investigated as the highest-value potential addition (it
-would let the CVaR pod price real historical options instead of a
-theoretical/synthetic model). Neither has a genuinely free ongoing tier
-for it: Polygon's free "Basic" plan excludes options data entirely (options
-access starts on a paid plan); Databento has no standing free tier, only a
-one-time signup credit applied against its usage-based billing. Since
-neither amounts to a free, repeatable historical-options source, the
-CVaR-pod analysts still price theoretical/synthetic options with
-model-estimated volatility (`agents/analysts/cvar_pod/_theoretical_options.py`)
-rather than pretending otherwise.
+**Historical options data is a documented limitation, not solved.**
+Databento and Polygon.io were evaluated; neither has a genuinely free
+ongoing tier for historical options, so the CVaR pod still prices
+theoretical/synthetic options off model-estimated vol
+(`agents/analysts/cvar_pod/_theoretical_options.py`).
 
-## Conventions worth knowing before touching the code
+## Project structure
 
-- **Every cross-component data structure is a Pydantic `BaseModel`** —
-  no raw dicts or dataclasses cross a module boundary. This is what
-  keeps 30 wildly different analyst implementations interchangeable from
-  every layer above them.
-- **Two date types, two layers, do not mix them.** Market-data code
-  (`_market_math.py`, `point_in_time.py`, every analyst's
-  `generate_signal`/`scale_factor`) works in `pd.Timestamp`. Everything
-  performance-tracking (`scoring/`) works in plain `datetime.date`.
-  `Commander.decide()` and `ManagerAgent.evaluate()` are the one place
-  that converts between them (`.date()`), right before calling into
-  `scoring/`.
-- `logging_config.py` is the project's only logging setup —
-  `get_logger(__name__)` at import time everywhere, `configure_logging()`
-  called once by an entry point. See CLAUDE.md for the one Streamlit
-  `__name__` trap already hit here.
-- `quantcore` is a dependency, never something to fork or patch from
-  this repo.
+```
+src/agentic_trading/
+├── agents/
+│   ├── analysts/          # Layer 1 — one subpackage per pod (risk_pod, cvar_pod, ...)
+│   ├── managers/          # Layer 2 — one manager class per pod
+│   ├── base.py            # shared AnalystAgent / ManagerAgent interfaces
+│   ├── commander.py        # Layer 3
+│   ├── portfolio_construction.py  # optional Layer 4
+│   ├── roster.py           # default 29-analyst / 8-manager wiring
+│   └── schemas.py          # Pydantic schemas shared across layers
+├── backtest/
+│   ├── engine.py           # deterministic fills + accounting
+│   ├── portfolio.py        # holdings/positions
+│   └── baselines.py        # equal-weight/buy-and-hold/momentum/vol-target benchmarks
+├── data/
+│   ├── loaders/             # one module per external source
+│   ├── cache.py             # on-disk parquet cache
+│   ├── db.py                 # SQLite fetch log
+│   ├── loader.py             # price-loading fallback chain
+│   ├── point_in_time.py      # no-look-ahead enforcement
+│   └── ticker_catalog.py
+├── scoring/                 # track record + weighting strategies
+├── gui/dashboard.py         # Streamlit dashboard
+├── cli.py                   # `agentic-trading-cli` / `agentic-trading-experiment`
+├── main.py                  # `agentic-trading` (GUI) entry point
+└── logging_config.py        # the project's only logging setup
+tests/unit/                  # mirrors the src/ layout
+```
+
+## Setup
+
+```bash
+uv sync --locked --group dev     # install deps + dev tools
+cp .env.example .env             # then fill in the keys you want to use
+```
+
+Every key in `.env.example` is optional — without it, that specific data
+source falls back or is skipped (see the Data sources table above);
+prices work with no keys at all via `yfinance`/Stooq.
 
 ## Running it
 
 ```bash
-uv sync --locked --group dev              # install deps
-
 uv run agentic-trading                    # launch the Streamlit dashboard
-uv run agentic-trading-cli <assets> --start-date <date> --end-date <date>   # headless backtest
+
+# headless single-phase backtest
+uv run agentic-trading-cli <assets> --start-date <date> --end-date <date>
+
+# calibration phase + out-of-sample test phase, with trust weights carried over
+uv run agentic-trading-experiment <assets> \
+  --train-start <date> --train-end <date> \
+  --test-start <date> --test-end <date>
 
 uv run pytest                             # tests
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src/
 ```
 
+`agentic-trading-experiment` calls its first phase *calibration*, not
+training — there's no persistent ML model, only measured analyst/manager
+track records that carry into the test period. Useful flags:
+`--include-baselines` (equal-weight/buy-and-hold/momentum/vol-target
+benchmarks from `backtest/baselines.py`), `--include-isolated` (run every
+analyst/manager as its own strategy, for diagnostics), `--exclude-analyst`
+(repeatable, omit one analyst by id), and `--calibration-checkpoint`/
+`--test-checkpoint` with `--resume` to checkpoint and resume a long run.
+
 The dashboard (`gui/dashboard.py`) is a visualization layer, not part of
-the backtest engine itself: a multi-asset "trading desk" view, tabbed
-(Overview / Desks / Analysts) to fit on one page, with day-by-day playback
-(step forward/backward, a day-scrubber slider, autoplay). The Overview tab
-leads with an **agent-flow view** — the Analysts → Pod Managers →
-Commander → (optional) Portfolio Construction pipeline rendered live for
-the current playback day and selected asset, each node colored by whether
-it agrees with that day's majority-vote direction, so the roster's
-heterogeneous agents debating is visible rather than just asserted — and a
-**data-source status strip** showing which external sources this run
-actually hit live vs. served from cache vs. never touched. The Desks and
-Analysts tabs each add a **trust panel**: trailing Sharpe/contribution
-next to the same scoring-derived weight the backtest itself applied, so
-it's visually obvious trust is earned, not hardcoded. All of the original
-per-day signal breakdown, holdings/blotter views, and scoreboard are still
-there.
+the backtest engine: a tabbed (Overview / Desks / Analysts) multi-asset
+"trading desk" view with day-by-day playback. The Overview tab leads with
+an **agent-flow view** — Analysts → Pod Managers → Commander → (optional)
+Portfolio Construction rendered live for the current day/asset — and a
+**data-source status strip** (live vs. cached vs. untouched). The Desks
+and Analysts tabs each add a **trust panel**: trailing Sharpe/contribution
+next to the scoring-derived weight the backtest actually applied.
+
+## Conventions worth knowing before touching the code
+
+- **Every cross-component data structure is a Pydantic `BaseModel`** —
+  no raw dicts or dataclasses cross a module boundary.
+- **Two date types, two layers, do not mix them.** Market-data code
+  works in `pd.Timestamp`; `scoring/` works in plain `datetime.date`.
+  `Commander.decide()` and `ManagerAgent.evaluate()` are the one place
+  that converts between them (`.date()`).
+- `logging_config.py` is the project's only logging setup —
+  `get_logger(__name__)` at import time everywhere, `configure_logging()`
+  called once by an entry point.
+- `quantcore` is a dependency, never something to fork or patch from
+  this repo.
 
 See `CLAUDE.md` for the full command reference, coding conventions, and
 current architectural rules — it takes precedence over this file for

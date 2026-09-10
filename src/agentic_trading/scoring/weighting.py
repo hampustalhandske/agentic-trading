@@ -66,3 +66,49 @@ class Hedge(WeightingStrategy):
         }
         average_weight = sum(raw_weights.values()) / len(raw_weights)
         return {source_id: weight / average_weight for source_id, weight in raw_weights.items()}
+
+
+class EqualWeight(WeightingStrategy):
+    """Equal influence baseline for managers with no performance preference."""
+
+    def get_weights(self, scoreboard, source_ids, as_of_date):
+        return dict.fromkeys(source_ids, 1.0)
+
+
+class SharpeWeight(WeightingStrategy):
+    """Positive trailing-Sharpe weighting with a conservative equal fallback."""
+
+    def __init__(self, lookback_days: int = 60, floor: float = 0.25) -> None:
+        self.lookback_days = lookback_days
+        self.floor = floor
+
+    def get_weights(self, scoreboard, source_ids, as_of_date):
+        if not source_ids:
+            return {}
+        raw = {}
+        for source_id in source_ids:
+            try:
+                score = scoreboard.sharpe_ratio(source_id, as_of_date, self.lookback_days)
+            except ValueError:
+                score = 0.0
+            raw[source_id] = max(self.floor, 1.0 + score / 3.0)
+        average = sum(raw.values()) / len(raw)
+        return {source_id: value / average for source_id, value in raw.items()}
+
+
+class DrawdownAwareWeight(WeightingStrategy):
+    """Rewards cumulative contribution while shrinking sources with drawdown."""
+
+    def __init__(self, lookback_days: int = 60) -> None:
+        self.lookback_days = lookback_days
+
+    def get_weights(self, scoreboard, source_ids, as_of_date):
+        if not source_ids:
+            return {}
+        raw = {}
+        for source_id in source_ids:
+            cumulative = scoreboard.cumulative_return(source_id, as_of_date, self.lookback_days)
+            drawdown = abs(scoreboard.max_drawdown(source_id, as_of_date, self.lookback_days))
+            raw[source_id] = max(0.1, math.exp(cumulative) / (1.0 + drawdown))
+        average = sum(raw.values()) / len(raw)
+        return {source_id: value / average for source_id, value in raw.items()}

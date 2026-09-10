@@ -1,5 +1,6 @@
 # cli.py
 
+import json
 from datetime import date
 
 import typer
@@ -7,9 +8,14 @@ import typer
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.roster import build_default_analysts, build_default_managers
+from agentic_trading.agents.schemas import BacktestResult
+from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystCommander
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
-from agentic_trading.data.loader import load_price_history_with_fallback
+from agentic_trading.data.loader import (
+    DEFAULT_BACKTEST_WARMUP_DAYS,
+    load_price_history_with_fallback,
+)
 
 # NOTE: adjust this import to wherever ticker_catalog.py actually lives in the
 # repo (it reads as a data/ module from its own docstring — "data/loader.py"
@@ -25,6 +31,7 @@ from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import Hedge
 
 app = typer.Typer()
+experiment_app = typer.Typer()
 
 # Every asset class CATALOG actually classifies into (see ticker_catalog.py's
 # _QUOTE_TYPE_TO_ASSET_CLASS) — options are deliberately excluded there, so
@@ -193,6 +200,12 @@ def run(
         "default). Omit to be asked interactively; defaults to off in a fully "
         "non-interactive (all-flags-given) run.",
     ),
+    parallel_workers: int = typer.Option(
+        4, min=1, help="Concurrent manager-signal workers used within each simulated day."
+    ),
+    parallel_backend: str = typer.Option(
+        "thread", help="Concurrency backend: 'thread' for APIs or 'process' for CPU-heavy runs."
+    ),
 ) -> None:
     """Wires together Portfolio, Commander, and BacktestEngine for the
     given assets and date range, runs the backtest, and prints a summary
@@ -250,6 +263,8 @@ def run(
 
     if portfolio_construction is None:
         portfolio_construction = _prompt_for_portfolio_construction() if interactive else False
+    if parallel_backend not in {"thread", "process"}:
+        raise typer.BadParameter("--parallel-backend must be 'thread' or 'process'")
 
     typer.echo()
     typer.echo(f"  Assets:                 {', '.join(resolved_assets)}")
@@ -273,6 +288,8 @@ def run(
     commander = Commander(
         managers=build_default_managers(analysts),
         weighting_strategy=Hedge(),
+        parallel_workers=parallel_workers,
+        parallel_backend=parallel_backend,  # type: ignore[arg-type]
     )
     # Pre-fetched once (with the same synthetic-data safety net the GUI
     # uses — load_price_history_with_fallback) rather than passed to
@@ -281,7 +298,11 @@ def run(
     # run actually used, and the engine's data_loader stays a trivial
     # pass-through.
     market_data, source_label = load_price_history_with_fallback(
-        resolved_assets, parsed_start_date, parsed_end_date
+        resolved_assets,
+        parsed_start_date,
+        parsed_end_date,
+        warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+        allow_synthetic_fallback=False,
     )
     logger.info("Market data source: %s", source_label)
     engine = BacktestEngine(
@@ -295,6 +316,7 @@ def run(
         portfolio_constructor=PortfolioConstructor(enabled=True)
         if portfolio_construction
         else None,
+        market_data_source=source_label,
     )
     try:
         result = engine.run()
@@ -309,5 +331,232 @@ def run(
     typer.echo(result.model_dump_json(indent=2))
 
 
+@experiment_app.command()
+def experiment(
+    assets: list[str] = typer.Argument(..., help="Asset symbols for the experiment."),  # noqa: B008
+    train_start: str = typer.Option(..., help="Calibration period start, YYYY-MM-DD."),
+    train_end: str = typer.Option(..., help="Calibration period end, YYYY-MM-DD."),
+    test_start: str = typer.Option(..., help="Out-of-sample test period start, YYYY-MM-DD."),
+    test_end: str = typer.Option(..., help="Out-of-sample test period end, YYYY-MM-DD."),
+    warmup_days: int = typer.Option(
+        DEFAULT_BACKTEST_WARMUP_DAYS,
+        min=0,
+        help="Extra historical days loaded before the training period.",
+    ),
+    parallel_workers: int = typer.Option(
+        4, min=1, help="Concurrent manager-signal workers per simulated day."
+    ),
+    parallel_backend: str = typer.Option(
+        "thread", help="Concurrency backend: 'thread' or 'process'."
+    ),
+    commission_rate: float = typer.Option(
+        0.0005, min=0.0, help="Commission as a fraction of traded notional."
+    ),
+    slippage_bps: float = typer.Option(
+        5.0, min=0.0, help="Execution slippage in basis points per trade."
+    ),
+    execution_lag_days: int = typer.Option(
+        1, min=0, max=1, help="Bars between signal formation and execution."
+    ),
+    calibration_checkpoint: str | None = typer.Option(
+        None, help="JSON checkpoint path for calibration; add --resume to continue it."
+    ),
+    test_checkpoint: str | None = typer.Option(
+        None, help="JSON checkpoint path for out-of-sample testing; add --resume to continue it."
+    ),
+    resume: bool = typer.Option(False, help="Resume from the supplied checkpoint files."),
+    include_baselines: bool = typer.Option(
+        True, help="Include simple benchmark strategies in the test report."
+    ),
+    include_isolated: bool = typer.Option(
+        False,
+        help="Run every analyst and manager as an isolated test strategy; "
+        "slower but more diagnostic.",
+    ),
+    exclude_analyst: list[str] = typer.Option(  # noqa: B008
+        [],
+        "--exclude-analyst",
+        help="Analyst id to omit; repeat the option for multiple analysts.",
+    ),
+) -> None:
+    """Run a calibration phase followed by a separate out-of-sample test phase.
+
+    The calibration phase establishes analyst and manager trust weights; it does
+    not train a machine-learning model.
+    The test phase starts with fresh portfolio holdings but carries those
+    learned weights forward. Both phases use strict real market data.
+    """
+    if parallel_backend not in {"thread", "process"}:
+        raise typer.BadParameter("--parallel-backend must be 'thread' or 'process'")
+    parsed_train_start = _parse_date_flag(train_start, "--train-start")
+    parsed_train_end = _parse_date_flag(train_end, "--train-end")
+    parsed_test_start = _parse_date_flag(test_start, "--test-start")
+    parsed_test_end = _parse_date_flag(test_end, "--test-end")
+    if parsed_train_end >= parsed_test_start:
+        raise typer.BadParameter("--train-end must be before --test-start")
+    if parsed_test_end <= parsed_test_start:
+        raise typer.BadParameter("--test-end must be after --test-start")
+
+    resolved_assets = [symbol.strip().upper() for symbol in assets]
+    configure_logging(disable=True)
+    excluded = {analyst_id.strip() for analyst_id in exclude_analyst}
+    analysts = [analyst for analyst in build_default_analysts() if analyst.agent_id not in excluded]
+    typer.echo(
+        f"Loading real data for {len(resolved_assets)} assets; excluded analysts: "
+        f"{', '.join(sorted(excluded)) or 'none'}",
+        err=True,
+    )
+    commander = Commander(
+        managers=build_default_managers(analysts),
+        weighting_strategy=Hedge(),
+        parallel_workers=parallel_workers,
+        parallel_backend=parallel_backend,  # type: ignore[arg-type]
+    )
+    market_data, source_label = load_price_history_with_fallback(
+        resolved_assets,
+        parsed_train_start,
+        parsed_test_end,
+        warmup_days=warmup_days,
+        allow_synthetic_fallback=False,
+    )
+    typer.echo(
+        f"Market data ready: {source_label}; {len(market_data)} aligned rows. "
+        "Starting calibration...",
+        err=True,
+    )
+    track_record = TrackRecord()
+
+    def build_engine(start: date, end: date) -> BacktestEngine:
+        return BacktestEngine(
+            commander=commander,
+            portfolio=Portfolio(
+                cash=10_000.0,
+                positions={},
+                commission_rate=commission_rate,
+                slippage_bps=slippage_bps,
+            ),
+            track_record=track_record,
+            data_loader=lambda _assets, _start, _end: market_data,
+            start_date=start,
+            end_date=end,
+            assets=resolved_assets,
+            market_data_source=source_label,
+            execution_lag_days=execution_lag_days,
+            checkpoint_path=(
+                calibration_checkpoint
+                if start == parsed_train_start
+                else test_checkpoint
+            ),
+            resume=resume,
+        )
+
+    def run_phase(label: str, start: date, end: date) -> BacktestResult:
+        def on_day_complete(
+            day_index: int, total_days: int, as_of_date: date, value: float
+        ) -> None:
+            typer.echo(
+                f"{label}: day {day_index + 1}/{total_days} ({as_of_date}) "
+                f"portfolio=${value:,.2f}",
+                err=True,
+            )
+
+        result = build_engine(start, end).run(on_day_complete=on_day_complete)
+        typer.echo(f"{label} complete. Starting next phase...", err=True)
+        return result
+
+    calibration_result = run_phase("CALIBRATION", parsed_train_start, parsed_train_end)
+    test_result = run_phase("TEST", parsed_test_start, parsed_test_end)
+    baseline_results: dict[str, dict[str, object]] = {}
+    if include_baselines:
+        for strategy in ("equal_weight", "buy_and_hold", "momentum", "volatility_target"):
+            baseline_engine = BacktestEngine(
+                commander=BaselineCommander(strategy),
+                portfolio=Portfolio(
+                    cash=10_000.0,
+                    positions={},
+                    commission_rate=commission_rate,
+                    slippage_bps=slippage_bps,
+                ),
+                track_record=TrackRecord(),
+                data_loader=lambda _assets, _start, _end: market_data,
+                start_date=parsed_test_start,
+                end_date=parsed_test_end,
+                assets=resolved_assets,
+                market_data_source=source_label,
+                execution_lag_days=execution_lag_days,
+            )
+            baseline_results[strategy] = baseline_engine.run().model_dump()
+    isolated_results: dict[str, dict[str, object]] = {}
+    if include_isolated:
+        for analyst in analysts:
+            isolated_engine = BacktestEngine(
+                commander=SingleAnalystCommander(analyst),
+                portfolio=Portfolio(
+                    cash=10_000.0,
+                    positions={},
+                    commission_rate=commission_rate,
+                    slippage_bps=slippage_bps,
+                ),
+                track_record=TrackRecord(),
+                data_loader=lambda _assets, _start, _end: market_data,
+                start_date=parsed_test_start,
+                end_date=parsed_test_end,
+                assets=resolved_assets,
+                market_data_source=source_label,
+                execution_lag_days=execution_lag_days,
+            )
+            isolated_results[f"analyst:{analyst.agent_id}"] = isolated_engine.run().model_dump()
+        for manager in build_default_managers(analysts):
+            isolated_engine = BacktestEngine(
+                commander=Commander(
+                    managers=[manager],
+                    weighting_strategy=Hedge(),
+                    parallel_workers=parallel_workers,
+                    parallel_backend=parallel_backend,  # type: ignore[arg-type]
+                ),
+                portfolio=Portfolio(
+                    cash=10_000.0,
+                    positions={},
+                    commission_rate=commission_rate,
+                    slippage_bps=slippage_bps,
+                ),
+                track_record=TrackRecord(),
+                data_loader=lambda _assets, _start, _end: market_data,
+                start_date=parsed_test_start,
+                end_date=parsed_test_end,
+                assets=resolved_assets,
+                market_data_source=source_label,
+                execution_lag_days=execution_lag_days,
+            )
+            isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump()
+    typer.echo(
+        json.dumps(
+            {
+                "experiment": {
+                    "assets": resolved_assets,
+                    "train_start": parsed_train_start.isoformat(),
+                    "train_end": parsed_train_end.isoformat(),
+                    "test_start": parsed_test_start.isoformat(),
+                    "test_end": parsed_test_end.isoformat(),
+                    "warmup_days": warmup_days,
+                    "excluded_analysts": sorted(excluded),
+                },
+                "market_data_source": source_label,
+                "synthetic_market_data_used": False,
+                "calibration": calibration_result.model_dump(),
+                "training": calibration_result.model_dump(),
+                "test": test_result.model_dump(),
+                "baselines": baseline_results,
+                "isolated": isolated_results,
+            },
+            indent=2,
+        )
+    )
+
+
 def main(args: list[str] | None = None) -> None:
     app(args=args)
+
+
+def experiment_main(args: list[str] | None = None) -> None:
+    experiment_app(args=args)

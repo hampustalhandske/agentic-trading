@@ -79,7 +79,8 @@ class ManagerAgent(Agent):
                         as_of_date=as_of_date.date(),
                         direction=SAFE_FALLBACK_DIRECTION,
                         confidence=SAFE_FALLBACK_CONFIDENCE,
-                        rationale="generate_signal() raised an exception — defaulting to hold.",
+                        rationale="generate_signal() raised an exception — signal unavailable.",
+                        status="error",
                     )
                 )
         return signals
@@ -120,6 +121,7 @@ class ManagerAgent(Agent):
         )
         scaled = []
         for signal in signals:
+            status = signal.status
             try:
                 factor = self.scale_factor(signal, market_data, as_of_date)
             except Exception:
@@ -134,6 +136,7 @@ class ManagerAgent(Agent):
                     exc_info=True,
                 )
                 factor = 0.0
+                status = "error"
             combined = factor * weights[signal.agent_id]
             scaled.append(
                 ManagerSignal(
@@ -145,6 +148,7 @@ class ManagerAgent(Agent):
                     confidence=min(signal.confidence * combined, 1.0),
                     scale_applied=combined,
                     rationale=f"{signal.rationale} [scaled x{combined:.2f} by {self.agent_id}]",
+                    status=status,
                 )
             )
         return scaled

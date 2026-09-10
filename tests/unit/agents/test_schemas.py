@@ -21,6 +21,7 @@ import pytest
 from pydantic import ValidationError
 
 from agentic_trading.agents.schemas import (
+    AgentSignal,
     AgentWeight,
     BacktestResult,
     ManagerSignal,
@@ -29,6 +30,32 @@ from agentic_trading.agents.schemas import (
 )
 
 _DATE = date(2024, 1, 5)
+
+
+def test_agent_signal_classifies_unusable_data_without_calling_it_a_real_flat_signal() -> None:
+    signal = AgentSignal(
+        agent_id="macro_var_spillover_analyst",
+        asset="MSFT",
+        as_of_date=_DATE,
+        direction="flat",
+        confidence=0.0,
+        rationale="VAR spillover fit failed on the available finite observations",
+    )
+
+    assert signal.status == "error"
+
+
+def test_agent_signal_keeps_a_legitimate_flat_signal_active() -> None:
+    signal = AgentSignal(
+        agent_id="pairs_cointegration_analyst",
+        asset="MSFT",
+        as_of_date=_DATE,
+        direction="flat",
+        confidence=0.0,
+        rationale="no cointegration detected (Engle-Granger p=0.42)",
+    )
+
+    assert signal.status == "active"
 
 
 def _manager_signal(

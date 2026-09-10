@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 _BASE_URL = (
     "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/user"
 )
-_PUBLICATION_LAG_DAYS = 1
+_PUBLICATION_LAG_DAYS = 2
 DEFAULT_LOOKBACK_DAYS = 90
 
 
@@ -64,7 +64,7 @@ def load_pageviews(
     start = (as_of_date - pd.Timedelta(days=lookback_days)).date()
     frame = cached_fetch(
         source="wikimedia_pageviews",
-        identifier=f"{article}_{lookback_days}d",
+        identifier=f"{article}_{start.isoformat()}_{today.isoformat()}",
         as_of_date=today,
         fetch_fn=lambda: _fetch_pageviews(article, start, today),
     )

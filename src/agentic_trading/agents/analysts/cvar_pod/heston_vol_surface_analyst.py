@@ -17,7 +17,7 @@ from agentic_trading.logging_config import get_logger
 logger = get_logger(__name__)
 
 TERM_STRUCTURE_WINDOWS: tuple[int, ...] = (10, 30, 60, 90)
-MIN_WINDOW_OBSERVATIONS = TERM_STRUCTURE_WINDOWS[-1] + 1
+MIN_WINDOW_OBSERVATIONS = TERM_STRUCTURE_WINDOWS[-1]
 CALIBRATION_PATHS = 200
 CALIBRATION_STEPS = 30
 TRADING_DAYS_PER_YEAR = 252

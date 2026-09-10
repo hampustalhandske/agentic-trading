@@ -58,10 +58,14 @@ def cached_fetch(
     identifier: str,
     as_of_date: date,
     fetch_fn: Callable[[], pd.DataFrame],
+    legacy_as_of_dates: tuple[date, ...] = (),
 ) -> pd.DataFrame:
     """Returns the cached frame for `(source, identifier, as_of_date)` if
     present on disk; otherwise calls `fetch_fn()`, persists the result (to
     both the parquet cache and the SQLite fetch log), and returns it.
+
+    `legacy_as_of_dates` allows a caller with immutable historical data to
+    reuse cache files written under an older cache-date convention.
 
     Raises immediately, without calling `fetch_fn()`, if `(source,
     identifier)` failed within the last `_FAILURE_TTL` — see module
@@ -70,6 +74,18 @@ def cached_fetch(
     if path.exists():
         logger.debug("Cache hit for %s/%s as of %s", source, identifier, as_of_date)
         return pd.read_parquet(path)
+
+    for legacy_as_of_date in legacy_as_of_dates:
+        legacy_path = _cache_path(source, identifier, legacy_as_of_date)
+        if legacy_path.exists():
+            logger.debug(
+                "Legacy cache hit for %s/%s as of %s (requested %s)",
+                source,
+                identifier,
+                legacy_as_of_date,
+                as_of_date,
+            )
+            return pd.read_parquet(legacy_path)
 
     failure_key = (source, identifier)
     last_failure = _recent_failures.get(failure_key)

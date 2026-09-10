@@ -1,11 +1,23 @@
 # commander.py
 
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
+from typing import Literal
+
 import pandas as pd
 
 from agentic_trading.agents.base import ManagerAgent
 from agentic_trading.agents.schemas import PortfolioDecision
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.weighting import WeightingStrategy
+
+
+def _collect_manager_signals(
+    manager: ManagerAgent,
+    asset: str,
+    market_data: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+) -> tuple[str, list]:
+    return manager.agent_id, manager.collect_signals(asset, market_data, as_of_date)
 
 
 class Commander:
@@ -18,9 +30,31 @@ class Commander:
         self,
         managers: list["ManagerAgent"],
         weighting_strategy: "WeightingStrategy",
+        parallel_workers: int = 1,
+        parallel_backend: Literal["thread", "process"] = "thread",
     ) -> None:
+        if parallel_workers < 1:
+            raise ValueError("parallel_workers must be at least 1")
         self.managers = managers
         self.weighting_strategy = weighting_strategy
+        self.parallel_workers = parallel_workers
+        self.parallel_backend = parallel_backend
+        self._executor: Executor | None = None
+
+    def _get_executor(self) -> Executor | None:
+        if self.parallel_workers == 1:
+            return None
+        if self._executor is None:
+            executor_type = (
+                ProcessPoolExecutor if self.parallel_backend == "process" else ThreadPoolExecutor
+            )
+            self._executor = executor_type(max_workers=self.parallel_workers)
+        return self._executor
+
+    def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
 
     def decide(
         self,
@@ -54,8 +88,24 @@ class Commander:
         decisions: list[PortfolioDecision] = []
         for asset in assets:
             contributed_signals = []
-            for manager in self.managers:
-                analyst_signals = manager.collect_signals(asset, market_data, as_of_date)
+            executor = self._get_executor()
+            if executor is None:
+                collected = [
+                    (manager.agent_id, manager.collect_signals(asset, market_data, as_of_date))
+                    for manager in self.managers
+                ]
+            else:
+                futures = [
+                    executor.submit(
+                        _collect_manager_signals, manager, asset, market_data, as_of_date
+                    )
+                    for manager in self.managers
+                ]
+                collected = [future.result() for future in futures]
+
+            managers_by_id = {manager.agent_id: manager for manager in self.managers}
+            for manager_id, analyst_signals in collected:
+                manager = managers_by_id[manager_id]
                 contributed_signals.extend(
                     manager.evaluate(analyst_signals, market_data, as_of_date, scoreboard)
                 )

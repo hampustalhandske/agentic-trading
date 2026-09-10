@@ -3,7 +3,9 @@
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+SignalStatus = Literal["active", "unavailable", "error"]
 
 
 class AgentSignal(BaseModel):
@@ -15,6 +17,29 @@ class AgentSignal(BaseModel):
     direction: Literal["long", "short", "flat"]
     confidence: float = Field(ge=0.0, le=1.0)
     rationale: str
+    status: SignalStatus = "active"
+
+    @model_validator(mode="after")
+    def classify_unavailable_signal(self) -> "AgentSignal":
+        """Classify legacy neutral signals that report unusable inputs."""
+        if self.status != "active":
+            return self
+        rationale = self.rationale.lower()
+        error_markers = (" lookup failed", " download failed", " fit failed", " failed")
+        unavailable_markers = (
+            "insufficient",
+            "not configured",
+            "no recent",
+            "no price history",
+            "no asset return history",
+            "missing a ",
+            "need >=",
+        )
+        if any(marker in rationale for marker in error_markers):
+            self.status = "error"
+        elif any(marker in rationale for marker in unavailable_markers):
+            self.status = "unavailable"
+        return self
 
 
 class ManagerSignal(BaseModel):
@@ -35,6 +60,7 @@ class ManagerSignal(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     scale_applied: float = Field(ge=0.0)
     rationale: str
+    status: SignalStatus = "active"
 
 
 class PortfolioDecision(BaseModel):
@@ -76,6 +102,7 @@ class TradeRecord(BaseModel):
     delta_shares: float
     price: float = Field(gt=0.0)
     notional: float = Field(ge=0.0)
+    transaction_cost: float = Field(ge=0.0, default=0.0)
 
 
 class PerformanceRecord(BaseModel):
@@ -130,3 +157,7 @@ class BacktestResult(BaseModel):
     final_profit_factor: float
     decisions_by_day: dict[date, list[PortfolioDecision]] = Field(default_factory=dict)
     trade_log: list[TradeRecord] = Field(default_factory=list)
+    signal_health: dict[str, dict[str, int]] = Field(default_factory=dict)
+    market_data_source: str | None = None
+    synthetic_market_data_used: bool = False
+    source_performance: dict[str, dict[str, float]] = Field(default_factory=dict)

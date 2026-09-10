@@ -29,6 +29,7 @@ package = true
 [project.scripts]
 agentic-trading = "agentic_trading.main:main"
 agentic-trading-cli = "agentic_trading.cli:main"
+agentic-trading-experiment = "agentic_trading.cli:experiment_main"
 
 [tool.uv.sources]
 quantcore = { git = "https://github.com/hampustalhandske/quantcore.git" }

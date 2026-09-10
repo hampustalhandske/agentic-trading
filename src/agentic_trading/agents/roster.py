@@ -73,7 +73,7 @@ from agentic_trading.agents.managers import (
     RiskManager,
     StatArbManager,
 )
-from agentic_trading.scoring.weighting import Hedge
+from agentic_trading.scoring.weighting import DrawdownAwareWeight, EqualWeight, Hedge, SharpeWeight
 
 RISK_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
     {
@@ -194,24 +194,33 @@ def build_default_managers(analysts: list[AnalystAgent] | None = None) -> list[M
         return [analyst for analyst in analysts if analyst.agent_id in analyst_ids]
 
     return [
-        RiskManager(managed_analysts=owned(RISK_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()),
-        CVaRManager(managed_analysts=owned(CVAR_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()),
+        RiskManager(
+            managed_analysts=owned(RISK_MANAGER_ANALYST_IDS), weighting_strategy=SharpeWeight()
+        ),
+        CVaRManager(
+            managed_analysts=owned(CVAR_MANAGER_ANALYST_IDS),
+            weighting_strategy=DrawdownAwareWeight(),
+        ),
         StatArbManager(
-            managed_analysts=owned(STAT_ARB_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()
+            managed_analysts=owned(STAT_ARB_MANAGER_ANALYST_IDS),
+            weighting_strategy=Hedge(eta=1.5),
         ),
         MacroRatesManager(
-            managed_analysts=owned(MACRO_RATES_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()
+            managed_analysts=owned(MACRO_RATES_MANAGER_ANALYST_IDS),
+            weighting_strategy=SharpeWeight(lookback_days=90),
         ),
         FactorManager(
-            managed_analysts=owned(FACTOR_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()
+            managed_analysts=owned(FACTOR_MANAGER_ANALYST_IDS), weighting_strategy=EqualWeight()
         ),
         EventCreditManager(
-            managed_analysts=owned(EVENT_CREDIT_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()
+            managed_analysts=owned(EVENT_CREDIT_MANAGER_ANALYST_IDS),
+            weighting_strategy=DrawdownAwareWeight(),
         ),
         AltDataManager(
-            managed_analysts=owned(ALT_DATA_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()
+            managed_analysts=owned(ALT_DATA_MANAGER_ANALYST_IDS), weighting_strategy=EqualWeight()
         ),
         AnomalyNetworkManager(
-            managed_analysts=owned(ANOMALY_NETWORK_MANAGER_ANALYST_IDS), weighting_strategy=Hedge()
+            managed_analysts=owned(ANOMALY_NETWORK_MANAGER_ANALYST_IDS),
+            weighting_strategy=Hedge(eta=0.5),
         ),
     ]

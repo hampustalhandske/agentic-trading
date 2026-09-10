@@ -13,6 +13,8 @@ class Portfolio(BaseModel):
 
     cash: float
     positions: dict[str, float]
+    commission_rate: float = 0.0
+    slippage_bps: float = 0.0
 
     def apply_decision(
         self, decision: PortfolioDecision, price: float, portfolio_value: float
@@ -29,7 +31,12 @@ class Portfolio(BaseModel):
         )
         target_shares = (decision.target_weight * portfolio_value) / price
         delta_shares = target_shares - current_shares
-        self.cash -= delta_shares * price
+        slippage = self.slippage_bps / 10_000.0
+        execution_price = price * (1.0 + slippage if delta_shares > 0 else 1.0 - slippage)
+        notional = abs(delta_shares * execution_price)
+        transaction_cost = notional * self.commission_rate
+        self.cash -= delta_shares * execution_price
+        self.cash -= transaction_cost
         self.positions[decision.asset] = target_shares
 
         action: Literal["buy", "sell", "hold"] = "hold"
@@ -46,8 +53,9 @@ class Portfolio(BaseModel):
             previous_weight=previous_weight,
             target_shares=target_shares,
             delta_shares=delta_shares,
-            price=price,
-            notional=abs(delta_shares * price),
+            price=execution_price,
+            notional=notional,
+            transaction_cost=transaction_cost,
         )
 
     def total_value(self, prices: dict[str, float]) -> float:

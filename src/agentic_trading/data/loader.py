@@ -1,19 +1,21 @@
 # loader.py
 
 import math
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 import pandas_datareader.data as pdr
 import yfinance as yf
 
+from agentic_trading.data.cache import cached_fetch
 from agentic_trading.data.loaders.alpha_vantage_loader import load_alpha_vantage_price_history
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 DEFAULT_BASKET: list[str] = ["AAPL", "MSFT", "GOOGL", "AMZN", "JPM"]
+DEFAULT_BACKTEST_WARMUP_DAYS = 365
 
 
 def _resolve_tickers(asset: str | list[str] | None) -> list[str]:
@@ -29,7 +31,7 @@ def _reshape_single_ticker(raw: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("yfinance returned no data for the requested ticker/date range")
 
     close = raw["Close"]
-    result = pd.DataFrame({"close": close})
+    result = pd.DataFrame({"open": raw["Open"], "close": close})
     # Log returns, not simple returns: quantcore's core/sde_solver.py and
     # pricing/black_scholes.py both assume GBM log-price dynamics.
     result["log_return"] = np.log(result["close"] / result["close"].shift(1))
@@ -41,7 +43,8 @@ def _reshape_stooq_frame(raw: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("Stooq returned no data for the requested ticker/date range")
     # Stooq returns rows in descending date order, unlike yfinance.
     ordered = raw.sort_index()
-    result = pd.DataFrame({"close": ordered["Close"]})
+    opening = ordered["Open"] if "Open" in ordered else ordered["Close"]
+    result = pd.DataFrame({"open": opening, "close": ordered["Close"]})
     result["log_return"] = np.log(result["close"] / result["close"].shift(1))
     return result
 
@@ -50,21 +53,68 @@ def _yfinance_result_is_usable(raw: pd.DataFrame) -> bool:
     return not raw.empty and not raw["Close"].isna().all()
 
 
-def _load_single_ticker(ticker: str, start: date | None, end: date | None) -> pd.DataFrame:
+def _range_identifier(ticker: str, start: date | None, end: date | None) -> str:
+    start_label = start.isoformat() if start else "none"
+    end_label = end.isoformat() if end else "none"
+    return f"{ticker.upper()}_{start_label}_{end_label}"
+
+
+def _fetch_yfinance_raw(ticker: str, start: date | None, end: date | None) -> pd.DataFrame:
     # yfinance 1.6.0 defaults multi_level_index=True, which returns
     # MultiIndex (Price, Ticker) columns even for a single ticker. Force
     # flat columns so raw["Close"] yields a Series, not a one-column
     # DataFrame. progress=False suppresses yfinance's own "N of M completed"
     # progress bar, which it prints straight to stdout regardless of any
     # logging configuration.
-    raw = yf.download(ticker, start=start, end=end, multi_level_index=False, progress=False)
+    return yf.download(  # type: ignore[no-any-return]
+        ticker, start=start, end=end, multi_level_index=False, progress=False
+    )
+
+
+def _price_cache_dates(end: date | None) -> tuple[date, tuple[date, ...]]:
+    """Use the requested historical end date as the stable cache key.
+
+    Older price files used the wall-clock fetch date, so retain a short
+    lookup window for those files while historical caches migrate naturally.
+    """
+    if end is None:
+        return date.today(), ()
+    today = date.today()
+    legacy_dates = tuple(today - timedelta(days=days) for days in range(1, 31))
+    return end, legacy_dates
+
+
+def _load_single_ticker(ticker: str, start: date | None, end: date | None) -> pd.DataFrame:
+    # Cached under today's real wall-clock date, keyed by the exact
+    # (ticker, start, end) requested — a historical close, once published,
+    # doesn't change, so re-running the same backtest (or a different
+    # backtest over the same ticker/range) is a cache hit rather than a
+    # fresh yfinance/Stooq call. Cached at the raw-frame level, before
+    # reshaping to close/log_return, so log_return is still computed fresh
+    # over exactly the requested slice on every call (cache hit or not) —
+    # log_return must NaN at the first row of *this* range regardless of
+    # what's cached for a wider range.
+    cache_date, legacy_cache_dates = _price_cache_dates(end)
+    raw = cached_fetch(
+        source="price_yfinance",
+        identifier=_range_identifier(ticker, start, end),
+        as_of_date=cache_date,
+        legacy_as_of_dates=legacy_cache_dates,
+        fetch_fn=lambda: _fetch_yfinance_raw(ticker, start, end),
+    )
     if _yfinance_result_is_usable(raw):
         logger.info("Loaded price history for %s from yfinance", ticker)
         return _reshape_single_ticker(raw)
 
     logger.info("yfinance had no usable data for %s — trying Stooq fallback", ticker)
     try:
-        stooq_raw = pdr.DataReader(ticker, "stooq", start, end)
+        stooq_raw = cached_fetch(
+            source="price_stooq",
+            identifier=_range_identifier(ticker, start, end),
+            as_of_date=cache_date,
+            legacy_as_of_dates=legacy_cache_dates,
+            fetch_fn=lambda: pdr.DataReader(ticker, "stooq", start, end),
+        )
         result = _reshape_stooq_frame(stooq_raw)
         logger.info("Loaded price history for %s from Stooq", ticker)
         return result
@@ -125,7 +175,12 @@ def load_price_history(
     frames: dict[str, pd.DataFrame] = {}
     for ticker in tickers:
         frames[ticker] = _load_single_ticker(ticker, start, end)
-    return pd.concat(frames, axis=1)
+    combined = pd.concat(frames, axis=1, join="inner")
+    close_columns = [(ticker, "close") for ticker in tickers]
+    combined = combined.dropna(subset=close_columns)
+    if combined.empty:
+        raise ValueError("price histories have no common trading dates")
+    return combined
 
 
 def _synthetic_price_history(ticker: str, start: date, end: date) -> pd.DataFrame:
@@ -153,13 +208,17 @@ def _synthetic_price_history(ticker: str, start: date, end: date) -> pd.DataFram
         level *= 1.0 + drift + wave
         prices.append(max(level, 1.0))
 
-    frame = pd.DataFrame({"close": prices}, index=dates)
+    frame = pd.DataFrame({"open": prices, "close": prices}, index=dates)
     frame["log_return"] = np.log(frame["close"] / frame["close"].shift(1))
     return frame
 
 
 def load_price_history_with_fallback(
-    tickers: list[str], start: date, end: date
+    tickers: list[str],
+    start: date,
+    end: date,
+    warmup_days: int = 0,
+    allow_synthetic_fallback: bool = True,
 ) -> tuple[pd.DataFrame, str]:
     """The shared entry point both the CLI and the GUI use to load market
     data — always returns MultiIndex (ticker, field) columns, even for a
@@ -174,21 +233,36 @@ def load_price_history_with_fallback(
     user (CLI log line / GUI caption) so it's always clear which one a
     given run actually used.
     """
+    if warmup_days < 0:
+        raise ValueError("warmup_days must be non-negative")
+    data_start = start - timedelta(days=warmup_days)
+
     try:
-        frame = load_price_history(list(tickers), start, end)
+        frame = load_price_history(list(tickers), data_start, end)
         if frame.empty:
             raise ValueError("loaded market data was empty")
         if not isinstance(frame.columns, pd.MultiIndex):
             frame = pd.concat({tickers[0]: frame}, axis=1)
         return frame, "live yfinance data"
     except Exception as exc:
+        if not allow_synthetic_fallback:
+            logger.error(
+                "Real market data unavailable for %s (%s to %s): %s — refusing synthetic data.",
+                tickers,
+                data_start,
+                end,
+                exc,
+            )
+            raise
         logger.warning(
             "Live yfinance load failed for %s (%s to %s): %s — using synthetic fallback "
             "data for every ticker in the basket.",
             tickers,
-            start,
+            data_start,
             end,
             exc,
         )
-        synthetic = {ticker: _synthetic_price_history(ticker, start, end) for ticker in tickers}
+        synthetic = {
+            ticker: _synthetic_price_history(ticker, data_start, end) for ticker in tickers
+        }
         return pd.concat(synthetic, axis=1), "synthetic fallback data"

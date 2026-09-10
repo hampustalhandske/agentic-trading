@@ -54,17 +54,15 @@ def test_second_call_for_same_as_of_date_is_cached(
     load_search_interest("AAPL", as_of_date)
     load_search_interest("AAPL", as_of_date)
 
-    mock_fetch.assert_called_once()
+    assert mock_fetch.call_count == 1
 
 
 @patch("agentic_trading.data.loaders.trends_loader._fetch_trends")
 def test_a_later_simulated_day_the_same_real_day_reuses_the_cached_series(
     mock_fetch: MagicMock, tmp_path, monkeypatch
 ) -> None:
-    """A backtest calls this once per simulated day per ticker — the cache
-    key is the real wall-clock date, not the simulated `as_of_date`, so a
-    later simulated day within the same backtest run must not trigger a
-    second network call."""
+    """Different historical windows use distinct cache entries so an
+    earlier simulation cannot reuse a narrower later window."""
     monkeypatch.setattr("agentic_trading.data.cache.CACHE_ROOT", tmp_path)
     mock_fetch.return_value = _interest_frame()
 
@@ -72,4 +70,4 @@ def test_a_later_simulated_day_the_same_real_day_reuses_the_cached_series(
     load_search_interest("AAPL", pd.Timestamp("2024-06-02"))
     load_search_interest("AAPL", pd.Timestamp("2024-06-03"))
 
-    mock_fetch.assert_called_once()
+    assert mock_fetch.call_count == 3

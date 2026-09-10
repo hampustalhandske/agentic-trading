@@ -34,19 +34,13 @@ from typing import Literal
 import yfinance as yf
 from pydantic import BaseModel
 
-AssetClass = Literal["stock", "index", "commodity", "forex", "crypto"]
+AssetClass = Literal["stock"]
 
 # yfinance's Ticker.info["quoteType"] values, as observed for each class in
 # this catalog, mapped to our five asset classes. Any quoteType not listed
 # here (e.g. "OPTION", "MUTUALFUND") has no home in this catalog — see the
 # module docstring for why options specifically are excluded.
-_QUOTE_TYPE_TO_ASSET_CLASS: dict[str, AssetClass] = {
-    "EQUITY": "stock",
-    "INDEX": "index",
-    "FUTURE": "commodity",
-    "CURRENCY": "forex",
-    "CRYPTOCURRENCY": "crypto",
-}
+_QUOTE_TYPE_TO_ASSET_CLASS: dict[str, AssetClass] = {"EQUITY": "stock"}
 
 
 class TickerInfo(BaseModel):
@@ -179,48 +173,13 @@ CATALOG: tuple[TickerInfo, ...] = (
     TickerInfo(
         symbol="MA", name="Mastercard Incorporated", asset_class="stock", quote_type="EQUITY"
     ),
-    # --- index (quoteType: INDEX) ---
-    TickerInfo(symbol="^GSPC", name="S&P 500", asset_class="index", quote_type="INDEX"),
-    TickerInfo(
-        symbol="^DJI", name="Dow Jones Industrial Average", asset_class="index", quote_type="INDEX"
-    ),
-    TickerInfo(symbol="^IXIC", name="NASDAQ Composite", asset_class="index", quote_type="INDEX"),
-    TickerInfo(symbol="^RUT", name="Russell 2000", asset_class="index", quote_type="INDEX"),
-    # --- commodity (quoteType: FUTURE) ---
-    TickerInfo(symbol="GC=F", name="Gold Futures", asset_class="commodity", quote_type="FUTURE"),
-    TickerInfo(
-        symbol="CL=F", name="Crude Oil Futures", asset_class="commodity", quote_type="FUTURE"
-    ),
-    TickerInfo(symbol="SI=F", name="Silver Futures", asset_class="commodity", quote_type="FUTURE"),
-    TickerInfo(
-        symbol="NG=F", name="Natural Gas Futures", asset_class="commodity", quote_type="FUTURE"
-    ),
-    # --- forex (quoteType: CURRENCY) ---
-    TickerInfo(symbol="EURUSD=X", name="EUR/USD", asset_class="forex", quote_type="CURRENCY"),
-    TickerInfo(symbol="GBPUSD=X", name="GBP/USD", asset_class="forex", quote_type="CURRENCY"),
-    TickerInfo(symbol="JPY=X", name="USD/JPY", asset_class="forex", quote_type="CURRENCY"),
-    TickerInfo(symbol="AUDUSD=X", name="AUD/USD", asset_class="forex", quote_type="CURRENCY"),
-    # --- crypto (quoteType: CRYPTOCURRENCY) ---
-    TickerInfo(
-        symbol="BTC-USD", name="Bitcoin USD", asset_class="crypto", quote_type="CRYPTOCURRENCY"
-    ),
-    TickerInfo(
-        symbol="ETH-USD", name="Ethereum USD", asset_class="crypto", quote_type="CRYPTOCURRENCY"
-    ),
-    TickerInfo(
-        symbol="SOL-USD", name="Solana USD", asset_class="crypto", quote_type="CRYPTOCURRENCY"
-    ),
-    TickerInfo(
-        symbol="DOGE-USD", name="Dogecoin USD", asset_class="crypto", quote_type="CRYPTOCURRENCY"
-    ),
 )
 
 _BY_SYMBOL: dict[str, TickerInfo] = {entry.symbol: entry for entry in CATALOG}
 
-# Preset stock baskets for the GUI's ticker-group selector (see
-# gui/dashboard.py). Deliberately stock-only, drawn from CATALOG's "stock"
-# entries: these are tradeable desk baskets, distinct from the S&P 500 and
-# basket-index *benchmarks* the dashboard plots alongside them.
+# Preset baskets for the GUI's ticker-group selector (see gui/dashboard.py).
+# Most are stock-only desk baskets; the multi-asset basket is intended for
+# diversified portfolio experiments rather than a single-sector desk.
 TICKER_GROUPS: tuple[TickerGroup, ...] = (
     TickerGroup(
         name="Original Five",
@@ -291,6 +250,32 @@ TICKER_GROUPS: tuple[TickerGroup, ...] = (
             "AMT",
             "LIN",
             "V",
+        ],
+    ),
+    TickerGroup(
+        name="Diversified Multi-Asset 20",
+        description="Equities, indices, commodities, FX, and crypto for portfolio experiments.",
+        symbols=[
+            "AAPL",
+            "MSFT",
+            "JPM",
+            "JNJ",
+            "XOM",
+            "CAT",
+            "^GSPC",
+            "^RUT",
+            "GC=F",
+            "CL=F",
+            "SI=F",
+            "NG=F",
+            "EURUSD=X",
+            "GBPUSD=X",
+            "JPY=X",
+            "AUDUSD=X",
+            "BTC-USD",
+            "ETH-USD",
+            "NEE",
+            "PG",
         ],
     ),
 )

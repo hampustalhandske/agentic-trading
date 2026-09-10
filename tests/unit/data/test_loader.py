@@ -20,13 +20,25 @@ implementation.
 """
 
 import math
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
+from agentic_trading.data.cache import cached_fetch
 from agentic_trading.data.loader import load_price_history, load_price_history_with_fallback
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cache_root(tmp_path, monkeypatch):
+    """Price loading now goes through `data/cache.py`'s cached_fetch, so
+    every test here must not touch the real on-disk cache — otherwise a
+    test run would write real cache files, and a stale entry from a
+    previous run could make a test see a cache hit instead of exercising
+    the mocked yfinance/Stooq/Alpha Vantage call it's actually testing."""
+    monkeypatch.setattr("agentic_trading.data.cache.CACHE_ROOT", tmp_path)
+    monkeypatch.setattr("agentic_trading.data.cache._recent_failures", {})
 
 
 def _mock_yfinance_frame() -> pd.DataFrame:
@@ -154,6 +166,22 @@ def test_with_fallback_uses_synthetic_data_when_yfinance_raises(
 @patch("agentic_trading.data.loader.load_alpha_vantage_price_history")
 @patch("agentic_trading.data.loader.pdr.DataReader")
 @patch("agentic_trading.data.loader.yf.download")
+def test_strict_mode_refuses_synthetic_data_when_real_sources_fail(
+    mock_download: MagicMock, mock_stooq: MagicMock, mock_alpha_vantage: MagicMock
+) -> None:
+    mock_download.side_effect = ConnectionError("simulated network failure")
+    mock_stooq.side_effect = ConnectionError("simulated network failure")
+    mock_alpha_vantage.side_effect = ConnectionError("simulated network failure")
+
+    with pytest.raises(ConnectionError, match="simulated network failure"):
+        load_price_history_with_fallback(
+            ["AAPL"], date(2024, 1, 2), date(2024, 1, 12), allow_synthetic_fallback=False
+        )
+
+
+@patch("agentic_trading.data.loader.load_alpha_vantage_price_history")
+@patch("agentic_trading.data.loader.pdr.DataReader")
+@patch("agentic_trading.data.loader.yf.download")
 def test_with_fallback_uses_synthetic_data_when_yfinance_returns_empty(
     mock_download: MagicMock, mock_stooq: MagicMock, mock_alpha_vantage: MagicMock
 ) -> None:
@@ -208,6 +236,55 @@ def test_stooq_fallback_used_when_yfinance_empty(
     assert list(result.index) == sorted(stooq_index)
     assert result["close"].iloc[0] == pytest.approx(100.0)
     assert result["close"].iloc[-1] == pytest.approx(102.9)
+
+
+@patch("agentic_trading.data.loader.yf.download")
+def test_second_call_for_same_ticker_and_range_is_cached(mock_download: MagicMock) -> None:
+    """A second call for the same (ticker, start, end) must hit the cache,
+    not re-query yfinance — this is what keeps a re-run of the same
+    backtest, or many-ticker runs sharing overlapping ranges, from
+    re-hitting yfinance for data already fetched."""
+    mock_download.return_value = _mock_yfinance_frame()
+    start, end = date(2024, 1, 2), date(2024, 1, 4)
+
+    load_price_history("AAPL", start, end)
+    load_price_history("AAPL", start, end)
+
+    mock_download.assert_called_once()
+
+
+@patch("agentic_trading.data.loader.yf.download")
+def test_historical_price_cache_reuses_file_written_on_an_earlier_day(
+    mock_download: MagicMock,
+) -> None:
+    """Historical prices remain reusable when the original cache used a
+    previous wall-clock date as its cache key."""
+    start, end = date(2024, 1, 2), date(2024, 1, 4)
+    cached_frame = _mock_yfinance_frame()
+    cached_fetch(
+        "price_yfinance",
+        "AAPL_2024-01-02_2024-01-04",
+        date.today() - timedelta(days=1),
+        lambda: cached_frame,
+    )
+
+    result = load_price_history("AAPL", start, end)
+
+    mock_download.assert_not_called()
+    assert result["close"].iloc[0] == pytest.approx(100.0)
+
+
+@patch("agentic_trading.data.loader.yf.download")
+def test_different_date_range_is_not_a_cache_hit(mock_download: MagicMock) -> None:
+    """A different (start, end) for the same ticker is a distinct cache
+    key — it must still call yfinance rather than reusing an unrelated
+    range's cached result."""
+    mock_download.return_value = _mock_yfinance_frame()
+
+    load_price_history("AAPL", date(2024, 1, 2), date(2024, 1, 4))
+    load_price_history("AAPL", date(2024, 2, 1), date(2024, 2, 5))
+
+    assert mock_download.call_count == 2
 
 
 def test_synthetic_fallback_is_deterministic_for_the_same_ticker() -> None:
