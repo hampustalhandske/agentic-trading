@@ -5,15 +5,23 @@ from __future__ import annotations
 from typing import Literal
 
 import pandas as pd
+from pydantic import PrivateAttr
 from quantcore.core.sde_solver import simulate_gbm_paths
-from quantcore.risk import fit_garch_11, garch_11_variance
 
-from agentic_trading.agents._market_math import clamp, market_slice
+from agentic_trading.agents._market_math import (
+    RefitCache,
+    clamp,
+    conditional_daily_volatility,
+    market_slice,
+)
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+TRADING_DAYS_PER_YEAR = 252
 
 
 class MonteCarloValuationAnalyst(AnalystAgent):
@@ -23,14 +31,16 @@ class MonteCarloValuationAnalyst(AnalystAgent):
     GARCH-fitted volatility, discounts the expected terminal price back
     to today as a 'fair value', and compares it against the current
     market price — proposes long when fair value exceeds market price,
-    short when market price exceeds fair value."""
+    short when market price exceeds fair value. The GARCH fit is only
+    re-run at most once every `_refit_cache.refit_interval_days` simulated
+    days per asset — see `RefitCache`'s docstring."""
 
     agent_id: str = "monte_carlo_valuation_analyst"
 
-    _risk_window: int = 60
     _num_paths: int = 2_000
     _num_steps: int = 32
     _time_to_maturity: float = 0.25
+    _refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)
 
     def generate_signal(
         self,
@@ -39,39 +49,31 @@ class MonteCarloValuationAnalyst(AnalystAgent):
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
         slice_ = market_slice(market_data, as_of_date, asset)
-        returns = slice_.log_returns[-self._risk_window :]
+        returns = slice_.log_returns[-settings.analysts.risk_window_short :]
         if slice_.close is None or returns.size < 2:
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
                 as_of_date=as_of_date.date(),
                 direction="flat",
-                confidence=0.5,
+                confidence=0.0,
                 rationale="insufficient history for quantcore Monte Carlo valuation",
+                status="unavailable",
             )
 
         mean_return = float(returns.mean())
-        volatility = float(returns.std(ddof=1))
-        try:
-            omega, alpha, beta = fit_garch_11(returns)
-            centered = returns - mean_return
-            variance_path = garch_11_variance(centered, omega, alpha, beta)
-            volatility = float((max(float(variance_path[-1]), 0.0)) ** 0.5)
-        except (RuntimeError, ValueError) as exc:
-            logger.debug(
-                "%s: GARCH fit failed for %s on %s (%s) — falling back to sample stdev "
-                "volatility=%.4f.",
-                self.agent_id,
-                asset,
-                as_of_date.date(),
-                exc,
-                volatility,
-            )
+        volatility = conditional_daily_volatility(
+            returns, self._refit_cache, asset, as_of_date, self.agent_id
+        )
 
+        # simulate_gbm_paths takes annualized rate/volatility over
+        # time_to_maturity in years (see quantcore's sde_solver docstring);
+        # mean_return/volatility above are daily-scale statistics of daily
+        # log returns and must be annualized before crossing that boundary.
         terminal_prices = simulate_gbm_paths(
             slice_.close,
-            mean_return,
-            volatility,
+            mean_return * TRADING_DAYS_PER_YEAR,
+            volatility * TRADING_DAYS_PER_YEAR**0.5,
             self._time_to_maturity,
             self._num_steps,
             self._num_paths,

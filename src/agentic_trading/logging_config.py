@@ -33,8 +33,9 @@ Two destinations, deliberately not treated the same:
   root, opened in append mode — never truncated, so it accumulates across
   every run for as long as the file exists) is a lean, permanent record:
   a marker for each run starting/finishing, WARNINGs (wherever code falls
-  back to a different behavior than the one it tried first — e.g. synthetic
-  data standing in for a failed live yfinance load), and ERRORs. It
+  back to a different behavior than the one it tried first — e.g. an
+  analyst reporting flat because a lakehouse table has no rows), and
+  ERRORs. It
   deliberately does NOT receive routine per-day/per-step progress lines —
   those would make the file grow by hundreds of lines on every single run
   for no lasting value.

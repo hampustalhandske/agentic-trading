@@ -1,21 +1,24 @@
 """Unit tests for agentic_trading.agents.roster.
 
 Covers the invariant the module's own docstring claims but never enforced:
-every default analyst is owned by exactly one of the eight pod managers in
-build_default_managers()'s split — no analyst silently falls through
+every default analyst is owned by exactly one of the eleven pod managers
+in build_default_managers()'s split — no analyst silently falls through
 uncovered, and none is double-counted under two managers (which would
 double-weight its signal in Commander.decide()).
 """
 
 from agentic_trading.agents.roster import (
     ALT_DATA_MANAGER_ANALYST_IDS,
-    ANOMALY_NETWORK_MANAGER_ANALYST_IDS,
+    CREDIT_MANAGER_ANALYST_IDS,
+    CROSS_ASSET_MANAGER_ANALYST_IDS,
     CVAR_MANAGER_ANALYST_IDS,
     EVENT_CREDIT_MANAGER_ANALYST_IDS,
     FACTOR_MANAGER_ANALYST_IDS,
     MACRO_RATES_MANAGER_ANALYST_IDS,
+    RATES_MANAGER_ANALYST_IDS,
     RISK_MANAGER_ANALYST_IDS,
     STAT_ARB_MANAGER_ANALYST_IDS,
+    TAIL_HEDGE_MANAGER_ANALYST_IDS,
     build_default_analysts,
     build_default_managers,
 )
@@ -25,10 +28,13 @@ ALL_ANALYST_ID_SETS = (
     CVAR_MANAGER_ANALYST_IDS,
     STAT_ARB_MANAGER_ANALYST_IDS,
     MACRO_RATES_MANAGER_ANALYST_IDS,
+    RATES_MANAGER_ANALYST_IDS,
+    CROSS_ASSET_MANAGER_ANALYST_IDS,
+    CREDIT_MANAGER_ANALYST_IDS,
     FACTOR_MANAGER_ANALYST_IDS,
     EVENT_CREDIT_MANAGER_ANALYST_IDS,
     ALT_DATA_MANAGER_ANALYST_IDS,
-    ANOMALY_NETWORK_MANAGER_ANALYST_IDS,
+    TAIL_HEDGE_MANAGER_ANALYST_IDS,
 )
 
 
@@ -59,7 +65,7 @@ def test_build_default_managers_splits_analysts_by_the_id_sets() -> None:
 
     managers = build_default_managers(analysts)
 
-    assert len(managers) == 8
+    assert len(managers) == 11
     owned_by_manager = {
         manager.agent_id: {a.agent_id for a in manager.managed_analysts} for manager in managers
     }
@@ -68,10 +74,13 @@ def test_build_default_managers_splits_analysts_by_the_id_sets() -> None:
     assert owned_by_manager["cvar_manager"] == CVAR_MANAGER_ANALYST_IDS
     assert owned_by_manager["stat_arb_manager"] == STAT_ARB_MANAGER_ANALYST_IDS
     assert owned_by_manager["macro_rates_manager"] == MACRO_RATES_MANAGER_ANALYST_IDS
+    assert owned_by_manager["rates_manager"] == RATES_MANAGER_ANALYST_IDS
+    assert owned_by_manager["cross_asset_manager"] == CROSS_ASSET_MANAGER_ANALYST_IDS
+    assert owned_by_manager["credit_manager"] == CREDIT_MANAGER_ANALYST_IDS
     assert owned_by_manager["factor_manager"] == FACTOR_MANAGER_ANALYST_IDS
     assert owned_by_manager["event_credit_manager"] == EVENT_CREDIT_MANAGER_ANALYST_IDS
     assert owned_by_manager["alt_data_manager"] == ALT_DATA_MANAGER_ANALYST_IDS
-    assert owned_by_manager["anomaly_network_manager"] == ANOMALY_NETWORK_MANAGER_ANALYST_IDS
+    assert owned_by_manager["tail_hedge_manager"] == TAIL_HEDGE_MANAGER_ANALYST_IDS
 
 
 def test_build_default_managers_owns_no_analyst_twice_across_managers() -> None:
@@ -95,8 +104,8 @@ def test_build_default_managers_defaults_to_build_default_analysts() -> None:
     assert implicit_ids == explicit_ids
 
 
-def test_build_default_analysts_returns_thirty_uniquely_identified_analysts() -> None:
+def test_build_default_analysts_returns_thirty_one_uniquely_identified_analysts() -> None:
     analysts = build_default_analysts()
 
-    assert len(analysts) == 29
-    assert len({a.agent_id for a in analysts}) == 29
+    assert len(analysts) == 38
+    assert len({a.agent_id for a in analysts}) == 38

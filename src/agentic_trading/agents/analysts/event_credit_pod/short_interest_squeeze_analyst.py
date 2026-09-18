@@ -5,15 +5,15 @@ import pandas as pd
 from quantcore.statistics.cointegration import spread_zscore
 
 from agentic_trading.agents._market_math import clamp
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement, is_likely_equity
 from agentic_trading.agents.schemas import AgentSignal
-from agentic_trading.data.loaders.short_interest_loader import load_short_interest
+from agentic_trading.config import settings
+from agentic_trading.data.loaders.lakehouse_loader import load_short_interest_from_lakehouse
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 MAX_CONFIDENCE = 0.7
-Z_CAP = 3.0
 
 
 class ShortInterestSqueezeAnalyst(AnalystAgent):
@@ -21,12 +21,20 @@ class ShortInterestSqueezeAnalyst(AnalystAgent):
     own trailing history) signals squeeze risk — a contrarian long bias,
     since a crowded short position is itself fuel for a squeeze. Confidence
     is capped since short-interest extremes are rare and the z-score can
-    spike hard on thin data. Appends `[source_as_of=...]` per
-    EventCreditManager's staleness convention."""
+    spike hard on thin data. Reports the latest dissemination date as
+    `source_as_of` so EventCreditManager can dampen on staleness."""
 
     agent_id: str = "short_interest_squeeze_analyst"
 
     z_window: int = 6
+    data_requirements: tuple[DataRequirement, ...] = (
+        DataRequirement(
+            source="finra_short_interest",
+            identifier="{ticker}",
+            asset_scoped=True,
+            description="FINRA short interest",
+        ),
+    )
 
     def generate_signal(
         self,
@@ -34,19 +42,26 @@ class ShortInterestSqueezeAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        try:
-            history = load_short_interest(asset, as_of_date)
-        except Exception as exc:
-            logger.debug(
-                "%s: FINRA lookup failed for %s (%s) — returning flat.", self.agent_id, asset, exc
-            )
+        if not is_likely_equity(asset):
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
                 as_of_date=as_of_date.date(),
                 direction="flat",
                 confidence=0.0,
-                rationale="FINRA short interest lookup failed",
+                rationale="not an equity — FINRA short interest doesn't apply",
+                status="unavailable",
+            )
+        history = load_short_interest_from_lakehouse(asset, as_of_date.date())
+        if history is None:
+            return AgentSignal(
+                agent_id=self.agent_id,
+                asset=asset,
+                as_of_date=as_of_date.date(),
+                direction="flat",
+                confidence=0.0,
+                rationale="no FINRA short-interest coverage in the lakehouse",
+                status="unavailable",
             )
 
         if len(history) < self.z_window + 1:
@@ -57,6 +72,7 @@ class ShortInterestSqueezeAnalyst(AnalystAgent):
                 direction="flat",
                 confidence=0.0,
                 rationale="insufficient short interest history for a z-score read",
+                status="unavailable",
             )
 
         sorted_history = history.sort_values("settlement_date")
@@ -71,13 +87,15 @@ class ShortInterestSqueezeAnalyst(AnalystAgent):
                 as_of_date=as_of_date.date(),
                 direction="flat",
                 confidence=0.0,
-                rationale=(
-                    f"days-to-cover not elevated (z={current_z:.2f}) "
-                    f"[source_as_of={latest_dissemination.isoformat()}]"
-                ),
+                rationale=f"days-to-cover not elevated (z={current_z:.2f})",
+                source_as_of=latest_dissemination,
+                sample_count=len(history),
             )
 
-        confidence = clamp(min(current_z, Z_CAP) / Z_CAP) * MAX_CONFIDENCE
+        confidence = (
+            clamp(min(current_z, settings.analysts.z_cap) / settings.analysts.z_cap)
+            * MAX_CONFIDENCE
+        )
         return AgentSignal(
             agent_id=self.agent_id,
             asset=asset,
@@ -85,7 +103,8 @@ class ShortInterestSqueezeAnalyst(AnalystAgent):
             direction="long",
             confidence=confidence,
             rationale=(
-                f"days-to-cover elevated (z={current_z:.2f}) — contrarian squeeze-risk long bias "
-                f"[source_as_of={latest_dissemination.isoformat()}]"
+                f"days-to-cover elevated (z={current_z:.2f}) — contrarian squeeze-risk long bias"
             ),
+            source_as_of=latest_dissemination,
+            sample_count=len(history),
         )

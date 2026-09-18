@@ -4,27 +4,32 @@ from __future__ import annotations
 
 from typing import Literal
 
-import numpy as np
 import pandas as pd
-from quantcore.risk import conditional_value_at_risk, fit_garch_11, garch_11_variance, value_at_risk
 
-from agentic_trading.agents._market_math import clamp, market_slice
+from agentic_trading.agents._market_math import clamp, market_slice, vol_regime_zscore
 from agentic_trading.agents.base import AnalystAgent
-from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.agents.schemas import AgentSignal, SignalStatus
+from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+# Confidence reaches its cap at a 3-sigma vol-regime reading; the cap keeps
+# a single vol read from ever dominating a pod on its own.
+FULL_CONFIDENCE_ZSCORE = 3.0
+MAX_CONFIDENCE = 0.8
+
 
 class RiskMinimizingAnalyst(AnalystAgent):
-    """Favors assets with low quantcore VaR/CVaR — proposes directional
-    views that minimize downside risk exposure rather than maximize
-    expected return."""
+    """The low-volatility premium as a directional view: where today's
+    conditional volatility sits against the asset's own trailing vol
+    history (`_market_math.vol_regime_zscore`, an EWMA log-vol z-score
+    over the last year). A calm regime (z at or below
+    `settings.analysts.vol_zscore_long_threshold`) is long; a genuine
+    spike (z at or above `vol_zscore_short_threshold`) carries negative
+    expected return and is short; in between there is no view."""
 
     agent_id: str = "risk_minimizing_analyst"
-
-    _risk_window: int = 60
-    _confidence_level: float = 0.95
 
     def generate_signal(
         self,
@@ -32,57 +37,22 @@ class RiskMinimizingAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        slice_ = market_slice(market_data, as_of_date, asset)
-        returns = slice_.log_returns[-self._risk_window :]
-        direction: Literal["long", "short", "flat"]
-        if returns.size < 2:
-            direction = "flat"
-            confidence = 0.5
-            rationale = "insufficient history for quantcore risk estimate"
+        returns = market_slice(market_data, as_of_date, asset).log_returns
+        z_score = vol_regime_zscore(returns)
+        direction: Literal["long", "short", "flat"] = "flat"
+        confidence = 0.0
+        status: SignalStatus = "active"
+        if z_score is None:
+            status = "unavailable"
+            rationale = "insufficient history to place today's volatility in its own regime"
         else:
-            mean_return = float(np.mean(returns))
-            volatility = float(np.std(returns, ddof=1))
-            try:
-                omega, alpha, beta = fit_garch_11(returns)
-                centered = returns - mean_return
-                variance_path = garch_11_variance(centered, omega, alpha, beta)
-                volatility = float(np.sqrt(max(float(variance_path[-1]), 0.0)))
-            except (RuntimeError, ValueError) as exc:
-                logger.debug(
-                    "%s: GARCH fit failed for %s on %s (%s) — falling back to sample stdev "
-                    "volatility=%.4f.",
-                    self.agent_id,
-                    asset,
-                    as_of_date.date(),
-                    exc,
-                    volatility,
-                )
-
-            try:
-                var = value_at_risk(returns, self._confidence_level, volatility=volatility)
-                cvar = conditional_value_at_risk(
-                    returns, self._confidence_level, volatility=volatility
-                )
-            except ValueError as exc:
-                logger.debug(
-                    "%s: VaR/CVaR computation failed for %s on %s (%s) — falling back to "
-                    "volatility=%.4f for both.",
-                    self.agent_id,
-                    asset,
-                    as_of_date.date(),
-                    exc,
-                    volatility,
-                )
-                var = volatility
-                cvar = volatility
-
-            tail_risk = max(0.0, float(var)) + max(0.0, float(cvar)) + volatility
-            direction = "long" if mean_return >= 0.0 else "short"
-            confidence = clamp(1.0 / (1.0 + tail_risk))
-            rationale = (
-                f"quantcore low-tail-risk bias (VaR={var:.4f},"
-                f" CVaR={cvar:.4f}, vol={volatility:.4f})"
-            )
+            if z_score <= settings.analysts.vol_zscore_long_threshold:
+                direction = "long"
+            elif z_score >= settings.analysts.vol_zscore_short_threshold:
+                direction = "short"
+            if direction != "flat":
+                confidence = clamp(abs(z_score) / FULL_CONFIDENCE_ZSCORE, 0.0, MAX_CONFIDENCE)
+            rationale = f"vol-regime z-score={z_score:.2f} vs own trailing EWMA log-vol path"
         return AgentSignal(
             agent_id=self.agent_id,
             asset=asset,
@@ -90,4 +60,5 @@ class RiskMinimizingAnalyst(AnalystAgent):
             direction=direction,
             confidence=confidence,
             rationale=rationale,
+            status=status,
         )

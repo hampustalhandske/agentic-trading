@@ -17,7 +17,9 @@ so pre-seeding only `backtest_result`/`scoreboard` no longer exercises any
 tab's real content — see render_dashboard()'s own `desk_run is None` guard.
 """
 
+import json
 from datetime import date
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -90,6 +92,7 @@ def test_cumulative_pct_series_sums_within_a_day_and_across_days() -> None:
             asset="AAA",
             as_of_date=day1,
             attributable_return=0.01,
+            raw_attributable_return=0.01,
         )
     )
     track_record.record(
@@ -99,6 +102,7 @@ def test_cumulative_pct_series_sums_within_a_day_and_across_days() -> None:
             asset="BBB",
             as_of_date=day1,
             attributable_return=0.02,
+            raw_attributable_return=0.02,
         )
     )
     track_record.record(
@@ -108,6 +112,7 @@ def test_cumulative_pct_series_sums_within_a_day_and_across_days() -> None:
             asset="AAA",
             as_of_date=day2,
             attributable_return=-0.01,
+            raw_attributable_return=-0.01,
         )
     )
 
@@ -161,6 +166,7 @@ def _signal(manager_id: str, source_agent_id: str) -> ManagerSignal:
         as_of_date=date(2024, 1, 2),
         direction="long",
         confidence=0.5,
+        raw_confidence=0.5,
         scale_applied=1.0,
         rationale="test rationale",
     )
@@ -256,6 +262,7 @@ def test_signal_history_rows_enriches_with_realized_return_and_cumulative_pct_wh
             asset="AAA",
             as_of_date=date(2024, 1, 2),
             attributable_return=0.02,
+            raw_attributable_return=0.02,
         )
     )
 
@@ -388,22 +395,21 @@ def test_long_format_chart_frame_drops_rows_with_nan_values() -> None:
     assert result.iloc[0]["value"] == pytest.approx(1.0)
 
 
-def test_load_basket_data_wraps_single_ticker_into_multiindex(tmp_path, monkeypatch) -> None:
+@patch("agentic_trading.data.loader.load_price_history_from_lakehouse")
+def test_load_basket_data_wraps_single_ticker_into_multiindex(mock_lakehouse: MagicMock) -> None:
     """_load_basket_data always returns MultiIndex columns, even for a
-    one-ticker basket, so every downstream consumer only handles one shape.
-
-    "SYNTH_ONLY" isn't a real ticker, so yfinance/Stooq/Alpha Vantage all
-    genuinely fail and this exercises the real synthetic fallback path —
-    which now also means it exercises price loading's on-disk cache, so
-    CACHE_ROOT must be isolated here too, the same as every price-loader
-    test in test_loader.py."""
-    monkeypatch.setattr("agentic_trading.data.cache.CACHE_ROOT", tmp_path)
-    frame, _ = dashboard_module._load_basket_data(
-        ("SYNTH_ONLY",), date(2024, 1, 2), date(2024, 1, 5)
+    one-ticker basket, so every downstream consumer only handles one
+    shape — lakehouse-only, no live API/synthetic path to exercise."""
+    index = pd.bdate_range(date(2024, 1, 2), date(2024, 1, 5))
+    mock_lakehouse.return_value = pd.concat(
+        {"AAPL": pd.DataFrame({"close": [1.0] * len(index), "log_return": 0.0}, index=index)},
+        axis=1,
     )
 
+    frame, _ = dashboard_module._load_basket_data(("AAPL",), date(2024, 1, 2), date(2024, 1, 5))
+
     assert isinstance(frame.columns, pd.MultiIndex)
-    assert "SYNTH_ONLY" in frame.columns.get_level_values(0)
+    assert "AAPL" in frame.columns.get_level_values(0)
 
 
 def test_majority_direction_picks_the_most_common_direction() -> None:
@@ -426,6 +432,7 @@ def _flow_signal(manager_id: str, source_agent_id: str, direction: str, confiden
         as_of_date=date(2024, 1, 2),
         direction=direction,
         confidence=confidence,
+        raw_confidence=confidence,
         scale_applied=1.0,
         rationale="test rationale",
     )
@@ -481,33 +488,6 @@ def test_build_agent_flow_snapshot_empty_for_unmatched_asset() -> None:
     assert snapshot.majority_direction == "flat"
 
 
-def test_data_source_status_rows_classifies_live_cached_and_unused() -> None:
-    today = date(2024, 6, 10)
-    fetch_log = pd.DataFrame(
-        {
-            "source": ["fred", "fred", "cboe"],
-            "identifier": ["DGS3MO", "DGS3MO", "put_call"],
-            "as_of_date": ["2024-06-09", "2024-06-10", "2024-06-01"],
-            "fetched_at": ["x", "y", "z"],
-            "row_count": [1, 1, 1],
-        }
-    )
-
-    rows = dashboard_module._data_source_status_rows(fetch_log, ("fred", "cboe", "reddit"), today)
-    by_source = {row["source"]: row["status"] for row in rows}
-
-    assert by_source["fred"] == "live"
-    assert by_source["cboe"] == "cached"
-    assert by_source["reddit"] == "unused"
-
-
-def test_data_source_status_rows_all_unused_for_empty_log() -> None:
-    rows = dashboard_module._data_source_status_rows(
-        pd.DataFrame(columns=["source", "identifier", "as_of_date"]), ("fred",), date(2024, 6, 10)
-    )
-    assert rows == [{"source": "fred", "status": "unused", "last_fetched": "—"}]
-
-
 # ---------------------------------------------------------------------------
 # AppTest integration tests
 # ---------------------------------------------------------------------------
@@ -553,6 +533,7 @@ def _fake_track_record() -> TrackRecord:
                     asset="AAA",
                     as_of_date=day,
                     attributable_return=attributable_return,
+                    raw_attributable_return=attributable_return,
                 )
             )
     return track_record
@@ -746,16 +727,153 @@ def test_trust_panel_renders_without_exception() -> None:
     assert "Analysts trust panel" in markdown_texts
 
 
-def test_data_source_status_strip_renders_without_exception() -> None:
-    """The Overview tab's data-source status strip must render for a
-    seeded run without raising, even against whatever fetch log (or lack
-    of one) happens to exist on this machine."""
+# ---------------------------------------------------------------------------
+# Saved-run loader (📁 Saved Run tab)
+# ---------------------------------------------------------------------------
+
+
+def _fake_run_summary() -> dict:
+    return {
+        "experiment": {"assets": ["AAPL"], "excluded_analysts": ["sec_fundamentals_analyst"]},
+        "market_data_source": "lakehouse data",
+        "calibration": {
+            "start_date": "2018-01-02",
+            "end_date": "2018-03-30",
+            "portfolio_value_history": [["2018-01-02", 10_000.0], ["2018-03-30", 10_500.0]],
+            "final_sharpe_ratio": 0.8,
+            "final_max_drawdown": -0.1,
+            "final_sortino_ratio": 1.0,
+            "final_calmar_ratio": 1.5,
+            "final_information_ratio": None,
+            "final_hit_rate": 0.55,
+            "final_profit_factor": 1.1,
+            "signal_health": {
+                "risk_minimizing_analyst": {"active": 10, "unavailable": 0, "error": 0}
+            },
+            "source_performance": {
+                "risk_minimizing_analyst": {
+                    "cumulative_return": 0.02,
+                    "sharpe_ratio": 0.5,
+                    "max_drawdown": -0.01,
+                    "observations": 10.0,
+                },
+                "risk_manager": {
+                    "cumulative_return": 0.03,
+                    "sharpe_ratio": 0.6,
+                    "max_drawdown": -0.02,
+                    "observations": 20.0,
+                },
+            },
+        },
+        "test": {
+            "start_date": "2018-04-02",
+            "end_date": "2018-04-04",
+            "portfolio_value_history": [
+                ["2018-04-02", 10_000.0],
+                ["2018-04-03", 10_100.0],
+                ["2018-04-04", 9_950.0],
+            ],
+            "final_sharpe_ratio": 0.97,
+            "final_max_drawdown": -0.31,
+            "final_sortino_ratio": 1.36,
+            "final_calmar_ratio": 0.51,
+            "final_information_ratio": None,
+            "final_hit_rate": 0.554,
+            "final_profit_factor": 1.22,
+            "signal_health": {
+                "risk_minimizing_analyst": {"active": 10, "unavailable": 0, "error": 0},
+                "cir_rate_regime_analyst": {"active": 7, "unavailable": 0, "error": 3},
+            },
+            "source_performance": {
+                "risk_minimizing_analyst": {
+                    "cumulative_return": -0.02,
+                    "sharpe_ratio": -0.1,
+                    "max_drawdown": -0.03,
+                    "observations": 10.0,
+                },
+                "cvar_manager": {
+                    "cumulative_return": -0.9,
+                    "sharpe_ratio": -0.14,
+                    "max_drawdown": -1.1,
+                    "observations": 30.0,
+                },
+            },
+        },
+        "baselines": {
+            "equal_weight": {
+                "start_date": "2018-04-02",
+                "end_date": "2018-04-04",
+                "portfolio_value_history": [
+                    ["2018-04-02", 10_000.0],
+                    ["2018-04-03", 10_050.0],
+                    ["2018-04-04", 10_020.0],
+                ],
+                "final_sharpe_ratio": 1.1,
+                "final_max_drawdown": -0.01,
+                "final_sortino_ratio": 1.3,
+                "final_calmar_ratio": 1.0,
+                "final_information_ratio": None,
+                "final_hit_rate": 0.5,
+                "final_profit_factor": 1.05,
+            },
+        },
+    }
+
+
+def test_saved_run_tab_prompts_for_a_load_when_nothing_is_loaded_yet() -> None:
     at = _seeded_app().run(timeout=30)
 
     assert not at.exception
+    info_texts = " ".join(info.value for info in at.info)
+    assert "Load a saved run" in info_texts
+
+
+def test_saved_run_tab_renders_loaded_summary_without_exception() -> None:
+    at = _seeded_app()
+    at.session_state["saved_run_summary"] = _fake_run_summary()
+    at.session_state["saved_run_source_path"] = "results/fake_run/experiment_result.json"
+
+    at.run(timeout=30)
+
+    assert not at.exception
     markdown_texts = " ".join(md.value for md in at.markdown)
-    assert "status-pill" in markdown_texts
-    assert "market data:" in markdown_texts
+    assert "results/fake_run/experiment_result.json" in markdown_texts
+
+
+def test_load_saved_run_summary_auto_extracts_a_full_result_file(tmp_path) -> None:
+    """A raw experiment_result.json (decisions_by_day/trade_log present)
+    must be auto-reduced to the summary shape on load, not handed to the
+    rest of the panel unmodified."""
+    full_result = _fake_run_summary()
+    for period in ("calibration", "test"):
+        full_result[period]["decisions_by_day"] = {"2018-04-02": [{"asset": "AAPL"}]}
+        full_result[period]["trade_log"] = [{"asset": "AAPL"}]
+    path = tmp_path / "experiment_result.json"
+    path.write_text(json.dumps(full_result))
+
+    loaded = dashboard_module._load_saved_run_summary(path)
+
+    assert "decisions_by_day" not in loaded["test"]
+    assert "trade_log" not in loaded["test"]
+    assert loaded["test"]["final_sharpe_ratio"] == 0.97
+
+
+def test_load_saved_run_summary_accepts_an_already_extracted_summary(tmp_path) -> None:
+    summary = _fake_run_summary()
+    path = tmp_path / "summary.json"
+    path.write_text(json.dumps(summary))
+
+    loaded = dashboard_module._load_saved_run_summary(path)
+
+    assert loaded == summary
+
+
+def test_load_saved_run_summary_raises_for_a_payload_missing_period_blocks(tmp_path) -> None:
+    path = tmp_path / "not_a_run.json"
+    path.write_text(json.dumps({"foo": "bar"}))
+
+    with pytest.raises(ValueError, match=r"test.*calibration"):
+        dashboard_module._load_saved_run_summary(path)
 
 
 def test_stepping_forward_advances_current_day_index_that_every_chart_clips_by() -> None:
@@ -842,13 +960,6 @@ def test_empty_ticker_selection_warns_and_does_not_run(monkeypatch: pytest.Monke
     """Clearing the ticker multiselect entirely must warn, not attempt a
     zero-ticker simulation."""
     monkeypatch.setattr("agentic_trading.agents.roster.build_default_analysts", lambda: [])
-
-    def _raise_to_force_synthetic_fallback(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("network disabled in tests")
-
-    monkeypatch.setattr(
-        "agentic_trading.data.loader.load_price_history", _raise_to_force_synthetic_fallback
-    )
 
     at = AppTest.from_file(dashboard_module.__file__)
     at.run(timeout=30)

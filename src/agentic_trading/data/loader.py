@@ -1,216 +1,25 @@
 # loader.py
 
-import math
+"""Market-data entry point for the CLI and GUI: price history comes from
+the lakehouse (`data/loaders/lakehouse_loader.py`) and nowhere else. The
+frame this module returns still has to pass through the point-in-time
+boundary (`data/point_in_time.py`) before any agent sees it."""
+
 from datetime import date, timedelta
 
-import numpy as np
 import pandas as pd
-import pandas_datareader.data as pdr
-import yfinance as yf
 
-from agentic_trading.data.cache import cached_fetch
-from agentic_trading.data.loaders.alpha_vantage_loader import load_alpha_vantage_price_history
+from agentic_trading.data.loaders.lakehouse_loader import load_price_history_from_lakehouse
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 DEFAULT_BASKET: list[str] = ["AAPL", "MSFT", "GOOGL", "AMZN", "JPM"]
-DEFAULT_BACKTEST_WARMUP_DAYS = 365
-
-
-def _resolve_tickers(asset: str | list[str] | None) -> list[str]:
-    if asset is None:
-        return list(DEFAULT_BASKET)
-    if isinstance(asset, str):
-        return [asset]
-    return asset
-
-
-def _reshape_single_ticker(raw: pd.DataFrame) -> pd.DataFrame:
-    if raw.empty:
-        raise ValueError("yfinance returned no data for the requested ticker/date range")
-
-    close = raw["Close"]
-    result = pd.DataFrame({"open": raw["Open"], "close": close})
-    # Log returns, not simple returns: quantcore's core/sde_solver.py and
-    # pricing/black_scholes.py both assume GBM log-price dynamics.
-    result["log_return"] = np.log(result["close"] / result["close"].shift(1))
-    return result
-
-
-def _reshape_stooq_frame(raw: pd.DataFrame) -> pd.DataFrame:
-    if raw.empty:
-        raise ValueError("Stooq returned no data for the requested ticker/date range")
-    # Stooq returns rows in descending date order, unlike yfinance.
-    ordered = raw.sort_index()
-    opening = ordered["Open"] if "Open" in ordered else ordered["Close"]
-    result = pd.DataFrame({"open": opening, "close": ordered["Close"]})
-    result["log_return"] = np.log(result["close"] / result["close"].shift(1))
-    return result
-
-
-def _yfinance_result_is_usable(raw: pd.DataFrame) -> bool:
-    return not raw.empty and not raw["Close"].isna().all()
-
-
-def _range_identifier(ticker: str, start: date | None, end: date | None) -> str:
-    start_label = start.isoformat() if start else "none"
-    end_label = end.isoformat() if end else "none"
-    return f"{ticker.upper()}_{start_label}_{end_label}"
-
-
-def _fetch_yfinance_raw(ticker: str, start: date | None, end: date | None) -> pd.DataFrame:
-    # yfinance 1.6.0 defaults multi_level_index=True, which returns
-    # MultiIndex (Price, Ticker) columns even for a single ticker. Force
-    # flat columns so raw["Close"] yields a Series, not a one-column
-    # DataFrame. progress=False suppresses yfinance's own "N of M completed"
-    # progress bar, which it prints straight to stdout regardless of any
-    # logging configuration.
-    return yf.download(  # type: ignore[no-any-return]
-        ticker, start=start, end=end, multi_level_index=False, progress=False
-    )
-
-
-def _price_cache_dates(end: date | None) -> tuple[date, tuple[date, ...]]:
-    """Use the requested historical end date as the stable cache key.
-
-    Older price files used the wall-clock fetch date, so retain a short
-    lookup window for those files while historical caches migrate naturally.
-    """
-    if end is None:
-        return date.today(), ()
-    today = date.today()
-    legacy_dates = tuple(today - timedelta(days=days) for days in range(1, 31))
-    return end, legacy_dates
-
-
-def _load_single_ticker(ticker: str, start: date | None, end: date | None) -> pd.DataFrame:
-    # Cached under today's real wall-clock date, keyed by the exact
-    # (ticker, start, end) requested — a historical close, once published,
-    # doesn't change, so re-running the same backtest (or a different
-    # backtest over the same ticker/range) is a cache hit rather than a
-    # fresh yfinance/Stooq call. Cached at the raw-frame level, before
-    # reshaping to close/log_return, so log_return is still computed fresh
-    # over exactly the requested slice on every call (cache hit or not) —
-    # log_return must NaN at the first row of *this* range regardless of
-    # what's cached for a wider range.
-    cache_date, legacy_cache_dates = _price_cache_dates(end)
-    raw = cached_fetch(
-        source="price_yfinance",
-        identifier=_range_identifier(ticker, start, end),
-        as_of_date=cache_date,
-        legacy_as_of_dates=legacy_cache_dates,
-        fetch_fn=lambda: _fetch_yfinance_raw(ticker, start, end),
-    )
-    if _yfinance_result_is_usable(raw):
-        logger.info("Loaded price history for %s from yfinance", ticker)
-        return _reshape_single_ticker(raw)
-
-    logger.info("yfinance had no usable data for %s — trying Stooq fallback", ticker)
-    try:
-        stooq_raw = cached_fetch(
-            source="price_stooq",
-            identifier=_range_identifier(ticker, start, end),
-            as_of_date=cache_date,
-            legacy_as_of_dates=legacy_cache_dates,
-            fetch_fn=lambda: pdr.DataReader(ticker, "stooq", start, end),
-        )
-        result = _reshape_stooq_frame(stooq_raw)
-        logger.info("Loaded price history for %s from Stooq", ticker)
-        return result
-    except Exception as stooq_exc:
-        logger.info(
-            "Stooq also had no usable data for %s (%s) — trying Alpha Vantage fallback "
-            "(free tier, ~25 requests/day — this tier only fires when both yfinance and "
-            "Stooq have already failed, so it isn't burned on the common path)",
-            ticker,
-            stooq_exc,
-        )
-        return _load_alpha_vantage_fallback(ticker, start, end)
-
-
-def _load_alpha_vantage_fallback(ticker: str, start: date | None, end: date | None) -> pd.DataFrame:
-    as_of = pd.Timestamp(end) if end is not None else pd.Timestamp.today()
-    raw = load_alpha_vantage_price_history(ticker, as_of)
-    if start is not None:
-        raw = raw.loc[raw.index >= pd.Timestamp(start)]
-    if raw.empty:
-        raise ValueError(f"Alpha Vantage returned no usable data for {ticker!r} either")
-    result = pd.DataFrame({"close": raw["close"]})
-    result["log_return"] = np.log(result["close"] / result["close"].shift(1))
-    logger.info("Loaded price history for %s from Alpha Vantage", ticker)
-    return result
-
-
-def load_price_history(
-    asset: str | list[str] | None = None,
-    start: date | None = None,
-    end: date | None = None,
-) -> pd.DataFrame:
-    """Loads full price history for `asset` between `start` and `end`
-    (inclusive). Does not enforce point-in-time discipline — callers that
-    need a no-look-ahead guarantee must pass the result through
-    get_point_in_time_data (see point_in_time.py).
-
-    `asset` may be a single ticker, an explicit list of tickers, or None
-    to fall back to the project's default basket (DEFAULT_BASKET). A
-    single ticker returns a frame with flat 'close'/'log_return' columns;
-    multiple tickers return a frame with a MultiIndex on columns, keyed
-    (ticker, field). `start`/`end` follow yfinance's own convention of
-    None meaning an unbounded end of the range.
-
-    Tries yfinance first for each ticker; if it raises, comes back empty,
-    or comes back all-NaN, falls through to Stooq (an independent, no-key
-    source), then to Alpha Vantage (rate-limited, so only reached once
-    both of the above have already failed) before giving up. Only
-    `load_price_history_with_fallback`'s synthetic generator kicks in if
-    all three real sources fail.
-    """
-    tickers = _resolve_tickers(asset)
-    logger.debug("Loading price history for %s (%s to %s)", tickers, start, end)
-
-    if len(tickers) == 1:
-        return _load_single_ticker(tickers[0], start, end)
-
-    frames: dict[str, pd.DataFrame] = {}
-    for ticker in tickers:
-        frames[ticker] = _load_single_ticker(ticker, start, end)
-    combined = pd.concat(frames, axis=1, join="inner")
-    close_columns = [(ticker, "close") for ticker in tickers]
-    combined = combined.dropna(subset=close_columns)
-    if combined.empty:
-        raise ValueError("price histories have no common trading dates")
-    return combined
-
-
-def _synthetic_price_history(ticker: str, start: date, end: date) -> pd.DataFrame:
-    """A deterministic, offline stand-in price series for `ticker` — used
-    only when a live yfinance load fails (see
-    `load_price_history_with_fallback`). Not randomness in the trading
-    sense (no unseeded RNG — the "seed" here is derived purely from the
-    ticker's characters, so the same ticker always produces the same
-    synthetic series), just enough shape (drift + a bounded oscillation) to
-    let the rest of the system keep running and be visibly exercised
-    offline."""
-    dates = pd.bdate_range(start=start, end=end)
-    if dates.empty:
-        raise ValueError("no business days available for the requested date range")
-
-    seed = sum(ord(character) for character in ticker)
-    base_price = 80.0 + (seed % 40)
-    drift = 0.0004 + ((seed % 7) * 0.00015)
-    amplitude = 0.012 + ((seed % 5) * 0.003)
-
-    prices: list[float] = []
-    level = base_price
-    for index, _timestamp in enumerate(dates):
-        wave = math.sin(index / 3.0 + seed / 10.0) * amplitude
-        level *= 1.0 + drift + wave
-        prices.append(max(level, 1.0))
-
-    frame = pd.DataFrame({"open": prices, "close": prices}, index=dates)
-    frame["log_return"] = np.log(frame["close"] / frame["close"].shift(1))
-    return frame
+# Calendar days of history loaded before the first simulated day so every
+# rolling window is full on day 1: the longest analyst window is three
+# trading years (`settings.analysts.risk_window_garch`/`hmm_window` = 750
+# observations), which is ~1100 calendar days.
+DEFAULT_BACKTEST_WARMUP_DAYS = 1100
 
 
 def load_price_history_with_fallback(
@@ -218,51 +27,40 @@ def load_price_history_with_fallback(
     start: date,
     end: date,
     warmup_days: int = 0,
-    allow_synthetic_fallback: bool = True,
 ) -> tuple[pd.DataFrame, str]:
-    """The shared entry point both the CLI and the GUI use to load market
-    data — always returns MultiIndex (ticker, field) columns, even for a
-    single-ticker basket, so every downstream consumer only has to handle
-    one shape. Falls back to a synthetic series per-ticker (logged as a
-    WARNING — this is exactly a "gave a different output than intended"
-    moment, not a silent one) if the live yfinance load fails for any
-    reason, so a network hiccup degrades the run instead of crashing it.
+    """The shared entry point the CLI uses to load market data — always
+    returns MultiIndex (ticker, field) columns, even for a single-ticker
+    basket, so every downstream consumer only has to handle one shape.
 
-    Returns `(frame, source_label)`, where `source_label` is
-    "live yfinance data" or "synthetic fallback data" — surfaced to the
-    user (CLI log line / GUI caption) so it's always clear which one a
-    given run actually used.
+    Lakehouse-only: this project never calls a live price API or
+    fabricates data during a run. Raises `ValueError` naming whichever
+    tickers the lakehouse doesn't cover for the requested range —
+    `backtest/preflight.py` is what reports this to the user before a
+    run starts, rather than this function's raise being the first
+    anyone hears of it mid-load.
+
+    Returns `(frame, source_label)` — `source_label` is always
+    `"lakehouse data"`, kept in the return shape so existing callers
+    (e.g. the CLI's log line) don't need to change.
     """
     if warmup_days < 0:
         raise ValueError("warmup_days must be non-negative")
     data_start = start - timedelta(days=warmup_days)
 
-    try:
-        frame = load_price_history(list(tickers), data_start, end)
-        if frame.empty:
-            raise ValueError("loaded market data was empty")
-        if not isinstance(frame.columns, pd.MultiIndex):
-            frame = pd.concat({tickers[0]: frame}, axis=1)
-        return frame, "live yfinance data"
-    except Exception as exc:
-        if not allow_synthetic_fallback:
-            logger.error(
-                "Real market data unavailable for %s (%s to %s): %s — refusing synthetic data.",
-                tickers,
-                data_start,
-                end,
-                exc,
-            )
-            raise
-        logger.warning(
-            "Live yfinance load failed for %s (%s to %s): %s — using synthetic fallback "
-            "data for every ticker in the basket.",
-            tickers,
-            data_start,
-            end,
-            exc,
+    lake_frame = load_price_history_from_lakehouse(list(tickers), data_start, end)
+    lake_tickers = set(lake_frame.columns.get_level_values(0)) if lake_frame is not None else set()
+    missing_tickers = [ticker for ticker in tickers if ticker not in lake_tickers]
+    if missing_tickers:
+        raise ValueError(
+            f"lakehouse has no price coverage for {missing_tickers} over "
+            f"{data_start.isoformat()} to {end.isoformat()}"
         )
-        synthetic = {
-            ticker: _synthetic_price_history(ticker, data_start, end) for ticker in tickers
-        }
-        return pd.concat(synthetic, axis=1), "synthetic fallback data"
+
+    close_columns = [(ticker, "close") for ticker in tickers]
+    frame = lake_frame.dropna(subset=close_columns)  # type: ignore[union-attr]
+    if frame.empty:
+        raise ValueError(
+            f"lakehouse price data for {tickers} was empty over "
+            f"{data_start.isoformat()} to {end.isoformat()}"
+        )
+    return frame, "lakehouse data"

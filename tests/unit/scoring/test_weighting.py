@@ -12,7 +12,7 @@ from datetime import date
 
 import pytest
 
-from agentic_trading.scoring.weighting import Hedge
+from agentic_trading.scoring.weighting import EqualWeight, Hedge, ShrinkageWeight
 
 
 class _FixedScoreboard:
@@ -114,3 +114,90 @@ def test_hedge_constructs_with_sensible_defaults() -> None:
 
     assert hedge.eta > 0
     assert hedge.lookback_days > 0
+
+
+class _FakeTrackRecord:
+    def __init__(self, observation_counts: dict[str, int]) -> None:
+        self._observation_counts = observation_counts
+
+    def history_for(self, source_id: str, as_of_date: date, lookback_days: int) -> list[object]:
+        return [object()] * self._observation_counts.get(source_id, 0)
+
+
+class _ScoreboardWithTrackRecord(_FixedScoreboard):
+    def __init__(
+        self, cumulative_returns: dict[str, float], observation_counts: dict[str, int]
+    ) -> None:
+        super().__init__(cumulative_returns)
+        self.track_record = _FakeTrackRecord(observation_counts)
+
+
+def test_shrinkage_weight_keeps_a_dense_source_almost_unchanged() -> None:
+    """A source with observations >= full_trust_observations keeps (almost) its
+    raw weight — shrinkage_factor is capped at 1.0."""
+    scoreboard = _ScoreboardWithTrackRecord(
+        {"analyst-a": 0.10, "analyst-b": 0.01},
+        {"analyst-a": 30, "analyst-b": 30},
+    )
+    base = Hedge(eta=1.0, lookback_days=30)
+    shrinkage = ShrinkageWeight(base=base, full_trust_observations=20)
+
+    raw = base.get_weights(scoreboard, ["analyst-a", "analyst-b"], AS_OF_DATE)
+    shrunk = shrinkage.get_weights(scoreboard, ["analyst-a", "analyst-b"], AS_OF_DATE)
+
+    assert shrunk == pytest.approx(raw)
+
+
+def test_shrinkage_weight_pulls_a_thin_source_toward_the_average() -> None:
+    """A source with zero real observations gets pulled all the way to the
+    cross-sectional average, regardless of how extreme its raw weight is."""
+    scoreboard = _ScoreboardWithTrackRecord(
+        {"analyst-a": 0.10, "analyst-b": 0.01},
+        {"analyst-a": 30, "analyst-b": 0},
+    )
+    base = Hedge(eta=1.0, lookback_days=30)
+    shrinkage = ShrinkageWeight(base=base, full_trust_observations=20)
+
+    raw = base.get_weights(scoreboard, ["analyst-a", "analyst-b"], AS_OF_DATE)
+    shrunk = shrinkage.get_weights(scoreboard, ["analyst-a", "analyst-b"], AS_OF_DATE)
+    average = sum(raw.values()) / len(raw)
+
+    assert shrunk["analyst-b"] == pytest.approx(average)
+    assert shrunk["analyst-a"] == pytest.approx(raw["analyst-a"])
+
+
+def test_shrinkage_weight_interpolates_linearly_between_raw_and_average() -> None:
+    scoreboard = _ScoreboardWithTrackRecord(
+        {"analyst-a": 0.10, "analyst-b": 0.01},
+        {"analyst-a": 10, "analyst-b": 10},
+    )
+    base = Hedge(eta=1.0, lookback_days=30)
+    shrinkage = ShrinkageWeight(base=base, full_trust_observations=20)
+
+    raw = base.get_weights(scoreboard, ["analyst-a", "analyst-b"], AS_OF_DATE)
+    shrunk = shrinkage.get_weights(scoreboard, ["analyst-a", "analyst-b"], AS_OF_DATE)
+    average = sum(raw.values()) / len(raw)
+
+    # 10/20 observations -> shrinkage_factor 0.5
+    expected = {source_id: 0.5 * value + 0.5 * average for source_id, value in raw.items()}
+    assert shrunk == pytest.approx(expected)
+
+
+def test_shrinkage_weight_wraps_equal_weight_without_error() -> None:
+    """EqualWeight has no lookback_days attribute — ShrinkageWeight must fall
+    back to a default lookback rather than raising."""
+    scoreboard = _ScoreboardWithTrackRecord(
+        {"analyst-a": 0.0, "analyst-b": 0.0}, {"analyst-a": 5, "analyst-b": 5}
+    )
+    shrinkage = ShrinkageWeight(base=EqualWeight())
+
+    weights = shrinkage.get_weights(scoreboard, ["analyst-a", "analyst-b"], AS_OF_DATE)
+
+    assert weights == pytest.approx({"analyst-a": 1.0, "analyst-b": 1.0})
+
+
+def test_shrinkage_weight_handles_empty_source_ids() -> None:
+    scoreboard = _ScoreboardWithTrackRecord({}, {})
+    shrinkage = ShrinkageWeight(base=Hedge())
+
+    assert shrinkage.get_weights(scoreboard, [], AS_OF_DATE) == {}

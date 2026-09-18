@@ -4,108 +4,100 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from quantcore.core.stochastic import simulate_heston_paths
 
 from agentic_trading.agents._market_math import clamp, market_slice
-from agentic_trading.agents.analysts.cvar_pod._theoretical_options import (
+from agentic_trading.agents.analysts.cvar_pod._options_data import (
     annualized_garch_volatility,
+    real_atm_options_by_expiration,
 )
 from agentic_trading.agents.base import AnalystAgent
-from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.agents.schemas import AgentSignal, SignalStatus
+from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-TERM_STRUCTURE_WINDOWS: tuple[int, ...] = (10, 30, 60, 90)
-MIN_WINDOW_OBSERVATIONS = TERM_STRUCTURE_WINDOWS[-1]
-CALIBRATION_PATHS = 200
-CALIBRATION_STEPS = 30
-TRADING_DAYS_PER_YEAR = 252
-VOL_DIVERGENCE_THRESHOLD = 0.02
+DAYS_PER_YEAR = 365.0
+TARGET_DTE = 30
+# At least two expiries for a slope; an expiry inside five days is dominated
+# by expiry-day distortions and is ignored as the nearest point.
+MIN_EXPIRIES = 2
+MIN_NEAREST_DTE = 5
+# Two expiries fewer than 20 days apart carry no usable term information.
+MIN_SLOPE_SPAN_DAYS = 20
+# Backwardation of 3 vol points between nearest and longest expiry is a
+# stress signature regardless of the premium.
+BACKWARDATION_SLOPE = -0.03
+# A 6-vol-point term slope adds the full 50% confidence uplift.
+SLOPE_FULL_UPLIFT = 0.06
+SLOPE_UPLIFT_WEIGHT = 0.5
+# Beyond 30 vol points the "premium" is a data error, not a signal.
+MAX_ABS_VRP = 0.30
+MAX_CONFIDENCE = 0.75
+# GARCH needs a reasonable sample; its failure falls back to trailing
+# realized vol over this many days.
+MIN_RETURN_OBSERVATIONS = 30
+REALIZED_FALLBACK_WINDOW = 60
 
 
-def _realized_vol_term_structure(returns: np.ndarray) -> np.ndarray:
-    values = []
-    for window in TERM_STRUCTURE_WINDOWS:
-        windowed = returns[-window:]
-        values.append(float(np.std(windowed, ddof=1)) * float(np.sqrt(TRADING_DAYS_PER_YEAR)))
-    return np.asarray(values, dtype=np.float64)
-
-
-def _simulated_vol_term_structure(
-    v0: float, kappa: float, theta: float, xi: float, rho: float, spot: float
-) -> np.ndarray:
-    _, variance_paths = simulate_heston_paths(
-        spot,
-        v0,
-        0.0,
-        kappa,
-        theta,
-        xi,
-        rho,
-        t=1.0,
-        n_paths=CALIBRATION_PATHS,
-        n_steps=CALIBRATION_STEPS,
-        seed=42,
+def _interpolated_atm_iv(days: np.ndarray, ivs: np.ndarray, target_days: int) -> float:
+    """ATM IV at `target_days`, interpolated linearly in total variance
+    between the two bracketing expiries; the nearest expiry's IV when no
+    pair brackets the target."""
+    lower = np.where(days <= target_days)[0]
+    upper = np.where(days >= target_days)[0]
+    if lower.size == 0 or upper.size == 0:
+        nearest = int(np.argmin(np.abs(days - target_days)))
+        return float(ivs[nearest])
+    lo, hi = int(lower[-1]), int(upper[0])
+    if lo == hi:
+        return float(ivs[lo])
+    t_lo, t_hi, t_target = (
+        days[lo] / DAYS_PER_YEAR,
+        days[hi] / DAYS_PER_YEAR,
+        (target_days / DAYS_PER_YEAR),
     )
-    log_returns = np.diff(np.log(np.maximum(variance_paths, 1e-12)), axis=1)
-    values = []
-    for window in TERM_STRUCTURE_WINDOWS:
-        horizon_steps = max(1, round(window / 365.0 * CALIBRATION_STEPS))
-        horizon_steps = min(horizon_steps, log_returns.shape[1])
-        segment = log_returns[:, :horizon_steps]
-        values.append(float(np.std(segment)) * float(np.sqrt(TRADING_DAYS_PER_YEAR)))
-    return np.asarray(values, dtype=np.float64)
-
-
-def _calibrate_heston(
-    realized_term_structure: np.ndarray, spot: float
-) -> tuple[dict[str, float], float]:
-    from scipy.optimize import minimize
-
-    initial_variance = float(realized_term_structure[0]) ** 2
-
-    def objective(params: np.ndarray) -> float:
-        kappa, theta, xi, rho = params
-        simulated = _simulated_vol_term_structure(
-            initial_variance, abs(kappa), abs(theta), abs(xi), np.clip(rho, -0.99, 0.99), spot
-        )
-        return float(np.sum((simulated - realized_term_structure) ** 2))
-
-    result = minimize(
-        objective,
-        x0=np.array([1.5, initial_variance, 0.3, -0.5]),
-        method="Nelder-Mead",
-        options={"maxiter": 50, "xatol": 1e-3, "fatol": 1e-6},
-    )
-    kappa, theta, xi, rho = result.x
-    params = {
-        "v0": initial_variance,
-        "kappa": abs(float(kappa)),
-        "theta": abs(float(theta)),
-        "xi": abs(float(xi)),
-        "rho": float(np.clip(rho, -0.99, 0.99)),
-    }
-    return params, float(result.fun)
+    var_lo, var_hi = float(ivs[lo]) ** 2 * t_lo, float(ivs[hi]) ** 2 * t_hi
+    var_target = var_lo + (var_hi - var_lo) * (t_target - t_lo) / (t_hi - t_lo)
+    return float(np.sqrt(max(var_target, 0.0) / t_target))
 
 
 class HestonVolSurfaceAnalyst(AnalystAgent):
-    """Compares two *model* volatility regimes, not model-vs-market.
+    """Model-free variance-risk-premium read on the real ATM implied-vol
+    term structure. The lakehouse chain carries a handful of expiries out
+    to about two months, which cannot identify a stochastic-volatility
+    term-structure model, so the signal uses the observed surface
+    directly: `vrp = IV_30 - GARCH vol` (30-day ATM IV interpolated in
+    total variance, against this analyst's own annualized GARCH(1,1) read
+    on a year of returns) and `slope = IV_longest - IV_nearest`.
 
-    There is no real market IV skew to calibrate against historically (see
-    `data/loaders/options_loader.py`), so this analyst instead calibrates
-    Heston parameters against the asset's own historical realized-vol term
-    structure (10/30/60/90-day trailing realized vol, treated as a
-    synthetic term structure) and compares the resulting long-run
-    (theta-implied) forward vol against the short-horizon GARCH read from
-    `_theoretical_options`. This reads whether the model's own term
-    structure implies rising or falling forward vol relative to the
-    current GARCH read — it is not a market-skew signal.
-    """
+    A rich premium (`vrp >= vrp_threshold`) in contango is long
+    (Bollerslev-Tauchen-Zhou: a positive variance risk premium predicts
+    positive returns); implied vol below the model forecast, or a
+    backwardated curve, is short. Confidence grows from zero at the
+    threshold to full `vrp_full_confidence_span` beyond it, with up to a
+    50% uplift for a steep term slope, capped at 0.75. Flat with zero
+    confidence when fewer than two usable expiries exist for the date.
+    The agent id is kept so scoreboard history stays continuous."""
 
     agent_id: str = "heston_vol_surface_analyst"
 
-    _risk_window: int = 90
+    def _flat(
+        self,
+        asset: str,
+        as_of_date: pd.Timestamp,
+        rationale: str,
+        status: SignalStatus = "active",
+    ) -> AgentSignal:
+        return AgentSignal(
+            agent_id=self.agent_id,
+            asset=asset,
+            as_of_date=as_of_date.date(),
+            direction="flat",
+            confidence=0.0,
+            rationale=rationale,
+            status=status,
+        )
 
     def generate_signal(
         self,
@@ -114,51 +106,62 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
         slice_ = market_slice(market_data, as_of_date, asset)
-        returns = slice_.log_returns[-self._risk_window :]
-        if slice_.close is None or returns.size < MIN_WINDOW_OBSERVATIONS:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient history to fit a realized-vol term structure",
+        returns = slice_.log_returns[-settings.analysts.risk_window_long :]
+        if slice_.close is None or returns.size < MIN_RETURN_OBSERVATIONS:
+            return self._flat(
+                asset, as_of_date, "insufficient history for a volatility read", "unavailable"
             )
 
-        realized_term_structure = _realized_vol_term_structure(returns)
-        garch_vol = annualized_garch_volatility(returns, self.agent_id, asset)
-
-        try:
-            params, residual = _calibrate_heston(realized_term_structure, slice_.close)
-        except Exception as exc:
-            logger.debug(
-                "%s: Heston calibration failed for %s (%s) — returning flat.",
-                self.agent_id,
+        real_options = real_atm_options_by_expiration(asset, as_of_date, slice_.close)
+        if real_options is None or real_options.empty:
+            return self._flat(
                 asset,
-                exc,
+                as_of_date,
+                "no real option-chain snapshot in the lakehouse for this date",
+                "unavailable",
             )
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="Heston term-structure calibration failed",
+        usable = real_options[real_options["days_to_expiration"] >= MIN_NEAREST_DTE]
+        if len(usable) < MIN_EXPIRIES:
+            return self._flat(
+                asset,
+                as_of_date,
+                f"fewer than {MIN_EXPIRIES} usable expiries in the chain",
+                "unavailable",
             )
+        days = usable["days_to_expiration"].to_numpy(dtype=np.float64)
+        ivs = usable["implied_volatility"].to_numpy(dtype=np.float64)
 
-        heston_forward_vol = float(np.sqrt(max(params["theta"], 0.0)))
-        divergence = heston_forward_vol - garch_vol
+        iv_30 = _interpolated_atm_iv(days, ivs, TARGET_DTE)
+        try:
+            model_vol = annualized_garch_volatility(returns, self.agent_id, asset, as_of_date)
+        except (RuntimeError, ValueError):
+            model_vol = float(np.std(returns[-REALIZED_FALLBACK_WINDOW:], ddof=1)) * np.sqrt(
+                settings.firm.trading_days_per_year
+            )
+        vrp = iv_30 - model_vol
+        if abs(vrp) > MAX_ABS_VRP:
+            return self._flat(
+                asset,
+                as_of_date,
+                f"variance risk premium {vrp:.3f} outside plausible range",
+                "unavailable",
+            )
+        slope = float(ivs[-1] - ivs[0]) if days[-1] - days[0] >= MIN_SLOPE_SPAN_DAYS else 0.0
 
-        direction: Literal["long", "short", "flat"]
-        if divergence > VOL_DIVERGENCE_THRESHOLD:
-            direction = "short"
-        elif divergence < -VOL_DIVERGENCE_THRESHOLD:
+        threshold = settings.analysts.vrp_threshold
+        direction: Literal["long", "short", "flat"] = "flat"
+        if vrp >= threshold and slope >= 0.0:
             direction = "long"
-        else:
-            direction = "flat"
+        elif vrp <= -threshold or slope <= BACKWARDATION_SLOPE:
+            direction = "short"
 
-        fit_quality = clamp(1.0 / (1.0 + residual))
-        confidence = clamp(fit_quality * min(abs(divergence) / VOL_DIVERGENCE_THRESHOLD, 1.0))
+        confidence = 0.0
+        if direction != "flat":
+            premium_strength = clamp(
+                (abs(vrp) - threshold) / settings.analysts.vrp_full_confidence_span
+            )
+            slope_uplift = 1.0 + SLOPE_UPLIFT_WEIGHT * clamp(abs(slope) / SLOPE_FULL_UPLIFT)
+            confidence = clamp(premium_strength * slope_uplift, 0.0, MAX_CONFIDENCE)
 
         return AgentSignal(
             agent_id=self.agent_id,
@@ -167,7 +170,7 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
             direction=direction,
             confidence=confidence,
             rationale=(
-                f"Heston forward vol {heston_forward_vol:.4f} vs GARCH read {garch_vol:.4f} "
-                f"(calibration residual={residual:.6f})"
+                f"variance risk premium {vrp:+.4f} (IV_30={iv_30:.4f} vs model vol "
+                f"{model_vol:.4f}), term slope {slope:+.4f} over {days[0]:.0f}-{days[-1]:.0f} DTE"
             ),
         )

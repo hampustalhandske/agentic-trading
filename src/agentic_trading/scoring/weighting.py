@@ -96,6 +96,49 @@ class SharpeWeight(WeightingStrategy):
         return {source_id: value / average for source_id, value in raw.items()}
 
 
+class ShrinkageWeight(WeightingStrategy):
+    """Wraps another `WeightingStrategy` and pulls each source's raw weight
+    partway back toward the cross-sectional average of all sources being
+    weighted, in proportion to how few real observations that source has
+    in its own lookback window — a James-Stein-style empirical-Bayes
+    shrinkage estimator, not a redesign of the wrapped strategy's own
+    logic. A source with a long, dense track record keeps almost all of
+    its own weight; one with a thin or sparse window (typical of an
+    alt-data source that's gated/unavailable much of the time) gets pulled
+    hard toward "no reason yet to trust it more or less than its peers" —
+    exactly the defense a raw trailing-Sharpe/Hedge weight has no way to
+    apply on its own, since a handful of noisy observations swings its
+    output as confidently as a long, reliable history would."""
+
+    def __init__(self, base: WeightingStrategy, full_trust_observations: int = 20) -> None:
+        self.base = base
+        self.full_trust_observations = full_trust_observations
+
+    def get_weights(
+        self,
+        scoreboard: "PerformanceScoreboard",
+        source_ids: list[str],
+        as_of_date: date,
+    ) -> dict[str, float]:
+        raw_weights = self.base.get_weights(scoreboard, source_ids, as_of_date)
+        if not raw_weights:
+            return raw_weights
+
+        average_weight = sum(raw_weights.values()) / len(raw_weights)
+        lookback_days = getattr(self.base, "lookback_days", 30)
+
+        shrunk_weights = {}
+        for source_id, weight in raw_weights.items():
+            observation_count = len(
+                scoreboard.track_record.history_for(source_id, as_of_date, lookback_days)
+            )
+            shrinkage_factor = min(1.0, observation_count / self.full_trust_observations)
+            shrunk_weights[source_id] = (
+                shrinkage_factor * weight + (1.0 - shrinkage_factor) * average_weight
+            )
+        return shrunk_weights
+
+
 class DrawdownAwareWeight(WeightingStrategy):
     """Rewards cumulative contribution while shrinking sources with drawdown."""
 

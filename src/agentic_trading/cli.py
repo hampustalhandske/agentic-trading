@@ -5,17 +5,20 @@ from datetime import date
 
 import typer
 
+from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
-from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.roster import build_default_analysts, build_default_managers
 from agentic_trading.agents.schemas import BacktestResult
 from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystCommander
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
+from agentic_trading.backtest.preflight import check_data_availability
+from agentic_trading.config import apply_overrides, parse_override, settings
 from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
     load_price_history_with_fallback,
 )
+from agentic_trading.data.loaders.macro_loader import load_risk_free_rate_series
 
 # NOTE: adjust this import to wherever ticker_catalog.py actually lives in the
 # repo (it reads as a data/ module from its own docstring — "data/loader.py"
@@ -28,17 +31,21 @@ from agentic_trading.data.ticker_catalog import (
 )
 from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.scoring.track_record import TrackRecord
-from agentic_trading.scoring.weighting import Hedge
+from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
 
 app = typer.Typer()
 experiment_app = typer.Typer()
 
 # Every asset class CATALOG actually classifies into (see ticker_catalog.py's
-# _QUOTE_TYPE_TO_ASSET_CLASS) — options are deliberately excluded there, so
-# they're excluded here too, not an oversight.
+# AssetClass) — options are deliberately excluded there, so they're
+# excluded here too, not an oversight.
 _ASSET_CLASSES: tuple[AssetClass, ...] = ("stock", "index", "commodity", "forex", "crypto")
 
 _DATE_FORMAT_HINT = "YYYY-MM-DD"
+
+# The market benchmark `experiment()` computes final_information_ratio
+# against — independent of whatever assets the run itself trades.
+SP500_BENCHMARK_TICKER = "^GSPC"
 _DATE_EXAMPLE = "2023-01-01"
 
 
@@ -144,14 +151,6 @@ def _prompt_for_date(label: str, *, after: date | None = None) -> date:
         return parsed
 
 
-def _prompt_for_portfolio_construction() -> bool:
-    return typer.confirm(
-        "Run the optional portfolio-construction stage "
-        "(Black-Litterman + risk parity, after the Commander)?",
-        default=False,
-    )
-
-
 def _parse_date_flag(value: str, flag_name: str) -> date:
     """Validates a date string supplied via a CLI flag (not interactively) —
     fails fast with a clear message rather than silently falling through to
@@ -165,9 +164,60 @@ def _parse_date_flag(value: str, flag_name: str) -> date:
         ) from exc
 
 
+def resolve_roster_after_preflight(
+    analysts: list[AnalystAgent],
+    assets: list[str],
+    start_date: date,
+    end_date: date,
+    *,
+    auto_confirm: bool,
+) -> list[AnalystAgent]:
+    """Runs `check_data_availability` against the final roster/ticker
+    list, prints a report for anything that can't run fully with real
+    lakehouse data, and — unless `auto_confirm` — asks once (a single
+    batched prompt covering every failing analyst, not one per analyst)
+    whether to drop them and continue. Exits the process on a decline,
+    or on any failure at all when `auto_confirm` is False and the run
+    isn't interactive enough to ask (Typer's `confirm` itself handles
+    the actual prompting)."""
+    report = check_data_availability(analysts, assets, start_date, end_date)
+    if not report.failing_analyst_ids:
+        return analysts
+
+    typer.echo()
+    for analyst_id in sorted(report.failing_analyst_ids):
+        typer.echo(f"  ⚠ {report.failure_summary(analyst_id)}", err=True)
+    typer.echo()
+
+    if not auto_confirm and not typer.confirm(
+        f"{len(report.failing_analyst_ids)} analyst(s) cannot run fully with real data. "
+        "Drop them and continue?",
+        default=False,
+    ):
+        typer.echo("Aborting — no real-data-backed roster to run.", err=True)
+        raise typer.Exit(code=1)
+
+    return [analyst for analyst in analysts if analyst.agent_id in report.passing_analyst_ids]
+
+
 # --------------------------------------------------------------------------
 # Command
 # --------------------------------------------------------------------------
+
+
+def _apply_cli_overrides(tokens: list[str]) -> dict[str, str]:
+    """Parse repeated `--set group.field=value` tokens and apply them to
+    `config.settings` before any analyst/manager is built; a bad key or
+    out-of-range value is a usage error, not a silent default."""
+    overrides: dict[str, str] = {}
+    for token in tokens:
+        try:
+            key, value = parse_override(token)
+            apply_overrides({key: value})
+        except (KeyError, ValueError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        overrides[key] = value
+    return overrides
 
 
 @app.command()
@@ -193,18 +243,25 @@ def run(
     no_log: bool = typer.Option(
         False, "--no-log", help="Disable logging entirely — nothing to console or the log file."
     ),
-    portfolio_construction: bool | None = typer.Option(
-        None,
-        "--portfolio-construction/--no-portfolio-construction",
-        help="Run the optional post-Commander portfolio construction stage (risk parity by "
-        "default). Omit to be asked interactively; defaults to off in a fully "
-        "non-interactive (all-flags-given) run.",
-    ),
     parallel_workers: int = typer.Option(
         4, min=1, help="Concurrent manager-signal workers used within each simulated day."
     ),
     parallel_backend: str = typer.Option(
         "thread", help="Concurrency backend: 'thread' for APIs or 'process' for CPU-heavy runs."
+    ),
+    set_override: list[str] = typer.Option(  # noqa: B008
+        [],
+        "--set",
+        help="Override one strategy constant for this run, as group.field=value "
+        "(e.g. commander.drawdown_trip_threshold=-0.15, "
+        "pod_sizing.stat_arb_manager.leverage_cap=4.0); repeat for several. "
+        "See agentic_trading/config.py for every key.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Auto-drop analysts that fail the real-data preflight check instead of "
+        "prompting — required for scripted/CI use.",
     ),
 ) -> None:
     """Wires together Portfolio, Commander, and BacktestEngine for the
@@ -232,8 +289,8 @@ def run(
     """
     # True whenever anything essential wasn't supplied on the command line —
     # this is also what gates the portfolio-construction prompt, so a fully
-    # scripted invocation that omits --portfolio-construction gets the old
-    # silent-default-False behavior rather than an unexpected prompt.
+    # scripted invocation that omits --portfolio-construction silently
+    # defaults to False rather than prompting.
     interactive = not assets or start_date is None or end_date is None
 
     if interactive:
@@ -261,8 +318,6 @@ def run(
             f"--start-date ({parsed_start_date.isoformat()})."
         )
 
-    if portfolio_construction is None:
-        portfolio_construction = _prompt_for_portfolio_construction() if interactive else False
     if parallel_backend not in {"thread", "process"}:
         raise typer.BadParameter("--parallel-backend must be 'thread' or 'process'")
 
@@ -271,52 +326,52 @@ def run(
     typer.echo(
         f"  Date range:             {parsed_start_date.isoformat()} → {parsed_end_date.isoformat()}"
     )
-    typer.echo(f"  Portfolio construction: {'on' if portfolio_construction else 'off'}")
     typer.echo()
 
     configure_logging(verbose=verbose, disable=no_log)
+    _apply_cli_overrides(set_override)
     logger = get_logger(__name__)
 
     logger.info(
-        "CLI invoked: assets=%s, start_date=%s, end_date=%s, portfolio_construction=%s",
+        "CLI invoked: assets=%s, start_date=%s, end_date=%s",
         resolved_assets,
         parsed_start_date,
         parsed_end_date,
-        portfolio_construction,
     )
-    analysts = build_default_analysts()
+    analysts = resolve_roster_after_preflight(
+        build_default_analysts(),
+        resolved_assets,
+        parsed_start_date,
+        parsed_end_date,
+        auto_confirm=yes,
+    )
     commander = Commander(
         managers=build_default_managers(analysts),
-        weighting_strategy=Hedge(),
+        weighting_strategy=ShrinkageWeight(Hedge()),
         parallel_workers=parallel_workers,
         parallel_backend=parallel_backend,  # type: ignore[arg-type]
     )
-    # Pre-fetched once (with the same synthetic-data safety net the GUI
-    # uses — load_price_history_with_fallback) rather than passed to
-    # BacktestEngine as a lazy callable: this way the CLI can log which
-    # source_label ("live yfinance data" vs "synthetic fallback data") the
-    # run actually used, and the engine's data_loader stays a trivial
-    # pass-through.
+    # Pre-fetched once, lakehouse-only, rather than passed to
+    # BacktestEngine as a lazy callable: this way the CLI can log the
+    # source_label the run actually used, and the engine's data_loader
+    # stays a trivial pass-through.
     market_data, source_label = load_price_history_with_fallback(
         resolved_assets,
         parsed_start_date,
         parsed_end_date,
         warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
-        allow_synthetic_fallback=False,
     )
     logger.info("Market data source: %s", source_label)
     engine = BacktestEngine(
         commander=commander,
-        portfolio=Portfolio(cash=10_000.0, positions={}),
+        portfolio=Portfolio(cash=settings.firm.starting_cash, positions={}),
         track_record=TrackRecord(),
         data_loader=lambda _assets, _start, _end: market_data,
         start_date=parsed_start_date,
         end_date=parsed_end_date,
         assets=resolved_assets,
-        portfolio_constructor=PortfolioConstructor(enabled=True)
-        if portfolio_construction
-        else None,
         market_data_source=source_label,
+        execution_lag_days=settings.firm.execution_lag_days,
     )
     try:
         result = engine.run()
@@ -350,13 +405,20 @@ def experiment(
         "thread", help="Concurrency backend: 'thread' or 'process'."
     ),
     commission_rate: float = typer.Option(
-        0.0005, min=0.0, help="Commission as a fraction of traded notional."
+        settings.firm.commission_rate,
+        min=0.0,
+        help="Commission as a fraction of traded notional (default: firm.commission_rate).",
     ),
     slippage_bps: float = typer.Option(
-        5.0, min=0.0, help="Execution slippage in basis points per trade."
+        settings.firm.slippage_bps,
+        min=0.0,
+        help="Execution slippage in basis points per trade (default: firm.slippage_bps).",
     ),
     execution_lag_days: int = typer.Option(
-        1, min=0, max=1, help="Bars between signal formation and execution."
+        settings.firm.execution_lag_days,
+        min=0,
+        max=1,
+        help="Bars between signal formation and execution (default: firm.execution_lag_days).",
     ),
     calibration_checkpoint: str | None = typer.Option(
         None, help="JSON checkpoint path for calibration; add --resume to continue it."
@@ -377,6 +439,20 @@ def experiment(
         [],
         "--exclude-analyst",
         help="Analyst id to omit; repeat the option for multiple analysts.",
+    ),
+    set_override: list[str] = typer.Option(  # noqa: B008
+        [],
+        "--set",
+        help="Override one strategy constant for this run, as group.field=value "
+        "(e.g. commander.drawdown_trip_threshold=-0.15, "
+        "pod_sizing.stat_arb_manager.leverage_cap=4.0); repeat for several. "
+        "See agentic_trading/config.py for every key.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Auto-drop analysts that fail the real-data preflight check instead of "
+        "prompting — required for scripted/CI use.",
     ),
 ) -> None:
     """Run a calibration phase followed by a separate out-of-sample test phase.
@@ -399,16 +475,24 @@ def experiment(
 
     resolved_assets = [symbol.strip().upper() for symbol in assets]
     configure_logging(disable=True)
-    excluded = {analyst_id.strip() for analyst_id in exclude_analyst}
-    analysts = [analyst for analyst in build_default_analysts() if analyst.agent_id not in excluded]
+    overrides = _apply_cli_overrides(set_override)
+    excluded = frozenset(analyst_id.strip() for analyst_id in exclude_analyst)
+    analysts = build_default_analysts(excluded_analyst_ids=excluded)
     typer.echo(
         f"Loading real data for {len(resolved_assets)} assets; excluded analysts: "
         f"{', '.join(sorted(excluded)) or 'none'}",
         err=True,
     )
+    analysts = resolve_roster_after_preflight(
+        analysts,
+        resolved_assets,
+        parsed_train_start,
+        parsed_test_end,
+        auto_confirm=yes,
+    )
     commander = Commander(
         managers=build_default_managers(analysts),
-        weighting_strategy=Hedge(),
+        weighting_strategy=ShrinkageWeight(Hedge()),
         parallel_workers=parallel_workers,
         parallel_backend=parallel_backend,  # type: ignore[arg-type]
     )
@@ -417,7 +501,6 @@ def experiment(
         parsed_train_start,
         parsed_test_end,
         warmup_days=warmup_days,
-        allow_synthetic_fallback=False,
     )
     typer.echo(
         f"Market data ready: {source_label}; {len(market_data)} aligned rows. "
@@ -426,11 +509,26 @@ def experiment(
     )
     track_record = TrackRecord()
 
+    # Every Sharpe/Sortino/Information-Ratio this experiment reports (system,
+    # baselines, and any --include-isolated run) shares these two inputs, so
+    # they're loaded once here rather than per-engine: a real 3-month T-bill
+    # rate (FRED DGS3MO from the lakehouse) for excess-return Sharpe/Sortino, and an
+    # S&P 500 buy-and-hold's own daily returns as the market benchmark
+    # information_ratio is computed against.
+    risk_free_rate_series = load_risk_free_rate_series(parsed_train_start, parsed_test_end)
+    sp500_frame, _sp500_source = load_price_history_with_fallback(
+        [SP500_BENCHMARK_TICKER],
+        parsed_train_start,
+        parsed_test_end,
+        warmup_days=0,
+    )
+    benchmark_returns = sp500_frame[SP500_BENCHMARK_TICKER]["close"].dropna().pct_change().dropna()
+
     def build_engine(start: date, end: date) -> BacktestEngine:
         return BacktestEngine(
             commander=commander,
             portfolio=Portfolio(
-                cash=10_000.0,
+                cash=settings.firm.starting_cash,
                 positions={},
                 commission_rate=commission_rate,
                 slippage_bps=slippage_bps,
@@ -446,6 +544,8 @@ def experiment(
                 calibration_checkpoint if start == parsed_train_start else test_checkpoint
             ),
             resume=resume,
+            risk_free_rate_series=risk_free_rate_series,
+            benchmark_returns=benchmark_returns,
         )
 
     def run_phase(label: str, start: date, end: date) -> BacktestResult:
@@ -469,7 +569,7 @@ def experiment(
             baseline_engine = BacktestEngine(
                 commander=BaselineCommander(strategy),
                 portfolio=Portfolio(
-                    cash=10_000.0,
+                    cash=settings.firm.starting_cash,
                     positions={},
                     commission_rate=commission_rate,
                     slippage_bps=slippage_bps,
@@ -481,15 +581,17 @@ def experiment(
                 assets=resolved_assets,
                 market_data_source=source_label,
                 execution_lag_days=execution_lag_days,
+                risk_free_rate_series=risk_free_rate_series,
+                benchmark_returns=benchmark_returns,
             )
-            baseline_results[strategy] = baseline_engine.run().model_dump()
+            baseline_results[strategy] = baseline_engine.run().model_dump(mode="json")
     isolated_results: dict[str, dict[str, object]] = {}
     if include_isolated:
         for analyst in analysts:
             isolated_engine = BacktestEngine(
                 commander=SingleAnalystCommander(analyst),
                 portfolio=Portfolio(
-                    cash=10_000.0,
+                    cash=settings.firm.starting_cash,
                     positions={},
                     commission_rate=commission_rate,
                     slippage_bps=slippage_bps,
@@ -501,18 +603,22 @@ def experiment(
                 assets=resolved_assets,
                 market_data_source=source_label,
                 execution_lag_days=execution_lag_days,
+                risk_free_rate_series=risk_free_rate_series,
+                benchmark_returns=benchmark_returns,
             )
-            isolated_results[f"analyst:{analyst.agent_id}"] = isolated_engine.run().model_dump()
+            isolated_results[f"analyst:{analyst.agent_id}"] = isolated_engine.run().model_dump(
+                mode="json"
+            )
         for manager in build_default_managers(analysts):
             isolated_engine = BacktestEngine(
                 commander=Commander(
                     managers=[manager],
-                    weighting_strategy=Hedge(),
+                    weighting_strategy=ShrinkageWeight(Hedge()),
                     parallel_workers=parallel_workers,
                     parallel_backend=parallel_backend,  # type: ignore[arg-type]
                 ),
                 portfolio=Portfolio(
-                    cash=10_000.0,
+                    cash=settings.firm.starting_cash,
                     positions={},
                     commission_rate=commission_rate,
                     slippage_bps=slippage_bps,
@@ -524,8 +630,12 @@ def experiment(
                 assets=resolved_assets,
                 market_data_source=source_label,
                 execution_lag_days=execution_lag_days,
+                risk_free_rate_series=risk_free_rate_series,
+                benchmark_returns=benchmark_returns,
             )
-            isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump()
+            isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump(
+                mode="json"
+            )
     typer.echo(
         json.dumps(
             {
@@ -537,12 +647,11 @@ def experiment(
                     "test_end": parsed_test_end.isoformat(),
                     "warmup_days": warmup_days,
                     "excluded_analysts": sorted(excluded),
+                    "config_overrides": overrides,
                 },
                 "market_data_source": source_label,
-                "synthetic_market_data_used": False,
-                "calibration": calibration_result.model_dump(),
-                "training": calibration_result.model_dump(),
-                "test": test_result.model_dump(),
+                "calibration": calibration_result.model_dump(mode="json"),
+                "test": test_result.model_dump(mode="json"),
                 "baselines": baseline_results,
                 "isolated": isolated_results,
             },

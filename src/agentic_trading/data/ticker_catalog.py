@@ -2,18 +2,14 @@
 
 """Curated, extendable ticker categorization lookup.
 
-yfinance has no endpoint that enumerates "all tickers," so this module takes
-the opposite approach: a small, hand-picked seed set of tickers, each
-classified once via yfinance's own per-ticker metadata (`Ticker.info`'s
-`quoteType` field) into one of five asset classes, and stored below as a
-static table rather than re-queried from yfinance on every import or app
-start — that would make every dashboard boot slow, flaky, and rate-limit
-prone for data that essentially never changes. `CATALOG` is the source of
-truth; `classify_via_yfinance()` is a dev-time helper for extending it.
+A small, hand-picked seed set of tickers, each classified into one of
+five asset classes and stored below as a static table — `CATALOG` is the
+source of truth, and `quote_type` records the Yahoo Finance `quoteType`
+each entry was classified from. Extend it by adding a `TickerInfo` row.
 
 Options are deliberately excluded from this catalog. An option is a
 contract on an underlying ticker (a call/put with its own strike and
-expiry) — yfinance reports `quoteType == "OPTION"` for one specific
+expiry) — Yahoo Finance reports `quoteType == "OPTION"` for one specific
 contract's symbol (e.g. "AAPL250117C00150000"), not for "the options on
 AAPL" as a durable, catalogable identity the way a stock/index/commodity
 future/forex pair/crypto pair is. There is no stable ticker to classify the
@@ -31,27 +27,15 @@ from __future__ import annotations
 
 from typing import Literal
 
-import yfinance as yf
 from pydantic import BaseModel
 
 AssetClass = Literal["stock", "index", "commodity", "forex", "crypto"]
 
-# yfinance's Ticker.info["quoteType"] values, as observed for each class in
-# this catalog, mapped to our five asset classes. Any quoteType not listed
-# here (e.g. "OPTION", "MUTUALFUND") has no home in this catalog — see the
-# module docstring for why options specifically are excluded.
-_QUOTE_TYPE_TO_ASSET_CLASS: dict[str, AssetClass] = {
-    "EQUITY": "stock",
-    "INDEX": "index",
-    "FUTURE": "commodity",
-    "CURRENCY": "forex",
-    "CRYPTOCURRENCY": "crypto",
-}
-
 
 class TickerInfo(BaseModel):
-    """One catalog entry: a ticker symbol, its display name, and the asset
-    class it was classified into from yfinance's `quoteType`."""
+    """One catalog entry: a ticker symbol, its display name, the asset
+    class it belongs to, and the Yahoo Finance `quoteType` it was
+    classified from."""
 
     symbol: str
     name: str
@@ -68,9 +52,8 @@ class TickerGroup(BaseModel):
     symbols: list[str]
 
 
-# Classified from live yfinance Ticker.info lookups (quoteType field) at the
-# time this catalog was built. Re-run classify_via_yfinance() on a symbol to
-# verify or refresh its class before editing an entry below.
+# quote_type is the Yahoo Finance quoteType each symbol carried when this
+# catalog was built (EQUITY / INDEX / FUTURE / CURRENCY / CRYPTOCURRENCY).
 CATALOG: tuple[TickerInfo, ...] = (
     # --- stock (quoteType: EQUITY) ---
     TickerInfo(symbol="AAPL", name="Apple Inc.", asset_class="stock", quote_type="EQUITY"),
@@ -319,19 +302,3 @@ def get_ticker_info(symbol: str) -> TickerInfo | None:
 def tickers_by_asset_class(asset_class: AssetClass) -> list[TickerInfo]:
     """Every catalogued ticker in one asset class, in catalog order."""
     return [entry for entry in CATALOG if entry.asset_class == asset_class]
-
-
-def classify_via_yfinance(symbol: str) -> AssetClass | None:
-    """Dev-time helper for extending the catalog: looks up `symbol`'s live
-    quoteType via yfinance and maps it to an AssetClass. Returns None if the
-    lookup fails or the quoteType has no mapped class (e.g. "OPTION" — see
-    the module docstring). Not called anywhere at import time or app
-    startup; the catalog above is the static source of truth. Use this to
-    find a new symbol's class, then add a TickerInfo entry for it."""
-    try:
-        quote_type = yf.Ticker(symbol).info.get("quoteType")
-    except Exception:
-        return None
-    if quote_type is None:
-        return None
-    return _QUOTE_TYPE_TO_ASSET_CLASS.get(quote_type)

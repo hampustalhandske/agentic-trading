@@ -1,6 +1,7 @@
 # track_record.py
 
 from datetime import date, timedelta
+from typing import Literal
 
 from agentic_trading.agents.schemas import PerformanceRecord
 
@@ -26,8 +27,22 @@ class TrackRecord:
 
     @property
     def entries(self) -> list[PerformanceRecord]:
-        """Chronological storage view used by durable backtest checkpoints."""
+        """Chronological storage view used by durable backtest checkpoints.
+        Copies the full list — O(n). For an append-only checkpoint that
+        only needs *new* entries since some earlier count, use
+        `entries_since` instead, which is O(k) in the number of new
+        entries rather than O(n) in the whole history."""
         return list(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def entries_since(self, count: int) -> list[PerformanceRecord]:
+        """Every entry recorded after the first `count` — a plain list
+        slice, O(k) in the number of new entries, not O(n) in the whole
+        history. Pair with `len(track_record)` taken before a batch of
+        `record()` calls to get exactly that batch back afterward."""
+        return self._entries[count:]
 
     def restore(self, entries: list[PerformanceRecord]) -> None:
         """Replace in-memory history from a validated checkpoint payload."""
@@ -38,16 +53,21 @@ class TrackRecord:
         source_id: str,
         as_of_date: date,
         lookback_days: int,
+        source_type: Literal["analyst", "manager"] | None = None,
     ) -> list[PerformanceRecord]:
         """Returns every PerformanceRecord for `source_id` with
         as_of_date in (as_of_date - lookback_days, as_of_date], across all
-        assets."""
+        assets. `source_type` narrows the result to records of that one
+        type (a source tracked as both an analyst and a manager keeps
+        the two histories apart); None returns both."""
         lower_bound = as_of_date - timedelta(days=lookback_days)
 
         return [
             entry
             for entry in self._entries
-            if entry.source_id == source_id and lower_bound <= entry.as_of_date <= as_of_date
+            if entry.source_id == source_id
+            and lower_bound <= entry.as_of_date <= as_of_date
+            and (source_type is None or entry.source_type == source_type)
         ]
 
     def entries_for(self, source_id: str) -> list[PerformanceRecord]:

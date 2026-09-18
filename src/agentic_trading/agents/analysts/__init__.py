@@ -1,23 +1,14 @@
+from agentic_trading.agents.analysts.alt_data_pod.calendar_seasonality_analyst import (
+    CalendarSeasonalityAnalyst,
+)
 from agentic_trading.agents.analysts.alt_data_pod.insider_cluster_buying_analyst import (
     InsiderClusterBuyingAnalyst,
 )
-from agentic_trading.agents.analysts.alt_data_pod.reddit_sentiment_analyst import (
-    RedditSentimentAnalyst,
-)
-from agentic_trading.agents.analysts.alt_data_pod.retail_attention_analyst import (
-    RetailAttentionAnalyst,
-)
-from agentic_trading.agents.analysts.alt_data_pod.wikipedia_pageviews_analyst import (
-    WikipediaPageviewsAnalyst,
-)
-from agentic_trading.agents.analysts.anomaly_network_pod.calendar_seasonality_analyst import (
-    CalendarSeasonalityAnalyst,
-)
-from agentic_trading.agents.analysts.anomaly_network_pod.network_centrality_analyst import (
+from agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst import (
     LeadLagNetworkCentralityAnalyst,
 )
-from agentic_trading.agents.analysts.anomaly_network_pod.options_skew_sentiment_analyst import (
-    OptionsSkewSentimentAnalyst,
+from agentic_trading.agents.analysts.credit_pod.credit_spread_signal_analyst import (
+    CreditSpreadSignalAnalyst,
 )
 from agentic_trading.agents.analysts.cvar_pod.black_scholes_valuation_analyst import (
     BlackScholesValuationAnalyst,
@@ -31,7 +22,6 @@ from agentic_trading.agents.analysts.cvar_pod.heston_vol_surface_analyst import 
 from agentic_trading.agents.analysts.cvar_pod.monte_carlo_valuation_analyst import (
     MonteCarloValuationAnalyst,
 )
-from agentic_trading.agents.analysts.event_credit_pod.news_sentiment import NewsSentimentAnalyst
 from agentic_trading.agents.analysts.event_credit_pod.sec_fundamentals_analyst import (
     SecFundamentalsAnalyst,
 )
@@ -79,6 +69,7 @@ __all__ = [
     "BlackScholesValuationAnalyst",
     "CIRRateRegimeAnalyst",
     "CalendarSeasonalityAnalyst",
+    "CreditSpreadSignalAnalyst",
     "EGARCHAsymmetricVolAnalyst",
     "FamaFrenchFactorAnalyst",
     "FamaMacbethAnalyst",
@@ -92,16 +83,11 @@ __all__ = [
     "MacroVarSpilloverAnalyst",
     "MonteCarloValuationAnalyst",
     "NeweyWestSignificanceAnalyst",
-    "NewsSentimentAnalyst",
     "OUMeanReversionAnalyst",
-    "OptionsSkewSentimentAnalyst",
     "PairsCointegrationAnalyst",
-    "RedditSentimentAnalyst",
     "RegimeHMMAnalyst",
-    "RetailAttentionAnalyst",
     "RiskMaximizingAnalyst",
     "RiskMinimizingAnalyst",
     "SecFundamentalsAnalyst",
     "ShortInterestSqueezeAnalyst",
-    "WikipediaPageviewsAnalyst",
 ]

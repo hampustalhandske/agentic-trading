@@ -5,21 +5,44 @@ Contains the abstract base classes for all agents in the system, both analysts a
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Literal
 
 import pandas as pd
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
-from agentic_trading.agents.schemas import AgentSignal, ManagerSignal
+from agentic_trading.agents._market_math import wide_log_returns
+from agentic_trading.agents.portfolio_construction import PodView, PortfolioConstructor
+from agentic_trading.agents.schemas import AgentSignal, ManagerSignal, PortfolioDecision
 from agentic_trading.logging_config import get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.weighting import WeightingStrategy
+
+_DIRECTION_SIGN: dict[str, float] = {"long": 1.0, "short": -1.0, "flat": 0.0}
 
 logger = get_logger(__name__)
 
 # The safe fallback for any agent that fails to produce a real decision
 SAFE_FALLBACK_DIRECTION: Literal["flat"] = "flat"
 SAFE_FALLBACK_CONFIDENCE = 0.0
+
+
+def _pod_information_coefficient(
+    active: list[ManagerSignal],
+    confidence_sum: float,
+    shrunk_ic: Callable[[str], float],
+) -> float | None:
+    """Confidence-weighted mean of the contributing analysts' shrunk ICs,
+    floored at 0.0 so a pod whose analysts have been reliably wrong
+    carries no view rather than an inverted one; None with no
+    contributing signals. Signals whose confidences sum to zero fall
+    back to an unweighted mean."""
+    if not active:
+        return None
+    if confidence_sum > 0.0:
+        weighted = sum(signal.confidence * shrunk_ic(signal.source_agent_id) for signal in active)
+        return max(0.0, weighted / confidence_sum)
+    return max(0.0, sum(shrunk_ic(signal.source_agent_id) for signal in active) / len(active))
 
 
 class Agent(BaseModel, ABC):
@@ -31,8 +54,66 @@ class Agent(BaseModel, ABC):
     # Needed for concrete subclasses that will eventually hold non-Pydantic
 
 
+# Bond/credit/index ETFs traded by the Rates/Credit/Tail-Hedge pods
+# (agents/managers/rates_manager.py, credit_manager.py,
+# tail_hedge_manager.py) — plain tickers with no `=`/`-`,
+# so the naming-convention check in `is_likely_equity` alone can't catch
+# them. Hardcoded here (rather than imported from those manager modules)
+# to avoid a base.py <-> managers import cycle; small and stable enough
+# not to need a shared registry.
+_KNOWN_NON_EQUITY_TICKERS = frozenset({"SHY", "IEF", "TLT", "HYG", "LQD", "SPY"})
+
+
+def is_likely_equity(ticker: str) -> bool:
+    """True unless `ticker` uses one of this project's established
+    non-equity ticker-naming conventions — a futures/FX suffix
+    (`=F`/`=X`) or a crypto-pair suffix (`-USD` etc.) — or is one of the
+    known bond/credit ETFs that don't follow that convention but also
+    aren't an operating company with SEC financial-statement filings.
+    Not a formal asset-class classification (see `data/ticker_catalog.py`
+    for that, though its static catalog is far from exhaustive) — just
+    enough to keep an equity-only analyst or `DataRequirement` (SEC
+    filings, FINRA short interest) from firing on an asset class it was
+    never designed for, on an unscoped pod that sees every asset in the
+    run."""
+    return (
+        "=" not in ticker and "-" not in ticker and ticker.upper() not in _KNOWN_NON_EQUITY_TICKERS
+    )
+
+
+class DataRequirement(BaseModel):
+    """One real-data dependency an analyst needs beyond `market_data`
+    (guaranteed present via the backtest's own lakehouse-only price
+    load — see `backtest/preflight.py`, which checks every declared
+    requirement's real coverage against a run's tickers/date range
+    before the simulation starts).
+
+    `asset_scoped=False` means the requirement doesn't vary by ticker
+    (e.g. one FRED series every asset's analyst call shares); `True`
+    means it must be checked per run ticker, with `identifier` as a
+    `"{ticker}"` template the preflight substitutes."""
+
+    source: Literal[
+        "fred",
+        "ken_french_factors",
+        "sec_edgar_facts",
+        "finra_short_interest",
+        "sec_insider_transactions",
+    ]
+    identifier: str
+    asset_scoped: bool
+    description: str
+
+
 class AnalystAgent(Agent):
     """Layer-1 analyst agent scaffold, every concrete analyst implements this"""
+
+    # Declarative real-data dependencies beyond `market_data`. Empty for
+    # any analyst that only reads `market_data` or an already-graceful
+    # lakehouse table (price, options, dividends, COT, earnings, SIC —
+    # all `None`-on-miss with no live-API cost) — only analysts reading
+    # a source that can be genuinely missing for a given run declare one.
+    data_requirements: tuple[DataRequirement, ...] = ()
 
     @abstractmethod
     def generate_signal(
@@ -51,6 +132,28 @@ class ManagerAgent(Agent):
     managed_analysts: list[AnalystAgent]
     # The weighting strategy this manager uses to scale each analyst's signal confidence
     weighting_strategy: WeightingStrategy
+    # This pod's own risk-and-sizing engine (Bridgewater-style risk parity
+    # + volatility targeting) — every manager owns and runs one
+    # independently; the Commander never re-touches position sizing.
+    portfolio_constructor: PortfolioConstructor
+    # `None` (every existing equity pod): this manager acts on whatever
+    # asset list the Commander passes it — today, always the whole
+    # backtest's traded universe. Set to a fixed tuple for an
+    # asset-class-scoped pod (e.g. a Rates pod that should only ever
+    # price SHY/IEF/TLT even when the Commander's universe also includes
+    # equities/FX/commodities) — `construct_portfolio` then restricts
+    # itself to the intersection of that tuple and whatever assets are
+    # actually present that day, and reports every other asset flat
+    # (0.0 weight, no contributing signals) rather than pricing something
+    # this pod was never built for.
+    assets: tuple[str, ...] | None = None
+
+    # Yesterday's sized weights, fed into portfolio_constructor.construct()
+    # so it can compute this pod's own realized return (for the Kelly
+    # overlay) and apply the no-trade buffer/cost-clearance logic. Same
+    # one-instance-dict-tracking-yesterday's-weights shape Commander's own
+    # _PodReturnTracker uses one layer up.
+    _previous_weights: dict[str, float] = PrivateAttr(default_factory=dict)
 
     def collect_signals(
         self,
@@ -146,9 +249,99 @@ class ManagerAgent(Agent):
                     as_of_date=signal.as_of_date,
                     direction=signal.direction,
                     confidence=min(signal.confidence * combined, 1.0),
+                    raw_confidence=signal.confidence,
                     scale_applied=combined,
                     rationale=f"{signal.rationale} [scaled x{combined:.2f} by {self.agent_id}]",
                     status=status,
+                    source_as_of=signal.source_as_of,
+                    sample_count=signal.sample_count,
                 )
             )
         return scaled
+
+    def construct_portfolio(
+        self,
+        assets: list[str],
+        market_data: pd.DataFrame,
+        as_of_date: pd.Timestamp,
+        scoreboard: "PerformanceScoreboard",
+    ) -> list["PortfolioDecision"]:
+        """Turns this pod's own analysts' signals into a complete,
+        risk-managed set of per-asset target weights — this manager's own
+        portfolio, sized independently of every other pod via
+        `self.portfolio_constructor` (covariance-aware, within its own
+        leverage_cap). The Commander only ever combines already-sized pod
+        portfolios by capital allocation (see `commander.py`); it never
+        re-touches position sizing itself.
+
+        Each asset's `PodView` fed to `portfolio_constructor` is this pod's
+        own combined analyst opinion — direction_sign * confidence summed
+        across every active, non-flat ManagerSignal for that asset, plus
+        how many signals contributed, their total confidence, and the
+        confidence-weighted mean of the contributing analysts' shrunk
+        trailing information coefficients — left in signal units; the
+        constructor converts it to a return view.
+
+        If `self.assets` is set, only that subset of `assets` is actually
+        priced — every other asset gets a flat 0.0-weight decision with
+        no contributing signals, the same shape an insufficient-history
+        day already produces, so an asset-class-scoped pod (see
+        `self.assets`' own docstring) never runs its analysts against an
+        instrument it was never built for."""
+        scoped_assets = (
+            [asset for asset in assets if asset in self.assets]
+            if self.assets is not None
+            else assets
+        )
+
+        # Scoreboard/TrackRecord are keyed by plain `date` — same boundary
+        # conversion as `evaluate`. One shrunk IC per analyst per day,
+        # shared across every asset it signals on.
+        scoring_date = as_of_date.date()
+        analyst_ics: dict[str, float] = {}
+
+        def shrunk_ic(analyst_id: str) -> float:
+            if analyst_id not in analyst_ics:
+                analyst_ics[analyst_id] = scoreboard.shrunk_information_coefficient(
+                    analyst_id, scoring_date
+                )
+            return analyst_ics[analyst_id]
+
+        views: dict[str, PodView] = {}
+        signals_by_asset: dict[str, list[ManagerSignal]] = {}
+        for asset in scoped_assets:
+            analyst_signals = self.collect_signals(asset, market_data, as_of_date)
+            manager_signals = self.evaluate(analyst_signals, market_data, as_of_date, scoreboard)
+            signals_by_asset[asset] = manager_signals
+            active = [
+                signal
+                for signal in manager_signals
+                if signal.status == "active" and signal.direction != "flat"
+            ]
+            confidence_sum = sum(signal.confidence for signal in active)
+            views[asset] = PodView(
+                net_signal=sum(
+                    _DIRECTION_SIGN[signal.direction] * signal.confidence for signal in active
+                ),
+                signal_count=len(active),
+                confidence_sum=confidence_sum,
+                information_coefficient=_pod_information_coefficient(
+                    active, confidence_sum, shrunk_ic
+                ),
+            )
+
+        returns_history = wide_log_returns(scoped_assets, market_data)
+        sized_weights = self.portfolio_constructor.construct(
+            views, returns_history, as_of_date, self._previous_weights
+        )
+        self._previous_weights = dict(sized_weights)
+
+        return [
+            PortfolioDecision(
+                asset=asset,
+                as_of_date=as_of_date.date(),
+                target_weight=sized_weights.get(asset, 0.0),
+                contributing_signals=signals_by_asset.get(asset, []),
+            )
+            for asset in assets
+        ]

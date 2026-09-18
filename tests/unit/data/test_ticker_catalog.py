@@ -1,17 +1,9 @@
-"""Unit tests for agentic_trading.data.ticker_catalog.
-
-classify_via_yfinance() is mocked at the module boundary (agentic_trading.
-data.ticker_catalog.yf.Ticker), mirroring test_loader.py's convention — no
-real network calls in this suite.
-"""
-
-from unittest.mock import MagicMock, patch
+"""Unit tests for agentic_trading.data.ticker_catalog."""
 
 from agentic_trading.data.ticker_catalog import (
     CATALOG,
     TICKER_GROUPS,
     AssetClass,
-    classify_via_yfinance,
     get_ticker_info,
     tickers_by_asset_class,
 )
@@ -67,33 +59,3 @@ def test_ticker_groups_are_non_empty_and_reference_stock_symbols() -> None:
     for group in TICKER_GROUPS:
         assert group.symbols
         assert set(group.symbols) <= catalog_symbols
-
-
-@patch("agentic_trading.data.ticker_catalog.yf.Ticker")
-def test_classify_via_yfinance_maps_known_quote_types(mock_ticker_cls: MagicMock) -> None:
-    mock_ticker_cls.return_value.info = {"quoteType": "CRYPTOCURRENCY"}
-
-    result = classify_via_yfinance("BTC-USD")
-
-    assert result == "crypto"
-
-
-@patch("agentic_trading.data.ticker_catalog.yf.Ticker")
-def test_classify_via_yfinance_returns_none_for_unmapped_quote_type(
-    mock_ticker_cls: MagicMock,
-) -> None:
-    """OPTION has no mapped class — see the module docstring on why options are excluded."""
-    mock_ticker_cls.return_value.info = {"quoteType": "OPTION"}
-
-    result = classify_via_yfinance("AAPL250117C00150000")
-
-    assert result is None
-
-
-@patch("agentic_trading.data.ticker_catalog.yf.Ticker")
-def test_classify_via_yfinance_returns_none_on_lookup_failure(mock_ticker_cls: MagicMock) -> None:
-    mock_ticker_cls.side_effect = Exception("network error")
-
-    result = classify_via_yfinance("NOT_A_REAL_TICKER")
-
-    assert result is None

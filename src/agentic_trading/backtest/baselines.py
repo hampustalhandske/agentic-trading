@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 
+from agentic_trading.agents._market_math import single_asset_from_attrs
 from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.commander import CommanderRiskState
 from agentic_trading.agents.schemas import PortfolioDecision
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
+
+# volatility_target compares a *daily* trailing-stdev against this
+# threshold, so the threshold must itself be daily-scaled — annualizing a
+# 15%-per-year vol target via sqrt(252) gives the equivalent daily figure
+# rather than comparing a daily stdev against a raw annual number.
+_ANNUAL_VOL_TARGET = 0.15
+_TRADING_DAYS_PER_YEAR = 252
+_DAILY_VOL_TARGET = _ANNUAL_VOL_TARGET / math.sqrt(_TRADING_DAYS_PER_YEAR)
 
 
 class BaselineCommander:
@@ -16,8 +28,22 @@ class BaselineCommander:
         if strategy not in valid:
             raise ValueError(f"unsupported baseline strategy: {strategy}")
         self.strategy = strategy
+        # buy_and_hold only: True once the single initial buy has been
+        # issued, so every later `decide()` call returns no decisions at
+        # all and the engine never rebalances — the actual distinction
+        # from `equal_weight`, which *is* a daily-rebalanced constant-weight
+        # index. Returning the same fixed weight every day (the previous
+        # behavior) made the engine rebalance both strategies identically.
+        self._bought_and_held = False
 
     def close(self) -> None:
+        pass
+
+    def risk_state(self) -> CommanderRiskState:
+        """Baselines carry no pod-level risk state to checkpoint."""
+        return CommanderRiskState()
+
+    def restore_risk_state(self, state: CommanderRiskState) -> None:
         pass
 
     def decide(
@@ -25,13 +51,18 @@ class BaselineCommander:
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
         scoreboard: PerformanceScoreboard,
+        instrument_returns: dict[str, float] | None = None,
     ) -> list[PortfolioDecision]:
+        if self.strategy == "buy_and_hold" and self._bought_and_held:
+            return []
         assets = (
             list(dict.fromkeys(market_data.columns.get_level_values(0)))
             if isinstance(market_data.columns, pd.MultiIndex)
-            else [market_data.attrs.get("asset", "AAPL")]
+            else [single_asset_from_attrs(market_data)]
         )
         target_weights = self._target_weights(market_data, assets)
+        if self.strategy == "buy_and_hold":
+            self._bought_and_held = True
         return [
             PortfolioDecision(
                 asset=asset,
@@ -57,7 +88,9 @@ class BaselineCommander:
                 weights[asset] = equal_weight if float(np.mean(returns[-20:])) > 0 else 0.0
             else:
                 volatility = float(np.std(returns[-20:], ddof=1))
-                weights[asset] = min(equal_weight, equal_weight * 0.15 / max(volatility, 1e-8))
+                weights[asset] = min(
+                    equal_weight, equal_weight * _DAILY_VOL_TARGET / max(volatility, 1e-8)
+                )
         return weights
 
     @staticmethod
@@ -78,11 +111,18 @@ class SingleAnalystCommander:
     def close(self) -> None:
         pass
 
-    def decide(self, market_data, as_of_date, scoreboard):
+    def risk_state(self) -> CommanderRiskState:
+        """An isolated single-analyst run carries no pod-level risk state."""
+        return CommanderRiskState()
+
+    def restore_risk_state(self, state: CommanderRiskState) -> None:
+        pass
+
+    def decide(self, market_data, as_of_date, scoreboard, instrument_returns=None):
         assets = (
             list(dict.fromkeys(market_data.columns.get_level_values(0)))
             if isinstance(market_data.columns, pd.MultiIndex)
-            else [market_data.attrs.get("asset", "AAPL")]
+            else [single_asset_from_attrs(market_data)]
         )
         decisions = []
         for asset in assets:

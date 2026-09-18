@@ -13,7 +13,11 @@ import pytest
 from quantcore.performance.metrics import calmar_ratio, sortino_ratio
 
 from agentic_trading.agents.schemas import PerformanceRecord
-from agentic_trading.scoring.scoreboard import PerformanceScoreboard
+from agentic_trading.config import settings
+from agentic_trading.scoring.scoreboard import (
+    PerformanceScoreboard,
+    shrink_information_coefficient,
+)
 from agentic_trading.scoring.track_record import TrackRecord
 
 TRADING_DAYS_PER_YEAR = 252
@@ -26,6 +30,7 @@ def _record(source_id: str, as_of_date: date, attributable_return: float) -> Per
         asset="AAPL",
         as_of_date=as_of_date,
         attributable_return=attributable_return,
+        raw_attributable_return=attributable_return,
     )
 
 
@@ -159,3 +164,119 @@ def test_summary_matches_direct_calls_for_every_known_source_id_up_to_as_of_date
             "cumulative_return": scoreboard.cumulative_return(source_id, day3, full_lookback),
         }
         assert metrics == pytest.approx(expected)
+
+
+def _ic_record(
+    source_id: str,
+    as_of_date: date,
+    signal_score: float,
+    realized_return: float,
+    source_type: str = "analyst",
+) -> PerformanceRecord:
+    return PerformanceRecord(
+        source_id=source_id,
+        source_type=source_type,  # type: ignore[arg-type]
+        asset="AAPL",
+        as_of_date=as_of_date,
+        attributable_return=signal_score * realized_return,
+        raw_attributable_return=signal_score * realized_return,
+        signal_score=signal_score,
+        realized_return=realized_return,
+    )
+
+
+def _seed_ic(
+    scores: list[float], realized: list[float], source_type: str = "analyst"
+) -> tuple[PerformanceScoreboard, date]:
+    start = date(2024, 1, 1)
+    track_record = TrackRecord()
+    for offset, (score, ret) in enumerate(zip(scores, realized, strict=True)):
+        track_record.record(
+            _ic_record("analyst-a", start + timedelta(days=offset), score, ret, source_type)
+        )
+    return PerformanceScoreboard(track_record), start + timedelta(days=len(scores) - 1)
+
+
+def test_information_coefficient_is_pearson_correlation_of_score_and_realized() -> None:
+    rng = np.random.default_rng(1)
+    scores = rng.normal(size=40).tolist()
+    realized = [
+        0.3 * s + float(noise) for s, noise in zip(scores, rng.normal(size=40), strict=True)
+    ]
+    scoreboard, as_of = _seed_ic(scores, realized)
+
+    result = scoreboard.information_coefficient("analyst-a", as_of, lookback_days=60)
+
+    assert result == pytest.approx(float(np.corrcoef(scores, realized)[0, 1]))
+
+
+def test_information_coefficient_is_none_below_twenty_records() -> None:
+    scores = [float(i) for i in range(19)]
+    scoreboard, as_of = _seed_ic(scores, scores)
+
+    assert scoreboard.information_coefficient("analyst-a", as_of, lookback_days=60) is None
+
+
+def test_information_coefficient_is_none_with_zero_variance() -> None:
+    scores = [0.5] * 25
+    realized = [float(i) for i in range(25)]
+    scoreboard, as_of = _seed_ic(scores, realized)
+
+    assert scoreboard.information_coefficient("analyst-a", as_of, lookback_days=60) is None
+
+
+def test_information_coefficient_ignores_manager_level_records() -> None:
+    scores = [float(i) for i in range(25)]
+    scoreboard, as_of = _seed_ic(scores, scores, source_type="manager")
+
+    assert scoreboard.information_coefficient("analyst-a", as_of, lookback_days=60) is None
+
+
+def test_information_coefficient_respects_the_lookback_window() -> None:
+    scores = [float(i) for i in range(30)]
+    scoreboard, as_of = _seed_ic(scores, scores)
+
+    # Only 10 of the 30 records fall inside a 9-day window.
+    assert scoreboard.information_coefficient("analyst-a", as_of, lookback_days=9) is None
+    assert scoreboard.information_coefficient("analyst-a", as_of, lookback_days=60) == (
+        pytest.approx(1.0)
+    )
+
+
+def test_shrink_information_coefficient_blends_toward_the_prior() -> None:
+    cfg = settings.portfolio
+    n = 40
+    measured = 0.10
+    expected = (n * measured + cfg.ic_shrinkage_observations * cfg.information_coefficient) / (
+        n + cfg.ic_shrinkage_observations
+    )
+
+    assert shrink_information_coefficient(measured, n) == pytest.approx(expected)
+
+
+def test_shrink_information_coefficient_returns_prior_when_unmeasurable() -> None:
+    assert shrink_information_coefficient(None, 0) == settings.portfolio.information_coefficient
+    assert shrink_information_coefficient(None, 500) == settings.portfolio.information_coefficient
+
+
+def test_shrink_information_coefficient_clips_to_max_measured_ic() -> None:
+    cap = settings.portfolio.max_measured_ic
+
+    assert shrink_information_coefficient(1.0, 100_000) == pytest.approx(cap)
+    assert shrink_information_coefficient(-1.0, 100_000) == pytest.approx(-cap)
+
+
+def test_shrink_information_coefficient_lets_a_negative_measurement_pull_below_prior() -> None:
+    prior = settings.portfolio.information_coefficient
+
+    assert shrink_information_coefficient(-0.2, 60) < prior
+
+
+def test_shrunk_information_coefficient_uses_configured_lookback_and_prior() -> None:
+    scores = [float(i) for i in range(30)]
+    scoreboard, as_of = _seed_ic(scores, scores)
+
+    result = scoreboard.shrunk_information_coefficient("analyst-a", as_of)
+
+    assert result == pytest.approx(shrink_information_coefficient(1.0, 30))
+    assert result <= settings.portfolio.max_measured_ic

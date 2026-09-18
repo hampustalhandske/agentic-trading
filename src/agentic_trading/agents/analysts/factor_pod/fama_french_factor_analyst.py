@@ -1,5 +1,6 @@
 # fama_french_factor_analyst.py
 
+import math
 from typing import Literal
 
 import numpy as np
@@ -7,28 +8,59 @@ import pandas as pd
 from quantcore.statistics.regression import factor_loadings
 
 from agentic_trading.agents._market_math import clamp, market_slice
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
-from agentic_trading.data.loaders.factor_loader import load_fama_french_factors
+from agentic_trading.config import settings
+from agentic_trading.data.loaders.lakehouse_loader import load_fama_french_factors_from_lakehouse
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-RECENT_FACTOR_WINDOW = 21
-T_STAT_CONFIDENCE_SCALE = 4.0
+TRADING_DAYS_PER_MONTH = 21
+# A trailing year gives 3-5 loadings enough degrees of freedom for
+# standard errors around 0.1; the last month is dropped from the momentum
+# leg (12-1) to avoid short-term reversal.
+MIN_REGRESSION_OBSERVATIONS = 120
+MOMENTUM_LOOKBACK_DAYS = 252
+MOMENTUM_SKIP_DAYS = 21
+# Confidence cap so one factor view never dominates a pod on its own.
+MAX_CONFIDENCE = 0.8
+
+
+def _expected_factor_premia(factor_returns: pd.DataFrame) -> np.ndarray:
+    """Daily expected premium per factor: half 12-1-month factor momentum
+    (mean over days [-252, -21)), half the unconditional full-history
+    mean — momentum shrunk toward the long-run premium."""
+    history = factor_returns.to_numpy(dtype=np.float64)
+    unconditional = history.mean(axis=0)
+    momentum_window = history[-MOMENTUM_LOOKBACK_DAYS:-MOMENTUM_SKIP_DAYS]
+    momentum = momentum_window.mean(axis=0) if len(momentum_window) else unconditional
+    return np.asarray(0.5 * momentum + 0.5 * unconditional)
 
 
 class FamaFrenchFactorAnalyst(AnalystAgent):
-    """Regresses the asset's trailing excess returns on Fama-French factors
-    and signals from whether the asset's tilt toward the strongest recent
-    factor is positive and statistically significant. `confidence` is set
-    from the loading's Newey-West t-stat per the convention this pod's
-    manager (`FactorManager`) relies on: `clamp(abs(t_stat) / 4.0)`."""
+    """Expected return from factor exposures: regresses the asset's
+    trailing-year excess returns on the Fama-French factors, keeps only
+    loadings with a Newey-West |t| at or above
+    `settings.analysts.t_stat_threshold`, and multiplies them by each
+    factor's expected premium — half its 12-1-month momentum (Ehsani &
+    Linnainmaa), half its full-history mean. The monthly expected return
+    over the asset's own monthly vol is the signal: its sign is the
+    direction once above `factor_zscore_flat`, and confidence scales to
+    `factor_zscore_full` (an information-ratio-style ratio, so it does
+    not saturate the way a t-stat does)."""
 
     agent_id: str = "fama_french_factor_analyst"
 
     model: str = "3factor"
-    _risk_window: int = 120
+    data_requirements: tuple[DataRequirement, ...] = (
+        DataRequirement(
+            source="ken_french_factors",
+            identifier="3factor",
+            asset_scoped=False,
+            description="Ken French 3-factor returns",
+        ),
+    )
 
     def generate_signal(
         self,
@@ -36,23 +68,24 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        returns = market_slice(market_data, as_of_date, asset).log_returns[-self._risk_window :]
-        try:
-            factors = load_fama_french_factors(as_of_date, model=self.model)
-        except Exception as exc:
-            logger.debug("%s: factor download failed (%s) — returning flat.", self.agent_id, exc)
+        returns = market_slice(market_data, as_of_date, asset).log_returns[
+            -settings.analysts.risk_window_long :
+        ]
+        factors = load_fama_french_factors_from_lakehouse(as_of_date.date(), model=self.model)
+        if factors is None:
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
                 as_of_date=as_of_date.date(),
                 direction="flat",
                 confidence=0.0,
-                rationale="Fama-French factor download failed",
+                rationale="no Ken French factor coverage in the lakehouse",
+                status="unavailable",
             )
 
         factor_columns = [column for column in factors.columns if column != "RF"]
         length = min(returns.size, len(factors))
-        if length < 30:
+        if length < MIN_REGRESSION_OBSERVATIONS:
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
@@ -60,28 +93,45 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
                 direction="flat",
                 confidence=0.0,
                 rationale="insufficient overlapping history for a factor regression",
+                status="unavailable",
             )
 
         aligned_factors = factors.iloc[-length:]
         excess_returns = returns[-length:] - aligned_factors["RF"].to_numpy(dtype=np.float64)
         factor_matrix = aligned_factors[factor_columns].to_numpy(dtype=np.float64)
 
-        betas, t_stats = factor_loadings(excess_returns, factor_matrix)
-
-        recent_factor_returns = aligned_factors[factor_columns].iloc[-RECENT_FACTOR_WINDOW:].sum()
-        strongest_factor_index = int(np.argmax(np.abs(recent_factor_returns.to_numpy())))
-        strongest_beta = float(betas[strongest_factor_index])
-        strongest_t_stat = float(t_stats[strongest_factor_index])
-        strongest_factor_name = factor_columns[strongest_factor_index]
-        recent_factor_sign = (
-            1.0 if recent_factor_returns.iloc[strongest_factor_index] >= 0 else -1.0
+        # quantcore returns the intercept (alpha) first, then one loading
+        # per factor column — drop the intercept so positions line up with
+        # `factor_columns`, then gate each loading on its own significance.
+        loadings, loading_t_stats = factor_loadings(excess_returns, factor_matrix)
+        betas = np.where(
+            np.abs(loading_t_stats[1:]) >= settings.analysts.t_stat_threshold, loadings[1:], 0.0
         )
+        if not np.any(betas):
+            return AgentSignal(
+                agent_id=self.agent_id,
+                asset=asset,
+                as_of_date=as_of_date.date(),
+                direction="flat",
+                confidence=0.0,
+                rationale="no factor loading is statistically significant",
+            )
+
+        premia = _expected_factor_premia(factors[factor_columns])
+        monthly_alpha = TRADING_DAYS_PER_MONTH * float(np.dot(betas, premia))
+        monthly_vol = float(np.std(excess_returns, ddof=1)) * math.sqrt(TRADING_DAYS_PER_MONTH)
+        z_score = monthly_alpha / max(monthly_vol, 1e-12)
 
         direction: Literal["long", "short", "flat"] = "flat"
-        confidence = clamp(abs(strongest_t_stat) / T_STAT_CONFIDENCE_SCALE)
-        if confidence > 0.0:
-            direction = "long" if (strongest_beta * recent_factor_sign) >= 0 else "short"
-
+        confidence = 0.0
+        if abs(z_score) >= settings.analysts.factor_zscore_flat:
+            direction = "long" if z_score > 0.0 else "short"
+            confidence = clamp(
+                abs(z_score) / settings.analysts.factor_zscore_full, 0.0, MAX_CONFIDENCE
+            )
+        loadings_text = ", ".join(
+            f"{name}={beta:.2f}" for name, beta in zip(factor_columns, betas, strict=True)
+        )
         return AgentSignal(
             agent_id=self.agent_id,
             asset=asset,
@@ -89,7 +139,7 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
             direction=direction,
             confidence=confidence,
             rationale=(
-                f"tilt toward {strongest_factor_name}: beta={strongest_beta:.3f}, "
-                f"t={strongest_t_stat:.2f}"
+                f"factor expected return {monthly_alpha:.4f}/month vs vol {monthly_vol:.4f} "
+                f"(z={z_score:.3f}; significant loadings: {loadings_text})"
             ),
         )

@@ -1,12 +1,15 @@
 """Unit tests for agentic_trading.data.point_in_time.
 
-No mocking needed here — `get_point_in_time_data` operates purely on
-in-memory pandas DataFrames.
+No mocking needed here — both functions operate purely on in-memory
+pandas objects.
 """
 
-import pandas as pd
+from datetime import date
 
-from agentic_trading.data.point_in_time import get_point_in_time_data
+import pandas as pd
+import pytest
+
+from agentic_trading.data.point_in_time import assert_point_in_time, get_point_in_time_data
 
 
 def _sample_data() -> pd.DataFrame:
@@ -50,3 +53,79 @@ def test_as_of_date_before_all_data_returns_empty_result() -> None:
 
     assert result.empty
     assert isinstance(result, pd.DataFrame)
+
+
+def test_assert_point_in_time_passes_on_in_window_dataframe_column() -> None:
+    """A DataFrame whose date column stays within as_of_date is a no-op."""
+    frame = pd.DataFrame(
+        {"filed_date": pd.to_datetime(["2024-01-02", "2024-01-05"]), "value": [1.0, 2.0]}
+    )
+
+    assert_point_in_time(frame, date(2024, 1, 5), date_column="filed_date")
+
+
+def test_assert_point_in_time_raises_on_out_of_window_dataframe_column() -> None:
+    """A row after as_of_date in the named column raises, naming both dates."""
+    frame = pd.DataFrame(
+        {"filed_date": pd.to_datetime(["2024-01-02", "2024-01-08"]), "value": [1.0, 2.0]}
+    )
+
+    with pytest.raises(ValueError, match="2024-01-08") as excinfo:
+        assert_point_in_time(frame, date(2024, 1, 5), date_column="filed_date")
+    assert "2024-01-05" in str(excinfo.value)
+
+
+def test_assert_point_in_time_raises_on_out_of_window_index() -> None:
+    """No date_column given checks the index instead."""
+    series = pd.Series([1.0, 2.0], index=pd.to_datetime(["2024-01-02", "2024-01-08"]))
+
+    with pytest.raises(ValueError, match="2024-01-08"):
+        assert_point_in_time(series, date(2024, 1, 5))
+
+
+def test_assert_point_in_time_passes_on_in_window_series_index() -> None:
+    """A Series whose index stays within as_of_date is a no-op."""
+    series = pd.Series([1.0, 2.0], index=pd.to_datetime(["2024-01-02", "2024-01-05"]))
+
+    assert_point_in_time(series, date(2024, 1, 5))
+
+
+def test_assert_point_in_time_coerces_string_dtype_column() -> None:
+    """A date column stored as plain strings (not yet datetime64) is coerced before checking."""
+    frame = pd.DataFrame({"dissemination_date": ["2024-01-02", "2024-01-08"], "value": [1.0, 2.0]})
+
+    with pytest.raises(ValueError, match="2024-01-08"):
+        assert_point_in_time(frame, date(2024, 1, 5), date_column="dissemination_date")
+
+
+def test_assert_point_in_time_is_noop_on_none() -> None:
+    """Many loaders return None on no coverage — that's a valid, non-violating result."""
+    assert_point_in_time(None, date(2024, 1, 5))
+
+
+def test_assert_point_in_time_is_noop_on_list_of_tickers() -> None:
+    """load_sp500_constituents_asof returns tickers, not dates — nothing to check."""
+    assert_point_in_time(["AAPL", "MSFT"], date(2024, 1, 5))
+
+
+def test_assert_point_in_time_is_noop_on_empty_dataframe() -> None:
+    """An empty frame/series has no offending rows by construction."""
+    frame = pd.DataFrame({"filed_date": pd.to_datetime([]), "value": []})
+
+    assert_point_in_time(frame, date(2024, 1, 5), date_column="filed_date")
+
+
+def test_assert_point_in_time_message_lists_at_most_three_offending_dates() -> None:
+    """Many violating rows still produce a short, readable message naming only the first three."""
+    frame = pd.DataFrame(
+        {"filed_date": pd.to_datetime(["2024-01-06", "2024-01-07", "2024-01-08", "2024-01-09"])}
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        assert_point_in_time(frame, date(2024, 1, 5), date_column="filed_date")
+
+    message = str(excinfo.value)
+    assert "2024-01-06" in message
+    assert "2024-01-07" in message
+    assert "2024-01-08" in message
+    assert "2024-01-09" not in message

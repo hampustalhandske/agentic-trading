@@ -1,7 +1,6 @@
 from agentic_trading.agents.base import ManagerAgent
 from agentic_trading.agents.managers import (
     AltDataManager,
-    AnomalyNetworkManager,
     ConditionalValueAtRiskManager,
     CVaRManager,
     EventCreditManager,
@@ -10,6 +9,7 @@ from agentic_trading.agents.managers import (
     RiskManager,
     StatArbManager,
 )
+from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.scoring.weighting import Hedge
 
 ALL_MANAGER_CLASSES = (
@@ -21,7 +21,6 @@ ALL_MANAGER_CLASSES = (
     FactorManager,
     EventCreditManager,
     AltDataManager,
-    AnomalyNetworkManager,
 )
 
 
@@ -34,12 +33,15 @@ def test_managers_imports() -> None:
     assert FactorManager.__name__ == "FactorManager"
     assert EventCreditManager.__name__ == "EventCreditManager"
     assert AltDataManager.__name__ == "AltDataManager"
-    assert AnomalyNetworkManager.__name__ == "AnomalyNetworkManager"
 
 
 def test_managers_can_be_constructed_with_defaults() -> None:
     for manager_cls in ALL_MANAGER_CLASSES:
-        instance = manager_cls(managed_analysts=[], weighting_strategy=Hedge())
+        instance = manager_cls(
+            managed_analysts=[],
+            weighting_strategy=Hedge(),
+            portfolio_constructor=PortfolioConstructor(),
+        )
         assert isinstance(instance.agent_id, str) and instance.agent_id
 
 

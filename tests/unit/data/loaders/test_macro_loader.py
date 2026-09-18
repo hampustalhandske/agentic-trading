@@ -1,52 +1,71 @@
+"""Unit tests for agentic_trading.data.loaders.macro_loader.
+
+The lakehouse query is mocked at the module boundary
+(`agentic_trading.data.loaders.macro_loader.load_fred_series_from_lakehouse`)
+— no DuckDB/parquet access in this suite.
+"""
+
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
-from agentic_trading.data.loaders.macro_loader import DGS3MO, load_fred_series
+from agentic_trading.data.loaders.macro_loader import (
+    DGS3MO,
+    TRADING_DAYS_PER_YEAR,
+    load_risk_free_rate_series,
+)
 
 
-@patch("agentic_trading.data.loaders.macro_loader.require_env", return_value="fake-key")
-@patch("agentic_trading.data.loaders.macro_loader.Fred")
-def test_load_fred_series_passes_realtime_end_for_point_in_time(
-    mock_fred_cls: MagicMock, mock_require_env: MagicMock, tmp_path, monkeypatch
+@patch("agentic_trading.data.loaders.macro_loader.load_fred_series_from_lakehouse")
+def test_risk_free_rate_series_is_a_calendar_indexed_decimal_daily_rate(
+    mock_load: MagicMock,
 ) -> None:
-    """realtime_start is pinned to the same date as realtime_end — leaving
-    it at fredapi's default (1776-07-04) exceeds FRED's 2000-vintage cap
-    for a daily series, and a single-vintage query is also the correct
-    point-in-time semantics: the value as it was known as of as_of_date."""
-    monkeypatch.setattr("agentic_trading.data.cache.CACHE_ROOT", tmp_path)
-    mock_fred = mock_fred_cls.return_value
-    mock_fred.get_series.return_value = pd.Series([5.0, 5.1])
+    """A 5.04% annualized T-bill quote becomes `0.0504 / 252` per day,
+    reindexed onto every calendar day of the window with weekends and
+    holidays forward-filled from the last published observation."""
+    published = pd.bdate_range("2024-06-03", "2024-06-07")
+    mock_load.return_value = pd.Series([5.04] * len(published), index=published)
 
-    as_of_date = pd.Timestamp("2024-06-01")
-    load_fred_series(DGS3MO, as_of_date)
+    result = load_risk_free_rate_series(date(2024, 6, 3), date(2024, 6, 9))
 
-    mock_fred.get_series.assert_called_once_with(
-        DGS3MO, realtime_start=as_of_date.date(), realtime_end=as_of_date.date()
-    )
+    mock_load.assert_called_once_with(DGS3MO, date(2024, 6, 9))
+    expected_calendar = pd.date_range("2024-06-03", "2024-06-09", freq="D")
+    assert result.index.equals(expected_calendar)
+    assert not result.isna().any()
+    assert result.iloc[0] == pytest.approx(5.04 / 100.0 / TRADING_DAYS_PER_YEAR)
+    assert result.loc["2024-06-08"] == pytest.approx(result.loc["2024-06-07"])
 
 
-@patch("agentic_trading.data.loaders.macro_loader.require_env", return_value="fake-key")
-@patch("agentic_trading.data.loaders.macro_loader.Fred")
-def test_load_fred_series_is_cached_and_does_not_refetch(
-    mock_fred_cls: MagicMock, mock_require_env: MagicMock, tmp_path, monkeypatch
+@patch("agentic_trading.data.loaders.macro_loader.load_fred_series_from_lakehouse")
+def test_risk_free_rate_series_backfills_a_window_starting_before_the_first_observation(
+    mock_load: MagicMock,
 ) -> None:
-    """A second call for the same (series, as_of_date) must hit the cache,
-    not re-query FRED — this is what keeps a backtest re-run from re-hitting
-    the FRED API on every simulated day."""
-    monkeypatch.setattr("agentic_trading.data.cache.CACHE_ROOT", tmp_path)
-    mock_fred = mock_fred_cls.return_value
-    mock_fred.get_series.return_value = pd.Series([5.0, 5.1])
+    published = pd.bdate_range("2024-06-05", "2024-06-07")
+    mock_load.return_value = pd.Series([4.0, 4.5, 5.0], index=published)
 
-    as_of_date = pd.Timestamp("2024-06-01")
-    load_fred_series(DGS3MO, as_of_date)
-    load_fred_series(DGS3MO, as_of_date)
+    result = load_risk_free_rate_series(date(2024, 6, 3), date(2024, 6, 7))
 
-    mock_fred.get_series.assert_called_once()
+    assert result.loc["2024-06-03"] == pytest.approx(4.0 / 100.0 / TRADING_DAYS_PER_YEAR)
+    assert result.loc["2024-06-07"] == pytest.approx(5.0 / 100.0 / TRADING_DAYS_PER_YEAR)
 
 
-@patch("agentic_trading.data.loaders.macro_loader.require_env", return_value="fake-key")
-def test_unsupported_series_raises_value_error(mock_require_env: MagicMock) -> None:
-    with pytest.raises(ValueError):
-        load_fred_series("NOT_A_SERIES", pd.Timestamp("2024-06-01"))
+@patch("agentic_trading.data.loaders.macro_loader.load_fred_series_from_lakehouse")
+def test_risk_free_rate_series_raises_when_lakehouse_has_no_dgs3mo(
+    mock_load: MagicMock,
+) -> None:
+    mock_load.return_value = None
+
+    with pytest.raises(ValueError, match=DGS3MO):
+        load_risk_free_rate_series(date(2024, 6, 3), date(2024, 6, 7))
+
+
+@patch("agentic_trading.data.loaders.macro_loader.load_fred_series_from_lakehouse")
+def test_risk_free_rate_series_raises_when_lakehouse_series_is_empty(
+    mock_load: MagicMock,
+) -> None:
+    mock_load.return_value = pd.Series(dtype="float64")
+
+    with pytest.raises(ValueError, match=DGS3MO):
+        load_risk_free_rate_series(date(2024, 6, 3), date(2024, 6, 7))

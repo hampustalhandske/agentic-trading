@@ -21,6 +21,7 @@ def _record(
         asset=asset,
         as_of_date=as_of_date,
         attributable_return=attributable_return,
+        raw_attributable_return=attributable_return,
     )
 
 
@@ -137,3 +138,25 @@ def test_entries_for_excludes_other_sources_and_handles_unrecorded_source() -> N
 
     assert [e.source_id for e in track_record.entries_for("analyst-a")] == ["analyst-a"]
     assert track_record.entries_for("analyst-never-seen") == []
+
+
+def test_history_for_filters_by_source_type_when_given() -> None:
+    track_record = TrackRecord()
+    as_of_date = date(2024, 1, 10)
+    track_record.record(_record("source-a", as_of_date))
+    track_record.record(
+        PerformanceRecord(
+            source_id="source-a",
+            source_type="manager",
+            asset="AAPL",
+            as_of_date=as_of_date,
+            attributable_return=0.0,
+            raw_attributable_return=0.0,
+        )
+    )
+
+    assert len(track_record.history_for("source-a", as_of_date, 5)) == 2
+    analysts = track_record.history_for("source-a", as_of_date, 5, source_type="analyst")
+    managers = track_record.history_for("source-a", as_of_date, 5, source_type="manager")
+    assert [entry.source_type for entry in analysts] == ["analyst"]
+    assert [entry.source_type for entry in managers] == ["manager"]

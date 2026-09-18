@@ -98,7 +98,12 @@ CLAUDE.md
 log/
 
 # agentic_trading on-disk data cache (see src/agentic_trading/data/cache.py)
-src/agentic_trading/data/.cache/
+
+# agentic_trading experiment/backtest run outputs (large, regenerable)
+results/
+
+# Scratch notes / handoff docs, not project artifacts
+/temp/
 
 # Mac
 .DS_Store

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
-from typing import cast
+from pathlib import Path
+from typing import Any, cast
 
 import altair as alt
 import numpy as np
@@ -14,7 +16,6 @@ from agentic_trading.agents.base import AnalystAgent, ManagerAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.managers import (
     AltDataManager,
-    AnomalyNetworkManager,
     CVaRManager,
     EventCreditManager,
     FactorManager,
@@ -25,11 +26,13 @@ from agentic_trading.agents.managers import (
 from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.roster import (
     ALT_DATA_MANAGER_ANALYST_IDS,
-    ANOMALY_NETWORK_MANAGER_ANALYST_IDS,
+    CREDIT_MANAGER_ANALYST_IDS,
+    CROSS_ASSET_MANAGER_ANALYST_IDS,
     CVAR_MANAGER_ANALYST_IDS,
     EVENT_CREDIT_MANAGER_ANALYST_IDS,
     FACTOR_MANAGER_ANALYST_IDS,
     MACRO_RATES_MANAGER_ANALYST_IDS,
+    RATES_MANAGER_ANALYST_IDS,
     RISK_MANAGER_ANALYST_IDS,
     STAT_ARB_MANAGER_ANALYST_IDS,
     build_default_analysts,
@@ -43,8 +46,8 @@ from agentic_trading.agents.schemas import (
 )
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
-from agentic_trading.data.cache import CACHE_ROOT
-from agentic_trading.data.db import read_fetch_log
+from agentic_trading.backtest.run_summary import extract_run_summary
+from agentic_trading.config import settings
 from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
     load_price_history_with_fallback,
@@ -53,7 +56,7 @@ from agentic_trading.data.ticker_catalog import TICKER_GROUPS, TickerGroup, tick
 from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.track_record import TrackRecord
-from agentic_trading.scoring.weighting import Hedge
+from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
 
 # Hardcoded rather than get_logger(__name__): Streamlit execs this file
 # directly, so __name__ is "__main__" here, not "agentic_trading.gui.dashboard".
@@ -82,7 +85,6 @@ class DeskRun:
     backtest_result: BacktestResult
     track_record: TrackRecord
     scoreboard: PerformanceScoreboard
-    portfolio_construction_method: str | None = None
     sp500_benchmark: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     basket_benchmark: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
 
@@ -173,36 +175,6 @@ def _inject_styles() -> None:
                 background: rgba(239, 68, 68, 0.12);
                 border-color: rgba(239, 68, 68, 0.55);
             }
-
-            .status-pill {
-                display: inline-block;
-                border-radius: 999px;
-                padding: 0.15rem 0.6rem;
-                margin: 0.15rem 0.3rem 0.15rem 0;
-                font-size: 0.76rem;
-                font-weight: 600;
-                border: 1px solid rgba(148, 163, 184, 0.3);
-            }
-            .status-pill-live {
-                background: rgba(34, 197, 94, 0.14);
-                color: #4ade80;
-                border-color: rgba(34, 197, 94, 0.4);
-            }
-            .status-pill-cached {
-                background: rgba(59, 130, 246, 0.14);
-                color: #60a5fa;
-                border-color: rgba(59, 130, 246, 0.4);
-            }
-            .status-pill-fallback {
-                background: rgba(234, 179, 8, 0.14);
-                color: #facc15;
-                border-color: rgba(234, 179, 8, 0.4);
-            }
-            .status-pill-unused {
-                background: rgba(100, 116, 139, 0.10);
-                color: #94a3b8;
-                border-color: rgba(100, 116, 139, 0.3);
-            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -223,36 +195,60 @@ _SINGLE_POD_MANAGERS: dict[
     str, tuple[Callable[[list[AnalystAgent]], ManagerAgent], frozenset[str]]
 ] = {
     "Risk Manager": (
-        lambda owned: RiskManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        lambda owned: RiskManager(
+            managed_analysts=owned,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            portfolio_constructor=PortfolioConstructor(),
+        ),
         RISK_MANAGER_ANALYST_IDS,
     ),
     "CVaR Manager": (
-        lambda owned: CVaRManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        lambda owned: CVaRManager(
+            managed_analysts=owned,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            portfolio_constructor=PortfolioConstructor(),
+        ),
         CVAR_MANAGER_ANALYST_IDS,
     ),
     "StatArb Manager": (
-        lambda owned: StatArbManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        lambda owned: StatArbManager(
+            managed_analysts=owned,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            portfolio_constructor=PortfolioConstructor(),
+        ),
         STAT_ARB_MANAGER_ANALYST_IDS,
     ),
     "Macro/Rates Manager": (
-        lambda owned: MacroRatesManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        lambda owned: MacroRatesManager(
+            managed_analysts=owned,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            portfolio_constructor=PortfolioConstructor(),
+        ),
         MACRO_RATES_MANAGER_ANALYST_IDS,
     ),
     "Factor Manager": (
-        lambda owned: FactorManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        lambda owned: FactorManager(
+            managed_analysts=owned,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            portfolio_constructor=PortfolioConstructor(),
+        ),
         FACTOR_MANAGER_ANALYST_IDS,
     ),
     "Event/Credit Manager": (
-        lambda owned: EventCreditManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        lambda owned: EventCreditManager(
+            managed_analysts=owned,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            portfolio_constructor=PortfolioConstructor(),
+        ),
         EVENT_CREDIT_MANAGER_ANALYST_IDS,
     ),
     "Alt-Data Manager": (
-        lambda owned: AltDataManager(managed_analysts=owned, weighting_strategy=Hedge()),
+        lambda owned: AltDataManager(
+            managed_analysts=owned,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            portfolio_constructor=PortfolioConstructor(),
+        ),
         ALT_DATA_MANAGER_ANALYST_IDS,
-    ),
-    "Anomaly/Network Manager": (
-        lambda owned: AnomalyNetworkManager(managed_analysts=owned, weighting_strategy=Hedge()),
-        ANOMALY_NETWORK_MANAGER_ANALYST_IDS,
     ),
 }
 MANAGER_MODES: tuple[str, ...] = (*_SINGLE_POD_MANAGERS, ALL_PODS_MODE)
@@ -277,20 +273,14 @@ def _load_basket_data(
     start: date,
     end: date,
     warmup_days: int = 0,
-    allow_synthetic_fallback: bool = True,
 ) -> tuple[pd.DataFrame, str]:
     """Thin wrapper around the shared `data.loader.load_price_history_with_fallback`
-    — the exact same function the CLI uses, so both front ends fall back to
-    synthetic data (and log the same WARNING) identically on a live-data
-    failure. Deliberately uncached: every run fetches fresh from yfinance for
-    whatever tickers/date range the user has currently selected, rather than
-    silently serving a stale result from an earlier selection."""
+    — the exact same, lakehouse-only function the CLI uses."""
     return load_price_history_with_fallback(
         list(tickers),
         start,
         end,
         warmup_days=warmup_days,
-        allow_synthetic_fallback=allow_synthetic_fallback,
     )
 
 
@@ -305,7 +295,16 @@ def _normalized_return_pct(close: pd.Series) -> pd.Series:
 
 
 def _sp500_benchmark(start: date, end: date) -> pd.Series:
-    frame, _ = _load_basket_data((SP500_TICKER,), start, end)
+    """The S&P 500 buy-and-hold overlay for the performance chart. Real
+    lakehouse price data only — if it's unavailable for this date range,
+    the benchmark line is skipped (an empty series, the same "nothing to
+    plot" shape `_combined_chart_frame` already handles) rather than
+    crashing the whole page."""
+    try:
+        frame, _ = _load_basket_data((SP500_TICKER,), start, end)
+    except Exception as exc:
+        logger.warning("S&P 500 benchmark unavailable for %s to %s: %s", start, end, exc)
+        return pd.Series(dtype=float)
     return _normalized_return_pct(frame[SP500_TICKER]["close"])
 
 
@@ -515,7 +514,6 @@ def _simulate_desk(
     end: date,
     initial_cash: float,
     manager_mode: str,
-    portfolio_construction_method: str | None = None,
     on_day_complete: object = None,
 ) -> DeskRun:
     """Runs the desk via `BacktestEngine` — the same class the CLI calls,
@@ -525,16 +523,17 @@ def _simulate_desk(
     given, is forwarded straight to `BacktestEngine.run()` to drive a live
     progress display — see `_run_simulation_with_progress()`.
 
-    `portfolio_construction_method`, if given, enables the optional
-    post-Commander `PortfolioConstructor` stage with that risk-budget
-    method — mirroring the CLI's `--portfolio-construction` flag, off by
-    default (`None`) so existing runs are unaffected."""
+    Each pod manager always sizes its own book via its own
+    `PortfolioConstructor` (risk parity + volatility targeting) — no
+    longer an optional post-Commander stage a caller can turn on/off."""
     if start > end:
         start, end = end, start
 
     analysts = _build_analysts()
     managers = _build_managers(manager_mode, analysts)
-    commander = Commander(managers=managers, weighting_strategy=Hedge(), parallel_workers=4)
+    commander = Commander(
+        managers=managers, weighting_strategy=ShrinkageWeight(Hedge()), parallel_workers=4
+    )
     portfolio = Portfolio(cash=initial_cash, positions={})
     track_record = TrackRecord()
     market_data, source_label = _load_basket_data(
@@ -542,12 +541,6 @@ def _simulate_desk(
         start,
         end,
         warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
-        allow_synthetic_fallback=False,
-    )
-    portfolio_constructor = (
-        PortfolioConstructor(enabled=True, method=portfolio_construction_method)
-        if portfolio_construction_method is not None
-        else None
     )
 
     engine = BacktestEngine(
@@ -558,8 +551,8 @@ def _simulate_desk(
         start_date=start,
         end_date=end,
         assets=tickers,
-        portfolio_constructor=portfolio_constructor,
         market_data_source=source_label,
+        execution_lag_days=settings.firm.execution_lag_days,
     )
     backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
 
@@ -570,7 +563,6 @@ def _simulate_desk(
         source_label=source_label,
         manager_ids=[manager.agent_id for manager in managers],
         analyst_ids=[analyst.agent_id for analyst in analysts],
-        portfolio_construction_method=portfolio_construction_method,
         price_history=market_data,
         trade_blotter=_build_trade_blotter(
             backtest_result.trade_log, backtest_result.decisions_by_day
@@ -590,7 +582,6 @@ def _run_simulation_with_progress(
     end: date,
     initial_cash: float,
     manager_mode: str,
-    portfolio_construction_method: str | None = None,
 ) -> DeskRun:
     """Runs the desk behind a live, center-of-screen progress display.
     `st.status()` streams each day's update to the browser as it happens,
@@ -619,7 +610,6 @@ def _run_simulation_with_progress(
             end,
             initial_cash,
             manager_mode,
-            portfolio_construction_method=portfolio_construction_method,
             on_day_complete=_on_day_complete,
         )
         status.update(
@@ -1024,24 +1014,16 @@ def _render_agent_flow_view(desk_run: DeskRun, as_of_date: date) -> None:
             _render_flow_node(snapshot.commander)
     with col_l4:
         st.markdown(
-            '<div class="flow-layer-label">Layer 4 · Portfolio construction</div>',
+            '<div class="flow-layer-label">Per-pod risk parity + vol targeting</div>',
             unsafe_allow_html=True,
         )
-        if desk_run.portfolio_construction_method is not None:
-            st.markdown(
-                '<div class="agent-node agent-node-flat">'
-                f'<span class="agent-node-name">{desk_run.portfolio_construction_method}'
-                "</span>enabled — reshapes weights across the whole basket, not just "
-                f"{asset}</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                '<div class="agent-node agent-node-flat">'
-                '<span class="agent-node-name">Off</span>Commander\'s decision passes '
-                "through unchanged</div>",
-                unsafe_allow_html=True,
-            )
+        st.markdown(
+            '<div class="agent-node agent-node-flat">'
+            '<span class="agent-node-name">Always on</span>each pod manager sizes its own '
+            "book (Ledoit-Wolf covariance, Black-Litterman, risk parity, volatility-targeted "
+            "leverage) before the Commander allocates capital across pods</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def _trust_panel_frame(desk_run: DeskRun, source_ids: list[str], as_of_date: date) -> pd.DataFrame:
@@ -1111,81 +1093,189 @@ def _render_trust_panel(
     )
 
 
-_KNOWN_DATA_SOURCES: tuple[str, ...] = (
-    "fred",
-    "finnhub_news",
-    "sec_edgar",
-    "sec_fulltext",
-    "finra_short_interest",
-    "fama_french",
-    "tiingo",
-    "alpha_vantage",
-    "fmp",
-    "google_trends",
-    "wikimedia_pageviews",
-    "reddit",
-    "cboe",
-)
+# Pod name -> the analyst ids `roster.py` assigns it, reused here (rather
+# than a second hardcoded copy) so a saved run's analyst-performance table
+# groups by pod exactly the way the live roster does, and never drifts from
+# it if the roster changes.
+_POD_ANALYST_IDS: dict[str, frozenset[str]] = {
+    "Risk": RISK_MANAGER_ANALYST_IDS,
+    "CVaR": CVAR_MANAGER_ANALYST_IDS,
+    "StatArb": STAT_ARB_MANAGER_ANALYST_IDS,
+    "Macro/Rates": MACRO_RATES_MANAGER_ANALYST_IDS,
+    "Rates": RATES_MANAGER_ANALYST_IDS,
+    "Cross-Asset": CROSS_ASSET_MANAGER_ANALYST_IDS,
+    "Credit": CREDIT_MANAGER_ANALYST_IDS,
+    "Factor": FACTOR_MANAGER_ANALYST_IDS,
+    "Event/Credit": EVENT_CREDIT_MANAGER_ANALYST_IDS,
+    "Alt-Data": ALT_DATA_MANAGER_ANALYST_IDS,
+}
+_ANALYST_ID_TO_POD: dict[str, str] = {
+    analyst_id: pod for pod, analyst_ids in _POD_ANALYST_IDS.items() for analyst_id in analyst_ids
+}
+_MANAGER_ID_TO_POD: dict[str, str] = {
+    "risk_manager": "Risk",
+    "cvar_manager": "CVaR",
+    "stat_arb_manager": "StatArb",
+    "macro_rates_manager": "Macro/Rates",
+    "rates_manager": "Rates",
+    "cross_asset_manager": "Cross-Asset",
+    "credit_manager": "Credit",
+    "factor_manager": "Factor",
+    "event_credit_manager": "Event/Credit",
+    "alt_data_manager": "Alt-Data",
+}
 
 
-def _data_source_status_rows(
-    fetch_log: pd.DataFrame, known_sources: tuple[str, ...], today: date
-) -> list[dict[str, str]]:
-    """Per-source status for the strip: "live" if that source's most
-    recent recorded fetch happened today (real wall-clock date, matching
-    how `data/cache.py` keys most of these sources), "cached" if it has a
-    fetch on record from an earlier day, "unused" if this run never
-    touched it at all. Pure function over an already-loaded fetch log
-    frame so it's testable without a real SQLite file."""
-    latest_by_source: dict[str, str] = {}
-    if not fetch_log.empty:
-        for source, group in fetch_log.groupby("source"):
-            latest_by_source[str(source)] = str(group["as_of_date"].max())
-
-    rows = []
-    for source in known_sources:
-        latest = latest_by_source.get(source)
-        if latest is None:
-            status = "unused"
-        elif latest == today.isoformat():
-            status = "live"
-        else:
-            status = "cached"
-        rows.append({"source": source, "status": status, "last_fetched": latest or "—"})
-    return rows
+def _load_saved_run_summary(path: Path) -> dict[str, Any]:
+    """Reads a saved-run JSON file from disk and returns it in the compact
+    `run_summary.extract_run_summary` shape, accepting either that summary
+    directly or a full `experiment_result.json`/checkpoint (auto-extracted
+    on load, since a raw run file is `decisions_by_day`/`trade_log`-heavy —
+    hundreds of MB — and this GUI panel only ever reads the smaller shape).
+    Raises on a missing file, invalid JSON, or a payload missing the
+    `test`/`calibration` blocks the rest of this panel assumes exist."""
+    with path.open() as f:
+        raw: dict[str, Any] = json.load(f)
+    if "decisions_by_day" in raw.get("test", {}):
+        return extract_run_summary(raw)
+    if "test" not in raw or "calibration" not in raw:
+        raise ValueError("expected a 'test'/'calibration' keyed run summary or result file")
+    return raw
 
 
-def _render_data_source_status_strip(desk_run: DeskRun) -> None:
-    """Which external sources this run actually touched, and whether each
-    was a fresh live fetch today or served from an earlier cache entry —
-    surfaces the multi-source data layer (Task 1) at a glance instead of
-    leaving it implicit in the README."""
-    st.markdown("#### Data sources")
-    price_status = "live" if "live" in desk_run.source_label else "fallback"
-    price_class = {"live": "status-pill-live", "fallback": "status-pill-fallback"}[price_status]
+def _saved_run_pod_analyst_frame(source_performance: dict[str, dict[str, float]]) -> pd.DataFrame:
+    """`source_performance` (analyst id / manager id -> cumulative_return /
+    sharpe_ratio / max_drawdown / observations) split into one row per
+    analyst, tagged with its pod, sorted worst-to-best by cumulative
+    return — the same ranking the report's analyst-performance chart uses,
+    rendered here as a sortable table instead of a static PNG since the GUI
+    can just let the viewer sort/filter it directly."""
+    rows = [
+        {"analyst": analyst_id, "pod": _ANALYST_ID_TO_POD[analyst_id], **metrics}
+        for analyst_id, metrics in source_performance.items()
+        if analyst_id in _ANALYST_ID_TO_POD
+    ]
+    frame = pd.DataFrame(rows)
+    return frame.sort_values("cumulative_return") if not frame.empty else frame
+
+
+def _saved_run_pod_frame(source_performance: dict[str, dict[str, float]]) -> pd.DataFrame:
+    """The manager-level (pod) rows of `source_performance`, tagged with
+    their pod name, sorted worst-to-best by cumulative return."""
+    rows = [
+        {"pod": _MANAGER_ID_TO_POD[manager_id], **metrics}
+        for manager_id, metrics in source_performance.items()
+        if manager_id in _MANAGER_ID_TO_POD
+    ]
+    frame = pd.DataFrame(rows)
+    return frame.sort_values("cumulative_return") if not frame.empty else frame
+
+
+def _render_saved_run_tab() -> None:
+    """A saved, already-completed run's results (loaded via the sidebar's
+    "Load a saved run" panel), independent of the live desk simulation the
+    rest of this dashboard drives — for browsing a multi-year CLI
+    (`agentic-trading-experiment`) run too large to re-simulate live in a
+    Streamlit session, not for stepping through it day by day the way the
+    Overview tab does for a freshly-run desk."""
+    summary = st.session_state.get("saved_run_summary")
+    if summary is None:
+        st.info(
+            "Load a saved run from the sidebar (**Load a saved run**) to browse it here — "
+            "point it at a run's `experiment_result.json`, checkpoint, or pre-extracted "
+            "`summary.json` (see `scripts/extract_run_summary.py`)."
+        )
+        return
+
+    experiment = summary["experiment"]
+    st.markdown(f"#### `{st.session_state.get('saved_run_source_path', 'loaded run')}`")
+    st.caption(
+        f"Assets: {', '.join(experiment.get('assets', []))} · "
+        f"Excluded analysts: {', '.join(experiment.get('excluded_analysts', [])) or 'none'} · "
+        f"Market data: {summary['market_data_source']}"
+    )
+
+    available_periods = [p for p in ("test", "calibration") if p in summary]
+    period = st.radio("Period", available_periods, horizontal=True, key="saved_run_period")
+    period_data = summary[period]
+
     st.markdown(
-        f'<span class="status-pill {price_class}">market data: {desk_run.source_label}</span>',
-        unsafe_allow_html=True,
+        f"**{period_data['start_date']} → {period_data['end_date']}**"
+        f" ({len(period_data['portfolio_value_history'])} trading days)"
     )
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("Sharpe", f"{period_data['final_sharpe_ratio']:.2f}")
+    metric_cols[1].metric("Sortino", f"{period_data['final_sortino_ratio']:.2f}")
+    metric_cols[2].metric("Calmar", f"{period_data['final_calmar_ratio']:.2f}")
+    metric_cols[3].metric("Max drawdown", f"{period_data['final_max_drawdown']:.1%}")
+    metric_cols[4].metric("Hit rate", f"{period_data['final_hit_rate']:.1%}")
+    metric_cols[5].metric("Profit factor", f"{period_data['final_profit_factor']:.2f}")
 
-    try:
-        fetch_log = read_fetch_log(CACHE_ROOT / "fetch_log.db")
-    except Exception:
-        logger.debug("Could not read the fetch log for the data-source status strip", exc_info=True)
-        fetch_log = pd.DataFrame(columns=["source", "identifier", "as_of_date"])
+    st.markdown("##### Equity curve")
+    equity_frame = pd.DataFrame(
+        period_data["portfolio_value_history"], columns=["date", "system"]
+    ).set_index("date")
+    equity_frame.index = pd.to_datetime(equity_frame.index)
+    if period == "test" and summary.get("baselines"):
+        for name, baseline in summary["baselines"].items():
+            baseline_series = pd.DataFrame(
+                baseline["portfolio_value_history"], columns=["date", name]
+            ).set_index("date")
+            baseline_series.index = pd.to_datetime(baseline_series.index)
+            equity_frame = equity_frame.join(baseline_series, how="outer")
+    st.line_chart(equity_frame, height=360)
 
-    rows = _data_source_status_rows(fetch_log, _KNOWN_DATA_SOURCES, date.today())
-    pill_class = {
-        "live": "status-pill-live",
-        "cached": "status-pill-cached",
-        "unused": "status-pill-unused",
-    }
-    badges = "".join(
-        f'<span class="status-pill {pill_class[row["status"]]}" '
-        f'title="last fetched: {row["last_fetched"]}">{row["source"]}: {row["status"]}</span>'
-        for row in rows
+    pod_frame = _saved_run_pod_frame(period_data["source_performance"])
+    analyst_frame = _saved_run_pod_analyst_frame(period_data["source_performance"])
+
+    pod_col, analyst_col = st.columns([0.4, 0.6])
+    with pod_col:
+        st.markdown("##### Pod cumulative return")
+        if pod_frame.empty:
+            st.write("No pod-level source_performance recorded for this period.")
+        else:
+            st.bar_chart(pod_frame.set_index("pod")["cumulative_return"], height=320)
+    with analyst_col:
+        st.markdown("##### Analyst performance, by pod")
+        st.caption(
+            "Cumulative return here compounds each analyst's isolated, "
+            "confidence-scaled daily signal unbounded across the whole "
+            "period — a ranking signal, not a dollar P&L (see the report)."
+        )
+        if analyst_frame.empty:
+            st.write("No analyst-level source_performance recorded for this period.")
+        else:
+            st.dataframe(
+                analyst_frame[
+                    ["analyst", "pod", "cumulative_return", "sharpe_ratio", "observations"]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+
+    st.markdown("##### Signal health")
+    st.caption(
+        "unavailable = no input data that day (often expected — e.g. thin Form-4 "
+        "insider-transaction history). error = the analyst raised an exception and "
+        "was silently skipped for that observation — always worth investigating."
     )
-    st.markdown(badges, unsafe_allow_html=True)
+    health_rows = [
+        {"source": source_id, **counts}
+        for source_id, counts in period_data["signal_health"].items()
+    ]
+    health_frame = pd.DataFrame(health_rows)
+    if not health_frame.empty:
+        health_frame["total"] = (
+            health_frame["active"] + health_frame["unavailable"] + health_frame["error"]
+        )
+        health_frame["error_pct"] = health_frame["error"] / health_frame["total"]
+        health_frame["unavailable_pct"] = health_frame["unavailable"] / health_frame["total"]
+        health_frame = health_frame.sort_values(["error_pct", "unavailable_pct"], ascending=False)
+        st.dataframe(
+            health_frame[["source", "active", "unavailable", "error", "error_pct"]],
+            width="stretch",
+            hide_index=True,
+        )
 
 
 @st.dialog("Signal & trade history", width="large")
@@ -1322,9 +1412,6 @@ def _render_overview_tab() -> None:
             )
 
     with st.container(border=True):
-        _render_data_source_status_strip(desk_run)
-
-    with st.container(border=True):
         _render_agent_flow_view(desk_run, current_date)
 
     st.markdown("### Portfolio vs. benchmarks")
@@ -1334,7 +1421,7 @@ def _render_overview_tab() -> None:
         "</div>",
         unsafe_allow_html=True,
     )
-    initial_cash = float(st.session_state.get("initial_cash", 10_000.0))
+    initial_cash = float(st.session_state.get("initial_cash", settings.firm.starting_cash))
     portfolio_series = _portfolio_pct_series(backtest_result.portfolio_value_history, initial_cash)
     # Clip every series to the current playback day so this chart grows as
     # the user steps/scrubs/plays forward, rather than always showing the
@@ -1526,10 +1613,15 @@ def _render_tabbed_content(desk_run: DeskRun | None) -> None:
     re-executes only this function, not render_dashboard() above it, so
     defaults must be available here independently."""
     _seed_defaults()
-    tab_overview, tab_desks, tab_analysts = st.tabs(["📊 Overview", "🗂️ Desks", "🔎 Analysts"])
+    tab_overview, tab_desks, tab_analysts, tab_saved_run = st.tabs(
+        ["📊 Overview", "🗂️ Desks", "🔎 Analysts", "📁 Saved Run"]
+    )
 
     with tab_overview:
         _render_overview_tab()
+
+    with tab_saved_run:
+        _render_saved_run_tab()
 
     with tab_desks:
         _render_performance_tab(
@@ -1608,10 +1700,10 @@ def render_dashboard() -> None:
         end_date = st.date_input("End date", value=date(2024, 3, 1), key="end_date")
         initial_cash = st.number_input(
             "Initial cash",
-            min_value=1_000.0,
-            max_value=1_000_000.0,
-            value=10_000.0,
-            step=500.0,
+            min_value=100_000.0,
+            max_value=1_000_000_000.0,
+            value=float(settings.firm.starting_cash),
+            step=100_000.0,
             key="initial_cash",
         )
 
@@ -1623,25 +1715,37 @@ def render_dashboard() -> None:
             key="manager_mode",
         )
 
-        portfolio_construction_enabled = st.checkbox(
-            "Portfolio construction (Layer 4)",
-            value=False,
-            key="portfolio_construction_enabled",
-            help="Optional post-Commander stage: Black-Litterman views from the Commander's "
-            "own decisions, a risk-budget optimizer, then Kelly leverage scaling. Off by "
-            "default, same as the CLI's --portfolio-construction flag.",
-        )
-        portfolio_construction_method = st.selectbox(
-            "Risk budget method",
-            options=("risk_parity", "min_variance", "mean_variance"),
-            index=0,
-            key="portfolio_construction_method",
-            disabled=not portfolio_construction_enabled,
-        )
-
         st.divider()
         run_clicked = st.button("Run simulation", width="stretch", type="primary")
         reset_clicked = st.button("Reset desk", width="stretch")
+
+        st.divider()
+        with st.expander("📁 Load a saved run"):
+            st.caption(
+                "Browse a completed CLI run (`agentic-trading-experiment`) in the "
+                "**Saved Run** tab instead of re-simulating it live — point this at "
+                "its `experiment_result.json`/checkpoint, or a pre-extracted "
+                "`summary.json` (`scripts/extract_run_summary.py`)."
+            )
+            saved_run_path_input = st.text_input(
+                "Path",
+                key="saved_run_path_input",
+                placeholder="results/<run>/experiment_result.json",
+            )
+            load_saved_run_clicked = st.button("Load run", width="stretch")
+
+    if load_saved_run_clicked:
+        if not saved_run_path_input:
+            st.sidebar.error("Enter a path first.")
+        else:
+            try:
+                with st.spinner("Loading saved run..."):
+                    st.session_state["saved_run_summary"] = _load_saved_run_summary(
+                        Path(saved_run_path_input)
+                    )
+                st.session_state["saved_run_source_path"] = saved_run_path_input
+            except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+                st.sidebar.error(f"Could not load {saved_run_path_input!r}: {exc}")
 
     if reset_clicked:
         _reset_desk()
@@ -1674,9 +1778,6 @@ def render_dashboard() -> None:
             end_date,
             float(initial_cash),
             manager_mode,
-            portfolio_construction_method=(
-                portfolio_construction_method if portfolio_construction_enabled else None
-            ),
         )
         st.session_state["desk_run"] = new_run
         st.session_state["backtest_result"] = new_run.backtest_result
@@ -1687,14 +1788,8 @@ def render_dashboard() -> None:
     desk_run: DeskRun | None = st.session_state.get("desk_run")
 
     if desk_run is not None:
-        portfolio_construction_caption = (
-            f"Portfolio construction: {desk_run.portfolio_construction_method} "
-            if desk_run.portfolio_construction_method
-            else "Portfolio construction: off "
-        )
         st.caption(
             f"Simulation source: {desk_run.source_label} • Manager stack: {desk_run.manager_mode} "
-            f"• {portfolio_construction_caption}"
             f"• Basket: {desk_run.group_name}"
         )
 
