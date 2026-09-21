@@ -13,8 +13,10 @@ This is the only market/alternative-data source a run reads:
 `data/loader.py::load_price_history_with_fallback` raises for any ticker
 the lake doesn't cover rather than falling back to a live API."""
 
+import threading
 from datetime import date
 from pathlib import Path
+from typing import cast
 
 import duckdb
 import numpy as np
@@ -25,6 +27,36 @@ from agentic_trading.data.point_in_time import assert_point_in_time
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+_thread_local = threading.local()
+
+
+def _connection() -> duckdb.DuckDBPyConnection:
+    """This thread's own in-memory DuckDB connection, created once and
+    reused for the rest of the thread's life. Every loader query in this
+    module used to open and close a fresh connection per call — real
+    overhead on a run with thousands of lakehouse reads per simulated
+    day (~4.5s of pure connection setup on one profiled day, ~9% of that
+    day's compute), confirmed harmless to remove since every query here
+    is a read-only `SELECT` over local parquet files. Kept one connection
+    per thread rather than one process-wide connection since a single
+    DuckDB connection is not meant to be queried concurrently from
+    multiple threads at once (relevant under `--parallel-backend
+    thread`, where several analyst/manager threads can call into this
+    module at the same time)."""
+    if not hasattr(_thread_local, "connection"):
+        _thread_local.connection = duckdb.connect(database=":memory:", read_only=False)
+    return cast(duckdb.DuckDBPyConnection, _thread_local.connection)
+
+
+def reset_connection_cache() -> None:
+    """Drops this thread's cached connection so the next `_connection()`
+    call opens a fresh one. A real backtest never needs this — it's for
+    tests that monkeypatch `duckdb.connect` per-test and would otherwise
+    see an earlier test's cached connection instead of their own fake
+    one."""
+    if hasattr(_thread_local, "connection"):
+        del _thread_local.connection
 
 
 def _lake_dir() -> Path:
@@ -72,13 +104,11 @@ def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
           AND (end_date IS NULL OR end_date >= '{as_of_date.isoformat()}')
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         result = connection.execute(query).df()
     except Exception:
         logger.warning("sp500_membership lakehouse query failed", exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if result.empty:
         return None
@@ -89,6 +119,60 @@ def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
 
 def _option_chain_glob() -> str:
     return str(_lake_dir() / "table=dolthub_option_chain" / "*" / "*.parquet")
+
+
+def _stock_splits_glob() -> str:
+    return str(_lake_dir() / "table=dolthub_stock_splits" / "*" / "*.parquet")
+
+
+def _split_adjustment_factor(ticker: str, quote_date: date) -> float:
+    """Cumulative `to_factor / for_factor` of every real stock split for
+    `ticker` with an ex-date after `quote_date`. `dolthub_option_chain`
+    strikes and premiums are archival and never retroactively adjusted,
+    while `instrument_prices` is continuously split-adjusted across its
+    whole history; dividing a chain row quoted before a later split by
+    this factor brings it onto the same basis as the underlying's spot.
+    Returns 1.0 when the splits table is absent or no such split exists."""
+    if not _lake_dir().exists() or not any(
+        _lake_dir().glob("table=dolthub_stock_splits/*/*.parquet")
+    ):
+        return 1.0
+    query = f"""
+        SELECT to_factor, for_factor
+        FROM read_parquet('{_stock_splits_glob()}', hive_partitioning = true, union_by_name = true)
+        WHERE act_symbol = '{ticker}' AND ex_date > '{quote_date.isoformat()}'
+    """
+    try:
+        connection = _connection()
+        frame = connection.execute(query).df()
+    except Exception:
+        logger.warning("Stock-split lakehouse query failed for %s", ticker, exc_info=True)
+        return 1.0
+    if frame.empty:
+        return 1.0
+    factor = 1.0
+    for to_factor, for_factor in zip(frame["to_factor"], frame["for_factor"], strict=True):
+        if to_factor and for_factor:
+            factor *= float(to_factor) / float(for_factor)
+    return factor
+
+
+def _apply_split_adjustment(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Rescales an option-chain frame's price-denominated columns
+    (`strike`, `bid`, `ask`, `gamma`, `vega`, `theta`, `rho`) onto
+    `instrument_prices`' continuously split-adjusted basis, per each
+    row's own `date`. `delta` and `implied_volatility` are dimensionless
+    and untouched. A no-op for any ticker/date with no later split."""
+    frame = frame.copy()
+    for quote_date in frame["date"].dt.date.unique():
+        factor = _split_adjustment_factor(ticker, quote_date)
+        if factor == 1.0:
+            continue
+        mask = frame["date"].dt.date == quote_date
+        frame.loc[mask, ["strike", "bid", "ask"]] /= factor
+        frame.loc[mask, "gamma"] /= factor**2
+        frame.loc[mask, ["vega", "theta", "rho"]] /= factor
+    return frame
 
 
 def load_options_snapshot_from_lakehouse(
@@ -104,14 +188,12 @@ def load_options_snapshot_from_lakehouse(
 
     Returns `None` if the lake is unreachable, `ticker` has no coverage at
     all, or the nearest snapshot is more than `lookback_days` stale — the
-    CVaR-pod analysts calling this fall back to their synthetic,
-    theoretical approach in that case rather than treat a miss as fatal.
-    Self-asserts point-in-time on `date` before returning.
-    Every CVaR-pod analyst that touches options data is still a synthetic,
-    model-implied read for any ticker outside this real coverage (11
-    tickers as of this pull: AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA,
-    JPM, XOM, SPY, COIN — confirm the current set directly against the
-    lake if this list may have grown)."""
+    caller reports a flat, zero-confidence signal in that case rather
+    than treat a miss as fatal. `strike`/`bid`/`ask`/`gamma`/`vega`/
+    `theta`/`rho` are rescaled onto `instrument_prices`' continuously
+    split-adjusted basis via `_apply_split_adjustment` before returning,
+    since the raw chain is archival and never itself adjusted for a
+    later split. Self-asserts point-in-time on `date` before returning."""
     if not _lake_dir().exists() or not any(
         _lake_dir().glob("table=dolthub_option_chain/*/*.parquet")
     ):
@@ -132,18 +214,17 @@ def load_options_snapshot_from_lakehouse(
           )
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("Options-chain lakehouse query failed for %s", ticker, exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if frame.empty:
         return None
     frame["date"] = pd.to_datetime(frame["date"])
     frame["expiration"] = pd.to_datetime(frame["expiration"])
+    frame = _apply_split_adjustment(frame, ticker)
     assert_point_in_time(frame, as_of_date, date_column="date")
     return frame
 
@@ -209,13 +290,11 @@ def load_cot_positioning_from_lakehouse(
             ORDER BY report_date
         """
         try:
-            connection = duckdb.connect(database=":memory:", read_only=False)
+            connection = _connection()
             frame = connection.execute(query).df()
         except Exception:
             logger.warning("COT lakehouse query failed for %s/%s", table, ticker, exc_info=True)
             frame = pd.DataFrame()
-        finally:
-            connection.close()
         if not frame.empty:
             frame["report_date"] = pd.to_datetime(frame["report_date"])
             series = frame.set_index("report_date")["net_positioning_ratio"]
@@ -250,13 +329,11 @@ def load_dividends_from_lakehouse(ticker: str, as_of_date: date) -> pd.Series | 
         ORDER BY ex_date
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("Dividends lakehouse query failed for %s", ticker, exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if frame.empty:
         return None
@@ -317,13 +394,11 @@ def load_earnings_surprise_from_lakehouse(
         LIMIT 1
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("Earnings-surprise lakehouse query failed for %s", ticker, exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if frame.empty:
         return None
@@ -357,13 +432,11 @@ def load_sic_code_from_lakehouse(ticker: str) -> str | None:
         WHERE rn = 1
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("SIC-classification lakehouse query failed for %s", ticker, exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if frame.empty or pd.isna(frame.iloc[0]["sic"]):
         return None
@@ -434,13 +507,11 @@ def load_price_history_from_lakehouse(
         ORDER BY ticker, date
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("Lakehouse price query failed for %s", tickers, exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if frame.empty:
         return None
@@ -515,13 +586,11 @@ def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Seri
         ORDER BY date
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("FRED lakehouse query failed for %s", series_id, exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if frame.empty:
         return None
@@ -580,13 +649,11 @@ def load_fama_french_factors_from_lakehouse(
         ORDER BY date
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("Ken French lakehouse query failed for %s", model, exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if frame.empty:
         return None
@@ -634,13 +701,11 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
         ORDER BY filed
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("SEC EDGAR facts lakehouse query failed for %s", ticker, exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if frame.empty:
         return None
@@ -683,13 +748,11 @@ def load_short_interest_from_lakehouse(ticker: str, as_of_date: date) -> pd.Data
         ORDER BY settlement_date
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("FINRA lakehouse query failed for %s", ticker, exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if frame.empty:
         return None
@@ -735,13 +798,11 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
         ORDER BY filed_date, transaction_date
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("Insider-transactions lakehouse query failed for %s", ticker, exc_info=True)
         return None
-    finally:
-        connection.close()
 
     if frame.empty:
         return None
@@ -762,8 +823,13 @@ def load_option_quote_from_lakehouse(
     """The latest chain row quoting one exact contract on or before
     `as_of_date` within `lookback_days`, regardless of whether the latest
     snapshot still lists that expiry. Same columns as
-    `load_options_snapshot_from_lakehouse`; `None` when never quoted in
-    the window. Self-asserts point-in-time on `date` before returning."""
+    `load_options_snapshot_from_lakehouse`, including the
+    `_apply_split_adjustment` rescaling. `strike` is matched in that same
+    adjusted basis rather than in SQL against the raw column, since the
+    two can differ for a contract quoted before a later split — the
+    strike filter is applied in pandas after adjustment instead. `None`
+    when never quoted in the window. Self-asserts point-in-time on
+    `date` before returning."""
     if not _lake_dir().exists() or not any(
         _lake_dir().glob("table=dolthub_option_chain/*/*.parquet")
     ):
@@ -776,22 +842,23 @@ def load_option_quote_from_lakehouse(
         WHERE underlying = '{underlying}'
           AND expiration = '{expiration.isoformat()}'
           AND option_type = '{option_type}'
-          AND ABS(strike - {strike!r}) < 1e-6
           AND date BETWEEN '{window_start}' AND '{as_of_date.isoformat()}'
         ORDER BY date DESC
-        LIMIT 1
     """
     try:
-        connection = duckdb.connect(database=":memory:", read_only=False)
+        connection = _connection()
         frame = connection.execute(query).df()
     except Exception:
         logger.warning("Option quote lakehouse query failed for %s", underlying, exc_info=True)
         return None
-    finally:
-        connection.close()
     if frame.empty:
         return None
     frame["date"] = pd.to_datetime(frame["date"])
     frame["expiration"] = pd.to_datetime(frame["expiration"])
+    frame = _apply_split_adjustment(frame, underlying)
+    frame = frame[(frame["strike"] - strike).abs() < 1e-6]
+    if frame.empty:
+        return None
+    frame = frame.iloc[[0]]
     assert_point_in_time(frame, as_of_date, date_column="date")
     return frame

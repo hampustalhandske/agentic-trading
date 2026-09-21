@@ -1611,7 +1611,7 @@ wheels = [
 [[package]]
 name = "quantcore"
 version = "0.1.0"
-source = { git = "https://github.com/hampustalhandske/quantcore.git#4db4081718cbaec598fd318196bdba532c1c61ab" }
+source = { git = "https://github.com/hampustalhandske/quantcore.git#450a5a2f11f6c4b9ce7ccf9509fd03a6bca361c2" }
 dependencies = [
     { name = "numba" },
     { name = "numpy" },

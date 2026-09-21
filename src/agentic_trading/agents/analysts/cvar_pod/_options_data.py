@@ -66,7 +66,7 @@ def real_atm_options_by_expiration(
     Returns `None` if `asset` has no real snapshot for this date; every
     CVaR-pod analyst calling this then reports flat with zero confidence
     rather than pricing off a model-implied substitute quote."""
-    snapshot = load_options_snapshot_from_lakehouse(asset, as_of_date)
+    snapshot = load_options_snapshot_from_lakehouse(asset, as_of_date.date())
     if snapshot is None or snapshot.empty:
         return None
 
