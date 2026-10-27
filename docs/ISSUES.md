@@ -48,7 +48,7 @@ Paths are relative to `src/agentic_trading/`.
 - Evidence: [V] `data/loaders/lakehouse_loader.py:130-159` has no dedup on `scraped_at`. Factors: AAPL 1.2e24 (true 4), NVDA 1e40 (10), TSLA 1.2e19 (3), AMZN/GOOGL 1.2e104 (20). CVaR results since 2026-09-18 are invalid.
 - Acceptance: `_split_adjustment_factor` returns exactly 4.0 (AAPL 2020-08-28), 10.0 (NVDA 2024-06-07), 3.0 (TSLA 2022-08-01), 20.0 (AMZN, GOOGL the day before their 2022 ex-dates). Source is `equity_splits` with `applied`. A unit test writes one split row three times.
 - Blocked-by / Blocks: none. Done first and alone.
-- Commits: 6f56fa2 (factor magnitude). Follow-up: instrument_prices close is adjusted by Yahoo's own split list, so the factor moves to `yahoo_splits`, which also carries spin-offs written as fractional splits. 13 of its rows are measured as not adjusted in Yahoo's close; two of them (AVB 2026-08-17, SSP 2025-12-08) have option chains quoted before the split. Blocked-by the lake flag that marks those rows.
+- Commits: 6f56fa2 (factor magnitude). Follow-up: instrument_prices close is adjusted by Yahoo's own split list, so the factor moves to `yahoo_splits`, which also carries spin-offs written as fractional splits. 13 of its rows are measured as not adjusted in Yahoo's close; two of them (AVB 2026-08-17, SSP 2025-12-08) have option chains quoted before the split. Blocked-by LK-41 (`yahoo_splits.in_close_basis`: false for the 13, null where untestable); the factor then counts rows where `in_close_basis IS NOT FALSE`.
 
 ### AT-2 FRED read as latest value, not `fred_vintages`
 - Status: open
@@ -870,6 +870,6 @@ Paths are relative to `src/agentic_trading/`.
 - Gate: data
 - Raised by: database-57 consumer audit 2026-10-28
 - Evidence: `dolthub_option_chain` starts 2019-02; `option_chain_history` holds SPY, QQQ and IWM full chains with open interest from 2008 to 2025-12. The 2010-2017 test window has no options today.
-- Acceptance: option analysts read `option_chain_history` for SPY, QQQ and IWM before 2019, gated on its documented snapshot time; coverage per analyst in 2010-2017 is reported.
+- Acceptance: option analysts read `option_chain_history` for SPY, QQQ and IWM before 2019. Each row is a 16:00 ET end-of-day snapshot on `snapshot_date`, usable at that close; fills use bid/ask, never `mark` (wrong for deep in-the-money contracts in early years). Coverage per analyst in 2010-2017 is reported. The table is static and ends 2025-12-12; `option_chain_snapshots` resumes 2026-09-27, so the gap between them is stated, not filled.
 - Blocked-by / Blocks: narrows LK-37 to single names before 2019
 - Commits: none
