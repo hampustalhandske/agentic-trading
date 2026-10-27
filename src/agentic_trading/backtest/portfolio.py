@@ -127,7 +127,8 @@ class Portfolio(BaseModel):
         `settings.options.min_premium_per_share` of premium (a close to
         zero needs only a bid), and a contract count is capped so its
         underlying notional stays within `settings.options.max_notional_fraction`
-        of NAV when `spot` is known. A change smaller than `settings.options.rebalance_band` of the held
+        of NAV when `spot` is known. A change smaller than
+        `settings.options.rebalance_band` of the held
         contracts is a hold (closing to zero always fills). A fill that
         would open or grow a short past
         `settings.options.max_short_premium_fraction` of NAV (short

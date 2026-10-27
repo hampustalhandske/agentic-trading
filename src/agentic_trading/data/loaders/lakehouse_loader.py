@@ -97,7 +97,9 @@ def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY ticker, start_date, end_date ORDER BY scraped_at DESC
             ) AS rn
-            FROM read_parquet('{_sp500_membership_glob()}', hive_partitioning = true, union_by_name = true)
+            FROM read_parquet(
+                '{_sp500_membership_glob()}', hive_partitioning = true, union_by_name = true
+            )
         )
         WHERE rn = 1
           AND start_date <= '{as_of_date.isoformat()}'
@@ -208,7 +210,9 @@ def load_options_snapshot_from_lakehouse(
           AND date BETWEEN '{window_start}' AND '{as_of_date.isoformat()}'
           AND date = (
               SELECT MAX(date)
-              FROM read_parquet('{_option_chain_glob()}', hive_partitioning = true, union_by_name = true)
+              FROM read_parquet(
+                  '{_option_chain_glob()}', hive_partitioning = true, union_by_name = true
+              )
               WHERE underlying = '{ticker}'
                 AND date BETWEEN '{window_start}' AND '{as_of_date.isoformat()}'
           )
@@ -281,7 +285,9 @@ def load_cot_positioning_from_lakehouse(
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY ticker, report_date ORDER BY scraped_at DESC
                 ) AS rn
-                FROM read_parquet('{_cot_glob(table)}', hive_partitioning = true, union_by_name = true)
+                FROM read_parquet(
+                    '{_cot_glob(table)}', hive_partitioning = true, union_by_name = true
+                )
                 WHERE ticker = '{ticker}'
                   AND report_date BETWEEN '{window_start}' AND '{availability_cutoff}'
                   AND date_add(CAST(report_date AS DATE), INTERVAL 3 DAY) <= '{availability_cutoff}'
@@ -322,7 +328,10 @@ def load_dividends_from_lakehouse(ticker: str, as_of_date: date) -> pd.Series | 
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY act_symbol, ex_date ORDER BY scraped_at DESC
             ) AS rn
-            FROM read_parquet('{_lake_dir() / "table=dolthub_stock_dividends" / "*" / "*.parquet"}', hive_partitioning = true, union_by_name = true)
+            FROM read_parquet(
+                '{_lake_dir() / "table=dolthub_stock_dividends" / "*" / "*.parquet"}',
+                hive_partitioning = true, union_by_name = true
+            )
             WHERE act_symbol = '{ticker}' AND ex_date <= '{as_of_date.isoformat()}'
         )
         WHERE rn = 1
@@ -426,7 +435,10 @@ def load_sic_code_from_lakehouse(ticker: str) -> str | None:
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY ticker ORDER BY scraped_at DESC
             ) AS rn
-            FROM read_parquet('{_lake_dir() / "table=sec_sic_classification" / "*" / "*.parquet"}', hive_partitioning = true, union_by_name = true)
+            FROM read_parquet(
+                '{_lake_dir() / "table=sec_sic_classification" / "*" / "*.parquet"}',
+                hive_partitioning = true, union_by_name = true
+            )
             WHERE ticker = '{ticker}'
         )
         WHERE rn = 1
@@ -500,8 +512,11 @@ def load_price_history_from_lakehouse(
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY ticker, date ORDER BY scraped_at DESC
             ) AS rn
-            FROM read_parquet('{_instrument_prices_glob()}', hive_partitioning = true, union_by_name = true)
-            WHERE ticker IN ({tickers_sql}) AND date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
+            FROM read_parquet(
+                '{_instrument_prices_glob()}', hive_partitioning = true, union_by_name = true
+            )
+            WHERE ticker IN ({tickers_sql})
+              AND date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
         )
         WHERE rn = 1
         ORDER BY ticker, date
@@ -642,7 +657,9 @@ def load_fama_french_factors_from_lakehouse(
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY date ORDER BY scraped_at DESC
             ) AS rn
-            FROM read_parquet('{_table_glob(table)}', hive_partitioning = true, union_by_name = true)
+            FROM read_parquet(
+                '{_table_glob(table)}', hive_partitioning = true, union_by_name = true
+            )
             WHERE date <= '{as_of_date.isoformat()}'
         )
         WHERE rn = 1
