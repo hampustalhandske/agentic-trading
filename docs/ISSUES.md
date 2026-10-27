@@ -61,24 +61,24 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-3 COT and Fama-French read frozen retired directories
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-E3)
 - Evidence: [V] `lakehouse_loader.py:271-276` and `:618-621`. COT stops at report_date 2026-09-22, Fama-French at 2026-08-31.
 - Acceptance: loaders read `cftc_cot_*` with the 12-code map and `famafrench_returns` (or `famafrench_vintages`, see AT-5). COT max report_date is 2026-10-20 or later.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: 3ff8eff
 
 ### AT-4 Every loader reads lake Parquet by path; no lake T or version recorded
-- Status: open
+- Status: in-progress
 - Priority: must (M2, M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-E4)
 - Evidence: [V] every `read_parquet` in `lakehouse_loader.py` (lines 100, 144, 208, 213, 288, 331, 387, 394, 438, 515, 594, 660, 712, 758, 808, 858). Path reads see raw append logs, including flagged ranges, superseded keys and private tables.
 - Acceptance: no `read_parquet` or `glob` against `LAKE_DIR` remains (a grep test). Every query goes through `/v1/sql` against the typed views, and the lake T and version are recorded.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: 3ff8eff (every read on /v1/sql; `lake_provenance()` added). Remaining: each run records the lake version and read time, with AT-37.
 
 ### AT-5 Fama-French gated on factor date, not publication or vintage
 - Status: open
@@ -677,14 +677,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-61 Loader errors silently become "no coverage"
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S3)
 - Evidence: [C] every loader wraps its query in `except Exception: ... return None` (`lakehouse_loader.py:108-113,147-152,220-225,298-303`). A schema or SQL error becomes `status="unavailable"` instead of `error`.
 - Acceptance: query errors propagate, or return a typed error result that maps to `status="error"`.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: 3ff8eff
 
 ### AT-62 SIC is a current mapping used historically
 - Status: open
