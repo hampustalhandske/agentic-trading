@@ -41,14 +41,14 @@ Paths are relative to `src/agentic_trading/`.
 ## Entries
 
 ### AT-1 Option split rescale multiplies every raw write of `dolthub_stock_splits`
-- Status: done
+- Status: in-progress
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-E1)
 - Evidence: [V] `data/loaders/lakehouse_loader.py:130-159` has no dedup on `scraped_at`. Factors: AAPL 1.2e24 (true 4), NVDA 1e40 (10), TSLA 1.2e19 (3), AMZN/GOOGL 1.2e104 (20). CVaR results since 2026-09-18 are invalid.
 - Acceptance: `_split_adjustment_factor` returns exactly 4.0 (AAPL 2020-08-28), 10.0 (NVDA 2024-06-07), 3.0 (TSLA 2022-08-01), 20.0 (AMZN, GOOGL the day before their 2022 ex-dates). Source is `equity_splits` with `applied`. A unit test writes one split row three times.
 - Blocked-by / Blocks: none. Done first and alone.
-- Commits: 6f56fa2. Open question for the lake: whether unchecked_small_ratio and unchecked_no_bars rows belong in the instrument_prices basis (not counted today).
+- Commits: 6f56fa2 (factor magnitude). Follow-up: instrument_prices close is adjusted by Yahoo's own split list, so the factor moves to `yahoo_splits`, which also carries spin-offs written as fractional splits. 13 of its rows are measured as not adjusted in Yahoo's close; two of them (AVB 2026-08-17, SSP 2025-12-08) have option chains quoted before the split. Blocked-by the lake flag that marks those rows.
 
 ### AT-2 FRED read as latest value, not `fred_vintages`
 - Status: open
@@ -862,4 +862,14 @@ Paths are relative to `src/agentic_trading/`.
 - Evidence: edgelab pins a041d0d (2026-10-13), six commits ahead of our 450a5a2 (2026-09-19), an ancestor. Known numeric changes: "numerical results changed" (47fa8b9), exact ARIMA likelihood, cointegration rewrite.
 - Acceptance: pin a041d0d in `pyproject.toml` (with AT-72), run the full suite, and record every numeric change.
 - Blocked-by / Blocks: paired with EL-26 (one quantcore sha across both projects); blocks AT-77 step 3
+- Commits: none
+
+### AT-79 Pre-2019 options from `option_chain_history` (SPY, QQQ, IWM)
+- Status: open
+- Priority: should
+- Gate: data
+- Raised by: database-57 consumer audit 2026-10-28
+- Evidence: `dolthub_option_chain` starts 2019-02; `option_chain_history` holds SPY, QQQ and IWM full chains with open interest from 2008 to 2025-12. The 2010-2017 test window has no options today.
+- Acceptance: option analysts read `option_chain_history` for SPY, QQQ and IWM before 2019, gated on its documented snapshot time; coverage per analyst in 2010-2017 is reported.
+- Blocked-by / Blocks: narrows LK-37 to single names before 2019
 - Commits: none
