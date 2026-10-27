@@ -122,7 +122,8 @@ def preflight_lake(fake_lake: FakeLake) -> FakeLake:
         },
     )
     fake_lake.add_empty(
-        "fred_series_observations", {"series_id": "VARCHAR", "date": "DATE", "value": "DOUBLE"}
+        "fred_vintages",
+        {"series_id": "VARCHAR", "date": "DATE", "realtime_start": "DATE", "value": "DOUBLE"},
     )
     fake_lake.add_empty(
         "famafrench_returns",

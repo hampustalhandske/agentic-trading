@@ -471,18 +471,28 @@ def load_price_history_from_lakehouse(
 def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Series | None:
     """A FRED macro series (`DGS3MO`/`DGS2`/`DGS10`/`VIXCLS`/`CPIAUCSL`/
     `BAMLH0A0HYM2`/`BAMLC0A0CM` — the same series `macro_loader.
-    SUPPORTED_SERIES` names) from the `fred_series_observations` table
-    (`series_id`, `date`, `realtime_start`, `value`), filtered
-    `<= as_of_date`. Returns `None` if the table has no rows for
-    `series_id`. Self-asserts point-in-time on the date index before
-    returning."""
+    SUPPORTED_SERIES` names) as it stood on `as_of_date`, from the
+    `fred_vintages` table (`series_id`, `date`, `realtime_start`, `value`;
+    one row per published version of an observation). Each observation
+    date carries the value of its latest version with `realtime_start <=
+    as_of_date`; an observation with no version published by then is left
+    out. The index is sorted and unique. Returns `None` if no rows remain.
+    Self-asserts point-in-time on the date index before returning."""
     query = """
         SELECT date, value
-        FROM fred_series_observations
-        WHERE series_id = ? AND date <= ?
+        FROM (
+            SELECT date, value, ROW_NUMBER() OVER (
+                PARTITION BY date
+                ORDER BY realtime_start DESC
+            ) AS rn
+            FROM fred_vintages
+            WHERE series_id = ? AND realtime_start <= ? AND date <= ?
+        )
+        WHERE rn = 1
         ORDER BY date
     """
-    frame = _query(query, [series_id, as_of_date.isoformat()])
+    cutoff = as_of_date.isoformat()
+    frame = _query(query, [series_id, cutoff, cutoff])
     if frame.empty:
         return None
     frame["date"] = pd.to_datetime(frame["date"])
@@ -504,6 +514,9 @@ _KEN_FRENCH_FACTORS_BY_MODEL = {
     "5factor": ("Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"),
 }
 _KEN_FRENCH_FREQUENCY = "daily"
+# Ken French posts each month's daily factors after that month closes, so
+# the end of the following month is the conservative public date.
+_KEN_FRENCH_PUBLICATION_LAG_MONTHS = 1
 
 
 def load_fama_french_factors_from_lakehouse(
@@ -511,8 +524,12 @@ def load_fama_french_factors_from_lakehouse(
 ) -> pd.DataFrame | None:
     """Daily Fama-French factor returns for `model` ("3factor" or
     "5factor"), from the `famafrench_returns` table's matching daily US
-    factor dataset, filtered `<= as_of_date`. The lake stores returns as
-    plain percentage points (0.09 meaning 0.09%, Ken French's own
+    factor dataset. A day's values are returned only once public, which
+    is the last day of the month after that day's month
+    (`_KEN_FRENCH_PUBLICATION_LAG_MONTHS`) falling on or before
+    `as_of_date`. The values are today's revised history, because the
+    source keeps no daily vintages. The lake stores returns as plain
+    percentage points (0.09 meaning 0.09%, Ken French's own
     convention); the result is on a 0-1 return scale with Ken French's
     `Mkt-RF`/`SMB`/`HML`/`RF`(/`RMW`/`CMA`) column names. Returns `None`
     if the table has no rows or `model` isn't one of the two supported
@@ -529,7 +546,9 @@ def load_fama_french_factors_from_lakehouse(
         FROM famafrench_returns
         WHERE dataset = ? AND frequency = ?
           AND portfolio IN ({placeholders})
-          AND date <= ?
+          AND last_day(
+                date_add(CAST(date AS DATE), INTERVAL {_KEN_FRENCH_PUBLICATION_LAG_MONTHS} MONTH)
+              ) <= ?
         ORDER BY date
     """
     long = _query(query, [dataset, _KEN_FRENCH_FREQUENCY, *factors, as_of_date.isoformat()])

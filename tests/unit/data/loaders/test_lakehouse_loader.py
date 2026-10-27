@@ -127,9 +127,16 @@ def test_load_dividends_raises_on_future_ex_date(fake_lake: Any) -> None:
 def test_load_fred_series_returns_valid_data(fake_lake: Any) -> None:
     """Valid, in-window dates in the index pass straight through."""
     fake_lake.add(
-        "fred_series_observations",
-        pd.DataFrame({"series_id": ["DGS10"], "date": ["2024-01-10"], "value": [5.25]}),
-        date_columns=("date",),
+        "fred_vintages",
+        pd.DataFrame(
+            {
+                "series_id": ["DGS10"],
+                "date": ["2024-01-10"],
+                "realtime_start": ["2024-01-11"],
+                "value": [5.25],
+            }
+        ),
+        date_columns=("date", "realtime_start"),
     )
 
     result = lakehouse_loader.load_fred_series_from_lakehouse("DGS10", date(2024, 1, 15))
@@ -255,7 +262,7 @@ def test_cot_positioning_reads_the_cftc_table_by_contract_code(fake_lake: Any) -
 
 def test_fama_french_pivots_the_long_table_onto_a_zero_one_scale(fake_lake: Any) -> None:
     """The daily 3-factor dataset becomes Mkt-RF/SMB/HML/RF columns in
-    return units, ignoring other datasets and later dates."""
+    return units, ignoring other datasets and dates not yet public."""
     rows = [
         ("F-F_Research_Data_Factors_daily", "daily", "2024-01-02", "Mkt-RF", 0.5),
         ("F-F_Research_Data_Factors_daily", "daily", "2024-01-02", "SMB", 0.1),
@@ -270,7 +277,7 @@ def test_fama_french_pivots_the_long_table_onto_a_zero_one_scale(fake_lake: Any)
         date_columns=("date",),
     )
 
-    result = lakehouse_loader.load_fama_french_factors_from_lakehouse(date(2024, 1, 15))
+    result = lakehouse_loader.load_fama_french_factors_from_lakehouse(date(2024, 2, 29))
 
     assert result is not None
     assert list(result.columns) == ["Mkt-RF", "SMB", "HML", "RF"]

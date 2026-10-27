@@ -39,16 +39,16 @@ def test_risk_free_rate_series_is_a_calendar_indexed_decimal_daily_rate(
 
 
 @patch("agentic_trading.data.loaders.macro_loader.load_fred_series_from_lakehouse")
-def test_risk_free_rate_series_backfills_a_window_starting_before_the_first_observation(
+def test_risk_free_rate_series_raises_for_a_window_starting_before_the_first_observation(
     mock_load: MagicMock,
 ) -> None:
+    """A window opening before the first observation would need a
+    backward-filled rate, so it raises naming that observation's date."""
     published = pd.bdate_range("2024-06-05", "2024-06-07")
     mock_load.return_value = pd.Series([4.0, 4.5, 5.0], index=published)
 
-    result = load_risk_free_rate_series(date(2024, 6, 3), date(2024, 6, 7))
-
-    assert result.loc["2024-06-03"] == pytest.approx(4.0 / 100.0 / TRADING_DAYS_PER_YEAR)
-    assert result.loc["2024-06-07"] == pytest.approx(5.0 / 100.0 / TRADING_DAYS_PER_YEAR)
+    with pytest.raises(ValueError, match="2024-06-05"):
+        load_risk_free_rate_series(date(2024, 6, 3), date(2024, 6, 7))
 
 
 @patch("agentic_trading.data.loaders.macro_loader.load_fred_series_from_lakehouse")
