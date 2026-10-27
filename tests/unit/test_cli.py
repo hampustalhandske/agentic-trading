@@ -53,7 +53,7 @@ def _fake_backtest_result() -> BacktestResult:
 @patch("agentic_trading.cli.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_run_with_valid_arguments_exits_zero_and_prints_summary(
-    mock_engine_cls: MagicMock, mock_load: MagicMock
+    mock_engine_cls: MagicMock, mock_load: MagicMock, preflight_lake: object
 ) -> None:
     """Valid ticker + date-range arguments drive the (mocked) backtest pipeline to completion."""
     mock_load.return_value = (pd.DataFrame(), "lakehouse data")
@@ -72,7 +72,7 @@ def test_run_with_valid_arguments_exits_zero_and_prints_summary(
 @patch("agentic_trading.cli.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_run_never_executes_a_real_backtest(
-    mock_engine_cls: MagicMock, mock_load: MagicMock
+    mock_engine_cls: MagicMock, mock_load: MagicMock, preflight_lake: object
 ) -> None:
     """No LLM calls, no network calls: only the mocked BacktestEngine.run() may be invoked."""
     mock_load.return_value = (pd.DataFrame(), "lakehouse data")
@@ -178,7 +178,7 @@ def test_run_aborts_on_decline(
 @patch("agentic_trading.cli.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_run_builds_engine_with_execution_defaults_from_settings(
-    mock_engine_cls: MagicMock, mock_load: MagicMock
+    mock_engine_cls: MagicMock, mock_load: MagicMock, preflight_lake: object
 ) -> None:
     """`run` shares the firm-wide execution assumptions: commission and
     slippage on the Portfolio and the execution lag on the engine all come

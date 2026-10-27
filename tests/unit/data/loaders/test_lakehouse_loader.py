@@ -1,224 +1,184 @@
-"""Unit tests for agentic_trading.data.loaders.lakehouse_loader's
-point-in-time self-assertion.
+"""Unit tests for agentic_trading.data.loaders.lakehouse_loader.
 
-Each loader gates its own SQL query on `<= as_of_date`; these tests
-monkeypatch `duckdb.connect` to return a canned DataFrame directly (the
-query text itself is never executed), so they can independently confirm
-`assert_point_in_time` raises if that DataFrame ever contained a
-future-dated row that the SQL gate should have excluded.
+The loaders run their real SQL against a `FakeLake` (see `tests/conftest.py`).
+Each loader gates its own query on `<= as_of_date`; the "raises" tests make
+the fake return a future-dated frame regardless of the SQL, to confirm
+`assert_point_in_time` raises if a result ever contained a row the SQL gate
+should have excluded.
 """
 
 from datetime import date
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import pytest
 
-from agentic_trading.config import temporary_overrides
 from agentic_trading.data.loaders import lakehouse_loader
 
 
-class _FakeResult:
-    def __init__(self, frame: pd.DataFrame) -> None:
-        self._frame = frame
-
-    def df(self) -> pd.DataFrame:
-        return self._frame
-
-
-class _FakeConnection:
-    def __init__(self, frame: pd.DataFrame) -> None:
-        self._frame = frame
-
-    def execute(self, _query: str) -> _FakeResult:
-        return _FakeResult(self._frame)
-
-    def close(self) -> None:
-        pass
+def _short_interest_table(dissemination_date: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "symbol": ["AAPL"],
+            "settlement_date": ["2024-01-01"],
+            "dissemination_date": [dissemination_date],
+            "current_short_position": [1000],
+            "days_to_cover": [1.5],
+            "average_daily_volume": [500],
+        }
+    )
 
 
-def _touch_table(lake_dir: Path, table: str) -> None:
-    partition_dir = lake_dir / f"table={table}" / "partition=x"
-    partition_dir.mkdir(parents=True, exist_ok=True)
-    (partition_dir / "data.parquet").touch()
+def _short_interest_result(dissemination_date: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "settlement_date": ["2024-01-01"],
+            "dissemination_date": [dissemination_date],
+            "short_interest_shares": [1000],
+            "days_to_cover": [1.5],
+            "avg_daily_volume": [500],
+        }
+    )
 
 
-def _patch_connect(monkeypatch: pytest.MonkeyPatch, frame: pd.DataFrame) -> None:
-    def _fake_connect(*_args: Any, **_kwargs: Any) -> _FakeConnection:
-        return _FakeConnection(frame)
-
-    monkeypatch.setattr(lakehouse_loader.duckdb, "connect", _fake_connect)
-
-
-def test_load_short_interest_returns_valid_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_load_short_interest_returns_valid_data(fake_lake: Any) -> None:
     """Valid, in-window dissemination dates pass straight through."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _touch_table(tmp_path, "finra_short_interest")
-        frame = pd.DataFrame(
-            {
-                "settlement_date": ["2024-01-01"],
-                "dissemination_date": ["2024-01-10"],
-                "short_interest_shares": [1000],
-                "days_to_cover": [1.5],
-                "avg_daily_volume": [500],
-            }
-        )
-        _patch_connect(monkeypatch, frame)
+    fake_lake.add(
+        "finra_short_interest",
+        _short_interest_table("2024-01-10"),
+        date_columns=("settlement_date", "dissemination_date"),
+    )
 
-        result = lakehouse_loader.load_short_interest_from_lakehouse("AAPL", date(2024, 1, 15))
+    result = lakehouse_loader.load_short_interest_from_lakehouse("AAPL", date(2024, 1, 15))
 
     assert result is not None
     assert result.loc[0, "short_interest_shares"] == 1000
 
 
-def test_load_short_interest_raises_on_future_dissemination_date(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_load_short_interest_raises_on_future_dissemination_date(fake_lake: Any) -> None:
     """A dissemination_date after as_of_date is a broken SQL gate — must raise, not pass through."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _touch_table(tmp_path, "finra_short_interest")
-        frame = pd.DataFrame(
-            {
-                "settlement_date": ["2024-01-01"],
-                "dissemination_date": ["2024-01-20"],
-                "short_interest_shares": [1000],
-                "days_to_cover": [1.5],
-                "avg_daily_volume": [500],
-            }
-        )
-        _patch_connect(monkeypatch, frame)
+    fake_lake.fixed_result = _short_interest_result("2024-01-20")
 
-        with pytest.raises(ValueError, match="2024-01-20"):
-            lakehouse_loader.load_short_interest_from_lakehouse("AAPL", date(2024, 1, 15))
+    with pytest.raises(ValueError, match="2024-01-20"):
+        lakehouse_loader.load_short_interest_from_lakehouse("AAPL", date(2024, 1, 15))
 
 
-def test_load_company_facts_returns_valid_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _company_facts_table(filed: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ticker": ["AAPL"],
+            "concept": ["Revenues"],
+            "value": [1_000_000.0],
+            "fiscal_period": ["Q1"],
+            "filed_date": [filed],
+        }
+    )
+
+
+def test_load_company_facts_returns_valid_data(fake_lake: Any) -> None:
     """Valid, in-window filed dates pass straight through."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _touch_table(tmp_path, "sec_company_facts")
-        frame = pd.DataFrame(
-            {
-                "concept": ["Revenues"],
-                "value": [1_000_000.0],
-                "fiscal_period": ["Q1"],
-                "filed": ["2024-01-10"],
-            }
-        )
-        _patch_connect(monkeypatch, frame)
+    fake_lake.add(
+        "sec_company_facts", _company_facts_table("2024-01-10"), date_columns=("filed_date",)
+    )
 
-        result = lakehouse_loader.load_company_facts_from_lakehouse("AAPL", date(2024, 1, 15))
+    result = lakehouse_loader.load_company_facts_from_lakehouse("AAPL", date(2024, 1, 15))
 
     assert result is not None
     assert result.loc[0, "concept"] == "Revenues"
 
 
-def test_load_company_facts_raises_on_future_filed_date(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_load_company_facts_raises_on_future_filed_date(fake_lake: Any) -> None:
     """A filed date after as_of_date is a broken SQL gate — must raise, not pass through."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _touch_table(tmp_path, "sec_company_facts")
-        frame = pd.DataFrame(
-            {
-                "concept": ["Revenues"],
-                "value": [1_000_000.0],
-                "fiscal_period": ["Q1"],
-                "filed": ["2024-01-20"],
-            }
-        )
-        _patch_connect(monkeypatch, frame)
+    fake_lake.fixed_result = pd.DataFrame(
+        {
+            "concept": ["Revenues"],
+            "value": [1_000_000.0],
+            "fiscal_period": ["Q1"],
+            "filed": ["2024-01-20"],
+        }
+    )
 
-        with pytest.raises(ValueError, match="2024-01-20"):
-            lakehouse_loader.load_company_facts_from_lakehouse("AAPL", date(2024, 1, 15))
+    with pytest.raises(ValueError, match="2024-01-20"):
+        lakehouse_loader.load_company_facts_from_lakehouse("AAPL", date(2024, 1, 15))
 
 
-def test_load_dividends_returns_valid_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_dividends_returns_valid_data(fake_lake: Any) -> None:
     """Valid, in-window ex-dates pass straight through."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _touch_table(tmp_path, "dolthub_stock_dividends")
-        frame = pd.DataFrame({"ex_date": ["2024-01-10"], "amount": [0.25]})
-        _patch_connect(monkeypatch, frame)
+    fake_lake.add(
+        "dolthub_stock_dividends",
+        pd.DataFrame({"act_symbol": ["AAPL"], "ex_date": ["2024-01-10"], "amount": [0.25]}),
+        date_columns=("ex_date",),
+    )
 
-        result = lakehouse_loader.load_dividends_from_lakehouse("AAPL", date(2024, 1, 15))
+    result = lakehouse_loader.load_dividends_from_lakehouse("AAPL", date(2024, 1, 15))
 
     assert result is not None
     assert result.iloc[0] == 0.25
 
 
-def test_load_dividends_raises_on_future_ex_date(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_load_dividends_raises_on_future_ex_date(fake_lake: Any) -> None:
     """An ex-date after as_of_date in the index is a broken SQL gate — must raise."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _touch_table(tmp_path, "dolthub_stock_dividends")
-        frame = pd.DataFrame({"ex_date": ["2024-01-20"], "amount": [0.25]})
-        _patch_connect(monkeypatch, frame)
+    fake_lake.fixed_result = pd.DataFrame({"ex_date": ["2024-01-20"], "amount": [0.25]})
 
-        with pytest.raises(ValueError, match="2024-01-20"):
-            lakehouse_loader.load_dividends_from_lakehouse("AAPL", date(2024, 1, 15))
+    with pytest.raises(ValueError, match="2024-01-20"):
+        lakehouse_loader.load_dividends_from_lakehouse("AAPL", date(2024, 1, 15))
 
 
-def test_load_fred_series_returns_valid_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_load_fred_series_returns_valid_data(fake_lake: Any) -> None:
     """Valid, in-window dates in the index pass straight through."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _touch_table(tmp_path, "fred_series_observations")
-        frame = pd.DataFrame({"date": ["2024-01-10"], "value": [5.25]})
-        _patch_connect(monkeypatch, frame)
+    fake_lake.add(
+        "fred_series_observations",
+        pd.DataFrame({"series_id": ["DGS10"], "date": ["2024-01-10"], "value": [5.25]}),
+        date_columns=("date",),
+    )
 
-        result = lakehouse_loader.load_fred_series_from_lakehouse("DGS10", date(2024, 1, 15))
+    result = lakehouse_loader.load_fred_series_from_lakehouse("DGS10", date(2024, 1, 15))
 
     assert result is not None
     assert result.iloc[0] == 5.25
 
 
-def test_load_fred_series_raises_on_future_index_date(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_load_fred_series_raises_on_future_index_date(fake_lake: Any) -> None:
     """A date after as_of_date in the index is a broken SQL gate — must raise."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _touch_table(tmp_path, "fred_series_observations")
-        frame = pd.DataFrame({"date": ["2024-01-20"], "value": [5.25]})
-        _patch_connect(monkeypatch, frame)
+    fake_lake.fixed_result = pd.DataFrame({"date": ["2024-01-20"], "value": [5.25]})
 
-        with pytest.raises(ValueError, match="2024-01-20"):
-            lakehouse_loader.load_fred_series_from_lakehouse("DGS10", date(2024, 1, 15))
+    with pytest.raises(ValueError, match="2024-01-20"):
+        lakehouse_loader.load_fred_series_from_lakehouse("DGS10", date(2024, 1, 15))
 
 
-def _patch_routed_connect(
-    monkeypatch: pytest.MonkeyPatch, option_chain: pd.DataFrame, splits: pd.DataFrame
-) -> None:
-    """Routes by which table a query names, since a split-adjusted chain
-    read issues one query against `dolthub_option_chain` and a second
-    against `equity_splits` in the same call."""
+def _option_chain_table(
+    strike: float, bid: float, ask: float, implied_volatility: float, delta: float, **greeks: float
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "underlying": ["NVDA"],
+            "date": ["2024-04-01"],
+            "expiration": ["2024-04-26"],
+            "option_type": ["call"],
+            "strike": [strike],
+            "bid": [bid],
+            "ask": [ask],
+            "implied_volatility": [implied_volatility],
+            "delta": [delta],
+            **{name: [value] for name, value in greeks.items()},
+        }
+    )
 
-    def _fake_connect(*_args: Any, **_kwargs: Any) -> _FakeConnection:
-        return _RoutedConnection(option_chain, splits)
 
-    monkeypatch.setattr(lakehouse_loader.duckdb, "connect", _fake_connect)
-
-
-class _RoutedConnection:
-    def __init__(self, option_chain: pd.DataFrame, splits: pd.DataFrame) -> None:
-        self._option_chain = option_chain
-        self._splits = splits
-
-    def execute(self, query: str) -> _FakeResult:
-        is_splits_query = "equity_splits" in query
-        return _FakeResult(self._splits if is_splits_query else self._option_chain)
-
-    def close(self) -> None:
-        pass
+def _splits_table(ticker: str, ratios: list[float]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ticker": pd.Series([ticker] * len(ratios), dtype="string"),
+            "ex_date": ["2024-06-10"] * len(ratios),
+            "ratio": pd.Series(ratios, dtype=float),
+            "sources": pd.Series(["dolthub,yahoo"] * len(ratios), dtype="string"),
+            "status": pd.Series(["confirmed"] * len(ratios), dtype="string"),
+        }
+    )
 
 
 def test_options_snapshot_rescales_a_pre_split_strike_onto_todays_basis(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fake_lake: Any,
 ) -> None:
     """A contract quoted before a later 10-for-1 split is archival and
     never itself adjusted; the loader must divide its strike/bid/ask by
@@ -226,29 +186,16 @@ def test_options_snapshot_rescales_a_pre_split_strike_onto_todays_basis(
     `instrument_prices` — this is the bug behind the NVDA 630 call that
     marked near zero against an $88 spot in the live 2024_2026 run
     (KNOWN_LIMITATIONS §0)."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _touch_table(tmp_path, "dolthub_option_chain")
-        _touch_table(tmp_path, "equity_splits")
-        option_chain = pd.DataFrame(
-            {
-                "date": ["2024-04-01"],
-                "expiration": ["2024-04-26"],
-                "option_type": ["call"],
-                "strike": [630.0],
-                "bid": [274.35],
-                "ask": [278.0],
-                "implied_volatility": [0.5588],
-                "delta": [0.9948],
-                "gamma": [0.001],
-                "theta": [-0.02],
-                "vega": [0.03],
-                "rho": [0.01],
-            }
-        )
-        splits = pd.DataFrame({"ratio": [0.1]})
-        _patch_routed_connect(monkeypatch, option_chain, splits)
+    fake_lake.add(
+        "dolthub_option_chain",
+        _option_chain_table(
+            630.0, 274.35, 278.0, 0.5588, 0.9948, gamma=0.001, theta=-0.02, vega=0.03, rho=0.01
+        ),
+        date_columns=("date", "expiration"),
+    )
+    fake_lake.add("equity_splits", _splits_table("NVDA", [0.1]), date_columns=("ex_date",))
 
-        result = lakehouse_loader.load_options_snapshot_from_lakehouse("NVDA", date(2024, 4, 1))
+    result = lakehouse_loader.load_options_snapshot_from_lakehouse("NVDA", date(2024, 4, 1))
 
     assert result is not None
     row = result.iloc[0]
@@ -262,35 +209,71 @@ def test_options_snapshot_rescales_a_pre_split_strike_onto_todays_basis(
     assert row["implied_volatility"] == pytest.approx(0.5588)
 
 
-def test_options_snapshot_leaves_an_unsplit_ticker_unchanged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_options_snapshot_leaves_an_unsplit_ticker_unchanged(fake_lake: Any) -> None:
     """No split recorded after the quote date — the chain passes through
     exactly as quoted."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _touch_table(tmp_path, "dolthub_option_chain")
-        _touch_table(tmp_path, "equity_splits")
-        option_chain = pd.DataFrame(
-            {
-                "date": ["2024-04-01"],
-                "expiration": ["2024-04-26"],
-                "option_type": ["call"],
-                "strike": [180.0],
-                "bid": [5.0],
-                "ask": [5.2],
-                "implied_volatility": [0.25],
-                "delta": [0.5],
-                "gamma": [0.01],
-                "theta": [-0.05],
-                "vega": [0.1],
-                "rho": [0.02],
-            }
-        )
-        splits = pd.DataFrame({"ratio": pd.Series([], dtype=float)})
-        _patch_routed_connect(monkeypatch, option_chain, splits)
+    fake_lake.add(
+        "dolthub_option_chain",
+        _option_chain_table(
+            180.0, 5.0, 5.2, 0.25, 0.5, gamma=0.01, theta=-0.05, vega=0.1, rho=0.02
+        ).assign(underlying="AAPL"),
+        date_columns=("date", "expiration"),
+    )
+    fake_lake.add("equity_splits", _splits_table("AAPL", []), date_columns=("ex_date",))
 
-        result = lakehouse_loader.load_options_snapshot_from_lakehouse("AAPL", date(2024, 4, 1))
+    result = lakehouse_loader.load_options_snapshot_from_lakehouse("AAPL", date(2024, 4, 1))
 
     assert result is not None
     assert result.iloc[0]["strike"] == pytest.approx(180.0)
     assert result.iloc[0]["bid"] == pytest.approx(5.0)
+
+
+def test_cot_positioning_reads_the_cftc_table_by_contract_code(fake_lake: Any) -> None:
+    """Gold maps to its CFTC contract code in `cftc_cot_disaggregated`; the
+    ratio is managed-money net over open interest, gated on report_date + 3 days."""
+    fake_lake.add(
+        "cftc_cot_disaggregated",
+        pd.DataFrame(
+            {
+                "cftc_contract_market_code": ["088691", "088691", "067651"],
+                "report_date": ["2024-01-02", "2024-01-09", "2024-01-02"],
+                "open_interest_all": [1000, 1000, 1000],
+                "managed_money_long": [300, 400, 999],
+                "managed_money_short": [100, 100, 0],
+            }
+        ),
+        date_columns=("report_date",),
+    )
+
+    result = lakehouse_loader.load_cot_positioning_from_lakehouse("GC=F", date(2024, 1, 10))
+
+    assert result is not None
+    # The 2024-01-09 report is not yet public on 2024-01-10 (report_date + 3 days).
+    assert list(result) == [pytest.approx(0.2)]
+    assert lakehouse_loader.load_cot_positioning_from_lakehouse("AAPL", date(2024, 1, 10)) is None
+
+
+def test_fama_french_pivots_the_long_table_onto_a_zero_one_scale(fake_lake: Any) -> None:
+    """The daily 3-factor dataset becomes Mkt-RF/SMB/HML/RF columns in
+    return units, ignoring other datasets and later dates."""
+    rows = [
+        ("F-F_Research_Data_Factors_daily", "daily", "2024-01-02", "Mkt-RF", 0.5),
+        ("F-F_Research_Data_Factors_daily", "daily", "2024-01-02", "SMB", 0.1),
+        ("F-F_Research_Data_Factors_daily", "daily", "2024-01-02", "HML", -0.2),
+        ("F-F_Research_Data_Factors_daily", "daily", "2024-01-02", "RF", 0.01),
+        ("F-F_Research_Data_Factors_daily", "daily", "2024-02-01", "Mkt-RF", 9.0),
+        ("F-F_Research_Data_5_Factors_2x3_daily", "daily", "2024-01-02", "RMW", 0.3),
+    ]
+    fake_lake.add(
+        "famafrench_returns",
+        pd.DataFrame(rows, columns=["dataset", "frequency", "date", "portfolio", "value"]),
+        date_columns=("date",),
+    )
+
+    result = lakehouse_loader.load_fama_french_factors_from_lakehouse(date(2024, 1, 15))
+
+    assert result is not None
+    assert list(result.columns) == ["Mkt-RF", "SMB", "HML", "RF"]
+    assert len(result) == 1
+    assert result.iloc[0]["Mkt-RF"] == pytest.approx(0.005)
+    assert result.iloc[0]["HML"] == pytest.approx(-0.002)

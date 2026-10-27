@@ -1,78 +1,90 @@
 # lakehouse_loader.py
 
-"""Every data read a run makes, from the external partitioned-parquet
-lakehouse at `settings.data.lake_dir` (set by the `LAKEHOUSE_DIR`
-environment variable): equities/ETFs/indices/commodities/FX/crypto
-prices, point-in-time S&P 500 membership, option chains, dividends,
-CFTC positioning, earnings, SIC codes, FRED series, Ken French factors,
-FINRA short interest and SEC company facts, laid out as
-`table=<name>/<partition>/*.parquet` and queried in-process with DuckDB
-reading the parquet files directly.
+"""Every data read a run makes, from the lakehouse's HTTP API (`POST
+/v1/sql`, through `data/lakehouse_client.py`): equities/ETFs/indices/
+commodities/FX/crypto prices, point-in-time S&P 500 membership, option
+chains, dividends, CFTC positioning, earnings, SIC codes, FRED series, Ken
+French factors, FINRA short interest and SEC company facts. The service
+URL and token come from `LAKEHOUSE_API_URL` and `LAKEHOUSE_API_TOKEN`
+(process environment or the repo-root `.env`). Each table the API serves
+is already deduplicated (latest write wins), and every query passes its
+values as `?` parameters.
 
 This is the only market/alternative-data source a run reads:
 `data/loader.py::load_price_history_with_fallback` raises for any ticker
-the lake doesn't cover rather than falling back to a live API."""
+the lake doesn't cover rather than falling back to a live API.
 
-import threading
-from datetime import date
-from pathlib import Path
-from typing import cast
+A loader returns `None` only when its query succeeds and finds no rows. A
+failed request (`LakehouseError`, connection or timeout errors) propagates
+to the caller."""
 
-import duckdb
+from datetime import UTC, date, datetime
+from functools import cache
+from typing import Any, cast
+
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel
 
-from agentic_trading.config import settings
+from agentic_trading.config import _env_value
+from agentic_trading.data.lakehouse_client import Lake
 from agentic_trading.data.point_in_time import assert_point_in_time
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-_thread_local = threading.local()
+_URL_ENV_VAR = "LAKEHOUSE_API_URL"
+_TOKEN_ENV_VAR = "LAKEHOUSE_API_TOKEN"
 
 
-def _connection() -> duckdb.DuckDBPyConnection:
-    """This thread's own in-memory DuckDB connection, created once and
-    reused for the rest of the thread's life. Every loader query in this
-    module used to open and close a fresh connection per call — real
-    overhead on a run with thousands of lakehouse reads per simulated
-    day (~4.5s of pure connection setup on one profiled day, ~9% of that
-    day's compute), confirmed harmless to remove since every query here
-    is a read-only `SELECT` over local parquet files. Kept one connection
-    per thread rather than one process-wide connection since a single
-    DuckDB connection is not meant to be queried concurrently from
-    multiple threads at once (relevant under `--parallel-backend
-    thread`, where several analyst/manager threads can call into this
-    module at the same time)."""
-    if not hasattr(_thread_local, "connection"):
-        _thread_local.connection = duckdb.connect(database=":memory:", read_only=False)
-    return cast(duckdb.DuckDBPyConnection, _thread_local.connection)
+class LakeProvenance(BaseModel):
+    """Which lake build a run read, and when: `lake_version` is the git
+    commit of the running service, `read_at` the UTC time the status was
+    read, and `status_generated_at` the timestamp the lake stamped on its
+    own status document (`None` when the lake has not written one yet)."""
+
+    lake_version: str
+    read_at: datetime
+    status_generated_at: datetime | None
 
 
-def reset_connection_cache() -> None:
-    """Drops this thread's cached connection so the next `_connection()`
-    call opens a fresh one. A real backtest never needs this — it's for
-    tests that monkeypatch `duckdb.connect` per-test and would otherwise
-    see an earlier test's cached connection instead of their own fake
-    one."""
-    if hasattr(_thread_local, "connection"):
-        del _thread_local.connection
+def _required_env(name: str) -> str:
+    """The value of environment variable `name`; raises naming the
+    variable (never its value) when it is unset or empty."""
+    value = _env_value(name)
+    if not value:
+        raise RuntimeError(
+            f"{name} is not set; add it to the process environment or the repo-root .env"
+        )
+    return value
 
 
-def _lake_dir() -> Path:
-    return Path(settings.data.lake_dir)
+@cache
+def _lake() -> Lake:
+    """The process-wide lake client, built on first use from
+    `LAKEHOUSE_API_URL` and `LAKEHOUSE_API_TOKEN`. The underlying HTTP
+    client is safe to share across threads."""
+    return Lake(base_url=_required_env(_URL_ENV_VAR), token=_required_env(_TOKEN_ENV_VAR))
 
 
-def _instrument_prices_glob() -> str:
-    return str(_lake_dir() / "table=instrument_prices" / "*" / "*.parquet")
+def _query(query: str, params: list[Any]) -> pd.DataFrame:
+    """Runs one read-only `SELECT` with `?` placeholders bound to `params`
+    and returns every row as a DataFrame. Request failures propagate."""
+    return cast(pd.DataFrame, _lake().sql(query, params))
 
 
-def _sp500_membership_glob() -> str:
-    return str(_lake_dir() / "table=sp500_membership" / "*" / "*.parquet")
-
-
-def lakehouse_available() -> bool:
-    return _lake_dir().exists() and any(_lake_dir().glob("table=instrument_prices/*/*.parquet"))
+def lake_provenance() -> LakeProvenance:
+    """The lake's version and the UTC time its status was read, from
+    `Lake.status()` and the service's health payload."""
+    lake = _lake()
+    status = lake.status()
+    read_at = datetime.now(UTC)
+    generated = status.get("generated_at")
+    return LakeProvenance(
+        lake_version=str(lake.health()["version"]),
+        read_at=read_at,
+        status_generated_at=datetime.fromisoformat(generated) if generated else None,
+    )
 
 
 def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
@@ -82,45 +94,24 @@ def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
     a genuine member today's-relative-yesterday, so it belongs in a
     point-in-time universe for that date; excluding it would be the
     lookahead-shaped mistake of using tomorrow's knowledge to prune
-    today's universe). Returns `None` if the lake is unreachable or the
-    table has no rows — callers should fall back to a smaller static
-    universe, not treat this as an empty-but-valid membership list.
+    today's universe). Returns `None` if the table has no matching rows —
+    callers should fall back to a smaller static universe, not treat this
+    as an empty-but-valid membership list.
     Calls `assert_point_in_time` on the result for consistency with every
     other loader in this module, though it's a no-op here since this
     returns tickers, not dates."""
-    if not _lake_dir().exists() or not any(_lake_dir().glob("table=sp500_membership/*/*.parquet")):
-        return None
-
-    query = f"""
+    query = """
         SELECT DISTINCT ticker
-        FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY ticker, start_date, end_date ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet(
-                '{_sp500_membership_glob()}', hive_partitioning = true, union_by_name = true
-            )
-        )
-        WHERE rn = 1
-          AND start_date <= '{as_of_date.isoformat()}'
-          AND (end_date IS NULL OR end_date >= '{as_of_date.isoformat()}')
+        FROM sp500_membership
+        WHERE start_date <= ?
+          AND (end_date IS NULL OR end_date >= ?)
     """
-    try:
-        connection = _connection()
-        result = connection.execute(query).df()
-    except Exception:
-        logger.warning("sp500_membership lakehouse query failed", exc_info=True)
-        return None
-
+    result = _query(query, [as_of_date.isoformat(), as_of_date.isoformat()])
     if result.empty:
         return None
     tickers = sorted(result["ticker"].tolist())
     assert_point_in_time(tickers, as_of_date)
     return tickers
-
-
-def _option_chain_glob() -> str:
-    return str(_lake_dir() / "table=dolthub_option_chain" / "*" / "*.parquet")
 
 
 _COUNTED_SPLIT_STATUSES = ("confirmed", "before_first_bar", "inferred")
@@ -138,11 +129,8 @@ def _split_adjustment_factor(ticker: str, quote_date: date) -> float:
     Counts rows whose `status` is in `_COUNTED_SPLIT_STATUSES` and keeps
     one row per ex-date, preferring a row whose `sources` include yahoo.
     Rejected duplicates and spin-offs reclassified out of the split list
-    never count. Returns 1.0 when the table is absent or no such split
-    exists."""
-    if not _lake_dir().exists() or not any(_lake_dir().glob("table=equity_splits/*/*.parquet")):
-        return 1.0
-    statuses = ", ".join(f"'{status}'" for status in _COUNTED_SPLIT_STATUSES)
+    never count. Returns 1.0 when no such split exists."""
+    placeholders = ", ".join("?" for _ in _COUNTED_SPLIT_STATUSES)
     query = f"""
         SELECT ratio
         FROM (
@@ -150,21 +138,14 @@ def _split_adjustment_factor(ticker: str, quote_date: date) -> float:
                 PARTITION BY ex_date
                 ORDER BY (sources LIKE '%yahoo%') DESC, sources
             ) AS rn
-            FROM read_parquet(
-                '{_table_glob("equity_splits")}', hive_partitioning = true, union_by_name = true
-            )
-            WHERE ticker = '{ticker}'
-              AND ex_date > '{quote_date.isoformat()}'
-              AND status IN ({statuses})
+            FROM equity_splits
+            WHERE ticker = ?
+              AND ex_date > ?
+              AND status IN ({placeholders})
         )
         WHERE rn = 1
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("Stock-split lakehouse query failed for %s", ticker, exc_info=True)
-        return 1.0
+    frame = _query(query, [ticker, quote_date.isoformat(), *_COUNTED_SPLIT_STATUSES])
     factor = 1.0
     for ratio in frame["ratio"]:
         if ratio and ratio > 0:
@@ -197,46 +178,34 @@ def load_options_snapshot_from_lakehouse(
     implied_volatility, delta, gamma, theta, vega, rho — no open interest,
     no volume, confirmed absent from the source) for `ticker`, from the
     most recent available snapshot date on or before `as_of_date` within
-    `lookback_days` — coverage is real but not daily-dense (confirmed
-    live: roughly every-other-trading-day for AAPL), so a same-day match
-    isn't guaranteed even for a covered ticker.
+    `lookback_days` — coverage is real but not daily-dense (roughly
+    every-other-trading-day for AAPL), so a same-day match isn't
+    guaranteed even for a covered ticker.
 
-    Returns `None` if the lake is unreachable, `ticker` has no coverage at
-    all, or the nearest snapshot is more than `lookback_days` stale — the
-    caller reports a flat, zero-confidence signal in that case rather
-    than treat a miss as fatal. `strike`/`bid`/`ask`/`gamma`/`vega`/
-    `theta`/`rho` are rescaled onto `instrument_prices`' continuously
-    split-adjusted basis via `_apply_split_adjustment` before returning,
-    since the raw chain is archival and never itself adjusted for a
-    later split. Self-asserts point-in-time on `date` before returning."""
-    if not _lake_dir().exists() or not any(
-        _lake_dir().glob("table=dolthub_option_chain/*/*.parquet")
-    ):
-        return None
-
+    Returns `None` if `ticker` has no coverage at all or the nearest
+    snapshot is more than `lookback_days` stale — the caller reports a
+    flat, zero-confidence signal in that case rather than treat a miss as
+    fatal. `strike`/`bid`/`ask`/`gamma`/`vega`/`theta`/`rho` are rescaled
+    onto `instrument_prices`' continuously split-adjusted basis via
+    `_apply_split_adjustment` before returning, since the raw chain is
+    archival and never itself adjusted for a later split. Self-asserts
+    point-in-time on `date` before returning."""
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
-    query = f"""
+    window_end = as_of_date.isoformat()
+    query = """
         SELECT date, expiration, option_type, strike, bid, ask,
                implied_volatility, delta, gamma, theta, vega, rho
-        FROM read_parquet('{_option_chain_glob()}', hive_partitioning = true, union_by_name = true)
-        WHERE underlying = '{ticker}'
-          AND date BETWEEN '{window_start}' AND '{as_of_date.isoformat()}'
+        FROM dolthub_option_chain
+        WHERE underlying = ?
+          AND date BETWEEN ? AND ?
           AND date = (
               SELECT MAX(date)
-              FROM read_parquet(
-                  '{_option_chain_glob()}', hive_partitioning = true, union_by_name = true
-              )
-              WHERE underlying = '{ticker}'
-                AND date BETWEEN '{window_start}' AND '{as_of_date.isoformat()}'
+              FROM dolthub_option_chain
+              WHERE underlying = ?
+                AND date BETWEEN ? AND ?
           )
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("Options-chain lakehouse query failed for %s", ticker, exc_info=True)
-        return None
-
+    frame = _query(query, [ticker, window_start, window_end, ticker, window_start, window_end])
     if frame.empty:
         return None
     frame["date"] = pd.to_datetime(frame["date"])
@@ -246,8 +215,25 @@ def load_options_snapshot_from_lakehouse(
     return frame
 
 
-def _cot_glob(table: str) -> str:
-    return str(_lake_dir() / f"table={table}" / "*" / "*.parquet")
+# CFTC contract-market codes for the tickers the loader covers, keyed by
+# the `cftc_cot_disaggregated` (commodities) and `cftc_cot_tff` (FX and
+# rate futures) tables.
+_COT_DISAGGREGATED_CODES = {
+    "GC=F": "088691",
+    "CL=F": "067651",
+    "SI=F": "084691",
+    "NG=F": "023651",
+    "HG=F": "085692",
+}
+_COT_TFF_CODES = {
+    "EURUSD=X": "099741",
+    "GBPUSD=X": "096742",
+    "USDJPY=X": "097741",
+    "AUDUSD=X": "232741",
+    "ZT=F": "042601",
+    "ZN=F": "043602",
+    "ZB=F": "020601",
+}
 
 
 def load_cot_positioning_from_lakehouse(
@@ -259,9 +245,8 @@ def load_cot_positioning_from_lakehouse(
     for commodities, `leveraged_funds_long - leveraged_funds_short` (the
     TFF report's closest equivalent) for FX/rates, divided by
     `open_interest_all`. A given `ticker` only ever appears in one of the
-    two tables (commodities in `cot_disaggregated_positions`,
-    FX/rate-futures in `cot_tff_positions`) — this tries both and uses
-    whichever has rows.
+    two tables (commodities in `cftc_cot_disaggregated`, FX/rate-futures
+    in `cftc_cot_tff`), selected by its CFTC contract-market code.
 
     Point-in-time: COT reports have a real publication lag — the
     Tuesday-dated `report_date` isn't released until the following
@@ -270,50 +255,38 @@ def load_cot_positioning_from_lakehouse(
     FINRA short-interest loader already uses for an identical
     reporting-lag shape.
 
-    Returns `None` if the lake is unreachable or `ticker` has no COT
-    coverage at all — callers should treat that as "no positioning read
-    available," not an empty-but-valid series. Self-asserts point-in-time
-    on the `report_date` index before returning."""
-    if not _lake_dir().exists():
-        return None
-
+    Returns `None` if `ticker` has no COT coverage at all — callers
+    should treat that as "no positioning read available," not an
+    empty-but-valid series. Self-asserts point-in-time on the
+    `report_date` index before returning."""
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
     availability_cutoff = as_of_date.isoformat()
     queries = [
         (
-            "cot_disaggregated_positions",
+            "cftc_cot_disaggregated",
+            _COT_DISAGGREGATED_CODES,
             "(managed_money_long - managed_money_short)",
         ),
         (
-            "cot_tff_positions",
+            "cftc_cot_tff",
+            _COT_TFF_CODES,
             "(leveraged_funds_long - leveraged_funds_short)",
         ),
     ]
-    for table, net_position_expr in queries:
-        if not any(_lake_dir().glob(f"table={table}/*/*.parquet")):
+    for table, codes, net_position_expr in queries:
+        code = codes.get(ticker)
+        if code is None:
             continue
         query = f"""
             SELECT report_date, {net_position_expr} / open_interest_all AS net_positioning_ratio
-            FROM (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY ticker, report_date ORDER BY scraped_at DESC
-                ) AS rn
-                FROM read_parquet(
-                    '{_cot_glob(table)}', hive_partitioning = true, union_by_name = true
-                )
-                WHERE ticker = '{ticker}'
-                  AND report_date BETWEEN '{window_start}' AND '{availability_cutoff}'
-                  AND date_add(CAST(report_date AS DATE), INTERVAL 3 DAY) <= '{availability_cutoff}'
-            )
-            WHERE rn = 1 AND open_interest_all > 0
+            FROM {table}
+            WHERE cftc_contract_market_code = ?
+              AND report_date BETWEEN ? AND ?
+              AND date_add(CAST(report_date AS DATE), INTERVAL 3 DAY) <= ?
+              AND open_interest_all > 0
             ORDER BY report_date
         """
-        try:
-            connection = _connection()
-            frame = connection.execute(query).df()
-        except Exception:
-            logger.warning("COT lakehouse query failed for %s/%s", table, ticker, exc_info=True)
-            frame = pd.DataFrame()
+        frame = _query(query, [code, window_start, availability_cutoff, availability_cutoff])
         if not frame.empty:
             frame["report_date"] = pd.to_datetime(frame["report_date"])
             series = frame.set_index("report_date")["net_positioning_ratio"]
@@ -327,36 +300,15 @@ def load_dividends_from_lakehouse(ticker: str, as_of_date: date) -> pd.Series | 
     `ticker`, indexed by ex-date, filtered `<= as_of_date` — the ex-date
     is itself the real, already-past-tense corporate-action date (no
     additional estimated-lag gating needed, unlike COT/FINRA). Returns
-    `None` if the lake is unreachable or `ticker` has no dividend
-    history at all. Self-asserts point-in-time on the `ex_date` index
-    before returning."""
-    if not _lake_dir().exists() or not any(
-        _lake_dir().glob("table=dolthub_stock_dividends/*/*.parquet")
-    ):
-        return None
-
-    query = f"""
+    `None` if `ticker` has no dividend history at all. Self-asserts
+    point-in-time on the `ex_date` index before returning."""
+    query = """
         SELECT ex_date, amount
-        FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY act_symbol, ex_date ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet(
-                '{_lake_dir() / "table=dolthub_stock_dividends" / "*" / "*.parquet"}',
-                hive_partitioning = true, union_by_name = true
-            )
-            WHERE act_symbol = '{ticker}' AND ex_date <= '{as_of_date.isoformat()}'
-        )
-        WHERE rn = 1
+        FROM dolthub_stock_dividends
+        WHERE act_symbol = ? AND ex_date <= ?
         ORDER BY ex_date
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("Dividends lakehouse query failed for %s", ticker, exc_info=True)
-        return None
-
+    frame = _query(query, [ticker, as_of_date.isoformat()])
     if frame.empty:
         return None
     frame["ex_date"] = pd.to_datetime(frame["ex_date"])
@@ -378,50 +330,30 @@ def load_earnings_surprise_from_lakehouse(
     75-day window after `period_end_date` — a generous margin around the
     typical ~29-30 day real reporting lag, not a tight estimate.
 
-    Returns `None` if the lake is unreachable, `ticker` has no earnings
-    history at all, or no quarter's real announcement date has occurred
-    yet as of `as_of_date`. Self-asserts point-in-time on
-    `announcement_date` before returning."""
-    if (
-        not _lake_dir().exists()
-        or not any(_lake_dir().glob("table=dolthub_eps_history/*/*.parquet"))
-        or not any(_lake_dir().glob("table=dolthub_earnings_calendar/*/*.parquet"))
-    ):
-        return None
-
-    eps_glob = str(_lake_dir() / "table=dolthub_eps_history" / "*" / "*.parquet")
-    calendar_glob = str(_lake_dir() / "table=dolthub_earnings_calendar" / "*" / "*.parquet")
-    query = f"""
+    Returns `None` if `ticker` has no earnings history at all, or no
+    quarter's real announcement date has occurred yet as of
+    `as_of_date`. Self-asserts point-in-time on `announcement_date`
+    before returning."""
+    query = """
         SELECT h.reported, h.estimate, c.date AS announcement_date
         FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY act_symbol, period_end_date ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet('{eps_glob}', hive_partitioning = true, union_by_name = true)
-            WHERE act_symbol = '{ticker}' AND reported IS NOT NULL AND estimate IS NOT NULL
+            SELECT *
+            FROM dolthub_eps_history
+            WHERE act_symbol = ? AND reported IS NOT NULL AND estimate IS NOT NULL
         ) h
         JOIN (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY act_symbol, date ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet('{calendar_glob}', hive_partitioning = true, union_by_name = true)
-            WHERE act_symbol = '{ticker}'
+            SELECT *
+            FROM dolthub_earnings_calendar
+            WHERE act_symbol = ?
         ) c
         ON c.act_symbol = h.act_symbol
-           AND h.rn = 1 AND c.rn = 1
            AND CAST(c.date AS DATE) BETWEEN CAST(h.period_end_date AS DATE)
                AND date_add(CAST(h.period_end_date AS DATE), INTERVAL 75 DAY)
-        WHERE CAST(c.date AS DATE) <= '{as_of_date.isoformat()}'
+        WHERE CAST(c.date AS DATE) <= ?
         ORDER BY c.date DESC
         LIMIT 1
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("Earnings-surprise lakehouse query failed for %s", ticker, exc_info=True)
-        return None
-
+    frame = _query(query, [ticker, ticker, as_of_date.isoformat()])
     if frame.empty:
         return None
     assert_point_in_time(frame, as_of_date, date_column="announcement_date")
@@ -434,35 +366,9 @@ def load_sic_code_from_lakehouse(ticker: str) -> str | None:
     from SEC EDGAR, via `sec_sic_classification` — free, no GICS license
     restriction. Not time-varying in this lake (one row per ticker, not
     a point-in-time span), so no `as_of_date` gating; returns `None` if
-    the lake is unreachable or `ticker` has no SIC record (confirmed
-    live: mostly non-equity ETF/future/FX tickers, which have no SEC
-    filing to classify in the first place)."""
-    if not _lake_dir().exists() or not any(
-        _lake_dir().glob("table=sec_sic_classification/*/*.parquet")
-    ):
-        return None
-
-    query = f"""
-        SELECT sic
-        FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY ticker ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet(
-                '{_lake_dir() / "table=sec_sic_classification" / "*" / "*.parquet"}',
-                hive_partitioning = true, union_by_name = true
-            )
-            WHERE ticker = '{ticker}'
-        )
-        WHERE rn = 1
-    """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("SIC-classification lakehouse query failed for %s", ticker, exc_info=True)
-        return None
-
+    `ticker` has no SIC record (mostly non-equity ETF/future/FX tickers,
+    which have no SEC filing to classify in the first place)."""
+    frame = _query("SELECT sic FROM sec_sic_classification WHERE ticker = ?", [ticker])
     if frame.empty or pd.isna(frame.iloc[0]["sic"]):
         return None
     return str(frame.iloc[0]["sic"])
@@ -496,9 +402,10 @@ def load_price_history_from_lakehouse(
 ) -> pd.DataFrame | None:
     """Returns a `MultiIndex(ticker, field)` frame (`open`/`close`/
     `raw_close`/`volume`/`log_return`) for every ticker in `tickers` that the lake actually
-    covers, or `None` if the lake is unreachable or covers none of them
-    — never raises; `load_price_history_with_fallback` is what turns an
-    incomplete result into a clear error naming the uncovered ticker(s).
+    covers, or `None` if the lake covers none of them —
+    `load_price_history_with_fallback` is what turns an incomplete result
+    into a clear error naming the uncovered ticker(s). A failed request
+    propagates.
 
     Uses `adj_close` (dividend/split-adjusted) rather than raw `close` —
     correct for a multi-year backtest where corporate actions actually
@@ -506,41 +413,22 @@ def load_price_history_from_lakehouse(
     factor so the open the engine fills at and the close it marks at are
     on one price basis (an unadjusted open against an adjusted close would
     book the whole dividend-adjustment gap as a loss on every fill).
-    Deduplicates by latest `scraped_at` per (ticker, date), the same
-    "log is append-only, latest write wins" convention the lake's own
-    `db/analytics.py` views use. Self-asserts point-in-time on the
-    combined frame's date index against `end` before returning.
+    Self-asserts point-in-time on the combined frame's date index against
+    `end` before returning.
     """
-    if not lakehouse_available():
-        return None
-
-    tickers_sql = ", ".join(f"'{ticker}'" for ticker in tickers)
+    placeholders = ", ".join("?" for _ in tickers)
     query = f"""
         SELECT ticker, date,
                CASE WHEN close > 0 THEN open * adj_close / close ELSE NULL END AS open,
                adj_close AS close,
                close AS raw_close,
                volume
-        FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY ticker, date ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet(
-                '{_instrument_prices_glob()}', hive_partitioning = true, union_by_name = true
-            )
-            WHERE ticker IN ({tickers_sql})
-              AND date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
-        )
-        WHERE rn = 1
+        FROM instrument_prices
+        WHERE ticker IN ({placeholders})
+          AND date BETWEEN ? AND ?
         ORDER BY ticker, date
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("Lakehouse price query failed for %s", tickers, exc_info=True)
-        return None
-
+    frame = _query(query, [*tickers, start.isoformat(), end.isoformat()])
     if frame.empty:
         return None
 
@@ -555,10 +443,9 @@ def load_price_history_from_lakehouse(
         indexed = (
             group.set_index("date")[["open", "close", "raw_close", "volume"]].sort_index().copy()
         )
-        # Confirmed live: some lakehouse rows have a real, non-zero
-        # `close` but a corrupted `adj_close` of exactly 0.0 (a
-        # dividend-adjustment bug on that project's side, not this
-        # loader's) — a zero/negative price here would silently produce
+        # Some lakehouse rows have a real, non-zero
+        # `close` but a corrupted `adj_close` of exactly 0.0 — a
+        # zero/negative price here would silently produce
         # log(0) = -inf rather than NaN, which .dropna() downstream would
         # NOT catch. Mask non-positive prices to NaN before taking the
         # log, so a corrupted row degrades to "missing," the same way a
@@ -581,45 +468,21 @@ def load_price_history_from_lakehouse(
     return combined
 
 
-def _table_glob(table: str) -> str:
-    return str(_lake_dir() / f"table={table}" / "*" / "*.parquet")
-
-
 def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Series | None:
     """A FRED macro series (`DGS3MO`/`DGS2`/`DGS10`/`VIXCLS`/`CPIAUCSL`/
     `BAMLH0A0HYM2`/`BAMLC0A0CM` — the same series `macro_loader.
     SUPPORTED_SERIES` names) from the `fred_series_observations` table
     (`series_id`, `date`, `realtime_start`, `value`), filtered
-    `<= as_of_date`. Returns `None` if the lake or this table doesn't
-    exist yet, or has no rows for `series_id`. Self-asserts point-in-time
-    on the date index before returning."""
-    if not _lake_dir().exists() or not any(
-        _lake_dir().glob("table=fred_series_observations/*/*.parquet")
-    ):
-        return None
-
-    query = f"""
+    `<= as_of_date`. Returns `None` if the table has no rows for
+    `series_id`. Self-asserts point-in-time on the date index before
+    returning."""
+    query = """
         SELECT date, value
-        FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY series_id, date ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet(
-                '{_table_glob("fred_series_observations")}', hive_partitioning = true,
-                union_by_name = true
-            )
-            WHERE series_id = '{series_id}' AND date <= '{as_of_date.isoformat()}'
-        )
-        WHERE rn = 1
+        FROM fred_series_observations
+        WHERE series_id = ? AND date <= ?
         ORDER BY date
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("FRED lakehouse query failed for %s", series_id, exc_info=True)
-        return None
-
+    frame = _query(query, [series_id, as_of_date.isoformat()])
     if frame.empty:
         return None
     frame["date"] = pd.to_datetime(frame["date"])
@@ -628,69 +491,53 @@ def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Seri
     return series
 
 
-_KEN_FRENCH_TABLE_BY_MODEL = {
-    "3factor": "fama_french_3factor_daily",
-    "5factor": "fama_french_5factor_daily",
+# `famafrench_returns` holds every Ken French dataset as long rows
+# (`dataset`, `frequency`, `date`, `portfolio`, `value`); each model is one
+# daily US factor dataset and the portfolios that make up its factors, in
+# the column order the factor-pod analysts consume.
+_KEN_FRENCH_DATASET_BY_MODEL = {
+    "3factor": "F-F_Research_Data_Factors_daily",
+    "5factor": "F-F_Research_Data_5_Factors_2x3_daily",
 }
-# The lakehouse stores factor returns as plain percentage points
-# (e.g. 0.09 meaning 0.09%, matching Ken French's own published CSV
-# convention) with lowercase snake_case columns — rename to Ken French's
-# own `Mkt-RF`/`SMB`/`HML`/`RF`(/`RMW`/`CMA`) names and a 0-1 return
-# scale, the shape the factor-pod analysts consume.
-_KEN_FRENCH_COLUMN_RENAME = {
-    "mkt_rf": "Mkt-RF",
-    "smb": "SMB",
-    "hml": "HML",
-    "rmw": "RMW",
-    "cma": "CMA",
-    "rf": "RF",
+_KEN_FRENCH_FACTORS_BY_MODEL = {
+    "3factor": ("Mkt-RF", "SMB", "HML", "RF"),
+    "5factor": ("Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"),
 }
+_KEN_FRENCH_FREQUENCY = "daily"
 
 
 def load_fama_french_factors_from_lakehouse(
     as_of_date: date, model: str = "3factor"
 ) -> pd.DataFrame | None:
     """Daily Fama-French factor returns for `model` ("3factor" or
-    "5factor"), from the `fama_french_3factor_daily`/
-    `fama_french_5factor_daily` tables, filtered `<= as_of_date`.
-    Returns `None` if the lake or this table doesn't exist yet, has no
-    rows, or `model` isn't one of the two supported names. Self-asserts
-    point-in-time on the date index before returning."""
-    table = _KEN_FRENCH_TABLE_BY_MODEL.get(model)
-    if (
-        table is None
-        or not _lake_dir().exists()
-        or not any(_lake_dir().glob(f"table={table}/*/*.parquet"))
-    ):
+    "5factor"), from the `famafrench_returns` table's matching daily US
+    factor dataset, filtered `<= as_of_date`. The lake stores returns as
+    plain percentage points (0.09 meaning 0.09%, Ken French's own
+    convention); the result is on a 0-1 return scale with Ken French's
+    `Mkt-RF`/`SMB`/`HML`/`RF`(/`RMW`/`CMA`) column names. Returns `None`
+    if the table has no rows or `model` isn't one of the two supported
+    names. Self-asserts point-in-time on the date index before
+    returning."""
+    dataset = _KEN_FRENCH_DATASET_BY_MODEL.get(model)
+    if dataset is None:
         return None
+    factors = _KEN_FRENCH_FACTORS_BY_MODEL[model]
 
+    placeholders = ", ".join("?" for _ in factors)
     query = f"""
-        SELECT *
-        FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY date ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet(
-                '{_table_glob(table)}', hive_partitioning = true, union_by_name = true
-            )
-            WHERE date <= '{as_of_date.isoformat()}'
-        )
-        WHERE rn = 1
+        SELECT date, portfolio, value
+        FROM famafrench_returns
+        WHERE dataset = ? AND frequency = ?
+          AND portfolio IN ({placeholders})
+          AND date <= ?
         ORDER BY date
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("Ken French lakehouse query failed for %s", model, exc_info=True)
+    long = _query(query, [dataset, _KEN_FRENCH_FREQUENCY, *factors, as_of_date.isoformat()])
+    if long.empty:
         return None
-
-    if frame.empty:
-        return None
-    frame["date"] = pd.to_datetime(frame["date"])
-    frame = frame.set_index("date")
-    factor_columns = [column for column in _KEN_FRENCH_COLUMN_RENAME if column in frame.columns]
-    frame = frame[factor_columns].rename(columns=_KEN_FRENCH_COLUMN_RENAME)
+    long["date"] = pd.to_datetime(long["date"])
+    wide = long.pivot_table(index="date", columns="portfolio", values="value", aggfunc="max")
+    frame = wide[[factor for factor in factors if factor in wide.columns]]
     result = (frame.astype(float) / 100.0).sort_index()
     assert_point_in_time(result, as_of_date)
     return result
@@ -708,35 +555,16 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     multi-row-per-filing shape the original SEC EDGAR XBRL API already
     produced, not new here. Gated on the real `filed_date` (never the
     fiscal period it describes — a lookahead bug otherwise)
-    `<= as_of_date`. Returns `None` if the lake or this
-    table doesn't exist yet, or has no rows for `ticker`. Self-asserts
-    point-in-time on the returned `filed` column (the renamed
-    `filed_date`) before returning."""
-    if not _lake_dir().exists() or not any(_lake_dir().glob("table=sec_company_facts/*/*.parquet")):
-        return None
-
-    query = f"""
+    `<= as_of_date`. Returns `None` if the table has no rows for
+    `ticker`. Self-asserts point-in-time on the returned `filed` column
+    (the renamed `filed_date`) before returning."""
+    query = """
         SELECT concept, value, fiscal_period, filed_date AS filed
-        FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY ticker, concept, period_start, period_end, accession_number
-                ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet(
-                '{_table_glob("sec_company_facts")}', hive_partitioning = true, union_by_name = true
-            )
-            WHERE ticker = '{ticker}' AND filed_date <= '{as_of_date.isoformat()}'
-        )
-        WHERE rn = 1
+        FROM sec_company_facts
+        WHERE ticker = ? AND filed_date <= ?
         ORDER BY filed
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("SEC EDGAR facts lakehouse query failed for %s", ticker, exc_info=True)
-        return None
-
+    frame = _query(query, [ticker, as_of_date.isoformat()])
     if frame.empty:
         return None
     frame["filed"] = pd.to_datetime(frame["filed"])
@@ -751,39 +579,18 @@ def load_short_interest_from_lakehouse(ticker: str, as_of_date: date) -> pd.Data
     `average_daily_volume`, ...) — renamed to a
     `short_interest_shares`/`days_to_cover`/`avg_daily_volume`/
     `settlement_date`/`dissemination_date` shape. Gated on
-    `dissemination_date <= as_of_date`. Returns `None` if the lake or
-    this table doesn't exist yet, or has no rows for `ticker`.
-    Self-asserts point-in-time on `dissemination_date` before
-    returning."""
-    if not _lake_dir().exists() or not any(
-        _lake_dir().glob("table=finra_short_interest/*/*.parquet")
-    ):
-        return None
-
-    query = f"""
+    `dissemination_date <= as_of_date`. Returns `None` if the table has
+    no rows for `ticker`. Self-asserts point-in-time on
+    `dissemination_date` before returning."""
+    query = """
         SELECT settlement_date, dissemination_date,
                current_short_position AS short_interest_shares,
                days_to_cover, average_daily_volume AS avg_daily_volume
-        FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY symbol, settlement_date ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet(
-                '{_table_glob("finra_short_interest")}', hive_partitioning = true,
-                union_by_name = true
-            )
-            WHERE symbol = '{ticker}' AND dissemination_date <= '{as_of_date.isoformat()}'
-        )
-        WHERE rn = 1
+        FROM finra_short_interest
+        WHERE symbol = ? AND dissemination_date <= ?
         ORDER BY settlement_date
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("FINRA lakehouse query failed for %s", ticker, exc_info=True)
-        return None
-
+    frame = _query(query, [ticker, as_of_date.isoformat()])
     if frame.empty:
         return None
     frame["settlement_date"] = pd.to_datetime(frame["settlement_date"])
@@ -799,41 +606,18 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
     `transaction_code`, `shares`, `price_per_share`, `acquired_disposed`,
     `filed_date`), gated on `filed_date <= as_of_date` — the STOCK Act
     gives insiders two business days to file, so the filing date, not the
-    trade date, is when the information became public. Latest
-    `scraped_at` wins per (owner, accession, trade, security, code).
-    Returns `None` if the lake or table is absent or has no rows.
+    trade date, is when the information became public.
+    Returns `None` if the table has no rows for `ticker`.
     Self-asserts point-in-time on `filed_date` before returning."""
-    if not _lake_dir().exists() or not any(
-        _lake_dir().glob("table=sec_insider_transactions/*/*.parquet")
-    ):
-        return None
-
-    query = f"""
+    query = """
         SELECT owner_cik, owner_name, is_officer, is_director, is_ten_percent_owner,
                transaction_date, transaction_code, shares, price_per_share,
                acquired_disposed, filed_date
-        FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY owner_cik, accession_number, transaction_date, security_title,
-                             transaction_code
-                ORDER BY scraped_at DESC
-            ) AS rn
-            FROM read_parquet(
-                '{_table_glob("sec_insider_transactions")}', hive_partitioning = true,
-                union_by_name = true
-            )
-            WHERE issuer_ticker = '{ticker}' AND filed_date <= '{as_of_date.isoformat()}'
-        )
-        WHERE rn = 1
+        FROM sec_insider_transactions
+        WHERE issuer_ticker = ? AND filed_date <= ?
         ORDER BY filed_date, transaction_date
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("Insider-transactions lakehouse query failed for %s", ticker, exc_info=True)
-        return None
-
+    frame = _query(query, [ticker, as_of_date.isoformat()])
     if frame.empty:
         return None
     frame["filed_date"] = pd.to_datetime(frame["filed_date"])
@@ -860,27 +644,21 @@ def load_option_quote_from_lakehouse(
     strike filter is applied in pandas after adjustment instead. `None`
     when never quoted in the window. Self-asserts point-in-time on
     `date` before returning."""
-    if not _lake_dir().exists() or not any(
-        _lake_dir().glob("table=dolthub_option_chain/*/*.parquet")
-    ):
-        return None
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
-    query = f"""
+    query = """
         SELECT date, expiration, option_type, strike, bid, ask,
                implied_volatility, delta, gamma, theta, vega, rho
-        FROM read_parquet('{_option_chain_glob()}', hive_partitioning = true, union_by_name = true)
-        WHERE underlying = '{underlying}'
-          AND expiration = '{expiration.isoformat()}'
-          AND option_type = '{option_type}'
-          AND date BETWEEN '{window_start}' AND '{as_of_date.isoformat()}'
+        FROM dolthub_option_chain
+        WHERE underlying = ?
+          AND expiration = ?
+          AND option_type = ?
+          AND date BETWEEN ? AND ?
         ORDER BY date DESC
     """
-    try:
-        connection = _connection()
-        frame = connection.execute(query).df()
-    except Exception:
-        logger.warning("Option quote lakehouse query failed for %s", underlying, exc_info=True)
-        return None
+    frame = _query(
+        query,
+        [underlying, expiration.isoformat(), option_type, window_start, as_of_date.isoformat()],
+    )
     if frame.empty:
         return None
     frame["date"] = pd.to_datetime(frame["date"])

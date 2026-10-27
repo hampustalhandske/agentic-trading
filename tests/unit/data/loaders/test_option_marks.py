@@ -9,6 +9,7 @@ lookup (`option_marks._query_rate`) with a constant. No DuckDB access.
 
 from collections.abc import Iterator
 from datetime import date
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -78,7 +79,34 @@ class _ChainQueries:
 
 
 @pytest.fixture
-def chain(monkeypatch: pytest.MonkeyPatch) -> Iterator[_ChainQueries]:
+def chain(monkeypatch: pytest.MonkeyPatch, fake_lake: Any) -> Iterator[_ChainQueries]:
+    """Synthetic snapshots through `_query_chain`; the exact-contract
+    lookup falls through to a lake whose option chain holds no rows."""
+    fake_lake.add(
+        "dolthub_option_chain",
+        pd.DataFrame(
+            {
+                "underlying": pd.Series([], dtype="string"),
+                "date": pd.Series([], dtype="datetime64[ns]"),
+                "expiration": pd.Series([], dtype="datetime64[ns]"),
+                "option_type": pd.Series([], dtype="string"),
+                **{
+                    column: pd.Series([], dtype=float)
+                    for column in (
+                        "strike",
+                        "bid",
+                        "ask",
+                        "implied_volatility",
+                        "delta",
+                        "gamma",
+                        "theta",
+                        "vega",
+                        "rho",
+                    )
+                },
+            }
+        ),
+    )
     queries = _ChainQueries()
     option_marks.clear_cache()
     monkeypatch.setattr(option_marks, "_query_chain", queries)

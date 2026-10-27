@@ -86,8 +86,8 @@ universe; the others are scoped to their asset class.
 ## Data
 
 Every run reads only the lakehouse (`data/loaders/lakehouse_loader.py`,
-a parquet lake maintained by a separate scraping project, path in
-`LAKE_DIR`): prices (dividend-adjusted, with the open scaled to the same
+a lake maintained by a separate scraping project, read through its
+HTTP API with `LAKEHOUSE_API_URL` and `LAKEHOUSE_API_TOKEN`): prices (dividend-adjusted, with the open scaled to the same
 basis), option chains (11 underlyings, three expiries per snapshot),
 dividends, CFTC COT positioning, earnings surprises, SIC codes, S&P 500
 membership, FRED series, Ken French factors, FINRA short interest, SEC

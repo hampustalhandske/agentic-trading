@@ -2,12 +2,11 @@
 """Unit tests for agentic_trading.data.loaders.lakehouse_loader._split_adjustment_factor."""
 
 from datetime import date
-from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
 
-from agentic_trading.config import temporary_overrides
 from agentic_trading.data.loaders import lakehouse_loader
 
 _ROWS = [
@@ -27,13 +26,12 @@ _ROWS = [
 ]
 
 
-def _write_splits(lake_dir: Path, rows: list[tuple]) -> None:
-    partition_dir = lake_dir / "table=equity_splits" / "partition=x"
-    partition_dir.mkdir(parents=True, exist_ok=True)
+def _load_splits(fake_lake: Any, rows: list[tuple]) -> None:
     frame = pd.DataFrame(rows, columns=["ticker", "ex_date", "ratio", "sources", "status"])
-    frame["ex_date"] = pd.to_datetime(frame["ex_date"]).dt.date
-    frame["applied"] = True
-    frame.to_parquet(partition_dir / "data.parquet", index=False)
+    frame = frame.astype(
+        {"ticker": "string", "ratio": float, "sources": "string", "status": "string"}
+    )
+    fake_lake.add("equity_splits", frame, date_columns=("ex_date",))
 
 
 @pytest.mark.parametrize(
@@ -48,12 +46,11 @@ def _write_splits(lake_dir: Path, rows: list[tuple]) -> None:
     ],
 )
 def test_factor_is_product_of_inverse_ratios_after_quote_date(
-    tmp_path: Path, ticker: str, quote: date, expected: float
+    fake_lake: Any, ticker: str, quote: date, expected: float
 ) -> None:
     """Only splits with ex_date strictly after the quote date contribute 1/ratio."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _write_splits(tmp_path, _ROWS)
-        result = lakehouse_loader._split_adjustment_factor(ticker, quote)
+    _load_splits(fake_lake, _ROWS)
+    result = lakehouse_loader._split_adjustment_factor(ticker, quote)
     assert result == pytest.approx(expected, rel=1e-6)
 
 
@@ -65,12 +62,11 @@ def test_factor_is_product_of_inverse_ratios_after_quote_date(
     ],
 )
 def test_duplicate_ex_date_prefers_yahoo_row(
-    tmp_path: Path, ticker: str, quote: date, expected: float
+    fake_lake: Any, ticker: str, quote: date, expected: float
 ) -> None:
     """When rows share (ticker, ex_date), the row sourced from yahoo is the one counted."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _write_splits(tmp_path, _ROWS)
-        result = lakehouse_loader._split_adjustment_factor(ticker, quote)
+    _load_splits(fake_lake, _ROWS)
+    result = lakehouse_loader._split_adjustment_factor(ticker, quote)
     assert result == pytest.approx(expected, rel=1e-6)
 
 
@@ -85,25 +81,23 @@ def test_duplicate_ex_date_prefers_yahoo_row(
     ],
 )
 def test_rejected_and_spin_off_rows_are_ignored(
-    tmp_path: Path, ticker: str, quote: date, expected: float
+    fake_lake: Any, ticker: str, quote: date, expected: float
 ) -> None:
     """Rows with rejected_* or reclassified_spin_off status never contribute to the factor."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _write_splits(tmp_path, _ROWS)
-        result = lakehouse_loader._split_adjustment_factor(ticker, quote)
+    _load_splits(fake_lake, _ROWS)
+    result = lakehouse_loader._split_adjustment_factor(ticker, quote)
     assert result == pytest.approx(expected, rel=1e-6)
 
 
-def test_inferred_status_counts(tmp_path: Path) -> None:
+def test_inferred_status_counts(fake_lake: Any) -> None:
     """Rows with status inferred are counted as real splits."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        _write_splits(tmp_path, _ROWS)
-        result = lakehouse_loader._split_adjustment_factor("INF", date(2023, 2, 1))
+    _load_splits(fake_lake, _ROWS)
+    result = lakehouse_loader._split_adjustment_factor("INF", date(2023, 2, 1))
     assert result == pytest.approx(2.0, rel=1e-6)
 
 
-def test_absent_table_returns_one(tmp_path: Path) -> None:
-    """A lake without an equity_splits table yields a factor of 1.0."""
-    with temporary_overrides({"data.lake_dir": tmp_path}):
-        result = lakehouse_loader._split_adjustment_factor("AAPL", date(2020, 8, 28))
+def test_empty_table_returns_one(fake_lake: Any) -> None:
+    """An equity_splits table with no rows yields a factor of 1.0."""
+    _load_splits(fake_lake, [])
+    result = lakehouse_loader._split_adjustment_factor("AAPL", date(2020, 8, 28))
     assert result == 1.0

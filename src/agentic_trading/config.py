@@ -16,9 +16,9 @@ Three ways to override without editing source:
   don't leak settings into each other.
 - Direct: `apply_overrides({...})` for a permanent process-wide change.
 
-The lakehouse location is the one value that also comes from the
-environment: `LAKEHOUSE_DIR` (process environment or the repo-root
-`.env`) seeds `data.lake_dir`.
+The lakehouse API location and token are not strategy constants: the
+loader reads `LAKEHOUSE_API_URL` and `LAKEHOUSE_API_TOKEN` from the
+process environment or the repo-root `.env` through `_env_value`.
 
 Keys are dotted paths: `<group>.<field>`, or
 `pod_sizing.<manager_agent_id>.<field>` for the per-pod table. Values
@@ -45,7 +45,6 @@ from pydantic import BaseModel, ConfigDict, Field
 _GROUP_CONFIG = ConfigDict(validate_assignment=True, extra="forbid")
 
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
-_LAKE_DIR_ENV_VAR = "LAKEHOUSE_DIR"
 
 
 def _env_value(name: str) -> str | None:
@@ -64,18 +63,6 @@ def _env_value(name: str) -> str | None:
         if key.strip() == name:
             return value.strip().strip("'\"")
     return None
-
-
-class DataConfig(BaseModel):
-    model_config = _GROUP_CONFIG
-
-    # Root of the parquet lakehouse every run reads (`table=<name>/...`
-    # partitions). Comes from the `LAKEHOUSE_DIR` environment variable or
-    # the repo-root `.env`; the relative default keeps the location out of
-    # source on a machine that has neither set.
-    lake_dir: Path = Field(
-        default_factory=lambda: Path(_env_value(_LAKE_DIR_ENV_VAR) or "data/lake")
-    )
 
 
 class FirmConfig(BaseModel):
@@ -439,7 +426,6 @@ class AnalystConfig(BaseModel):
 class StrategyConfig(BaseModel):
     model_config = _GROUP_CONFIG
 
-    data: DataConfig = Field(default_factory=DataConfig)
     firm: FirmConfig = Field(default_factory=FirmConfig)
     options: OptionsConfig = Field(default_factory=OptionsConfig)
     managers: ManagerRiskConfig = Field(default_factory=ManagerRiskConfig)

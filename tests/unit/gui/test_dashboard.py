@@ -19,8 +19,10 @@ tab's real content — see render_dashboard()'s own `desk_run is None` guard.
 
 import json
 from datetime import date
+from typing import Any
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -915,8 +917,32 @@ def _find_multiselect(at: AppTest, key: str) -> Multiselect:
     raise AssertionError(f"no multiselect with key {key!r} was rendered")
 
 
+def _price_table(tickers: list[str]) -> pd.DataFrame:
+    """Deterministic business-day prices for `tickers`, covering the
+    dashboard's default window plus its warm-up."""
+    days = pd.bdate_range("2020-01-01", "2024-04-01")
+    frames = []
+    for offset, ticker in enumerate(tickers):
+        rng = np.random.default_rng(offset)
+        close = 100.0 * np.exp(np.cumsum(rng.normal(0.0003, 0.01, len(days))))
+        frames.append(
+            pd.DataFrame(
+                {
+                    "ticker": ticker,
+                    "date": days.date,
+                    "open": close,
+                    "close": close,
+                    "adj_close": close,
+                    "volume": 1_000_000.0,
+                }
+            )
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
 def test_ticker_multiselect_changes_the_basket_that_runs(
     monkeypatch: pytest.MonkeyPatch,
+    preflight_lake: Any,
 ) -> None:
     """Editing the ticker multiselect beyond the preset group's symbols must
     change the resolved ticker list the desk actually runs on"""
@@ -936,6 +962,10 @@ def test_ticker_multiselect_changes_the_basket_that_runs(
         )
 
     monkeypatch.setattr(dashboard_module, "_load_basket_data", _explicit_test_data)
+    preflight_lake.add(
+        "instrument_prices",
+        _price_table([*dashboard_module.TICKER_GROUPS[0].symbols, "NVDA"]),
+    )
 
     at = AppTest.from_file(dashboard_module.__file__)
     at.run(timeout=30)
