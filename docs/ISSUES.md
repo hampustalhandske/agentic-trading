@@ -837,7 +837,7 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: f08cc35
 
 ### AT-77 Design note: the agentic firm on edgelab, one engine, record then replay
-- Status: open, awaiting owner approval
+- Status: in-progress. Asks 1 (one engine) and 2 (LLM scope) approved by the owner 2026-10-28, relayed by the coordinator; ask 3 (budget) open pending OmniRoute route costs
 - Priority: must (M6)
 - Gate: owner decision
 - Raised by: agentic-trading-c5, design note 2026-10-27
