@@ -196,7 +196,7 @@ def _patch_routed_connect(
 ) -> None:
     """Routes by which table a query names, since a split-adjusted chain
     read issues one query against `dolthub_option_chain` and a second
-    against `dolthub_stock_splits` in the same call."""
+    against `equity_splits` in the same call."""
 
     def _fake_connect(*_args: Any, **_kwargs: Any) -> _FakeConnection:
         return _RoutedConnection(option_chain, splits)
@@ -210,7 +210,7 @@ class _RoutedConnection:
         self._splits = splits
 
     def execute(self, query: str) -> _FakeResult:
-        is_splits_query = "dolthub_stock_splits" in query
+        is_splits_query = "equity_splits" in query
         return _FakeResult(self._splits if is_splits_query else self._option_chain)
 
     def close(self) -> None:
@@ -228,7 +228,7 @@ def test_options_snapshot_rescales_a_pre_split_strike_onto_todays_basis(
     (KNOWN_LIMITATIONS §0)."""
     with temporary_overrides({"data.lake_dir": tmp_path}):
         _touch_table(tmp_path, "dolthub_option_chain")
-        _touch_table(tmp_path, "dolthub_stock_splits")
+        _touch_table(tmp_path, "equity_splits")
         option_chain = pd.DataFrame(
             {
                 "date": ["2024-04-01"],
@@ -245,7 +245,7 @@ def test_options_snapshot_rescales_a_pre_split_strike_onto_todays_basis(
                 "rho": [0.01],
             }
         )
-        splits = pd.DataFrame({"to_factor": [10.0], "for_factor": [1.0]})
+        splits = pd.DataFrame({"ratio": [0.1]})
         _patch_routed_connect(monkeypatch, option_chain, splits)
 
         result = lakehouse_loader.load_options_snapshot_from_lakehouse("NVDA", date(2024, 4, 1))
@@ -269,7 +269,7 @@ def test_options_snapshot_leaves_an_unsplit_ticker_unchanged(
     exactly as quoted."""
     with temporary_overrides({"data.lake_dir": tmp_path}):
         _touch_table(tmp_path, "dolthub_option_chain")
-        _touch_table(tmp_path, "dolthub_stock_splits")
+        _touch_table(tmp_path, "equity_splits")
         option_chain = pd.DataFrame(
             {
                 "date": ["2024-04-01"],
@@ -286,7 +286,7 @@ def test_options_snapshot_leaves_an_unsplit_ticker_unchanged(
                 "rho": [0.02],
             }
         )
-        splits = pd.DataFrame({"to_factor": [], "for_factor": []})
+        splits = pd.DataFrame({"ratio": pd.Series([], dtype=float)})
         _patch_routed_connect(monkeypatch, option_chain, splits)
 
         result = lakehouse_loader.load_options_snapshot_from_lakehouse("AAPL", date(2024, 4, 1))

@@ -123,26 +123,41 @@ def _option_chain_glob() -> str:
     return str(_lake_dir() / "table=dolthub_option_chain" / "*" / "*.parquet")
 
 
-def _stock_splits_glob() -> str:
-    return str(_lake_dir() / "table=dolthub_stock_splits" / "*" / "*.parquet")
+_COUNTED_SPLIT_STATUSES = ("confirmed", "before_first_bar", "inferred")
 
 
 def _split_adjustment_factor(ticker: str, quote_date: date) -> float:
-    """Cumulative `to_factor / for_factor` of every real stock split for
-    `ticker` with an ex-date after `quote_date`. `dolthub_option_chain`
-    strikes and premiums are archival and never retroactively adjusted,
-    while `instrument_prices` is continuously split-adjusted across its
-    whole history; dividing a chain row quoted before a later split by
-    this factor brings it onto the same basis as the underlying's spot.
-    Returns 1.0 when the splits table is absent or no such split exists."""
-    if not _lake_dir().exists() or not any(
-        _lake_dir().glob("table=dolthub_stock_splits/*/*.parquet")
-    ):
+    """Cumulative `1 / ratio` of every stock split for `ticker` with an
+    ex-date after `quote_date`, read from the lake's `equity_splits`
+    (`ratio` is new price over old price, so a 4-for-1 split is 0.25).
+    `dolthub_option_chain` strikes and premiums are quoted as traded and
+    never adjusted, while `instrument_prices` closes are adjusted for
+    every split; dividing a chain row quoted before a later split by this
+    factor puts it on the same basis as the underlying's spot.
+
+    Counts rows whose `status` is in `_COUNTED_SPLIT_STATUSES` and keeps
+    one row per ex-date, preferring a row whose `sources` include yahoo.
+    Rejected duplicates and spin-offs reclassified out of the split list
+    never count. Returns 1.0 when the table is absent or no such split
+    exists."""
+    if not _lake_dir().exists() or not any(_lake_dir().glob("table=equity_splits/*/*.parquet")):
         return 1.0
+    statuses = ", ".join(f"'{status}'" for status in _COUNTED_SPLIT_STATUSES)
     query = f"""
-        SELECT to_factor, for_factor
-        FROM read_parquet('{_stock_splits_glob()}', hive_partitioning = true, union_by_name = true)
-        WHERE act_symbol = '{ticker}' AND ex_date > '{quote_date.isoformat()}'
+        SELECT ratio
+        FROM (
+            SELECT ratio, ROW_NUMBER() OVER (
+                PARTITION BY ex_date
+                ORDER BY (sources LIKE '%yahoo%') DESC, sources
+            ) AS rn
+            FROM read_parquet(
+                '{_table_glob("equity_splits")}', hive_partitioning = true, union_by_name = true
+            )
+            WHERE ticker = '{ticker}'
+              AND ex_date > '{quote_date.isoformat()}'
+              AND status IN ({statuses})
+        )
+        WHERE rn = 1
     """
     try:
         connection = _connection()
@@ -150,12 +165,10 @@ def _split_adjustment_factor(ticker: str, quote_date: date) -> float:
     except Exception:
         logger.warning("Stock-split lakehouse query failed for %s", ticker, exc_info=True)
         return 1.0
-    if frame.empty:
-        return 1.0
     factor = 1.0
-    for to_factor, for_factor in zip(frame["to_factor"], frame["for_factor"], strict=True):
-        if to_factor and for_factor:
-            factor *= float(to_factor) / float(for_factor)
+    for ratio in frame["ratio"]:
+        if ratio and ratio > 0:
+            factor /= float(ratio)
     return factor
 
 
