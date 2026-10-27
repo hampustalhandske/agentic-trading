@@ -41,14 +41,14 @@ Paths are relative to `src/agentic_trading/`.
 ## Entries
 
 ### AT-1 Option split rescale multiplies every raw write of `dolthub_stock_splits`
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-E1)
 - Evidence: [V] `data/loaders/lakehouse_loader.py:130-159` has no dedup on `scraped_at`. Factors: AAPL 1.2e24 (true 4), NVDA 1e40 (10), TSLA 1.2e19 (3), AMZN/GOOGL 1.2e104 (20). CVaR results since 2026-09-18 are invalid.
 - Acceptance: `_split_adjustment_factor` returns exactly 4.0 (AAPL 2020-08-28), 10.0 (NVDA 2024-06-07), 3.0 (TSLA 2022-08-01), 20.0 (AMZN, GOOGL the day before their 2022 ex-dates). Source is `equity_splits` with `applied`. A unit test writes one split row three times.
 - Blocked-by / Blocks: none. Done first and alone.
-- Commits: none
+- Commits: 6f56fa2. Open question for the lake: whether unchecked_small_ratio and unchecked_no_bars rows belong in the instrument_prices basis (not counted today).
 
 ### AT-2 FRED read as latest value, not `fred_vintages`
 - Status: open
