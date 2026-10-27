@@ -51,14 +51,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: 6f56fa2 (factor magnitude). Follow-up: instrument_prices close is adjusted by Yahoo's own split list, so the factor moves to `yahoo_splits`, which also carries spin-offs written as fractional splits. 13 of its rows are measured as not adjusted in Yahoo's close; two of them (AVB 2026-08-17, SSP 2025-12-08) have option chains quoted before the split. Blocked-by LK-41 (`yahoo_splits.in_close_basis`: false for the 13, null where untestable); the factor then counts rows where `in_close_basis IS NOT FALSE`.
 
 ### AT-2 FRED read as latest value, not `fred_vintages`
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-E2)
 - Evidence: [V] `lakehouse_loader.py:575-615` gates on `date <= as_of`. [M] CPIAUCSL first published a median 41 days after its date; DGS10 and DGS3MO lag at least 1 day on 1566 of 1566 observations.
 - Acceptance: the loader takes the latest `realtime_start <= as_of` per date from `fred_vintages`. DGS10 dated 2024-03-14 is absent as of 2024-03-14 and present as of 2024-03-15. GDP 2024-01-01 as of 2024-05-01 equals 28284.498.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: dadea7a. Verified live: DGS10 2024-03-14 absent as of 2024-03-14, present as of 2024-03-15; GDP 2024-01-01 as of 2024-05-01 is 28284.498. DGS3MO vintages start 2005-06-28, so a run ending before then has no risk-free series.
 
 ### AT-3 COT and Fama-French read frozen retired directories
 - Status: done
@@ -81,14 +81,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: 3ff8eff (every read on /v1/sql; `lake_provenance()` added). Remaining: each run records the lake version and read time, with AT-37.
 
 ### AT-5 Fama-French gated on factor date, not publication or vintage
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M16)
 - Evidence: [C] `lakehouse_loader.py:663` uses `date <= as_of_date`. Ken French publishes monthly with a lag of about a month and restates history. `famafrench_vintages` exists.
 - Acceptance: factors come from the latest `famafrench_vintages.vintage_date <= as_of`. As of 2024-03-15 the latest factor date is no later than that vintage's last date (about 2024-01-31).
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: dadea7a. Gated on a one-month publication lag (a day's value is public at the end of the following month), not `famafrench_vintages`: the lake keeps no daily vintages, so daily values are today's revised history, stated in the loader. First-seen dates exist in `famafrench_returns_log` from 2026-09-27.
 
 ### AT-6 COT availability ignores holiday weeks
 - Status: open
@@ -717,14 +717,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-65 Risk-free series backfilled before its first value
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S8)
 - Evidence: [C] `data/loaders/macro_loader.py:58` uses `.ffill().bfill()` and divides by 252 on a calendar-day index. Days before the first observation take a later value.
 - Acceptance: no backfill; days before the first observation are missing, and the annualisation is consistent.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: dadea7a. No backfill; a start before the first DGS3MO observation raises ValueError naming that date, rather than returning missing days.
 
 ### AT-66 Open used for fills with no OHLC sanity check
 - Status: open
