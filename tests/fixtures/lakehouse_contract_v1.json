@@ -55,6 +55,21 @@
    "total_reportable_long": "BIGINT",
    "total_reportable_short": "BIGINT"
   },
+  "crypto_klines_1m": {
+   "close": "DOUBLE",
+   "dt": "DATE",
+   "high": "DOUBLE",
+   "low": "DOUBLE",
+   "n_trades": "BIGINT",
+   "open": "DOUBLE",
+   "open_time": "TIMESTAMP",
+   "quote_volume": "DOUBLE",
+   "symbol": "VARCHAR",
+   "table": "VARCHAR",
+   "taker_buy_base_volume": "DOUBLE",
+   "taker_buy_quote_volume": "DOUBLE",
+   "volume": "DOUBLE"
+  },
   "dolthub_earnings_calendar": {
    "act_symbol": "VARCHAR",
    "date": "DATE",

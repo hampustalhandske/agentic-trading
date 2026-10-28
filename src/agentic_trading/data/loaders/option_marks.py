@@ -26,6 +26,7 @@ from quantcore.pricing.options_positions import option_roll_schedule
 from agentic_trading.agents.schemas import OptionContract
 from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import (
+    STRIKE_MATCH_TOLERANCE,
     load_fred_series_from_lakehouse,
     load_option_quote_from_lakehouse,
     load_options_snapshot_from_lakehouse,
@@ -156,10 +157,13 @@ def _expired_mark(contract: OptionContract, as_of_date: date, spot: float) -> Op
 
 
 def _contract_row(snapshot: pd.DataFrame, contract: OptionContract) -> pd.Series | None:
+    """The first `snapshot` row with `contract`'s expiration and option
+    type and a strike within `STRIKE_MATCH_TOLERANCE` of its strike, or
+    `None` when no row matches."""
     rows = snapshot[
         (snapshot["expiration"] == pd.Timestamp(contract.expiry))
         & (snapshot["option_type"] == contract.option_type)
-        & ((snapshot["strike"] - contract.strike).abs() < 1e-9)
+        & ((snapshot["strike"] - contract.strike).abs() < STRIKE_MATCH_TOLERANCE)
     ]
     if rows.empty:
         return None

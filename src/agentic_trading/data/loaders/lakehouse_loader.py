@@ -29,7 +29,7 @@ from pydantic import BaseModel
 from agentic_trading.config import _env_value
 from agentic_trading.data.lakehouse_client import Lake
 from agentic_trading.data.point_in_time import assert_point_in_time
-from agentic_trading.data.trading_calendar import add_sessions, next_session
+from agentic_trading.data.trading_calendar import add_sessions, is_session, next_session
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -423,25 +423,24 @@ def same_sic_candidate_pairs(tickers: list[str]) -> list[tuple[str, str]]:
     return pairs
 
 
-def load_price_history_from_lakehouse(
-    tickers: list[str], start: date, end: date
-) -> pd.DataFrame | None:
-    """Returns a `MultiIndex(ticker, field)` frame (`open`/`close`/
-    `raw_close`/`volume`/`log_return`) for every ticker in `tickers` that the lake actually
-    covers, or `None` if the lake covers none of them —
-    `load_price_history_with_fallback` is what turns an incomplete result
-    into a clear error naming the uncovered ticker(s). A failed request
-    propagates.
+# Lake symbol in `crypto_klines_1m` for each crypto ticker the loader
+# serves: Binance USDT spot one-minute klines. USDT trades within a few
+# basis points of USD, so the USDT price stands in for the USD price.
+_CRYPTO_KLINE_SYMBOLS = {
+    "BTC-USD": "BTCUSDT",
+    "ETH-USD": "ETHUSDT",
+}
+# The NYSE regular session in America/New_York: the first and last
+# one-minute kline start times of each session.
+_SESSION_FIRST_MINUTE = "09:30:00"
+_SESSION_LAST_MINUTE = "15:59:00"
 
-    Uses `adj_close` (dividend/split-adjusted) rather than raw `close` —
-    correct for a multi-year backtest where corporate actions actually
-    occur — and scales the raw `open` by the same `adj_close / close`
-    factor so the open the engine fills at and the close it marks at are
-    on one price basis (an unadjusted open against an adjusted close would
-    book the whole dividend-adjustment gap as a loss on every fill).
-    Self-asserts point-in-time on the combined frame's date index against
-    `end` before returning.
-    """
+
+def _equity_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFrame:
+    """Daily `ticker`/`date`/`open`/`close`/`raw_close`/`volume` rows from
+    `instrument_prices` for `tickers` between `start` and `end`
+    inclusive: `close` is `adj_close`, `open` is the raw open scaled by
+    `adj_close / close`, `raw_close` the unadjusted close."""
     placeholders = ", ".join("?" for _ in tickers)
     query = f"""
         SELECT ticker, date,
@@ -454,9 +453,103 @@ def load_price_history_from_lakehouse(
           AND date BETWEEN ? AND ?
         ORDER BY ticker, date
     """
-    frame = _query(query, [*tickers, start.isoformat(), end.isoformat()])
+    return _query(query, [*tickers, start.isoformat(), end.isoformat()])
+
+
+def _crypto_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFrame:
+    """One `ticker`/`date`/`open`/`close`/`raw_close`/`volume` row per
+    NYSE session between `start` and `end` inclusive for each crypto
+    ticker in `tickers` (keys of `_CRYPTO_KLINE_SYMBOLS`), built from
+    `crypto_klines_1m` minutes whose `open_time` (naive UTC, the minute's
+    start) falls in the session in America/New_York: `open` is the open
+    of the minute starting at `_SESSION_FIRST_MINUTE`, `close` and
+    `raw_close` the close of the minute starting at
+    `_SESSION_LAST_MINUTE`, `volume` the summed volume of the minutes
+    from `_SESSION_FIRST_MINUTE` to `_SESSION_LAST_MINUTE`. A day without
+    a `_SESSION_LAST_MINUTE` kline, or that is not an NYSE session, has
+    no row. Only minutes inside the session on days in the range are
+    read; the aggregation runs in the lake."""
+    symbols = [_CRYPTO_KLINE_SYMBOLS[ticker] for ticker in tickers]
+    placeholders = ", ".join("?" for _ in symbols)
+    query = f"""
+        SELECT symbol,
+               CAST(local_time AS DATE) AS date,
+               max(open) FILTER (WHERE CAST(local_time AS TIME) = CAST(? AS TIME)) AS open,
+               max(close) FILTER (WHERE CAST(local_time AS TIME) = CAST(? AS TIME)) AS close,
+               sum(volume) AS volume
+        FROM (
+            SELECT symbol, open, close, volume,
+                   timezone(?, open_time AT TIME ZONE 'UTC') AS local_time
+            FROM crypto_klines_1m
+            WHERE symbol IN ({placeholders})
+              AND open_time >= CAST(? AS TIMESTAMP)
+              AND open_time < CAST(? AS TIMESTAMP)
+        )
+        WHERE CAST(local_time AS TIME) BETWEEN CAST(? AS TIME) AND CAST(? AS TIME)
+        GROUP BY symbol, CAST(local_time AS DATE)
+        HAVING max(close) FILTER (WHERE CAST(local_time AS TIME) = CAST(? AS TIME)) IS NOT NULL
+        ORDER BY symbol, date
+    """
+    params = [
+        _SESSION_FIRST_MINUTE,
+        _SESSION_LAST_MINUTE,
+        _DECISION_TIMEZONE,
+        *symbols,
+        start.isoformat(),
+        (end + pd.Timedelta(days=1)).isoformat(),
+        _SESSION_FIRST_MINUTE,
+        _SESSION_LAST_MINUTE,
+        _SESSION_LAST_MINUTE,
+    ]
+    frame = _query(query, params)
     if frame.empty:
+        return frame
+    ticker_by_symbol = {symbol: ticker for ticker, symbol in _CRYPTO_KLINE_SYMBOLS.items()}
+    frame["ticker"] = frame["symbol"].map(ticker_by_symbol)
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame[[is_session(stamp.date()) for stamp in frame["date"]]]
+    frame["raw_close"] = frame["close"]
+    return frame[["ticker", "date", "open", "close", "raw_close", "volume"]]
+
+
+def load_price_history_from_lakehouse(
+    tickers: list[str], start: date, end: date
+) -> pd.DataFrame | None:
+    """Returns a `MultiIndex(ticker, field)` frame (`open`/`close`/
+    `raw_close`/`volume`/`log_return`) for every ticker in `tickers` that the lake actually
+    covers, or `None` if the lake covers none of them —
+    `load_price_history_with_fallback` is what turns an incomplete result
+    into a clear error naming the uncovered ticker(s). A failed request
+    propagates.
+
+    Crypto tickers (`_CRYPTO_KLINE_SYMBOLS`) are built from one-minute
+    klines by `_crypto_price_rows`, one bar per NYSE session. Decisions
+    are taken at the US close, so crypto is sampled at 16:00
+    America/New_York (the close of the 15:59 minute) rather than at
+    Yahoo's 23:59 UTC daily close, keeping it synchronous with every
+    other asset's close.
+
+    Every other ticker reads `instrument_prices` and uses `adj_close`
+    (dividend/split-adjusted) rather than raw `close` — correct for a
+    multi-year backtest where corporate actions actually occur — and
+    scales the raw `open` by the same `adj_close / close` factor so the
+    open the engine fills at and the close it marks at are on one price
+    basis (an unadjusted open against an adjusted close would book the
+    whole dividend-adjustment gap as a loss on every fill).
+    Self-asserts point-in-time on the combined frame's date index against
+    `end` before returning.
+    """
+    crypto = [ticker for ticker in tickers if ticker in _CRYPTO_KLINE_SYMBOLS]
+    others = [ticker for ticker in tickers if ticker not in _CRYPTO_KLINE_SYMBOLS]
+    parts = []
+    if others:
+        parts.append(_equity_price_rows(others, start, end))
+    if crypto:
+        parts.append(_crypto_price_rows(crypto, start, end))
+    parts = [part for part in parts if not part.empty]
+    if not parts:
         return None
+    frame = pd.concat(parts, ignore_index=True)
 
     frame["date"] = pd.to_datetime(frame["date"])
     covered_tickers = set(frame["ticker"].unique())
@@ -802,6 +895,14 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
     return frame
 
 
+# Two chain rows quote the same strike when they differ by less than half a
+# cent: a split rescale leaves a strike up to a third of a cent from its
+# listed post-split value (625 / 3 = 208.333... against a listed 208.33),
+# and listed strikes are at least 0.5 apart, so no two distinct strikes
+# fall within this tolerance.
+STRIKE_MATCH_TOLERANCE = 0.005
+
+
 def load_option_quote_from_lakehouse(
     underlying: str,
     expiration: date,
@@ -810,14 +911,16 @@ def load_option_quote_from_lakehouse(
     as_of_date: date,
     lookback_days: int,
 ) -> pd.DataFrame | None:
-    """The latest chain row quoting one exact contract on or before
+    """The latest chain row quoting one contract on or before
     `as_of_date` within `lookback_days`, regardless of whether the latest
     snapshot still lists that expiry. Same columns as
     `load_options_snapshot_from_lakehouse`, including the
-    `_apply_split_adjustment` rescaling. `strike` is matched in that same
+    `_apply_split_adjustment` rescaling. A row matches on `expiration`
+    and `option_type` exactly and on a strike within
+    `STRIKE_MATCH_TOLERANCE` of `strike`; the strike is compared in the
     adjusted basis rather than in SQL against the raw column, since the
-    two can differ for a contract quoted before a later split — the
-    strike filter is applied in pandas after adjustment instead. `None`
+    two differ for a contract quoted before a later split. Of several
+    matching rows the one with the latest `date` is returned. `None`
     when never quoted in the window. Self-asserts point-in-time on
     `date` before returning."""
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
@@ -840,7 +943,7 @@ def load_option_quote_from_lakehouse(
     frame["date"] = pd.to_datetime(frame["date"])
     frame["expiration"] = pd.to_datetime(frame["expiration"])
     frame = _apply_split_adjustment(frame, underlying)
-    frame = frame[(frame["strike"] - strike).abs() < 1e-6]
+    frame = frame[(frame["strike"] - strike).abs() < STRIKE_MATCH_TOLERANCE]
     if frame.empty:
         return None
     frame = frame.iloc[[0]]

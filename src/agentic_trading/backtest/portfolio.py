@@ -123,7 +123,9 @@ class Portfolio(BaseModel):
         over NAV) in whole contracts of `decision.instrument`, buying at
         `mark.ask` and selling at `mark.bid`, paying
         `settings.options.commission_per_contract` per contract traded.
-        Any fill needs a two-sided quote with at least
+        A mark whose `tradeable` flag is false is a hold, leaving cash and
+        positions unchanged, whatever bid/ask it carries. Any fill needs a
+        two-sided quote with at least
         `settings.options.min_premium_per_share` of premium (a close to
         zero needs only a bid), and a contract count is capped so its
         underlying notional stays within `settings.options.max_notional_fraction`
@@ -161,7 +163,7 @@ class Portfolio(BaseModel):
                 instrument=contract,
             )
 
-        if mark.is_expired or mark.mid <= 0.0:
+        if not mark.tradeable or mark.is_expired or mark.mid <= 0.0:
             return _hold()
 
         target_contracts = round(decision.target_weight * portfolio_value / (mark.mid * multiplier))
