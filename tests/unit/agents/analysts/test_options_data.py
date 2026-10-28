@@ -21,6 +21,7 @@ import pytest
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
     real_atm_options_by_expiration,
 )
+from agentic_trading.config import temporary_overrides
 
 
 def _chain_frame() -> pd.DataFrame:
@@ -59,7 +60,8 @@ def test_real_atm_options_converts_timestamp_to_date_before_the_lakehouse_call(
         _fake_loader,
     )
 
-    result = real_atm_options_by_expiration("AAPL", pd.Timestamp("2024-04-01"), spot=180.0)
+    with temporary_overrides({"options.publication_lag_days": 0}):
+        result = real_atm_options_by_expiration("AAPL", pd.Timestamp("2024-04-01"), spot=180.0)
 
     assert seen["as_of_date_type"] is date
     assert seen["as_of_date"] == date(2024, 4, 1)

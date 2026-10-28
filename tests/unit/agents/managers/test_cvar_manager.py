@@ -5,6 +5,7 @@ adds a delta-hedged short straddle, and an untradeable chain keeps the
 equity weight."""
 
 from datetime import date, timedelta
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -110,7 +111,7 @@ def chain(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         option_marks,
         "select_expiry",
-        lambda underlying, as_of_date, tenor: as_of_date + timedelta(days=tenor),
+        lambda underlying, as_of_date, tenor, after=None: as_of_date + timedelta(days=tenor),
     )
     monkeypatch.setattr(
         option_marks,
@@ -214,7 +215,7 @@ def test_keeps_the_equity_weight_when_the_contract_is_untradeable(chain, monkeyp
 
 
 def test_keeps_the_equity_weight_without_a_listed_expiry(monkeypatch) -> None:
-    monkeypatch.setattr(option_marks, "select_expiry", lambda *_: None)
+    monkeypatch.setattr(option_marks, "select_expiry", lambda *_, **__: None)
     weight = _underlying_weight(_FixedAnalyst(agent_id="a"))
 
     decisions = _manager(_FixedAnalyst(agent_id="a")).construct_portfolio(
@@ -306,3 +307,48 @@ def test_flipped_view_closes_the_held_leg_and_opens_the_other_side(chain) -> Non
     ]
     assert len(opened) == 1 and opened[0].instrument is not None
     assert opened[0].instrument.option_type == "put"
+
+
+def _lake_chain_expiring_on(fake_lake: Any, underlying: str, day: date, strike: float) -> None:
+    """Seeds `fake_lake` with one quoted snapshot dated `day - 1` whose only
+    expiry is `day`, and no splits."""
+    fake_lake.add(
+        "dolthub_option_chain",
+        pd.DataFrame(
+            [
+                {
+                    "underlying": underlying,
+                    "date": (day - timedelta(days=1)).isoformat(),
+                    "expiration": day.isoformat(),
+                    "option_type": option_type,
+                    "strike": strike,
+                    "bid": 1.0,
+                    "ask": 1.2,
+                    "implied_volatility": 0.25,
+                    "delta": 0.5 if option_type == "call" else -0.5,
+                    "gamma": 0.02,
+                    "theta": -0.05,
+                    "vega": 0.1,
+                    "rho": 0.01,
+                }
+                for option_type in ("call", "put")
+            ]
+        ),
+        date_columns=("date", "expiration"),
+    )
+    fake_lake.add_empty(
+        "yahoo_split_close_basis",
+        {"ticker": "VARCHAR", "ex_date": "DATE", "ratio": "DOUBLE", "in_close_basis": "BOOLEAN"},
+    )
+
+
+def test_lagged_chain_listing_only_todays_expiry_selects_no_contract(fake_lake: Any) -> None:
+    """The chain read at `day - 1` lists only `day`'s expiry; selection never returns it."""
+    day = AS_OF.date()
+    _lake_chain_expiring_on(fake_lake, "AAPL", day, SPOT)
+    option_marks.clear_cache()
+    try:
+        assert option_marks.list_expiries("AAPL", day - timedelta(days=1)) == [day]
+        assert cvar_manager._select_contract("AAPL", "call", SPOT, SPOT, day) is None
+    finally:
+        option_marks.clear_cache()

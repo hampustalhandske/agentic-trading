@@ -334,10 +334,16 @@ class ConditionalValueAtRiskManager(ManagerAgent):
 def _select_contract(
     asset: str, option_type: Literal["call", "put"], target_strike: float, spot: float, day: date
 ) -> OptionContract | None:
-    expiry = option_marks.select_expiry(asset, day, settings.options.target_tenor_days)
+    """The `option_type` contract nearest `target_strike` at the listed
+    expiry after `day` nearest `day` plus the target tenor, both read from
+    the chain as published by `day` (`option_marks.published_chain_date`);
+    `None` when the chain lists no such expiry or no quoted strike."""
+    chain_day = option_marks.published_chain_date(day)
+    tenor_days = (day - chain_day).days + settings.options.target_tenor_days
+    expiry = option_marks.select_expiry(asset, chain_day, tenor_days, after=day)
     if expiry is None:
         return None
-    strike = option_marks.nearest_strike(asset, expiry, option_type, target_strike, day)
+    strike = option_marks.nearest_strike(asset, expiry, option_type, target_strike, chain_day)
     if strike is None:
         return None
     return OptionContract(underlying=asset, expiry=expiry, strike=strike, option_type=option_type)

@@ -81,7 +81,8 @@ class _ChainQueries:
 @pytest.fixture
 def chain(monkeypatch: pytest.MonkeyPatch, fake_lake: Any) -> Iterator[_ChainQueries]:
     """Synthetic snapshots through `_query_chain`; the exact-contract
-    lookup falls through to a lake whose option chain holds no rows."""
+    lookup falls through to a lake whose option chain holds no rows, and
+    expiry settlement to a lake with no underlying closes."""
     fake_lake.add(
         "dolthub_option_chain",
         pd.DataFrame(
@@ -106,6 +107,10 @@ def chain(monkeypatch: pytest.MonkeyPatch, fake_lake: Any) -> Iterator[_ChainQue
                 },
             }
         ),
+    )
+    fake_lake.add_empty(
+        "instrument_prices",
+        {"ticker": "VARCHAR", "date": "DATE", "close": "DOUBLE", "adj_close": "DOUBLE"},
     )
     queries = _ChainQueries()
     option_marks.clear_cache()

@@ -587,6 +587,32 @@ def load_price_history_from_lakehouse(
     return combined
 
 
+def load_raw_close_from_lakehouse(
+    ticker: str, as_of_date: date, lookback_days: int
+) -> float | None:
+    """`ticker`'s unadjusted `instrument_prices` close (the `raw_close`
+    basis of `load_price_history_from_lakehouse`, which option strikes are
+    rescaled onto) on its last session on or before `as_of_date` within
+    `lookback_days` calendar days. `None` when the lake has no positive
+    close for `ticker` in that window. Self-asserts point-in-time on
+    `date` before returning."""
+    window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
+    query = """
+        SELECT date, close
+        FROM instrument_prices
+        WHERE ticker = ?
+          AND date BETWEEN ? AND ?
+          AND close > 0
+        ORDER BY date DESC
+        LIMIT 1
+    """
+    frame = _query(query, [ticker, window_start, as_of_date.isoformat()])
+    if frame.empty:
+        return None
+    assert_point_in_time(frame, as_of_date, date_column="date")
+    return float(frame["close"].iloc[0])
+
+
 def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Series | None:
     """A FRED macro series (`DGS3MO`/`DGS2`/`DGS10`/`VIXCLS`/`CPIAUCSL`/
     `BAMLH0A0HYM2`/`BAMLC0A0CM` — the same series `macro_loader.

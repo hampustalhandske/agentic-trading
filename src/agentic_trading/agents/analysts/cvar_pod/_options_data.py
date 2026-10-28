@@ -6,7 +6,8 @@ Two things every options analyst in this pod reads from one place, so
 they all see the same numbers on the same day:
 
 - **Real option chain**: the lakehouse's historical chain snapshot for
-  the asset (`real_atm_options_by_expiration`), reduced to one ATM row
+  the asset as published by the decision date
+  (`real_atm_options_by_expiration`), reduced to one ATM row
   per real expiration. The pod is scoped (`cvar_manager.OPTIONS_ASSETS`)
   to tickers with real chain coverage, and an analyst that still finds
   no snapshot for a given date returns a flat, zero-confidence signal —
@@ -21,6 +22,7 @@ import pandas as pd
 
 from agentic_trading.agents._market_math import RefitCache, conditional_daily_volatility
 from agentic_trading.data.loaders.lakehouse_loader import load_options_snapshot_from_lakehouse
+from agentic_trading.data.loaders.option_marks import published_chain_date
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -59,14 +61,17 @@ def real_atm_options_by_expiration(
     the strike closest to `spot`, that strike's call/put implied
     volatility averaged (put-call parity means they're already close;
     averaging is noise reduction, not a new assumption), and the call
-    leg's real delta/gamma. `days_to_expiration` is measured from the
-    snapshot's own date, not `as_of_date` (they can differ by up to the
-    loader's `lookback_days`, since coverage isn't daily-dense).
+    leg's real delta/gamma. Only a snapshot already published by
+    `as_of_date` is visible: one dated on or before
+    `option_marks.published_chain_date(as_of_date)`. `days_to_expiration` is
+    measured from the snapshot's own date, not `as_of_date` (they differ
+    by at least the publication lag and up to the lag plus the loader's
+    `lookback_days`, since coverage isn't daily-dense).
 
     Returns `None` if `asset` has no real snapshot for this date; every
     CVaR-pod analyst calling this then reports flat with zero confidence
     rather than pricing off a model-implied substitute quote."""
-    snapshot = load_options_snapshot_from_lakehouse(asset, as_of_date.date())
+    snapshot = load_options_snapshot_from_lakehouse(asset, published_chain_date(as_of_date.date()))
     if snapshot is None or snapshot.empty:
         return None
 

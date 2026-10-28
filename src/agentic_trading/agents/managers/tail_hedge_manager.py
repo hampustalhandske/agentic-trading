@@ -153,17 +153,26 @@ class TailHedgeManager(ManagerAgent):
         self, market_data: pd.DataFrame, as_of_date: pd.Timestamp, budget: float
     ) -> str | None:
         """The contract id of a tradeable near-tenor OTM SPY put, or
-        `None` when the chain offers no expiry, strike or live mark."""
+        `None` when the chain offers no expiry after `as_of_date`, strike or
+        live mark. The expiry nearest `as_of_date` plus the hedge tenor and
+        the strike come from the chain as published by `as_of_date`
+        (`option_marks.published_chain_date`); the mark is the day's own."""
         underlying = TAIL_HEDGE_ASSETS[0]
         day = as_of_date.date()
         spot = raw_spot(market_data, as_of_date, underlying)
         if spot is None or spot <= 0.0:
             return None
-        expiry = option_marks.select_expiry(underlying, day, settings.options.tail_hedge_tenor_days)
+        chain_day = option_marks.published_chain_date(day)
+        tenor_days = (day - chain_day).days + settings.options.tail_hedge_tenor_days
+        expiry = option_marks.select_expiry(underlying, chain_day, tenor_days, after=day)
         if expiry is None:
             return None
         strike = option_marks.nearest_strike(
-            underlying, expiry, "put", spot * settings.options.tail_hedge_strike_moneyness, day
+            underlying,
+            expiry,
+            "put",
+            spot * settings.options.tail_hedge_strike_moneyness,
+            chain_day,
         )
         if strike is None:
             return None

@@ -139,6 +139,11 @@ class OptionsConfig(BaseModel):
     # stops carrying its expiry; the historical chain lists only three
     # expiries per snapshot and rotates the near ones weekly.
     max_mark_age_days: int = Field(default=45, ge=1)
+    # DoltHub publishes a chain dated t one to four days after t, so an
+    # agent deciding on day t only sees a snapshot dated on or before t
+    # minus this many calendar days. Applies to every decision and
+    # contract-selection read of the chain; marks and fills are not lagged.
+    publication_lag_days: int = Field(default=1, ge=0)
     # Reg-T style maintenance margin on a short option: premium plus this
     # fraction of underlying notional, financed at the margin rate.
     short_margin_fraction: float = Field(default=0.20, ge=0.0, le=1.0)
