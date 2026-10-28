@@ -21,6 +21,7 @@ to the caller."""
 from datetime import UTC, date, datetime
 from functools import cache
 from typing import Any, Literal, cast
+from weakref import WeakKeyDictionary
 
 import numpy as np
 import pandas as pd
@@ -183,6 +184,48 @@ def _apply_split_adjustment(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return frame
 
 
+# Underlyings whose end-of-day chains `option_chain_history` holds from
+# 2008, covering the years before `dolthub_option_chain` begins.
+_OPTION_CHAIN_HISTORY_UNDERLYINGS = frozenset({"SPY", "QQQ", "IWM"})
+
+# First `dolthub_option_chain` date per underlying, keyed by the lake
+# client that answered; a `None` value records an underlying with no rows.
+_FIRST_DOLTHUB_CHAIN_DATES: WeakKeyDictionary[Lake, dict[str, date | None]] = WeakKeyDictionary()
+
+
+def _first_dolthub_chain_date(underlying: str) -> date | None:
+    """The earliest snapshot `date` in `dolthub_option_chain` for
+    `underlying`, or `None` when it has no rows. Read once per underlying
+    and lake client and kept for the life of the process: the table only
+    grows forward, so its first date never moves."""
+    lake = _lake()
+    cached = _FIRST_DOLTHUB_CHAIN_DATES.setdefault(lake, {})
+    if underlying not in cached:
+        query = """
+            SELECT MIN(date) AS first
+            FROM dolthub_option_chain
+            WHERE underlying = ?
+        """
+        frame = _query(query, [underlying])
+        first = None if frame.empty else frame.iloc[0]["first"]
+        cached[underlying] = None if pd.isna(first) else pd.Timestamp(first).date()
+    return cached[underlying]
+
+
+def _option_chain_source(underlying: str, as_of_date: date) -> tuple[str, str]:
+    """The chain table a read of `underlying` as of `as_of_date` queries,
+    and that table's snapshot-date column. An underlying in
+    `_OPTION_CHAIN_HISTORY_UNDERLYINGS` reads `option_chain_history`
+    (`snapshot_date`) when `as_of_date` precedes its first
+    `dolthub_option_chain` date or it has no dolthub rows; every other
+    read uses `dolthub_option_chain` (`date`)."""
+    if underlying in _OPTION_CHAIN_HISTORY_UNDERLYINGS:
+        first = _first_dolthub_chain_date(underlying)
+        if first is None or as_of_date < first:
+            return "option_chain_history", "snapshot_date"
+    return "dolthub_option_chain", "date"
+
+
 # Calendar days before `as_of_date` within which
 # `load_options_snapshot_from_lakehouse` looks for the latest snapshot by
 # default: chain coverage is not daily-dense.
@@ -200,6 +243,14 @@ def load_options_snapshot_from_lakehouse(
     every-other-trading-day for AAPL), so a same-day match isn't
     guaranteed even for a covered ticker.
 
+    Rows come from the table `_option_chain_source` picks for `ticker`
+    and `as_of_date`: `dolthub_option_chain`, or `option_chain_history`
+    for SPY, QQQ and IWM before dolthub coverage begins. A history row's
+    `snapshot_date` (a 16:00 ET end-of-day snapshot) is returned as
+    `date`, and its `bid`/`ask` are the prices; its `mark` and
+    `last_trade_price` are never read. Both tables yield the same
+    columns and dtypes.
+
     Returns `None` if `ticker` has no coverage at all or the nearest
     snapshot is more than `lookback_days` stale — the caller reports a
     flat, zero-confidence signal in that case rather than treat a miss as
@@ -210,17 +261,18 @@ def load_options_snapshot_from_lakehouse(
     point-in-time on `date` before returning."""
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
     window_end = as_of_date.isoformat()
-    query = """
-        SELECT date, expiration, option_type, strike, bid, ask,
+    table, date_column = _option_chain_source(ticker, as_of_date)
+    query = f"""
+        SELECT {date_column} AS date, expiration, option_type, strike, bid, ask,
                implied_volatility, delta, gamma, theta, vega, rho
-        FROM dolthub_option_chain
+        FROM {table}
         WHERE underlying = ?
-          AND date BETWEEN ? AND ?
-          AND date = (
-              SELECT MAX(date)
-              FROM dolthub_option_chain
+          AND {date_column} BETWEEN ? AND ?
+          AND {date_column} = (
+              SELECT MAX({date_column})
+              FROM {table}
               WHERE underlying = ?
-                AND date BETWEEN ? AND ?
+                AND {date_column} BETWEEN ? AND ?
           )
     """
     frame = _query(query, [ticker, window_start, window_end, ticker, window_start, window_end])
@@ -1009,10 +1061,11 @@ def load_option_quote_from_lakehouse(
 ) -> pd.DataFrame | None:
     """The latest chain row quoting one contract on or before
     `as_of_date` within `lookback_days`, regardless of whether the latest
-    snapshot still lists that expiry. Same columns as
-    `load_options_snapshot_from_lakehouse`, including the
-    `_apply_split_adjustment` rescaling. A row matches on `expiration`
-    and `option_type` exactly and on a strike within
+    snapshot still lists that expiry. Same source table, columns and
+    prices as `load_options_snapshot_from_lakehouse` (the table
+    `_option_chain_source` picks for `underlying` and `as_of_date`),
+    including the `_apply_split_adjustment` rescaling. A row matches on
+    `expiration` and `option_type` exactly and on a strike within
     `STRIKE_MATCH_TOLERANCE` of `strike`; the strike is compared in the
     adjusted basis rather than in SQL against the raw column, since the
     two differ for a contract quoted before a later split. Of several
@@ -1020,15 +1073,16 @@ def load_option_quote_from_lakehouse(
     when never quoted in the window. Self-asserts point-in-time on
     `date` before returning."""
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
-    query = """
-        SELECT date, expiration, option_type, strike, bid, ask,
+    table, date_column = _option_chain_source(underlying, as_of_date)
+    query = f"""
+        SELECT {date_column} AS date, expiration, option_type, strike, bid, ask,
                implied_volatility, delta, gamma, theta, vega, rho
-        FROM dolthub_option_chain
+        FROM {table}
         WHERE underlying = ?
           AND expiration = ?
           AND option_type = ?
-          AND date BETWEEN ? AND ?
-        ORDER BY date DESC
+          AND {date_column} BETWEEN ? AND ?
+        ORDER BY {date_column} DESC
     """
     frame = _query(
         query,
@@ -1065,7 +1119,11 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
     check over the whole table:
 
     - `options_chain`: snapshot `date`s in `dolthub_option_chain` for
-      underlying `identifier`.
+      underlying `identifier`; for an underlying in
+      `_OPTION_CHAIN_HISTORY_UNDERLYINGS`, also the `option_chain_history`
+      `snapshot_date`s before its first dolthub date (all of them when it
+      has no dolthub rows), the two tables' ranges joined as the option
+      loaders read them.
     - `cftc_cot`: `report_date + _COT_PUBLICATION_LAG_DAYS` of the rows
       with positive open interest for the COT ticker of `identifier`
       (its `DEFAULT_COT_TICKER_BY_ASSET` future, else itself), from
@@ -1087,7 +1145,20 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
             FROM dolthub_option_chain
             WHERE underlying = ?
         """
-        return _first_and_last(_query(query, [identifier]))
+        dolthub = _first_and_last(_query(query, [identifier]))
+        if identifier not in _OPTION_CHAIN_HISTORY_UNDERLYINGS:
+            return dolthub
+        history_query = """
+            SELECT MIN(snapshot_date) AS first, MAX(snapshot_date) AS last
+            FROM option_chain_history
+            WHERE underlying = ?
+        """
+        if dolthub is None:
+            return _first_and_last(_query(history_query, [identifier]))
+        history = _first_and_last(
+            _query(history_query + " AND snapshot_date < ?", [identifier, dolthub[0].isoformat()])
+        )
+        return dolthub if history is None else (history[0], dolthub[1])
     if source == "cftc_cot":
         cot_ticker = DEFAULT_COT_TICKER_BY_ASSET.get(identifier or "", identifier or "")
         for table, codes in (
