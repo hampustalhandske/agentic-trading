@@ -51,6 +51,8 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-66 follow-up | unfilled orders recorded and counted per run | ebb98a0 |
 | AT-80 | S&P cross-section priced by security from `equity_daily_from_bars` | 7b37814 |
 | AT-78 | quantcore a041d0d (0.3.0); flat assets and pods; stress-test zero variance | 9a2de88 |
+| AT-6 | COT gated on CFTC's recorded release dates (`cftc_cot_publication`) | 21d5668 |
+| AT-82 | cash earns the risk-free rate at the previous bar's rate; benchmark accrues the same; `run` and dashboard pass the series | 3d846b5 |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
 2017-12-29) are verified. edgelab-62 runs the counted runs with `warmup`
@@ -71,18 +73,17 @@ defaults. No post-result cost version was registered.
 
 ## In progress
 
-- None. AT-78's A/B results are in ISSUES. The material change is Engle-Granger p-values, about three times larger (matching statsmodels): admissible pair-quarters over 2010-2017 fall from 31 to 13. The idle-pod capital found during the A/B is filed as AT-81 (held).
+- AT-81 (must, edgelab-3f decided option (b)): keep the pod allocation and hold the idle-pod share as cash at the risk-free rate (AT-82 makes that cash earn it). What remains is reporting: each period's result gives the idle-pod share (capital allocated to pods with an empty book that day) and the cash share of NAV, and the Commander documents the rule.
 
 ## Next steps, in order
 
 1. When LK-13 and LK-14 land, move company facts and insider transactions
    back from the `_log` views to the current views.
-2. AT-6: LK-15 landed (lake fa44af5). Gate COT on
-   `cftc_cot_publication.published_date` (join on `report_date`); skip
-   rows before 2000, where it is null.
-3. AT-80's residual exclusions (table in ISSUES) shrink when LK-50 lands;
-   re-measure then. AT-68 is blocked by LK-49 (no
-   usable declaration date; LK-48).
+2. AT-81 reporting (above).
+3. AT-80's residual exclusions (table in ISSUES): LK-50 landed (lake
+   dcd547b). Re-measure now. Exclude LDOS before 2013-09-30 (LK-51);
+   YHOO/AABA and 20 renamed members are still unfilled (LK-52). AT-68 is
+   blocked by LK-49 (no usable declaration date; LK-48).
 4. AT-40 ledger: shared format with pitch-edge (PE-21); the two
    conformance vectors are the acceptance tests and are written first.
 5. AT-77: measure OmniRoute route costs once its key is in `.env`.
