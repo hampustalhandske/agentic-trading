@@ -1,7 +1,8 @@
 {
  "additions": {
   "cftc_cot_publication": "added on top of contract v1 by lake commit fa44af5 (LK-15)",
-  "yahoo_split_close_basis": "added on top of contract v1 by lake commit 11e1960 (LK-41)"
+  "yahoo_split_close_basis": "added on top of contract v1 by lake commit 11e1960 (LK-41)",
+  "sp500_price_coverage.piece_start, piece_end": "added on top of contract v1 by lake commit 796b115 (LK-67 part 1)"
  },
  "contract": "lakehouse-contract-v1",
  "frozen_on": "2026-10-27",
@@ -339,6 +340,8 @@
    "start_date": "DATE",
    "end_date": "DATE",
    "security_id": "BIGINT",
+   "piece_start": "DATE",
+   "piece_end": "DATE",
    "first_bar_date": "DATE",
    "last_bar_date": "DATE",
    "n_bar_days": "INTEGER",

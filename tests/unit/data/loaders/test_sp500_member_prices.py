@@ -20,6 +20,8 @@ _COVERAGE = {
     "start_date": "DATE",
     "end_date": "DATE",
     "security_id": "BIGINT",
+    "piece_start": "DATE",
+    "piece_end": "DATE",
     "first_bar_date": "DATE",
     "last_bar_date": "DATE",
     "n_bar_days": "INTEGER",
@@ -43,11 +45,22 @@ _MON, _TUE, _WED, _THU, _FRI = (date(2024, 3, d) for d in (4, 5, 6, 7, 8))
 _NEXT_MON = date(2024, 3, 11)
 
 
-def _span(lake: Any, ticker: str, start: str, end: str | None, security_id: int) -> None:
+def _span(
+    lake: Any,
+    ticker: str,
+    start: str,
+    end: str | None,
+    security_id: int,
+    piece: tuple[str, str | None] | None = None,
+) -> None:
+    """One coverage row: a membership span, and the piece of it `security_id` covers (the whole
+    span unless `piece` gives its own half-open range)."""
+    piece_start, piece_end = piece or (start, end)
     lake._connection.execute(
-        "INSERT INTO sp500_price_coverage (ticker, start_date, end_date, security_id) "
-        "VALUES (?, ?, ?, ?)",
-        [ticker, start, end, security_id],
+        "INSERT INTO sp500_price_coverage "
+        "(ticker, start_date, end_date, security_id, piece_start, piece_end) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [ticker, start, end, security_id, piece_start, piece_end],
     )
 
 
@@ -88,6 +101,24 @@ def test_member_securities_follow_the_security_across_a_rename(lake: Any) -> Non
     assert load_sp500_member_securities_asof(date(2022, 6, 9)) == [
         IndexMember(security_id=21100, ticker="META")
     ]
+
+
+def test_a_two_piece_span_gives_one_security_per_day(lake: Any) -> None:
+    """Both pieces of one membership carry the whole span; each day resolves to the one piece
+    whose half-open range holds it, on the day before, on and after the boundary."""
+    _span(lake, "FOXA", "2004-12-20", None, 22636, piece=("2004-12-20", "2019-03-19"))
+    _span(lake, "FOXA", "2004-12-20", None, 22635, piece=("2019-03-19", None))
+
+    by_day = {
+        day: load_sp500_member_securities_asof(day)
+        for day in (date(2019, 3, 18), date(2019, 3, 19), date(2019, 3, 20))
+    }
+
+    assert by_day == {
+        date(2019, 3, 18): [IndexMember(security_id=22636, ticker="FOXA")],
+        date(2019, 3, 19): [IndexMember(security_id=22635, ticker="FOXA")],
+        date(2019, 3, 20): [IndexMember(security_id=22635, ticker="FOXA")],
+    }
 
 
 def test_member_securities_span_bounds_ordering_and_empty(lake: Any) -> None:

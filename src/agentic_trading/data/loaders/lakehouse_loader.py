@@ -528,13 +528,16 @@ def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | N
     """Point-in-time S&P 500 membership on `as_of_date` as securities, one
     `IndexMember` per `security_id`, sorted by ticker.
 
-    Reads `sp500_price_coverage`, whose spans are keyed by `security_id`:
-    a span counts when `start_date <= as_of_date < end_date`, and a null
-    `end_date` means still a member. When several counted spans share one
-    security (a rename recorded as two overlapping spans), the span with
-    the latest `start_date` names the ticker. A counted span without a
+    Reads `sp500_price_coverage`, one row per piece of a membership span:
+    every piece carries its span's `start_date` and `end_date`, and its
+    own `security_id` with the half-open range it covers, `piece_start`
+    to `piece_end` (null: still a member). A row counts when
+    `piece_start <= as_of_date < piece_end`, so a span whose member
+    security changes counts one piece on any date. When several counted
+    rows share one security (a rename recorded as two overlapping spans),
+    the row with the latest `start_date` names the ticker. A counted span without a
     `security_id` is left out and named in one WARNING. Returns `None`
-    when no span counts."""
+    when no row counts."""
     query = f"""
         SELECT security_id, ticker
         FROM (
@@ -547,11 +550,11 @@ def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | N
                     ORDER BY start_date DESC, ticker
                 ) AS security_rank
             FROM {_table_sql("sp500_price_coverage")}
-            WHERE start_date <= ?
-              AND (end_date IS NULL OR end_date > ?)
+            WHERE piece_start <= ?
+              AND (piece_end IS NULL OR piece_end > ?)
         ) AS ranked
         WHERE security_rank = 1
-        ORDER BY ticker
+        ORDER BY ticker, security_id
     """
     as_of = as_of_date.isoformat()
     result = _query(query, [as_of, as_of])
