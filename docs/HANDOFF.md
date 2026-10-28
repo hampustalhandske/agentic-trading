@@ -35,6 +35,7 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-5 | Fama-French daily values public at the end of the next month | dadea7a |
 | AT-65 | risk-free series forward-filled only; raises before first value | dadea7a |
 | AT-4, AT-37 | run provenance block; loaders tested against lake contract v1 | 9ed37ed |
+| AT-7, AT-8, AT-9, AT-11 | NYSE session calendar; short interest, earnings, SEC filings gated on it; insider log | fd8e1ca |
 | AT-77 | asks 1 and 2 approved: edgelab executes; LLM scope event-desk then macro | 119b15a |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
@@ -55,26 +56,12 @@ two sessions after its decision; the folder now rolls at 10 days
 
 ## In progress
 
-- AT-7, AT-8, AT-9, AT-11 (one batch, Opus implementer after a
-  test-writer). Agreed with database-57:
-  - AT-7: gate on settlement + 8 NYSE sessions (+1 day), holiday-aware;
-    the lake counts weekdays (LK-47). Rows with `revision_flag='R'` are
-    available only from the next dissemination; originals are not in the
-    log.
-  - AT-8: "After market close" or null `when` is available the next
-    trading day.
-  - AT-9: SEC filings available on `filed_date` only if `accepted_at`
-    (join `sec_filings` on `accession_number`) is before 16:00 ET,
-    otherwise the next trading day.
-  - AT-11: read `sec_insider_transactions_log` with DISTINCT over every
-    column except scraped_at, dt and table until LK-14 lands (the `_log`
-    views are a supported read).
-  - Needs an NYSE session calendar (exchange_calendars XNYS is the plan).
+Nothing in flight.
 
 ## Next steps, in order
 
-1. The AT-7/8/9/11 batch above, then AT-10 (discrete quarters from
-   company facts) and AT-12 (dividends from `equity_distributions`).
+1. AT-10 (discrete quarters from company facts; with LK-13) and AT-12
+   (dividends from `equity_distributions`, regular cash on one basis).
 2. AT-6 waits for LK-15 (COT `published_at`); until then the `+3 days`
    gate stands.
 3. Remaining data and point-in-time musts: AT-15..19, 21, 38, 39,
@@ -93,4 +80,8 @@ two sessions after its decision; the folder now rolls at 10 days
   from the lake's `docs/contract-v1.json` when a new contract is frozen.
   Security ids: equity_ticker_history (ticker and date, inclusive),
   futures contract_code with futures_roll_calendar, options by OSI.
+- `data/trading_calendar.py` is a hand-kept NYSE rule set (pandas holiday
+  rules plus special closures); it matches SPY session dates 2000-2026
+  exactly. A new unscheduled closure must be added there. Adding
+  `exchange-calendars` was blocked by the permission classifier.
 - The first lake request after 15 idle minutes can take up to 60 s.

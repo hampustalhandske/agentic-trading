@@ -101,34 +101,34 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-7 FINRA short interest: no holiday calendar; revisions overwrite undated
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M23)
 - Evidence: [M] `lakehouse_loader.py:756-762`. 80 of 212 AAPL settlements (38%) are early under a holiday-aware estimate. 2,589 rows carry `revision_flag='R'` and overwrite the original from the first dissemination.
 - Acceptance: dissemination uses the FINRA calendar, or settlement + 8 NYSE business days + 1 day. Revised rows are available no earlier than the next dissemination date after the original. A test uses a settlement date with Thanksgiving in its window.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: fd8e1ca. Availability = the session after the 8th NYSE session past settlement; the lake's weekday-only date is ignored (LK-47). Revised rows take the next settlement's availability; originals are not recoverable. Verified live: AAPL 2023-11-15 absent 2023-11-28, present 2023-11-29.
 
 ### AT-8 After-close earnings used in that day's close decision
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M17)
 - Evidence: [V] the join ignores `when` (`lakehouse_loader.py:382-401`). [M] 5,453 of 13,319 rows are "After market close". AAPL as of 2024-08-01 returns the 2024-08-01 report.
 - Acceptance: availability is `date + 1 trading day` when `when` is "After market close" or null. AAPL as of 2024-08-01 returns the 2024-05-02 quarter.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: fd8e1ca. Verified live: AAPL as of 2024-08-01 returns the 2024-05-02 report; as of 2024-08-02 the 2024-08-01 report.
 
 ### AT-9 SEC filings accepted after 16:00 ET used the same day
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M18)
 - Evidence: [M] `lakehouse_loader.py:715` and `:812` gate on `filed_date`. Since 2022, 79.0% of Form 4s (172,531 of 218,446), 47.8% of 10-Qs and 50.8% of 10-Ks were accepted after 16:00 ET.
 - Acceptance: the gate is `accepted_at <= decision timestamp` (join `sec_filings` on `accession_number`), or `filed_date + 1 trading day`. A Form 4 accepted at 21:30 UTC on day t is absent at close t.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: fd8e1ca. Acceptance from sec_filings, one row per accession (max accepted_at; a filing repeats once per issuer ticker). Live: 99.7% of NVDA insider rows and 54.9% of AAPL company-fact rows move to the next session; NVDA files Form 4s in the evening.
 
 ### AT-10 Company facts drop period columns and mix 3-month, YTD, annual and restated values
 - Status: open
@@ -141,14 +141,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-11 Insider loader collapses distinct lines of one filing
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M20)
 - Evidence: [M] `lakehouse_loader.py:803-806` partitions on the lake's defective key. NVDA: 1,867 loader rows vs 3,793 distinct, 121M vs 277M shares. AAPL 1,346 vs 1,874. JPM 2,106 vs 2,465.
 - Acceptance: all distinct lines are kept (dedup on the full row or the line number). NVDA's row count equals the distinct-economic-row count.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: fd8e1ca. Reads sec_insider_transactions_log de-duplicated over every column except scraped_at, dt, table until LK-14 lands. Verified live: NVDA 3,796 rows, 276.7M shares.
 
 ### AT-12 Dividend signal on mixed bases: splits and specials read as cuts
 - Status: open
