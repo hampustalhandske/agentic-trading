@@ -354,7 +354,7 @@ def _fact_row(accession: str) -> dict[str, Any]:
         "period_end": "2023-12-30",
         "period_start": "2023-10-01",
         "scraped_at": pd.Timestamp("2024-03-13", tz=_UTC),
-        "table": "sec_company_facts",
+        "table": "sec_company_facts_log",
         "ticker": "AAPL",
         "unit": "USD",
         "value": 119.0e9,
@@ -373,7 +373,7 @@ def test_company_facts_gate_on_acceptance_time(
     next session."""
     _seed_filings(fake_lake, {"F1": accepted_utc})
     fake_lake.add(
-        "sec_company_facts",
+        "sec_company_facts_log",
         pd.DataFrame([_fact_row("F1")]),
         date_columns=("dt", "filed_date", "period_end", "period_start"),
     )

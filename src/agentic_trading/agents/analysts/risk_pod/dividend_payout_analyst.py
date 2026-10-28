@@ -22,8 +22,10 @@ class DividendPayoutAnalyst(AnalystAgent):
     a raise is a real positive statement about a board's confidence in
     forward earnings — both are decisions company management makes with
     money, not signals derived from price action. Compares the two most
-    recent real dividend payments (`dolthub_stock_dividends`, via
-    `data/loaders/lakehouse_loader.py`) for `asset`: a cut signals short,
+    recent regular cash dividends (`equity_distributions`, split-adjusted,
+    via `data/loaders/lakehouse_loader.py::load_dividends_from_lakehouse`)
+    for `asset`, so a stock split never reads as a cut and a special
+    distribution never reads as a raise: a cut signals short,
     a raise signals long, an unchanged payout is flat. This is
     independent of `adj_close` already reflecting dividends in realized
     returns (a separate, existing correctness property) — this analyst

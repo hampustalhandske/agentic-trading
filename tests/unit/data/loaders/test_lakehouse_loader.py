@@ -48,11 +48,20 @@ def _company_facts_table(filed: str, accession: str) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "ticker": ["AAPL"],
+            "cik": [320193],
             "concept": ["Revenues"],
+            "unit": ["USD"],
+            "period_start": ["2023-10-01"],
+            "period_end": ["2023-12-30"],
             "value": [1_000_000.0],
+            "fiscal_year": [2024],
             "fiscal_period": ["Q1"],
+            "form": ["10-Q"],
             "filed_date": [filed],
             "accession_number": [accession],
+            "scraped_at": [pd.Timestamp("2024-01-11", tz="UTC")],
+            "dt": ["2024-01-11"],
+            "table": ["sec_company_facts_log"],
         }
     )
 
@@ -66,9 +75,9 @@ def _sec_filings_table(accession: str, accepted_at: str) -> pd.DataFrame:
 def test_load_company_facts_returns_valid_data(fake_lake: Any) -> None:
     """Facts from a filing accepted well before as_of_date pass straight through."""
     fake_lake.add(
-        "sec_company_facts",
+        "sec_company_facts_log",
         _company_facts_table("2024-01-10", "0000320193-24-000001"),
-        date_columns=("filed_date",),
+        date_columns=("filed_date", "period_start", "period_end", "dt"),
     )
     fake_lake.add("sec_filings", _sec_filings_table("0000320193-24-000001", "2024-01-10 14:00"))
 
@@ -96,8 +105,16 @@ def test_load_company_facts_raises_on_future_filed_date(fake_lake: Any) -> None:
 def test_load_dividends_returns_valid_data(fake_lake: Any) -> None:
     """Valid, in-window ex-dates pass straight through."""
     fake_lake.add(
-        "dolthub_stock_dividends",
-        pd.DataFrame({"act_symbol": ["AAPL"], "ex_date": ["2024-01-10"], "amount": [0.25]}),
+        "equity_distributions",
+        pd.DataFrame(
+            {
+                "ticker": ["AAPL"],
+                "ex_date": ["2024-01-10"],
+                "amount_as_traded": [0.25],
+                "amount_split_adjusted": [0.25],
+                "distribution_type": ["regular_cash"],
+            }
+        ),
         date_columns=("ex_date",),
     )
 
@@ -109,7 +126,22 @@ def test_load_dividends_returns_valid_data(fake_lake: Any) -> None:
 
 def test_load_dividends_raises_on_future_ex_date(fake_lake: Any) -> None:
     """An ex-date after as_of_date in the index is a broken SQL gate — must raise."""
-    fake_lake.fixed_result = pd.DataFrame({"ex_date": ["2024-01-20"], "amount": [0.25]})
+    fake_lake.add(
+        "equity_distributions",
+        pd.DataFrame(
+            {
+                "ticker": ["AAPL"],
+                "ex_date": ["2024-01-20"],
+                "amount_as_traded": [0.25],
+                "amount_split_adjusted": [0.25],
+                "distribution_type": ["regular_cash"],
+            }
+        ),
+        date_columns=("ex_date",),
+    )
+    fake_lake.fixed_result = pd.DataFrame(
+        {"ex_date": ["2024-01-20"], "amount_split_adjusted": [0.25]}
+    )
 
     with pytest.raises(ValueError, match="2024-01-20"):
         lakehouse_loader.load_dividends_from_lakehouse("AAPL", date(2024, 1, 15))

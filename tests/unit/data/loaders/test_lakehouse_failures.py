@@ -29,8 +29,16 @@ def test_connection_error_propagates(fake_lake: Any) -> None:
 
 def test_zero_rows_is_none(fake_lake: Any) -> None:
     fake_lake.add(
-        "dolthub_stock_dividends",
-        pd.DataFrame({"act_symbol": ["MSFT"], "ex_date": ["2024-01-10"], "amount": [0.5]}),
+        "equity_distributions",
+        pd.DataFrame(
+            {
+                "ticker": ["MSFT"],
+                "ex_date": ["2024-01-10"],
+                "amount_as_traded": [0.5],
+                "amount_split_adjusted": [0.5],
+                "distribution_type": ["regular_cash"],
+            }
+        ),
         date_columns=("ex_date",),
     )
     assert lakehouse_loader.load_dividends_from_lakehouse("AAPL", date(2024, 1, 15)) is None

@@ -287,24 +287,35 @@ def load_cot_positioning_from_lakehouse(
     return None
 
 
+# `equity_distributions.distribution_type` of an ordinary recurring cash
+# dividend; specials, spin-offs and unclassified large payments carry
+# other types.
+_REGULAR_CASH = "regular_cash"
+
+
 def load_dividends_from_lakehouse(ticker: str, as_of_date: date) -> pd.Series | None:
-    """Real dividend-per-share history (`dolthub_stock_dividends`) for
-    `ticker`, indexed by ex-date, filtered `<= as_of_date` — the ex-date
-    is itself the real, already-past-tense corporate-action date (no
-    additional estimated-lag gating needed, unlike COT/FINRA). Returns
-    `None` if `ticker` has no dividend history at all. Self-asserts
-    point-in-time on the `ex_date` index before returning."""
+    """Regular cash dividends per share for `ticker`, from the
+    `equity_distributions` table: rows whose `distribution_type` is
+    `regular_cash`, as `amount_split_adjusted` indexed by ex-date
+    (datetime64, ascending), with `ex_date <= as_of_date`.
+
+    Every amount is on one split-consistent basis, so a stock split
+    never reads as a dividend cut. Special cash distributions, spin-offs
+    and other non-recurring payments are excluded. Gating on the ex-date
+    is safe because a dividend is declared before its ex-date, so it is
+    public by then. Returns `None` when no rows qualify. Self-asserts
+    point-in-time on the ex-date index before returning."""
     query = """
-        SELECT ex_date, amount
-        FROM dolthub_stock_dividends
-        WHERE act_symbol = ? AND ex_date <= ?
+        SELECT ex_date, amount_split_adjusted
+        FROM equity_distributions
+        WHERE ticker = ? AND distribution_type = ? AND ex_date <= ?
         ORDER BY ex_date
     """
-    frame = _query(query, [ticker, as_of_date.isoformat()])
+    frame = _query(query, [ticker, _REGULAR_CASH, as_of_date.isoformat()])
     if frame.empty:
         return None
     frame["ex_date"] = pd.to_datetime(frame["ex_date"])
-    series = frame.set_index("ex_date")["amount"]
+    series = frame.set_index("ex_date")["amount_split_adjusted"]
     assert_point_in_time(series, as_of_date)
     return series
 
@@ -577,28 +588,42 @@ def load_fama_french_factors_from_lakehouse(
     return result
 
 
+# The columns identifying one reported period of one concept; a later
+# filing restating the same period replaces the earlier value.
+_COMPANY_FACT_PERIOD_KEY = ["concept", "unit", "period_start", "period_end"]
+
+
 def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataFrame | None:
-    """Filed SEC EDGAR company facts for `ticker`, from the
-    `sec_company_facts` table (`ticker`, `cik`, `concept`, `unit`,
+    """Filed SEC EDGAR company facts for `ticker` known at the close of
+    `as_of_date`, one row per reported period: columns `concept`, `unit`,
     `period_start`, `period_end`, `value`, `fiscal_year`,
-    `fiscal_period`, `form`, `accession_number`, `filed_date`) —
-    `filed_date` renamed to `filed`, giving a `concept`/`value`/
-    `fiscal_period`/`filed` shape. A single filing reports multiple period windows
-    for the same concept (current quarter, year-to-date, prior-year
-    comparatives) as separate rows sharing one `filed_date` — the same
-    multi-row-per-filing shape the original SEC EDGAR XBRL API already
-    produced. Gated on when the filing became public (never the fiscal
-    period it describes): `available_date` (datetime64) is set from the
-    filing's latest acceptance time in `sec_filings`
-    (`_SEC_ACCEPTANCE_QUERY`) by `_sec_available_dates`, and only rows
-    with `available_date <= as_of_date` are returned.
-    Returns `None` if no rows remain. Self-asserts point-in-time on
-    `filed` (the SQL gate) and on `available_date` before returning."""
+    `fiscal_period`, `form`, `filed` and `available_date` (the four date
+    columns datetime64), sorted by `filed` then `period_end`.
+
+    Reads the `sec_company_facts_log` view, which keeps every scrape,
+    because the deduplicated `sec_company_facts` view drops one of two
+    facts that differ only in `period_start` until lake issue LK-13
+    lands. Rows identical apart from their scrape (`scraped_at`, `dt`,
+    `table`) count once.
+
+    A filing reports several period windows for one concept (current
+    quarter, year-to-date, prior-year comparatives) as separate rows, and
+    later filings repeat or restate earlier periods. Gated on when the
+    filing became public, never the period it describes:
+    `available_date` is set from the filing's latest acceptance time in
+    `sec_filings` (`_SEC_ACCEPTANCE_QUERY`) by `_sec_available_dates`,
+    and only rows with `available_date <= as_of_date` are kept. Of
+    those, each (`concept`, `unit`, `period_start`, `period_end`) keeps
+    the row with the latest `available_date`, ties broken by the latest
+    `filed`. Returns `None` if no rows remain. Self-asserts
+    point-in-time on `filed` (the SQL gate) and on `available_date`
+    before returning."""
     query = f"""
-        SELECT x.concept, x.value, x.fiscal_period, x.filed_date AS filed, f.accepted_at
+        SELECT x.concept, x.unit, x.period_start, x.period_end, x.value, x.fiscal_year,
+               x.fiscal_period, x.form, x.filed_date AS filed, f.accepted_at
         FROM (
-            SELECT *
-            FROM sec_company_facts
+            SELECT DISTINCT * EXCLUDE (scraped_at, dt, "table")
+            FROM sec_company_facts_log
             WHERE ticker = ? AND filed_date <= ?
         ) x
         LEFT JOIN ({_SEC_ACCEPTANCE_QUERY}) f ON f.accession_number = x.accession_number
@@ -609,11 +634,18 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
         return None
     frame["filed"] = pd.to_datetime(frame["filed"])
     assert_point_in_time(frame, as_of_date, date_column="filed")
+    frame["period_start"] = pd.to_datetime(frame["period_start"])
+    frame["period_end"] = pd.to_datetime(frame["period_end"])
     frame["available_date"] = _sec_available_dates(frame["filed"], frame["accepted_at"])
     frame = frame[frame["available_date"] <= pd.Timestamp(as_of_date)].drop(columns="accepted_at")
     if frame.empty:
         return None
-    frame = frame.reset_index(drop=True)
+    frame = (
+        frame.sort_values(["available_date", "filed"], kind="stable")
+        .drop_duplicates(subset=_COMPANY_FACT_PERIOD_KEY, keep="last")
+        .sort_values(["filed", "period_end"], kind="stable")
+        .reset_index(drop=True)
+    )
     assert_point_in_time(frame, as_of_date, date_column="available_date")
     return frame
 

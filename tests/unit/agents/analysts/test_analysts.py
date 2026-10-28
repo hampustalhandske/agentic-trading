@@ -129,11 +129,16 @@ def test_sec_fundamentals_t_stat_matches_classical_ols_standard_error(monkeypatc
 
     rng = np.random.default_rng(0)
     values = 2.0 + 0.3 * np.arange(8) + rng.normal(0.0, 0.05, 8)
-    filed_dates = pd.date_range("2022-01-01", periods=8, freq="90D")
+    period_ends = pd.date_range("2022-03-31", periods=8, freq="91D")
+    filed_dates = period_ends + pd.Timedelta(days=30)
     facts = pd.DataFrame(
         {
             "concept": ["EarningsPerShareDiluted"] * 8,
+            "unit": "USD/shares",
+            "period_start": period_ends - pd.Timedelta(days=90),
+            "period_end": period_ends,
             "filed": filed_dates,
+            "available_date": filed_dates,
             "value": values,
         }
     )
@@ -143,7 +148,7 @@ def test_sec_fundamentals_t_stat_matches_classical_ols_standard_error(monkeypatc
         "AAPL", pd.DataFrame(), pd.Timestamp(filed_dates[-1]) + pd.Timedelta(days=1)
     )
 
-    periods = np.arange(8, dtype=np.float64)
+    periods = np.asarray((period_ends - period_ends[0]).days, dtype=np.float64) / 91.3125
     design_matrix = np.column_stack([np.ones(8), periods])
     coefs, _, _, _ = np.linalg.lstsq(design_matrix, values, rcond=None)
     residuals = values - design_matrix @ coefs

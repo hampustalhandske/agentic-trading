@@ -90,13 +90,29 @@
    "underlying": "VARCHAR",
    "vega": "DOUBLE"
   },
-  "dolthub_stock_dividends": {
-   "act_symbol": "VARCHAR",
-   "amount": "DOUBLE",
+  "equity_distributions": {
+   "amount_as_traded": "DOUBLE",
+   "amount_split_adjusted": "DOUBLE",
+   "applied": "BOOLEAN",
+   "applied_evidence": "VARCHAR",
+   "basis_evidence": "VARCHAR",
+   "distribution_type": "VARCHAR",
+   "dolthub_amount": "DOUBLE",
+   "dolthub_basis": "VARCHAR",
    "dt": "DATE",
    "ex_date": "DATE",
+   "observed_move": "DOUBLE",
+   "prior_close_as_traded": "DOUBLE",
    "scraped_at": "TIMESTAMP WITH TIME ZONE",
-   "table": "VARCHAR"
+   "security_id": "BIGINT",
+   "source_ticker": "VARCHAR",
+   "sources": "VARCHAR",
+   "table": "VARCHAR",
+   "ticker": "VARCHAR",
+   "type_evidence": "VARCHAR",
+   "yahoo_amount": "DOUBLE",
+   "yahoo_split_factor": "DOUBLE",
+   "yield_on_prior_close": "DOUBLE"
   },
   "famafrench_returns": {
    "dataset": "VARCHAR",
@@ -150,7 +166,7 @@
    "ticker": "VARCHAR",
    "volume": "BIGINT"
   },
-  "sec_company_facts": {
+  "sec_company_facts_log": {
    "accession_number": "VARCHAR",
    "cik": "BIGINT",
    "concept": "VARCHAR",
