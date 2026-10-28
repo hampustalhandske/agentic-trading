@@ -333,3 +333,35 @@ def test_experiment_prints_provenance_at_top_level(
     for expected in ("2024-01-02", "2024-01-05", "2024-01-08", "2024-01-12"):
         assert expected in cli_args
     mock_provenance.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("command", "arguments"),
+    [
+        (app, ["AAPL", "--start-date", "2024-01-02", "--end-date", "2024-01-05"]),
+        (
+            experiment_app,
+            [
+                "AAPL",
+                "--train-start",
+                "2023-01-03",
+                "--train-end",
+                "2023-06-30",
+                "--test-start",
+                "2023-07-03",
+                "--test-end",
+                "2023-12-29",
+            ],
+        ),
+    ],
+    ids=["run", "experiment"],
+)
+def test_parallel_backend_flag_is_rejected_and_not_advertised(
+    command: Any, arguments: list[str]
+) -> None:
+    """Both commands refuse `--parallel-backend` and their help text does not offer it."""
+    result = runner.invoke(command, [*arguments, "--parallel-backend", "process"])
+    help_text = runner.invoke(command, ["--help"]).output
+
+    assert result.exit_code != 0
+    assert "parallel-backend" not in help_text

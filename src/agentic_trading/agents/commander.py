@@ -1,8 +1,8 @@
 # commander.py
 
-from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
-from typing import Literal, cast
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -66,8 +66,8 @@ def _construct_pod_portfolio(
     scoreboard: PerformanceScoreboard,
 ) -> tuple[str, list[PortfolioDecision], SizingDiagnostics | None]:
     """Runs one pod's `construct_portfolio` and returns its id, decisions
-    and sizing diagnostics together, so a worker process's results reach
-    the caller even though its copy of `manager` does not."""
+    and sizing diagnostics together, so one call per pod can run on a
+    worker thread."""
     decisions = manager.construct_portfolio(assets, market_data, as_of_date, scoreboard)
     return manager.agent_id, decisions, manager.last_sizing_diagnostics()
 
@@ -667,7 +667,6 @@ class Commander:
         weighting_strategy: "WeightingStrategy",
         pod_returns_lookback_days: int | None = None,
         parallel_workers: int = 1,
-        parallel_backend: Literal["thread", "process"] = "thread",
         drawdown_breaker: "_DrawdownBreaker | None" = None,
     ) -> None:
         if parallel_workers < 1:
@@ -678,8 +677,7 @@ class Commander:
         self.weighting_strategy = weighting_strategy
         self.pod_returns_lookback_days = pod_returns_lookback_days
         self.parallel_workers = parallel_workers
-        self.parallel_backend = parallel_backend
-        self._executor: Executor | None = None
+        self._executor: ThreadPoolExecutor | None = None
         self._idle_pod_share: float | None = None
         self._unavailable_pod_share: float | None = None
         self._no_position_pod_share: float | None = None
@@ -691,14 +689,11 @@ class Commander:
             drawdown_breaker if drawdown_breaker is not None else _DrawdownBreaker()
         )
 
-    def _get_executor(self) -> Executor | None:
+    def _get_executor(self) -> ThreadPoolExecutor | None:
         if self.parallel_workers == 1:
             return None
         if self._executor is None:
-            executor_type = (
-                ProcessPoolExecutor if self.parallel_backend == "process" else ThreadPoolExecutor
-            )
-            self._executor = executor_type(max_workers=self.parallel_workers)
+            self._executor = ThreadPoolExecutor(max_workers=self.parallel_workers)
         return self._executor
 
     def close(self) -> None:

@@ -263,9 +263,6 @@ def run(
     parallel_workers: int = typer.Option(
         4, min=1, help="Concurrent manager-signal workers used within each simulated day."
     ),
-    parallel_backend: str = typer.Option(
-        "thread", help="Concurrency backend: 'thread' for APIs or 'process' for CPU-heavy runs."
-    ),
     set_override: list[str] = typer.Option(  # noqa: B008
         [],
         "--set",
@@ -335,9 +332,6 @@ def run(
             f"--start-date ({parsed_start_date.isoformat()})."
         )
 
-    if parallel_backend not in {"thread", "process"}:
-        raise typer.BadParameter("--parallel-backend must be 'thread' or 'process'")
-
     typer.echo()
     typer.echo(f"  Assets:                 {', '.join(resolved_assets)}")
     typer.echo(
@@ -370,7 +364,6 @@ def run(
             "start_date": parsed_start_date.isoformat(),
             "end_date": parsed_end_date.isoformat(),
             "parallel_workers": parallel_workers,
-            "parallel_backend": parallel_backend,
             "set": list(set_override),
             "yes": yes,
             "verbose": verbose,
@@ -383,7 +376,6 @@ def run(
         managers=managers,
         weighting_strategy=ShrinkageWeight(Hedge()),
         parallel_workers=parallel_workers,
-        parallel_backend=parallel_backend,  # type: ignore[arg-type]
     )
     # Pre-fetched once, lakehouse-only, rather than passed to
     # BacktestEngine as a lazy callable: this way the CLI can log the
@@ -443,9 +435,6 @@ def experiment(
     ),
     parallel_workers: int = typer.Option(
         4, min=1, help="Concurrent manager-signal workers per simulated day."
-    ),
-    parallel_backend: str = typer.Option(
-        "thread", help="Concurrency backend: 'thread' or 'process'."
     ),
     commission_rate: float | None = typer.Option(
         None,
@@ -508,8 +497,6 @@ def experiment(
     The test phase starts with fresh portfolio holdings but carries those
     learned weights forward. Both phases use strict real market data.
     """
-    if parallel_backend not in {"thread", "process"}:
-        raise typer.BadParameter("--parallel-backend must be 'thread' or 'process'")
     parsed_train_start = _parse_date_flag(train_start, "--train-start")
     parsed_train_end = _parse_date_flag(train_end, "--train-end")
     parsed_test_start = _parse_date_flag(test_start, "--test-start")
@@ -555,7 +542,6 @@ def experiment(
             "test_end": parsed_test_end.isoformat(),
             "warmup_days": warmup_days,
             "parallel_workers": parallel_workers,
-            "parallel_backend": parallel_backend,
             "commission_rate": resolved_commission_rate,
             "slippage_bps": resolved_slippage_bps,
             "execution_lag_days": resolved_execution_lag_days,
@@ -575,7 +561,6 @@ def experiment(
         managers=managers,
         weighting_strategy=ShrinkageWeight(Hedge()),
         parallel_workers=parallel_workers,
-        parallel_backend=parallel_backend,  # type: ignore[arg-type]
     )
     market_data, source_label = load_price_history_with_fallback(
         resolved_assets,
@@ -696,7 +681,6 @@ def experiment(
                     managers=[manager],
                     weighting_strategy=ShrinkageWeight(Hedge()),
                     parallel_workers=parallel_workers,
-                    parallel_backend=parallel_backend,  # type: ignore[arg-type]
                 ),
                 portfolio=Portfolio(
                     cash=settings.firm.starting_cash,
