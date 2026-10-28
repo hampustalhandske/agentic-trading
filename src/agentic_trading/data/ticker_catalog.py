@@ -53,7 +53,7 @@ class TickerGroup(BaseModel):
 
 
 # quote_type is the Yahoo Finance quoteType each symbol carried when this
-# catalog was built (EQUITY / INDEX / FUTURE / CURRENCY / CRYPTOCURRENCY).
+# catalog was built (EQUITY / ETF / FUTURE / CURRENCY / CRYPTOCURRENCY).
 CATALOG: tuple[TickerInfo, ...] = (
     # --- stock (quoteType: EQUITY) ---
     TickerInfo(symbol="AAPL", name="Apple Inc.", asset_class="stock", quote_type="EQUITY"),
@@ -162,9 +162,11 @@ CATALOG: tuple[TickerInfo, ...] = (
     TickerInfo(
         symbol="MA", name="Mastercard Incorporated", asset_class="stock", quote_type="EQUITY"
     ),
-    # --- index (quoteType: INDEX) ---
-    TickerInfo(symbol="^GSPC", name="S&P 500", asset_class="index", quote_type="INDEX"),
-    TickerInfo(symbol="^RUT", name="Russell 2000", asset_class="index", quote_type="INDEX"),
+    # --- index exposure through tradeable ETFs (quoteType: ETF) ---
+    TickerInfo(symbol="SPY", name="SPDR S&P 500 ETF Trust", asset_class="index", quote_type="ETF"),
+    TickerInfo(
+        symbol="IWM", name="iShares Russell 2000 ETF", asset_class="index", quote_type="ETF"
+    ),
     # --- commodity (quoteType: FUTURE) ---
     TickerInfo(symbol="GC=F", name="Gold Futures", asset_class="commodity", quote_type="FUTURE"),
     TickerInfo(
@@ -177,7 +179,7 @@ CATALOG: tuple[TickerInfo, ...] = (
     # --- forex (quoteType: CURRENCY) ---
     TickerInfo(symbol="EURUSD=X", name="EUR/USD", asset_class="forex", quote_type="CURRENCY"),
     TickerInfo(symbol="GBPUSD=X", name="GBP/USD", asset_class="forex", quote_type="CURRENCY"),
-    TickerInfo(symbol="JPY=X", name="USD/JPY", asset_class="forex", quote_type="CURRENCY"),
+    TickerInfo(symbol="USDJPY=X", name="USD/JPY", asset_class="forex", quote_type="CURRENCY"),
     TickerInfo(symbol="AUDUSD=X", name="AUD/USD", asset_class="forex", quote_type="CURRENCY"),
     # --- crypto (quoteType: CRYPTOCURRENCY) ---
     TickerInfo(
@@ -275,15 +277,15 @@ TICKER_GROUPS: tuple[TickerGroup, ...] = (
             "JNJ",
             "XOM",
             "CAT",
-            "^GSPC",
-            "^RUT",
+            "SPY",
+            "IWM",
             "GC=F",
             "CL=F",
             "SI=F",
             "NG=F",
             "EURUSD=X",
             "GBPUSD=X",
-            "JPY=X",
+            "USDJPY=X",
             "AUDUSD=X",
             "BTC-USD",
             "ETH-USD",
