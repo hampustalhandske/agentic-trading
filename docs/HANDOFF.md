@@ -53,8 +53,8 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-78 | quantcore a041d0d (0.3.0); flat assets and pods; stress-test zero variance | 9a2de88 |
 | AT-6 | COT gated on CFTC's recorded release dates (`cftc_cot_publication`) | 21d5668 |
 | AT-82 | cash earns the risk-free rate at the previous bar's rate; benchmark accrues the same; `run` and dashboard pass the series | 3d846b5 |
-| AT-81 | idle-pod share and cash share recorded per day and per period; allocation unchanged | pending |
-| AT-80 | exclusions re-measured after LK-50: 1.5-4.9% (was 4.4-8.8%) | pending |
+| AT-81 | idle-pod share and cash share recorded per day and per period; allocation unchanged | 2575e4d |
+| AT-80 | exclusions re-measured after LK-50: 1.5-4.9% (was 4.4-8.8%) | 2575e4d |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
 2017-12-29) are verified. edgelab-62 runs the counted runs with `warmup`

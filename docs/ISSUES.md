@@ -980,7 +980,7 @@ Paths are relative to `src/agentic_trading/`.
   - Live, AAPL/XOM/SPY 2016-01-04 to 02-29 (39 days) [V]: idle-pod share mean 0.58 (0.29-0.85) and cash share mean 0.998 (0.95-1.11).
   - The idle share is above the 0.30 estimated from the three pods that never trade, because a pod whose analysts are all flat that day is idle too.
   - The cash share is near 1 because the long and short sides largely offset.
-- Commits: pending
+- Commits: 2575e4d
 
 ### AT-82 Positive cash earns nothing while Sharpe subtracts the risk-free rate
 - Status: done
