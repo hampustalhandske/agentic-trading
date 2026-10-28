@@ -203,14 +203,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-17 Option spot is spin-off/dividend adjusted while strikes are as quoted
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M6)
 - Evidence: [M] `lakehouse_loader.py:509,556-558` and `_market_math.py:289-301`. GE 2023-01-03: option spot 52.94 vs as-traded 84.97 (-38%). T 2022-04-08: 18.23 vs 24.14.
 - Acceptance: option spot is the as-traded `equity_daily_from_bars` `official_close` (else `close`); strikes stay as quoted. GE's spot on 2023-01-03 is within 0.1% of 84.98.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: 99edc18 (AT-1). Resolved on the opposite basis to the acceptance: strikes are rescaled onto Yahoo's close basis, which counts spin-offs Yahoo writes as fractional splits, and `raw_spot` reads that same Yahoo close. Verified live: GE 2023-01-03 median strike 52.33 against spot 52.94; T 2022-04-08 18.13 against 18.23. Both sides scale by one factor, so moneyness and implied volatility are unchanged.
 
 ### AT-18 CVaR analysts choose ATM against the dividend-adjusted close
 - Status: open
