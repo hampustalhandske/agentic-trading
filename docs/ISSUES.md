@@ -994,3 +994,37 @@ Paths are relative to `src/agentic_trading/`.
   - Live (lake dcd547bb3bcc) on AAPL, XOM, SPY, 2016-01-04 to 2016-02-29, without and then with the series [V]: final NAV 9,799,497.83 → 9,803,826.08, Sharpe -2.8141 → -2.8143, Sortino -3.2991 → -3.2994, net financing +262.16 → -4,080.11 (about 4.3k of interest on about $9.3M cash, DGS3MO 0.20-0.35%).
   - Sharpe barely moves at near-zero rates. At a 5% rate the cash share would add about 5% a year to raw return and to the benchmark alike.
 - Commits: 3d846b5
+
+### AT-83 Firm runs at about 5% vol with no stated target; results not stated per pod
+- Status: in-progress (part 1 done)
+- Priority: must (M6)
+- Gate: data (edgelab-3f, 2026-10-28)
+- Raised by: edgelab-3f, 2026-10-28, reviewing AT-81
+- Evidence: [V] AAPL/XOM/SPY 2016-01-04 to 02-29 (lake dcd547bb3bcc): firm gross 6.8% of NAV on average (1.4-15.1%) and net -0.6% (-12.2% to +4.0%). Cash share is 1 - net - option premium, 0.998 on average, near 1 because longs and shorts offset. Realised firm vol is 4.7% annualised. The allocations sum to 1, so the firm book is an allocation-weighted average of pod books. Its vol is low for three reasons: each pod runs below its own `target_annualized_vol` of 0.15 (part 1 measures 3.7-7.1% on this window), the idle-pod share (mean 0.58, AT-81) sits in cash, and pods trading the same three names offset each other. A firm-level Sharpe or return mostly reflects how little is at risk.
+- Acceptance:
+  1. Per pod: each period's result and the run summary report each pod's return, vol, Sharpe and max drawdown, from the pod's own book at its own risk (the unscaled `pod_return_history`).
+     `BacktestResult.pod_return_history` is copied from the Commander's sizing tracker, which keeps only the trailing `commander.pod_returns_lookback_days` (90) calendar days [V]. So the engine keeps the whole run's series itself, and the Commander's trailing window is unchanged.
+  2. Firm: a documented `firm.target_annualized_vol` setting scales the combined book to an ex-ante firm vol target, within the existing firm limits (gross, single name, VaR, stress, leverage). Realised firm vol is reported against the target.
+  3. Run the AT-78 window before and after, and report gross, vol, Sharpe and NAV.
+- Conditions for part 2 (edgelab-3f, 2026-10-28):
+  - Ex-ante vol comes from a trailing covariance known at decision time (quantcore Ledoit-Wolf).
+  - The before/after reports net return and costs separately, and how often each firm limit binds. Scaling about 5% to 10% roughly doubles turnover.
+  - `firm.target_annualized_vol` = 0.10 is fixed before any result. Changing it later is a new counted variant.
+- Order: part 1, then part 2, then AT-40.
+- Blocked-by / Blocks: none
+- Part 1 resolution: `BacktestResult.pod_performance` gives each pod's observations, cumulative return, annualised vol, Sharpe (no risk-free subtraction, since a pod is a sleeve over cash) and max drawdown. These come from the engine's whole-run pod series, persisted through checkpoints. `run_summary` passes them through per period. Live, AAPL/XOM/SPY 2016-01-04 to 02-29 [V], 38 observations per pod:
+
+  | Pod | Cum. return | Ann. vol | Sharpe | Max DD |
+  |---|---|---|---|---|
+  | risk | -1.33% | 4.90% | -1.79 | 2.45% |
+  | cvar | -2.05% | 3.90% | -3.50 | 2.81% |
+  | stat_arb | -1.50% | 5.25% | -1.89 | 2.77% |
+  | macro_rates | -0.70% | 4.33% | -1.06 | 2.20% |
+  | rates, cross_asset, credit | 0 (idle) | 0 | none | 0 |
+  | factor | -2.95% | 7.07% | -2.77 | 3.18% |
+  | event_credit | +0.07% | 6.16% | 0.10 | 1.76% |
+  | alt_data | -2.30% | 6.14% | -2.48 | 3.19% |
+  | tail_hedge | -1.09% | 3.70% | -1.94 | 1.79% |
+
+  Every active pod runs at 3.7-7.1% vol against its 0.15 target. Part 2 finds out why (name caps on a 3-asset universe, Kelly, component-VaR caps) before scaling the firm.
+- Commits: pending

@@ -72,6 +72,7 @@ def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
         summary[period]["signal_health"] = block["signal_health"]
         summary[period]["source_performance"] = block["source_performance"]
         summary[period]["pod_return_history"] = block.get("pod_return_history", {})
+        summary[period]["pod_performance"] = block.get("pod_performance", {})
         summary[period].update(_unfilled_order_counts(block))
         summary[period].update(_capital_usage_means(block))
 

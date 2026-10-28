@@ -248,6 +248,25 @@ class CapitalUsage(BaseModel):
     cash_share: float
 
 
+class PodPerformance(BaseModel):
+    """One pod's result over a run, from the pod's own daily return series
+    (its unscaled book at its own risk, before the Commander's allocation).
+
+    `observations` is the number of daily returns. `cumulative_return` is
+    prod(1 + r) - 1. `annualized_vol` is the sample standard deviation
+    (ddof=1) times sqrt(trading days per year), 0.0 below 2 observations.
+    `sharpe_ratio` is the annualized Sharpe ratio of r with no risk-free
+    subtraction, since a pod's book is a sleeve over cash; `None` below 2
+    observations or at zero vol. `max_drawdown` is the maximum peak-to-trough
+    drawdown of the compounded series, 0.0 below 2 observations."""
+
+    observations: int
+    cumulative_return: float
+    annualized_vol: float
+    sharpe_ratio: float | None
+    max_drawdown: float
+
+
 class UnfilledOrder(BaseModel):
     """A decision the backtest engine could not execute on `as_of_date`, the
     day the order failed to fill.
@@ -308,5 +327,7 @@ class BacktestResult(BaseModel):
     # (premium paid minus premium received; expiry settlements excluded).
     total_option_premium_paid: float = 0.0
     # Each pod's genuine realized daily return (prior-day pod weights x
-    # today's asset returns), keyed by manager id, as the Commander tracked it.
+    # today's asset returns), keyed by manager id, over the whole run.
     pod_return_history: dict[str, list[tuple[date, float]]] = Field(default_factory=dict)
+    # Per-pod return, vol, Sharpe and drawdown computed from `pod_return_history`.
+    pod_performance: dict[str, PodPerformance] = Field(default_factory=dict)

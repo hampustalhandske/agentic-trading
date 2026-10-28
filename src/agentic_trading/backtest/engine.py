@@ -27,6 +27,7 @@ from agentic_trading.agents.schemas import (
     CapitalUsage,
     OptionContract,
     PerformanceRecord,
+    PodPerformance,
     PortfolioDecision,
     TradeRecord,
     UnfilledOrder,
@@ -190,9 +191,26 @@ class BacktestEngine:
             return
         restore(CommanderRiskState.model_validate(payload))
 
-    def _pod_return_history(self) -> dict[str, list[tuple[date, float]]]:
+    def _new_pod_returns(
+        self,
+        as_of_date: date,
+        pod_return_history: dict[str, list[tuple[date, float]]],
+        seen: set[tuple[str, date]],
+    ) -> list[tuple[str, date, float]]:
+        """Each pod's return dated `as_of_date` in the commander's risk
+        state that is not yet in `seen`; the returned pairs are added to
+        `seen`. Empty for a commander with no risk state."""
         state = self._commander_risk_state()
-        return {} if state is None else dict(state.pod_return_history)
+        if state is None:
+            return []
+        new_entries: list[tuple[str, date, float]] = []
+        for pod_id, entries in state.pod_return_history.items():
+            for entry_date, value in entries:
+                if entry_date == as_of_date and (pod_id, entry_date) not in seen:
+                    seen.add((pod_id, entry_date))
+                    pod_return_history.setdefault(pod_id, []).append((entry_date, value))
+                    new_entries.append((pod_id, entry_date, value))
+        return new_entries
 
     def _benchmark_returns_array(self, return_dates: list[date]) -> np.ndarray | None:
         """Daily decimal benchmark return for each of `return_dates`, from
@@ -450,6 +468,16 @@ class BacktestEngine:
             if checkpoint
             else []
         )
+        pod_return_history: dict[str, list[tuple[date, float]]] = {}
+        seen_pod_returns: set[tuple[str, date]] = set()
+        if checkpoint:
+            for pod_id, entries in checkpoint.get("pod_return_history", {}).items():
+                pod_return_history[pod_id] = [
+                    (date.fromisoformat(day), float(value)) for day, value in entries
+                ]
+                seen_pod_returns.update(
+                    (pod_id, entry_date) for entry_date, _ in pod_return_history[pod_id]
+                )
         signal_health = checkpoint.get("signal_health", {}) if checkpoint else {}
         pending_decisions = (
             [
@@ -506,6 +534,9 @@ class BacktestEngine:
                 (time.perf_counter() - day_started_at) * 1000,
             )
             decisions_by_day[as_of_timestamp.date()] = decisions
+            new_pod_returns = self._new_pod_returns(
+                as_of_timestamp.date(), pod_return_history, seen_pod_returns
+            )
 
             for decision in decisions:
                 for signal in decision.contributing_signals:
@@ -797,6 +828,7 @@ class BacktestEngine:
                     new_trades=trade_log[trades_before:],
                     new_unfilled_orders=unfilled_orders[unfilled_before:],
                     capital_usage=capital_usage[-1],
+                    new_pod_returns=new_pod_returns,
                     next_day_index=day_index + 1,
                     start_date=self.start_date,
                     end_date=self.end_date,
@@ -891,7 +923,10 @@ class BacktestEngine:
             final_sharpe_ratio,
             final_max_drawdown,
         )
-        pod_return_history = self._pod_return_history()
+        pod_performance = {
+            pod_id: _pod_performance([value for _, value in entries])
+            for pod_id, entries in pod_return_history.items()
+        }
         close_commander = getattr(self.commander, "close", None)
         if close_commander is not None:
             close_commander()
@@ -920,7 +955,31 @@ class BacktestEngine:
             total_financing_cost=total_financing_cost,
             total_option_premium_paid=total_option_premium_paid,
             pod_return_history=pod_return_history,
+            pod_performance=pod_performance,
         )
+
+
+def _pod_performance(returns: list[float]) -> PodPerformance:
+    """`PodPerformance` for one pod's daily return series."""
+    series = np.array(returns, dtype=np.float64)
+    observations = len(series)
+    cumulative_return = float(np.prod(1.0 + series) - 1.0)
+    if observations < 2:
+        return PodPerformance(
+            observations=observations,
+            cumulative_return=cumulative_return,
+            annualized_vol=0.0,
+            sharpe_ratio=None,
+            max_drawdown=0.0,
+        )
+    daily_vol = float(np.std(series, ddof=1))
+    return PodPerformance(
+        observations=observations,
+        cumulative_return=cumulative_return,
+        annualized_vol=daily_vol * math.sqrt(settings.firm.trading_days_per_year),
+        sharpe_ratio=float(sharpe_ratio(series)) if daily_vol > 0.0 else None,
+        max_drawdown=float(maximum_drawdown(series)),
+    )
 
 
 def _liquidity_inputs(

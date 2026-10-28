@@ -97,3 +97,33 @@ def test_resumed_run_has_complete_capital_usage(tmp_path: Path) -> None:
 
     assert [entry.as_of_date for entry in result.capital_usage] == [day.date() for day in _INDEX]
     assert all(entry.idle_pod_share == 0.3 for entry in result.capital_usage)
+
+
+def test_store_round_trips_pod_returns(tmp_path: Path) -> None:
+    connection = checkpoint_store.connect(tmp_path / "checkpoint.db")
+    days = [date(2024, 1, 2), date(2024, 1, 3)]
+    for index, day in enumerate(days):
+        checkpoint_store.append_day(
+            connection,
+            as_of_date=day,
+            portfolio_value=100_000.0,
+            new_track_record=[],
+            decisions=[],
+            new_trades=[],
+            next_day_index=index + 1,
+            start_date=days[0],
+            end_date=days[-1],
+            assets=["AAPL"],
+            portfolio={"cash": 100_000.0},
+            signal_health={},
+            pending_decisions=[],
+            new_pod_returns=[("pod_a", day, 0.01 * (index + 1)), ("pod_b", day, -0.02)],
+        )
+
+    payload = checkpoint_store.read_all(connection)
+
+    assert payload is not None
+    assert payload["pod_return_history"] == {
+        "pod_a": [("2024-01-02", 0.01), ("2024-01-03", 0.02)],
+        "pod_b": [("2024-01-02", -0.02), ("2024-01-03", -0.02)],
+    }
