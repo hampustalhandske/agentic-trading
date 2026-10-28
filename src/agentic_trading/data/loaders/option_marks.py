@@ -7,7 +7,9 @@ A contract is marked from the latest chain snapshot on or before the
 mark date within `settings.options.max_snapshot_age_days`. A same-day
 snapshot is used as quoted; an older one is re-marked with quantcore
 Black-Scholes at the snapshot's implied volatility and today's spot,
-keeping the snapshot's relative bid/ask spread. On or after expiry the
+keeping the snapshot's relative bid/ask spread. A contract the snapshot
+no longer lists is marked from its own last quote, re-marked at the
+volatility interpolated from the snapshot's surface. On or after expiry the
 mark is intrinsic value against the underlying's close on the last
 session on or before the expiry. Chain queries are cached in-process per
 (underlying, as_of_date) so marking several contracts on one underlying
@@ -25,6 +27,7 @@ import math
 from datetime import date, timedelta
 from typing import Any, Literal
 
+import numpy as np
 import pandas as pd
 from pydantic import BaseModel
 from quantcore.pricing.black_scholes import black_scholes_call, black_scholes_put
@@ -106,14 +109,19 @@ def _query_chain(underlying: str, as_of_date: date) -> pd.DataFrame | None:
 
 
 def _query_rate(as_of_date: date) -> float:
-    """Continuously-compounded-style annual risk-free rate from the latest
-    DGS3MO observation on or before `as_of_date`; 0.0 when none exists."""
+    """Annual risk-free rate as a fraction, from the latest DGS3MO
+    observation published on or before `as_of_date`.
+
+    Raises `ValueError` naming the series and `as_of_date` when no such
+    observation exists."""
     series = load_fred_series_from_lakehouse(_RATE_SERIES_ID, as_of_date)
-    if series is None:
-        return 0.0
-    series = series.dropna()
-    if series.empty:
-        return 0.0
+    if series is not None:
+        series = series.dropna()
+    if series is None or series.empty:
+        raise ValueError(
+            f"lakehouse has no FRED {_RATE_SERIES_ID} observation published on or "
+            f"before {as_of_date.isoformat()}; option marks need a risk-free rate"
+        )
     return float(series.iloc[-1]) / 100.0
 
 
@@ -212,6 +220,50 @@ def _contract_row(snapshot: pd.DataFrame, contract: OptionContract) -> pd.Series
     return rows.iloc[0]
 
 
+def _surface_volatility(snapshot: pd.DataFrame, contract: OptionContract) -> float | None:
+    """Implied volatility for `contract` read off `snapshot`'s surface of
+    the same option type, or `None` when that surface has no row with a
+    finite positive implied volatility and an expiry after the snapshot.
+
+    Within each listed expiry the volatility is linear in strike and flat
+    beyond the quoted strikes. Across expiries total variance
+    `iv**2 * tau` (tau in years from the snapshot date) is linear in tau
+    and the volatility is `sqrt(w / tau)` at the contract's tau; outside
+    the listed tenor range the nearest expiry's volatility is used flat."""
+    snapshot_date = snapshot["date"].max()
+    rows = snapshot[
+        (snapshot["option_type"] == contract.option_type)
+        & (snapshot["expiration"] > snapshot_date)
+        & np.isfinite(snapshot["strike"].astype(float))
+        & np.isfinite(snapshot["implied_volatility"].astype(float))
+        & (snapshot["implied_volatility"].astype(float) > 0.0)
+    ]
+    if rows.empty:
+        return None
+    tenors: list[float] = []
+    volatilities: list[float] = []
+    for expiration, smile in rows.groupby("expiration", sort=True):
+        by_strike = smile.groupby("strike")["implied_volatility"].mean().sort_index()
+        tenors.append((pd.Timestamp(expiration) - snapshot_date).days / _DAYS_PER_YEAR)
+        volatilities.append(
+            float(
+                np.interp(
+                    contract.strike,
+                    by_strike.index.to_numpy(dtype=float),
+                    by_strike.to_numpy(dtype=float),
+                )
+            )
+        )
+    tenor = (pd.Timestamp(contract.expiry) - snapshot_date).days / _DAYS_PER_YEAR
+    if tenor <= tenors[0]:
+        return volatilities[0]
+    if tenor >= tenors[-1]:
+        return volatilities[-1]
+    total_variances = [vol**2 * tau for vol, tau in zip(volatilities, tenors, strict=True)]
+    total_variance = float(np.interp(tenor, tenors, total_variances))
+    return math.sqrt(total_variance / tenor)
+
+
 def _model_mark(
     contract: OptionContract,
     as_of_date: date,
@@ -287,20 +339,36 @@ def load_option_mark(contract: OptionContract, as_of_date: date, spot: float) ->
     Otherwise the contract is looked up in the latest snapshot
     within the age window: a same-day snapshot is used as quoted, an
     older one is re-marked with Black-Scholes at the snapshot's implied
-    volatility and today's `spot`. `None` when no snapshot in the window
-    quotes the contract."""
+    volatility and today's `spot`. When that snapshot does not list the
+    contract, its own last quote (`_last_quote_row`) supplies the bid/ask
+    and is re-marked at the volatility interpolated from the snapshot's
+    surface (`_surface_volatility`), or at the quote's own implied
+    volatility when there is no snapshot or no usable surface. Such a
+    mark keeps the quote's date as `snapshot_date` and is untradeable
+    once that date is older than `settings.options.max_snapshot_age_days`.
+    `None` when neither the snapshot nor the contract's own quotes
+    within `settings.options.max_mark_age_days` price the contract."""
     if as_of_date >= contract.expiry:
         return _expired_mark(contract, as_of_date, spot)
     snapshot = _snapshot(contract.underlying, as_of_date)
     row = _contract_row(snapshot, contract) if snapshot is not None else None
+    surface_volatility: float | None = None
     if row is None:
         row = _last_quote_row(contract, as_of_date)
+        if row is not None and snapshot is not None:
+            surface_date = snapshot["date"].max().date()
+            if pd.Timestamp(row["date"]).date() < surface_date:
+                surface_volatility = _surface_volatility(snapshot, contract)
     if row is None:
         return None
     snapshot_date = pd.Timestamp(row["date"]).date()
     bid = max(_finite(row["bid"], 0.0), 0.0)
     ask = max(_finite(row["ask"], bid), bid)
-    implied_volatility = _finite(row["implied_volatility"], 0.0)
+    implied_volatility = (
+        _finite(row["implied_volatility"], 0.0)
+        if surface_volatility is None
+        else surface_volatility
+    )
     if snapshot_date < as_of_date and implied_volatility > 0.0 and spot > 0.0:
         mark = _model_mark(contract, as_of_date, spot, snapshot_date, implied_volatility, bid, ask)
         # A quote older than the trading window still marks the position
