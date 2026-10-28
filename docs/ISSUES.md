@@ -907,7 +907,7 @@ Paths are relative to `src/agentic_trading/`.
     - A cached `ConvergenceError` cannot be pickled. Nothing pickles analyst caches today.
     - ARIMA non-convergence under exact MLE is status `error` and is refit daily; no such case occurred in either window.
   - The first A/B found a port bug, fixed before commit: a flat pod left out of risk parity took its raw trailing-performance weight. The three idle pods (rates, cross-asset, credit) then held 75% of capital, and gross fell 40%. It is now sized as an average pod (`test_commander_flat_pods.py`). The idle-pod capital that remains on both pins is AT-81.
-- Commits: pending
+- Commits: 9a2de88
 
 ### AT-79 Pre-2019 options from `option_chain_history` (SPY, QQQ, IWM)
 - Status: done

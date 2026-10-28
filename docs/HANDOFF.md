@@ -50,7 +50,7 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-79 | SPY/QQQ/IWM option chains from `option_chain_history` before DoltHub | 3a8f250 |
 | AT-66 follow-up | unfilled orders recorded and counted per run | ebb98a0 |
 | AT-80 | S&P cross-section priced by security from `equity_daily_from_bars` | 7b37814 |
-| AT-78 | quantcore a041d0d (0.3.0); flat assets and pods; stress-test zero variance | pending |
+| AT-78 | quantcore a041d0d (0.3.0); flat assets and pods; stress-test zero variance | 9a2de88 |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
 2017-12-29) are verified. edgelab-62 runs the counted runs with `warmup`
