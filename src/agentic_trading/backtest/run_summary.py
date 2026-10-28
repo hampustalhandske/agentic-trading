@@ -16,7 +16,8 @@ analyst/manager skill), and `pod_return_history` (each pod's own real,
 weighted daily return — small, one number per pod per day, not one row
 per asset per day like the fields this strips). `pod_performance` and
 `pod_costs` (each pod's fill costs, option premium and turnover) pass
-through as they are. Per-pod sizing diagnostics are reduced to each pod's
+through as they are, and `execution_costs` gives the run's fill-cost
+totals by kind. Per-pod sizing diagnostics are reduced to each pod's
 binding-stage shares and mean final-to-target vol ratio, and unfactored
 split-sized moves to a count per security; the per-day and per-move
 entries are not kept."""
@@ -36,6 +37,24 @@ PERIOD_METRIC_KEYS = (
     "final_hit_rate",
     "final_profit_factor",
 )
+
+
+# Summary label -> `BacktestResult` field, for the `execution_costs` block.
+# `total_transaction_cost` is commission only; `all_in` is commission plus
+# slippage, impact and option spread.
+EXECUTION_COST_KEYS = {
+    "commission": "total_transaction_cost",
+    "slippage": "total_slippage_cost",
+    "impact": "total_impact_cost",
+    "spread": "total_spread_cost",
+    "all_in": "total_execution_cost",
+}
+
+
+def _execution_costs(block: dict[str, Any]) -> dict[str, float | None]:
+    """A period block's fill-cost totals keyed by the labels of
+    `EXECUTION_COST_KEYS`; a total the block does not carry is `None`."""
+    return {label: block.get(field) for label, field in EXECUTION_COST_KEYS.items()}
 
 
 def _unfilled_order_counts(block: dict[str, Any]) -> dict[str, Any]:
@@ -122,6 +141,7 @@ def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
         summary[period]["pod_return_history"] = block.get("pod_return_history", {})
         summary[period]["pod_performance"] = block.get("pod_performance", {})
         summary[period]["pod_costs"] = block.get("pod_costs", {})
+        summary[period]["execution_costs"] = _execution_costs(block)
         summary[period]["unfactored_split_moves_by_security"] = _unfactored_split_move_counts(block)
         summary[period].update(_unfilled_order_counts(block))
         summary[period].update(_capital_usage_means(block))

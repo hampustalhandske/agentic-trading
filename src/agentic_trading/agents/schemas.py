@@ -174,7 +174,18 @@ class TradeRecord(BaseModel):
     per-share premium, `contracts` is the signed contract delta of the
     fill and `premium` its signed cash flow (negative when premium is
     paid, positive when received). An "expire" record is the settlement
-    of a position at intrinsic value on or after its expiry."""
+    of a position at intrinsic value on or after its expiry.
+
+    `reference_price` is the price the fill is measured against before
+    any execution cost: the market price handed to the fill for an
+    equity, the mark's mid for an option, intrinsic value for an expiry
+    (`None` on a record that does not carry one). `transaction_cost` is
+    the commission. `slippage_cost` and `impact_cost` are an equity
+    fill's |delta_shares| x `reference_price` x `slippage_bps` and
+    x `impact_bps`, over 10,000; `spread_cost` is an option fill's
+    |contracts| x |price - reference_price| x the contract multiplier.
+    Every cost is in currency, already in the fill's cash flow, and 0 on
+    a hold or expiry."""
 
     as_of_date: date
     asset: str
@@ -185,7 +196,11 @@ class TradeRecord(BaseModel):
     delta_shares: float
     price: float = Field(ge=0.0)
     notional: float = Field(ge=0.0)
+    reference_price: float | None = Field(ge=0.0, default=None)
     transaction_cost: float = Field(ge=0.0, default=0.0)
+    slippage_cost: float = Field(ge=0.0, default=0.0)
+    impact_cost: float = Field(ge=0.0, default=0.0)
+    spread_cost: float = Field(ge=0.0, default=0.0)
     # Square-root market impact paid on this fill, in basis points of
     # price; 0 when the asset has no volume data.
     impact_bps: float = Field(ge=0.0, default=0.0)
@@ -285,17 +300,20 @@ class PodCostAttribution(BaseModel):
 
     A pod's contribution to an asset is the Commander's allocation to the
     pod times the pod's target weight, before firm limits (a tail-hedge
-    option row counts at its face value). The `transaction_cost` and
-    premium of each fill a decision produced are split across pods pro
-    rata to |change in contribution| to the filled asset on that decision,
+    option row counts at its face value). Each cost and the premium of
+    each fill a decision produced are split across pods pro rata to
+    |change in contribution| to the filled asset on that decision,
     against the commander's previous decision. A fill on which no pod's
     contribution changed, every fill of a commander that reports no
     contributions, and the transaction cost of an expiry settlement are
     charged to the `"commander"` entry.
 
-    `transaction_cost` is the commission, slippage and impact charged to
-    the pod. `option_premium_paid` is the net option premium charged to it
-    (paid minus received; expiry settlements excluded). `turnover` is the
+    `transaction_cost` is the commission charged to the pod;
+    `slippage_cost`, `impact_cost` and `spread_cost` are its share of the
+    fills' costs of those names (see `TradeRecord`), and `execution_cost`
+    is the sum of all four. `option_premium_paid` is the net option
+    premium charged to it (paid minus received; expiry settlements
+    excluded). `turnover` is the
     sum over decisions and assets of |change in contribution|, times
     trading days per year over the number of valuation days. `trading_days`
     counts the decisions on which any of the pod's contributions changed.
@@ -305,6 +323,10 @@ class PodCostAttribution(BaseModel):
     `trading_days` and `sign_changes`."""
 
     transaction_cost: float = 0.0
+    slippage_cost: float = 0.0
+    impact_cost: float = 0.0
+    spread_cost: float = 0.0
+    execution_cost: float = 0.0
     option_premium_paid: float = 0.0
     turnover: float = 0.0
     trading_days: int = 0
@@ -317,13 +339,17 @@ class PodCostDay(BaseModel):
     `contributions` maps pod id to asset to the pod's contribution on that
     day's decision, with zero contributions left out (a pod with none maps
     to `{}`); `None` when the commander does not report contributions.
-    `transaction_cost` and `option_premium_paid` are what that day's fills
+    `transaction_cost` (commission), `slippage_cost`, `impact_cost`,
+    `spread_cost` and `option_premium_paid` are what that day's fills
     charged each pod id (and `"commander"`), with ids charged nothing left
     out."""
 
     as_of_date: date
     contributions: dict[str, dict[str, float]] | None
     transaction_cost: dict[str, float] = Field(default_factory=dict)
+    slippage_cost: dict[str, float] = Field(default_factory=dict)
+    impact_cost: dict[str, float] = Field(default_factory=dict)
+    spread_cost: dict[str, float] = Field(default_factory=dict)
     option_premium_paid: dict[str, float] = Field(default_factory=dict)
 
 
@@ -478,6 +504,15 @@ class BacktestResult(BaseModel):
     # is larger). Both are already reflected in portfolio value.
     total_transaction_cost: float = 0.0
     total_financing_cost: float = 0.0
+    # Cumulative slippage, market impact and option spread cost across
+    # `trade_log` (see `TradeRecord`), and `total_execution_cost`, their
+    # sum with `total_transaction_cost`: every cost of filling at a price
+    # other than the reference price, plus commission. All are already
+    # reflected in portfolio value.
+    total_slippage_cost: float = 0.0
+    total_impact_cost: float = 0.0
+    total_spread_cost: float = 0.0
+    total_execution_cost: float = 0.0
     # Net premium outflow across every option buy/sell fill in `trade_log`
     # (premium paid minus premium received; expiry settlements excluded).
     total_option_premium_paid: float = 0.0
@@ -488,8 +523,8 @@ class BacktestResult(BaseModel):
     pod_performance: dict[str, PodPerformance] = Field(default_factory=dict)
     # Fill costs, option premium and turnover per pod id, plus a
     # `"commander"` entry for costs no pod's contribution change explains.
-    # Transaction costs over every entry sum to `total_transaction_cost`,
-    # and premium to `total_option_premium_paid`.
+    # Each cost kind over every entry sums to its `total_*` field (commission
+    # to `total_transaction_cost`), and premium to `total_option_premium_paid`.
     pod_costs: dict[str, PodCostAttribution] = Field(default_factory=dict)
     # Split-sized moves the run's lakehouse reads found with no adjustment
     # factor, one per (security, date), sorted by security then date.

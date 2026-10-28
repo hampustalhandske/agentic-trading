@@ -70,7 +70,13 @@ class Portfolio(BaseModel):
         `settings.firm.max_adv_participation` of ADV (a partial fill; the
         remainder is re-targeted by the next decision) and pays square-root
         market impact (`quantcore.execution.market_impact`) on top of
-        slippage. Without volume data neither applies."""
+        slippage. Without volume data neither applies.
+
+        Slippage and impact move the execution price away from `price`,
+        the record's `reference_price`; the record books each as
+        |delta_shares| x `price` x its bps over 10,000 (`slippage_cost`,
+        `impact_cost`) and the commission on the executed notional as
+        `transaction_cost`."""
         current_shares = self.positions.get(decision.asset, 0.0)
         previous_weight = (
             0.0 if portfolio_value == 0 else (current_shares * price) / portfolio_value
@@ -91,6 +97,7 @@ class Portfolio(BaseModel):
                 )
         slippage = (self.slippage_bps + impact_bps) / 10_000.0
         execution_price = price * (1.0 + slippage if delta_shares > 0 else 1.0 - slippage)
+        reference_notional = abs(delta_shares) * price
         notional = abs(delta_shares * execution_price)
         transaction_cost = notional * self.commission_rate
         self.cash -= delta_shares * execution_price
@@ -113,7 +120,10 @@ class Portfolio(BaseModel):
             delta_shares=delta_shares,
             price=execution_price,
             notional=notional,
+            reference_price=price,
             transaction_cost=transaction_cost,
+            slippage_cost=reference_notional * self.slippage_bps / 10_000.0,
+            impact_cost=reference_notional * impact_bps / 10_000.0,
             impact_bps=impact_bps,
         )
 
@@ -180,9 +190,11 @@ class Portfolio(BaseModel):
         over NAV) in whole as-traded contracts of `decision.instrument`,
         buying at `mark.ask` and selling at `mark.bid`, paying
         `settings.options.commission_per_contract` per as-traded contract
-        traded. A mark whose `tradeable` flag is false is a hold, leaving
-        cash and positions unchanged, whatever bid/ask it carries. Any
-        fill needs a two-sided quote with at least
+        traded. The record's `reference_price` is `mark.mid`, and its
+        `spread_cost` is |delta contracts| x |fill price - mid| x the
+        contract multiplier. A mark whose `tradeable` flag is false is a
+        hold, leaving cash and positions unchanged, whatever bid/ask it
+        carries. Any fill needs a two-sided quote with at least
         `settings.options.min_premium_per_share` of as-traded premium (a
         close to zero needs only a bid), and a contract count is capped so
         its underlying notional stays within
@@ -231,6 +243,7 @@ class Portfolio(BaseModel):
                 delta_shares=0.0,
                 price=mark.mid,
                 notional=0.0,
+                reference_price=mark.mid,
                 instrument=contract,
             )
 
@@ -320,7 +333,9 @@ class Portfolio(BaseModel):
             delta_shares=float(delta_contracts),
             price=fill_price,
             notional=abs(delta_contracts) * fill_price * multiplier,
+            reference_price=mark.mid,
             transaction_cost=transaction_cost,
+            spread_cost=abs(delta_contracts) * abs(fill_price - mark.mid) * multiplier,
             instrument=contract,
             contracts=float(delta_contracts),
             premium=premium,
@@ -354,6 +369,7 @@ class Portfolio(BaseModel):
                     delta_shares=float(-position.contracts),
                     price=intrinsic,
                     notional=abs(settlement),
+                    reference_price=intrinsic,
                     instrument=position.contract,
                     contracts=float(-position.contracts),
                     premium=settlement,

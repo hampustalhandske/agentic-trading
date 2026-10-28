@@ -54,6 +54,11 @@ logger = get_logger(__name__)
 # by zero or noise), and the run reports 0.0 for both instead.
 ZERO_EXCESS_RETURN_TOLERANCE = 1e-12
 
+# The per-pod cost kinds `PodCostDay` and `PodCostAttribution` carry, one
+# field each: commission, then the execution costs `TradeRecord` books
+# against its reference price.
+_COST_KINDS = ("transaction_cost", "slippage_cost", "impact_cost", "spread_cost")
+
 # Called after each simulated day completes, with (day_index, total_days,
 # as_of_date, portfolio_value) — the hook a caller (the GUI) uses to drive a
 # live progress display. Safe to have this call UI code: unlike the GUI's
@@ -1009,6 +1014,10 @@ class BacktestEngine:
         if self._checkpoint_connection is not None:
             self._checkpoint_connection.close()
             self._checkpoint_connection = None
+        total_transaction_cost = sum(trade.transaction_cost for trade in trade_log)
+        total_slippage_cost = sum(trade.slippage_cost for trade in trade_log)
+        total_impact_cost = sum(trade.impact_cost for trade in trade_log)
+        total_spread_cost = sum(trade.spread_cost for trade in trade_log)
         return BacktestResult(
             start_date=self.start_date,
             end_date=self.end_date,
@@ -1028,7 +1037,13 @@ class BacktestEngine:
             signal_health=signal_health,
             market_data_source=self.market_data_source,
             source_performance=self._source_performance(),
-            total_transaction_cost=sum(trade.transaction_cost for trade in trade_log),
+            total_transaction_cost=total_transaction_cost,
+            total_slippage_cost=total_slippage_cost,
+            total_impact_cost=total_impact_cost,
+            total_spread_cost=total_spread_cost,
+            total_execution_cost=(
+                total_transaction_cost + total_slippage_cost + total_impact_cost + total_spread_cost
+            ),
             total_financing_cost=total_financing_cost,
             total_option_premium_paid=total_option_premium_paid,
             pod_return_history=pod_return_history,
@@ -1078,11 +1093,15 @@ def _charge(totals: dict[str, float], amount: float, shares: dict[str, float] | 
 def _charge_fill(
     day: PodCostDay, trade: TradeRecord, deltas: dict[str, dict[str, float]] | None
 ) -> None:
-    """Splits `trade`'s transaction cost and net premium paid (the negated
-    signed `premium`) into `day` by the contribution changes to
-    `trade.asset` in `deltas`, the decision that produced the fill."""
+    """Splits `trade`'s commission, slippage, impact and spread cost and
+    its net premium paid (the negated signed `premium`) into `day` by the
+    contribution changes to `trade.asset` in `deltas`, the decision that
+    produced the fill."""
     shares = deltas.get(trade.asset) if deltas is not None else None
     _charge(day.transaction_cost, trade.transaction_cost, shares)
+    _charge(day.slippage_cost, trade.slippage_cost, shares)
+    _charge(day.impact_cost, trade.impact_cost, shares)
+    _charge(day.spread_cost, trade.spread_cost, shares)
     _charge(day.option_premium_paid, -trade.premium, shares)
 
 
@@ -1090,8 +1109,9 @@ def _pod_cost_attribution(
     days: list[PodCostDay], observed_days: int
 ) -> dict[str, PodCostAttribution]:
     """Each pod's `PodCostAttribution` over `days`, plus a `"commander"`
-    entry when any cost was charged to it. Costs are the sums of the daily
-    charges in day order. Turnover, trading days and sign changes come
+    entry when any cost was charged to it. Each cost kind is the sum of
+    its daily charges in day order, and `execution_cost` the sum of the
+    four kinds. Turnover, trading days and sign changes come
     from each day's contributions against the previous day's;
     `observed_days` (the number of valuation days) annualises turnover."""
     pod_ids: dict[str, None] = {}
@@ -1099,7 +1119,7 @@ def _pod_cost_attribution(
     trading_days: dict[str, int] = {}
     sign_changes: dict[str, int] = {}
     last_sign: dict[tuple[str, str], bool] = {}
-    transaction_cost: dict[str, float] = {}
+    costs: dict[str, dict[str, float]] = {kind: {} for kind in _COST_KINDS}
     option_premium_paid: dict[str, float] = {}
     previous: dict[str, dict[str, float]] | None = None
     for day in days:
@@ -1122,16 +1142,22 @@ def _pod_cost_attribution(
                         sign_changes[pod_id] = sign_changes.get(pod_id, 0) + 1
                     last_sign[(pod_id, asset)] = positive
         previous = day.contributions
-        for pod_id, amount in day.transaction_cost.items():
-            transaction_cost[pod_id] = transaction_cost.get(pod_id, 0.0) + amount
+        for kind, totals in costs.items():
+            for pod_id, amount in getattr(day, kind).items():
+                totals[pod_id] = totals.get(pod_id, 0.0) + amount
         for pod_id, amount in day.option_premium_paid.items():
             option_premium_paid[pod_id] = option_premium_paid.get(pod_id, 0.0) + amount
-    pod_ids.update(dict.fromkeys(transaction_cost))
+    for totals in costs.values():
+        pod_ids.update(dict.fromkeys(totals))
     pod_ids.update(dict.fromkeys(option_premium_paid))
     annualise = settings.firm.trading_days_per_year / observed_days if observed_days else 0.0
     return {
         pod_id: PodCostAttribution(
-            transaction_cost=transaction_cost.get(pod_id, 0.0),
+            transaction_cost=costs["transaction_cost"].get(pod_id, 0.0),
+            slippage_cost=costs["slippage_cost"].get(pod_id, 0.0),
+            impact_cost=costs["impact_cost"].get(pod_id, 0.0),
+            spread_cost=costs["spread_cost"].get(pod_id, 0.0),
+            execution_cost=sum(totals.get(pod_id, 0.0) for totals in costs.values()),
             option_premium_paid=option_premium_paid.get(pod_id, 0.0),
             turnover=moved.get(pod_id, 0.0) * annualise,
             trading_days=trading_days.get(pod_id, 0),
