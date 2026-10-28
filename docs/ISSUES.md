@@ -1027,4 +1027,4 @@ Paths are relative to `src/agentic_trading/`.
   | tail_hedge | -1.09% | 3.70% | -1.94 | 1.79% |
 
   Every active pod runs at 3.7-7.1% vol against its 0.15 target. Part 2 finds out why (name caps on a 3-asset universe, Kelly, component-VaR caps) before scaling the firm.
-- Commits: pending
+- Commits: bfa56ee (part 1)
