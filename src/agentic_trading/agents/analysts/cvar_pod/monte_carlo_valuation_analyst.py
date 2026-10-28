@@ -12,6 +12,7 @@ from agentic_trading.agents._market_math import (
     RefitCache,
     clamp,
     conditional_daily_volatility,
+    derived_seed,
     market_slice,
 )
 from agentic_trading.agents.base import AnalystAgent
@@ -77,7 +78,7 @@ class MonteCarloValuationAnalyst(AnalystAgent):
             self._time_to_maturity,
             self._num_steps,
             self._num_paths,
-            seed=42,
+            seed=derived_seed(self.agent_id, asset, as_of_date.date()),
         )[:, -1]
         fair_value = float(terminal_prices.mean())
         relative_edge = (fair_value - slice_.close) / slice_.close

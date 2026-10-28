@@ -89,25 +89,43 @@ def lake_provenance() -> LakeProvenance:
 
 
 def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
-    """Real, point-in-time S&P 500 membership as of `as_of_date` — every
-    ticker whose `sp500_membership` span covers this date, including
-    names since removed (a name that left the index yesterday was still
-    a genuine member today's-relative-yesterday, so it belongs in a
-    point-in-time universe for that date; excluding it would be the
-    lookahead-shaped mistake of using tomorrow's knowledge to prune
-    today's universe). Returns `None` if the table has no matching rows —
-    callers should fall back to a smaller static universe, not treat this
-    as an empty-but-valid membership list.
+    """Point-in-time S&P 500 membership on `as_of_date`, one ticker per
+    company, sorted.
+
+    A `sp500_membership` row counts when `start_date <= as_of_date <
+    end_date`; a null `end_date` means still a member. Each counted row is
+    keyed by the security its ticker belongs to on that date, from the
+    `equity_ticker_history` row with `valid_from <= as_of_date < valid_to`
+    (null `valid_to` means still valid), so a renamed company yields only
+    the ticker it traded under on the date. A ticker with no such history
+    row is kept and keyed by itself. When several counted rows resolve to
+    one security, the row with the latest `start_date` wins. Returns
+    `None` when no row counts; callers fall back to a smaller static
+    universe rather than treating this as an empty membership list.
     Calls `assert_point_in_time` on the result for consistency with every
-    other loader in this module, though it's a no-op here since this
-    returns tickers, not dates."""
+    other loader in this module; it is a no-op on a list of tickers."""
     query = """
         SELECT DISTINCT ticker
-        FROM sp500_membership
-        WHERE start_date <= ?
-          AND (end_date IS NULL OR end_date >= ?)
+        FROM (
+            SELECT
+                m.ticker,
+                ROW_NUMBER() OVER (
+                    PARTITION BY h.security_id,
+                        CASE WHEN h.security_id IS NULL THEN m.ticker END
+                    ORDER BY m.start_date DESC, m.ticker
+                ) AS security_rank
+            FROM sp500_membership AS m
+            LEFT JOIN equity_ticker_history AS h
+              ON h.ticker = m.ticker
+             AND h.valid_from <= ?
+             AND (h.valid_to IS NULL OR h.valid_to > ?)
+            WHERE m.start_date <= ?
+              AND (m.end_date IS NULL OR m.end_date > ?)
+        ) AS ranked
+        WHERE security_rank = 1
     """
-    result = _query(query, [as_of_date.isoformat(), as_of_date.isoformat()])
+    as_of = as_of_date.isoformat()
+    result = _query(query, [as_of, as_of, as_of, as_of])
     if result.empty:
         return None
     tickers = sorted(result["ticker"].tolist())
@@ -388,12 +406,17 @@ def _earnings_available_date(announced: date, when: str | None) -> pd.Timestamp:
 
 
 def load_sic_code_from_lakehouse(ticker: str) -> str | None:
-    """Real SIC (Standard Industrial Classification) code for `ticker`
-    from SEC EDGAR, via `sec_sic_classification` — free, no GICS license
-    restriction. Not time-varying in this lake (one row per ticker, not
-    a point-in-time span), so no `as_of_date` gating; returns `None` if
-    `ticker` has no SIC record (mostly non-equity ETF/future/FX tickers,
-    which have no SEC filing to classify in the first place)."""
+    """SIC (Standard Industrial Classification) code for `ticker` from
+    SEC EDGAR, via `sec_sic_classification`; `None` if `ticker` has no SIC
+    record (mostly non-equity ETF/future/FX tickers, which have no SEC
+    filing to classify).
+
+    Not point-in-time: the lake holds one current classification per
+    ticker and no history of reclassifications, so a backtest date sees
+    the code as of the lake's last scrape. A company reclassified after
+    that date is grouped by its later industry. This is a known look-ahead
+    limit of SIC-based pair screening, with no `as_of_date` gate possible
+    until the lake carries classification history."""
     frame = _query("SELECT sic FROM sec_sic_classification WHERE ticker = ?", [ticker])
     if frame.empty or pd.isna(frame.iloc[0]["sic"]):
         return None
@@ -405,9 +428,9 @@ def same_sic_candidate_pairs(tickers: list[str]) -> list[tuple[str, str]]:
     genuine industry-classification candidate list for pairs-cointegration
     screening, replacing a hand-picked "looks same-sector to me" list.
     Tickers with no SIC record (non-equities, or an equity outside SEC
-    EDGAR's coverage) simply can't form a pair here — this only ever
-    under-generates candidates, never fabricates one for an
-    unclassified ticker."""
+    EDGAR's coverage) can't form a pair here, so this only ever
+    under-generates candidates. The codes are current, not point-in-time
+    (see `load_sic_code_from_lakehouse`)."""
     sic_by_ticker: dict[str, str] = {}
     for ticker in tickers:
         sic = load_sic_code_from_lakehouse(ticker)

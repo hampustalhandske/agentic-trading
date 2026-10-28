@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 
+from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import load_price_history_from_lakehouse
 from agentic_trading.data.point_in_time import get_point_in_time_data
 from agentic_trading.logging_config import get_logger
@@ -96,6 +98,18 @@ def market_slice(
 
 def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return float(max(lower, min(upper, value)))
+
+
+def derived_seed(analyst_id: str, asset: str, as_of: date) -> int:
+    """A reproducible 32-bit seed for one analyst's simulation of `asset`
+    on `as_of`: the first 16 hex digits of the sha256 of
+    `"{settings.analysts.mc_seed}|{analyst_id}|{asset}|{YYYY-MM-DD}"`,
+    reduced modulo 2**32. A `datetime` or `pd.Timestamp` counts as its
+    calendar date. The base seed is read on every call, so an override of
+    `analysts.mc_seed` takes effect immediately."""
+    day = as_of.date() if isinstance(as_of, datetime) else as_of
+    key = f"{settings.analysts.mc_seed}|{analyst_id}|{asset}|{day.isoformat()}"
+    return int(hashlib.sha256(key.encode()).hexdigest()[:16], 16) % 2**32
 
 
 def load_fixed_universe_returns(

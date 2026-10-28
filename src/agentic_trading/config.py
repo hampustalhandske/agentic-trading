@@ -426,6 +426,11 @@ class AnalystConfig(BaseModel):
     # The hedge sleeve is always on at this confidence so protection is
     # owned before a stress, not bought after VIX has already spiked.
     tail_hedge_base_confidence: float = Field(default=0.15, ge=0.0, le=1.0)
+    # Base seed for every Monte Carlo analyst's simulation; each simulation
+    # derives its own seed from this plus analyst, asset and date
+    # (`_market_math.derived_seed`), so runs are reproducible while paths
+    # differ across names and days. 42 is an arbitrary policy choice.
+    mc_seed: int = Field(default=42, ge=0)
 
 
 class StrategyConfig(BaseModel):

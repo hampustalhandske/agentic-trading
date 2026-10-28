@@ -9,7 +9,7 @@ from pydantic import PrivateAttr
 from quantcore.core.stochastic import simulate_ou_paths
 from quantcore.statistics.cointegration import ou_half_life, spread_zscore
 
-from agentic_trading.agents._market_math import RefitCache, market_slice
+from agentic_trading.agents._market_math import RefitCache, derived_seed, market_slice
 from agentic_trading.agents.analysts.stat_arb_pod.pairs_cointegration_analyst import (
     spread_confidence,
     spread_direction,
@@ -119,7 +119,14 @@ class OUMeanReversionAnalyst(AnalystAgent):
             mu = float(np.mean(spread))
             sigma = float(np.std(spread, ddof=1))
             simulated = simulate_ou_paths(
-                theta, mu, sigma, spread[-1], t=half_life * 4, n_paths=500, n_steps=50, seed=42
+                theta,
+                mu,
+                sigma,
+                spread[-1],
+                t=half_life * 4,
+                n_paths=500,
+                n_steps=50,
+                seed=derived_seed(self.agent_id, asset, as_of_date.date()),
             )
             reverted_toward_mean = simulated[:, -1] - spread[-1]
             simulated_direction_agrees = (

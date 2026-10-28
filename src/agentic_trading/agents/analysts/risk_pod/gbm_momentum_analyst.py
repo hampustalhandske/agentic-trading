@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from quantcore.core.sde_solver import simulate_gbm_paths
 
-from agentic_trading.agents._market_math import clamp, market_slice
+from agentic_trading.agents._market_math import clamp, derived_seed, market_slice
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
@@ -60,7 +60,7 @@ class GBMMomentumAnalyst(AnalystAgent):
             self._time_to_maturity,
             self._num_steps,
             self._num_paths,
-            seed=42,
+            seed=derived_seed(self.agent_id, asset, as_of_date.date()),
         )[:, -1]
         probability_up = float(np.mean(terminal_prices > slice_.close))
 

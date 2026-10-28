@@ -206,14 +206,26 @@ def resolve_roster_after_preflight(
 # --------------------------------------------------------------------------
 
 
+# Settings read once at import (`firm.max_leverage` bounds the Pydantic
+# schemas in `agents/schemas.py`), so a `--set` for them would be recorded
+# in provenance without changing what the run trades on.
+_IMPORT_TIME_SETTINGS = frozenset({"firm.max_leverage"})
+
+
 def _apply_cli_overrides(tokens: list[str]) -> dict[str, str]:
     """Parse repeated `--set group.field=value` tokens and apply them to
-    `config.settings` before any analyst/manager is built; a bad key or
-    out-of-range value is a usage error, not a silent default."""
+    `config.settings` before any analyst/manager is built; a bad key,
+    an out-of-range value, or a key in `_IMPORT_TIME_SETTINGS` is a usage
+    error, not a silent default."""
     overrides: dict[str, str] = {}
     for token in tokens:
         try:
             key, value = parse_override(token)
+            if key in _IMPORT_TIME_SETTINGS:
+                raise ValueError(
+                    f"{key} is read at import and cannot be overridden with --set; "
+                    "change its default in config.py instead"
+                )
             apply_overrides({key: value})
         except (KeyError, ValueError) as exc:
             raise typer.BadParameter(str(exc)) from exc
@@ -429,21 +441,24 @@ def experiment(
     parallel_backend: str = typer.Option(
         "thread", help="Concurrency backend: 'thread' or 'process'."
     ),
-    commission_rate: float = typer.Option(
-        settings.firm.commission_rate,
+    commission_rate: float | None = typer.Option(
+        None,
         min=0.0,
-        help="Commission as a fraction of traded notional (default: firm.commission_rate).",
+        help="Commission as a fraction of traded notional "
+        "(default: firm.commission_rate, after --set).",
     ),
-    slippage_bps: float = typer.Option(
-        settings.firm.slippage_bps,
+    slippage_bps: float | None = typer.Option(
+        None,
         min=0.0,
-        help="Execution slippage in basis points per trade (default: firm.slippage_bps).",
+        help="Execution slippage in basis points per trade "
+        "(default: firm.slippage_bps, after --set).",
     ),
-    execution_lag_days: int = typer.Option(
-        settings.firm.execution_lag_days,
+    execution_lag_days: int | None = typer.Option(
+        None,
         min=0,
         max=1,
-        help="Bars between signal formation and execution (default: firm.execution_lag_days).",
+        help="Bars between signal formation and execution "
+        "(default: firm.execution_lag_days, after --set).",
     ),
     calibration_checkpoint: str | None = typer.Option(
         None, help="JSON checkpoint path for calibration; add --resume to continue it."
@@ -501,6 +516,14 @@ def experiment(
     resolved_assets = [symbol.strip().upper() for symbol in assets]
     configure_logging(disable=True)
     overrides = _apply_cli_overrides(set_override)
+    # An explicit flag wins; otherwise the firm setting as `--set` left it.
+    resolved_commission_rate = (
+        settings.firm.commission_rate if commission_rate is None else commission_rate
+    )
+    resolved_slippage_bps = settings.firm.slippage_bps if slippage_bps is None else slippage_bps
+    resolved_execution_lag_days = (
+        settings.firm.execution_lag_days if execution_lag_days is None else execution_lag_days
+    )
     excluded = frozenset(analyst_id.strip() for analyst_id in exclude_analyst)
     analysts = build_default_analysts(excluded_analyst_ids=excluded)
     typer.echo(
@@ -526,9 +549,9 @@ def experiment(
             "warmup_days": warmup_days,
             "parallel_workers": parallel_workers,
             "parallel_backend": parallel_backend,
-            "commission_rate": commission_rate,
-            "slippage_bps": slippage_bps,
-            "execution_lag_days": execution_lag_days,
+            "commission_rate": resolved_commission_rate,
+            "slippage_bps": resolved_slippage_bps,
+            "execution_lag_days": resolved_execution_lag_days,
             "calibration_checkpoint": calibration_checkpoint,
             "test_checkpoint": test_checkpoint,
             "resume": resume,
@@ -581,8 +604,8 @@ def experiment(
             portfolio=Portfolio(
                 cash=settings.firm.starting_cash,
                 positions={},
-                commission_rate=commission_rate,
-                slippage_bps=slippage_bps,
+                commission_rate=resolved_commission_rate,
+                slippage_bps=resolved_slippage_bps,
             ),
             track_record=track_record,
             data_loader=lambda _assets, _start, _end: market_data,
@@ -590,7 +613,7 @@ def experiment(
             end_date=end,
             assets=resolved_assets,
             market_data_source=source_label,
-            execution_lag_days=execution_lag_days,
+            execution_lag_days=resolved_execution_lag_days,
             checkpoint_path=(
                 calibration_checkpoint if start == parsed_train_start else test_checkpoint
             ),
@@ -622,8 +645,8 @@ def experiment(
                 portfolio=Portfolio(
                     cash=settings.firm.starting_cash,
                     positions={},
-                    commission_rate=commission_rate,
-                    slippage_bps=slippage_bps,
+                    commission_rate=resolved_commission_rate,
+                    slippage_bps=resolved_slippage_bps,
                 ),
                 track_record=TrackRecord(),
                 data_loader=lambda _assets, _start, _end: market_data,
@@ -631,7 +654,7 @@ def experiment(
                 end_date=parsed_test_end,
                 assets=resolved_assets,
                 market_data_source=source_label,
-                execution_lag_days=execution_lag_days,
+                execution_lag_days=resolved_execution_lag_days,
                 risk_free_rate_series=risk_free_rate_series,
                 benchmark_returns=benchmark_returns,
             )
@@ -644,8 +667,8 @@ def experiment(
                 portfolio=Portfolio(
                     cash=settings.firm.starting_cash,
                     positions={},
-                    commission_rate=commission_rate,
-                    slippage_bps=slippage_bps,
+                    commission_rate=resolved_commission_rate,
+                    slippage_bps=resolved_slippage_bps,
                 ),
                 track_record=TrackRecord(),
                 data_loader=lambda _assets, _start, _end: market_data,
@@ -653,7 +676,7 @@ def experiment(
                 end_date=parsed_test_end,
                 assets=resolved_assets,
                 market_data_source=source_label,
-                execution_lag_days=execution_lag_days,
+                execution_lag_days=resolved_execution_lag_days,
                 risk_free_rate_series=risk_free_rate_series,
                 benchmark_returns=benchmark_returns,
             )
@@ -671,8 +694,8 @@ def experiment(
                 portfolio=Portfolio(
                     cash=settings.firm.starting_cash,
                     positions={},
-                    commission_rate=commission_rate,
-                    slippage_bps=slippage_bps,
+                    commission_rate=resolved_commission_rate,
+                    slippage_bps=resolved_slippage_bps,
                 ),
                 track_record=TrackRecord(),
                 data_loader=lambda _assets, _start, _end: market_data,
@@ -680,7 +703,7 @@ def experiment(
                 end_date=parsed_test_end,
                 assets=resolved_assets,
                 market_data_source=source_label,
-                execution_lag_days=execution_lag_days,
+                execution_lag_days=resolved_execution_lag_days,
                 risk_free_rate_series=risk_free_rate_series,
                 benchmark_returns=benchmark_returns,
             )

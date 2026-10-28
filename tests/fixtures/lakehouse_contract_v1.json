@@ -129,6 +129,12 @@
    "yahoo_split_factor": "DOUBLE",
    "yield_on_prior_close": "DOUBLE"
   },
+  "equity_ticker_history": {
+   "security_id": "BIGINT",
+   "ticker": "VARCHAR",
+   "valid_from": "DATE",
+   "valid_to": "DATE"
+  },
   "famafrench_returns": {
    "dataset": "VARCHAR",
    "date": "DATE",

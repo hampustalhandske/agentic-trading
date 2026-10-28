@@ -30,7 +30,7 @@ from agentic_trading.backtest.preflight import (
     RequirementCoverage,
 )
 from agentic_trading.cli import app, experiment, experiment_app
-from agentic_trading.config import settings, temporary_overrides
+from agentic_trading.config import temporary_overrides
 from agentic_trading.data.loaders.lakehouse_loader import LakeProvenance
 from agentic_trading.provenance import RunProvenance
 
@@ -209,9 +209,9 @@ def test_run_builds_engine_with_execution_defaults_from_settings(
     assert kwargs["portfolio"].slippage_bps == pytest.approx(9.0)
 
 
-def test_experiment_options_default_to_firm_settings() -> None:
-    """The experiment command's overridable execution options carry the
-    same settings-derived defaults as every other entry point."""
+def test_experiment_options_default_to_none() -> None:
+    """The experiment command's overridable execution options default to
+    `None`, so they resolve from `settings` after `--set` overrides."""
     signature = inspect.signature(experiment)
     option_defaults = {
         name: signature.parameters[name].default.default
@@ -219,9 +219,9 @@ def test_experiment_options_default_to_firm_settings() -> None:
     }
 
     assert option_defaults == {
-        "commission_rate": settings.firm.commission_rate,
-        "slippage_bps": settings.firm.slippage_bps,
-        "execution_lag_days": settings.firm.execution_lag_days,
+        "commission_rate": None,
+        "slippage_bps": None,
+        "execution_lag_days": None,
     }
 
 

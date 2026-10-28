@@ -7,7 +7,7 @@ import pandas as pd
 from pydantic import PrivateAttr
 from quantcore.core.stochastic import cir_fit, simulate_cir_paths
 
-from agentic_trading.agents._market_math import RefitCache, clamp
+from agentic_trading.agents._market_math import RefitCache, clamp, derived_seed
 from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
@@ -109,7 +109,7 @@ class CIRRateRegimeAnalyst(AnalystAgent):
             t=SIMULATION_HORIZON_DAYS / 365.0,
             n_paths=500,
             n_steps=SIMULATION_HORIZON_DAYS,
-            seed=42,
+            seed=derived_seed(self.agent_id, asset, as_of_date.date()),
         )
         simulated_terminal = float(np.mean(simulated[:, -1]))
         rate_trend = simulated_terminal - r0
