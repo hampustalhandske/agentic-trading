@@ -6,9 +6,29 @@ commodities/FX/crypto prices, point-in-time S&P 500 membership, option
 chains, dividends, CFTC positioning, earnings, SIC codes, FRED series, Ken
 French factors, FINRA short interest and SEC company facts. The service
 URL and token come from `LAKEHOUSE_API_URL` and `LAKEHOUSE_API_TOKEN`
-(process environment or the repo-root `.env`). Each table the API serves
-is already deduplicated (latest write wins), and every query passes its
+(process environment or the repo-root `.env`). Every query passes its
 values as `?` parameters.
+
+Inside a `lake_session` every read sees the lake as it stood at one lake
+time T. Each query names its tables through `_table_sql`, which turns a
+table into the relation it held at T, using the lake's own metadata for
+the table (`Lake.describe`, read once when the session opens):
+
+- a "current" table reads `<table>_log` filtered on `scraped_at <= T` and
+  deduplicated on the table's key columns (the latest write at or before
+  T wins); the loader's own filters apply after that dedupe;
+- an append-only table reads `<table>_log` filtered on `scraped_at <= T`
+  with no dedupe, and `crypto_klines_1m`, which has no `scraped_at`, is
+  filtered on its own row time `open_time <= T`;
+- a log view read directly (`sec_company_facts_log`,
+  `sec_insider_transactions_log`) is filtered on `scraped_at <= T`;
+- the `equity_ticker_history` view is rebuilt from
+  `security_source_map_log` as of T;
+- a rebuilt-whole table holds only its current build, so it is read
+  unpinned and its build time is recorded in the session.
+
+Outside a session each query reads the lake's current, deduplicated
+views (latest write wins) as the lake stands at that moment.
 
 This is the only market/alternative-data source a run reads:
 `data/loader.py::load_price_history_with_fallback` raises for any ticker
@@ -16,21 +36,24 @@ the lake doesn't cover rather than falling back to a live API.
 
 A loader returns `None` only when its query succeeds and finds no rows. A
 failed request (`LakehouseError`, connection or timeout errors) propagates
-to the caller."""
+to the caller; inside a session the lake's refusal of a pinned read
+(HTTP 409) and a change of lake version raise `LakeTimeError`."""
 
 import threading
-from datetime import UTC, date, datetime
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, date, datetime, timedelta
 from functools import cache
 from typing import Any, Literal, cast, get_args
 from weakref import WeakKeyDictionary
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 from agentic_trading.agents.schemas import UnfactoredSplitMove
 from agentic_trading.config import _env_value
-from agentic_trading.data.lakehouse_client import Lake
+from agentic_trading.data.lakehouse_client import Lake, LakehouseError
 from agentic_trading.data.point_in_time import assert_point_in_time
 from agentic_trading.data.trading_calendar import add_sessions, is_session, next_session
 from agentic_trading.logging_config import get_logger
@@ -48,12 +71,29 @@ class LakeProvenance(BaseModel):
     own status document (`None` when the lake has not written one yet).
     `adjustment_table_rows` maps each price-adjustment table
     (`equity_adjustment_factors`, `yahoo_split_close_basis`) to its total
-    row count."""
+    row count.
+
+    When read inside a `lake_session`, `lake_time` is the session's lake
+    time T, `rebuilt_whole_builds` maps each rebuilt-whole table the loader
+    reads to the build time (its `scraped_at`) the run read, and
+    `row_time_pinned_tables` lists the tables pinned on their own row time
+    rather than on `scraped_at`. Outside a session they are `None`, `{}`
+    and `[]`."""
 
     lake_version: str
     read_at: datetime
     status_generated_at: datetime | None
     adjustment_table_rows: dict[str, int] = {}
+    lake_time: datetime | None = None
+    rebuilt_whole_builds: dict[str, datetime] = {}
+    row_time_pinned_tables: list[str] = []
+
+
+class LakeTimeError(RuntimeError):
+    """A read cannot be made at the session's lake time: a conflicting
+    lake time, a lake time before a rebuilt-whole table's build, the lake
+    refusing a pinned read (HTTP 409), a lake version change during the
+    session, or a checkpoint written at another lake time."""
 
 
 def _required_env(name: str) -> str:
@@ -75,21 +115,330 @@ def _lake() -> Lake:
     return Lake(base_url=_required_env(_URL_ENV_VAR), token=_required_env(_TOKEN_ENV_VAR))
 
 
+# Every table the loader's queries read. `equity_ticker_history` is a
+# compatibility view over `security_source_map`, so the session reads the
+# metadata of the table behind it.
+READ_TABLES: tuple[str, ...] = (
+    "cftc_cot_disaggregated",
+    "cftc_cot_publication",
+    "cftc_cot_tff",
+    "crypto_klines_1m",
+    "dolthub_earnings_calendar",
+    "dolthub_eps_history",
+    "dolthub_option_chain",
+    "equity_adjustment_factors",
+    "equity_daily_from_bars",
+    "equity_distributions",
+    "famafrench_returns",
+    "finra_short_interest",
+    "fred_vintages",
+    "instrument_prices",
+    "option_chain_history",
+    "sec_company_facts_log",
+    "sec_filings",
+    "sec_insider_transactions_log",
+    "sec_sic_classification",
+    "security_source_map",
+    "sp500_membership",
+    "sp500_price_coverage",
+    "yahoo_split_close_basis",
+)
+
+# Tables with no `scraped_at`, pinned on their own row-time column (naive
+# UTC) instead.
+_ROW_TIME_PIN_COLUMNS = {"crypto_klines_1m": "open_time"}
+
+# `equity_ticker_history` is `security_source_map` restricted to this
+# source's active links, with `source_symbol` as `ticker`.
+_TICKER_HISTORY_VIEW = "equity_ticker_history"
+_TICKER_HISTORY_TABLE = "security_source_map"
+_TICKER_HISTORY_SOURCE = "us_equity_bars_5m"
+
+# Prefix of the lake client's error text for an HTTP 409, the status the
+# lake answers a pin it cannot serve with.
+_HTTP_409_PREFIX = "HTTP 409:"
+
+
+class LakeTableMetadata(BaseModel):
+    """The lake's description of one table (`Lake.describe`): its `kind`
+    ("current", "append-only", "log" or "compatibility view"), the
+    `key_columns` a "current" table deduplicates on, whether it is
+    `rebuilt_whole` (holding only its latest build), and `last_write`, the
+    newest write the lake's status file records (rounded up to the second;
+    it can lag the data). `None` when the lake reports no write."""
+
+    kind: str = "current"
+    key_columns: list[str] = []
+    rebuilt_whole: bool = False
+    last_write: datetime | None = None
+
+
+class LakeSession(BaseModel):
+    """One lake time for every read made while the session is open.
+    `lake_time` is T (UTC), `lake_version` the `X-Lakehouse-Version` the
+    session first saw (`None` until a response carries one), and
+    `rebuilt_whole_builds` maps each rebuilt-whole table in `READ_TABLES`
+    that holds rows to its build time. The table metadata the reads are
+    shaped from is held privately for the life of the session."""
+
+    lake_time: datetime
+    lake_version: str | None = None
+    rebuilt_whole_builds: dict[str, datetime] = {}
+    _tables: dict[str, LakeTableMetadata] = PrivateAttr(default_factory=dict)
+
+    def row_time_pinned_tables(self) -> list[str]:
+        """The tables in `READ_TABLES` this session pins on a row-time
+        column instead of `scraped_at`, sorted."""
+        return sorted(
+            table
+            for table in _ROW_TIME_PIN_COLUMNS
+            if table in self._tables and not self._tables[table].rebuilt_whole
+        )
+
+
+# The open session, shared by every thread: analysts read the lake from
+# `ThreadPoolExecutor` workers, which a context variable would not reach.
+_SESSION: LakeSession | None = None
+_SESSION_LOCK = threading.Lock()
+
+
+def _current_session() -> LakeSession | None:
+    with _SESSION_LOCK:
+        return _SESSION
+
+
+def current_lake_time() -> datetime | None:
+    """The open `lake_session`'s lake time T (UTC), or `None` when no
+    session is open."""
+    session = _current_session()
+    return None if session is None else session.lake_time
+
+
+def _utc(value: Any) -> datetime | None:
+    """`value` (a timestamp from a query result; naive means UTC) as an
+    aware UTC `datetime`, or `None` when it is null."""
+    if value is None or pd.isna(value):
+        return None
+    stamp = pd.Timestamp(value)
+    stamp = stamp.tz_localize(UTC) if stamp.tzinfo is None else stamp.tz_convert(UTC)
+    return stamp.to_pydatetime().astimezone(UTC)
+
+
+def _rebuilt_whole_build(lake: Lake, table: str) -> datetime | None:
+    """The build time of rebuilt-whole `table`: the newest `scraped_at` of
+    its current rows, `None` when it holds none."""
+    frame = cast(pd.DataFrame, lake.sql(f"SELECT max(scraped_at) AS build FROM {table}", []))
+    return None if frame.empty else _utc(frame.iloc[0]["build"])
+
+
+def _open_session(lake_time: datetime | None) -> LakeSession:
+    """Reads the metadata of every table in `READ_TABLES` and the build of
+    each rebuilt-whole one, then fixes T: `lake_time` when given, else 1 s
+    after the newest of the tables' `last_write` and the builds. Raises
+    `LakeTimeError` when an explicit `lake_time` precedes a build, or when
+    no default can be formed because the lake reports no write for any of
+    the tables."""
+    lake = _lake()
+    tables = {
+        table: LakeTableMetadata.model_validate(lake.describe(table)) for table in READ_TABLES
+    }
+    builds: dict[str, datetime] = {}
+    for table, metadata in tables.items():
+        if metadata.rebuilt_whole:
+            build = _rebuilt_whole_build(lake, table)
+            if build is not None:
+                builds[table] = build
+    if lake_time is None:
+        writes = [
+            metadata.last_write.astimezone(UTC)
+            for metadata in tables.values()
+            if metadata.last_write is not None
+        ]
+        newest = max([*writes, *builds.values()], default=None)
+        if newest is None:
+            raise LakeTimeError(
+                "cannot choose a default lake time: the lake reports no write for any table the "
+                "loader reads; pass an explicit lake time"
+            )
+        lake_time = newest + timedelta(seconds=1)
+    else:
+        for table, build in sorted(builds.items()):
+            if lake_time < build:
+                raise LakeTimeError(
+                    f"lake time {lake_time.isoformat()} precedes the build of rebuilt-whole table "
+                    f"{table} ({build.isoformat()}); the lake keeps only that build, so a read at "
+                    "this lake time cannot be reproduced"
+                )
+    session = LakeSession(
+        lake_time=lake_time, lake_version=lake.last_version, rebuilt_whole_builds=builds
+    )
+    session._tables = tables
+    return session
+
+
+@contextmanager
+def lake_session(lake_time: datetime | None = None) -> Iterator[LakeSession]:
+    """Opens a process-wide session in which every loader read sees the
+    lake as it stood at one lake time T, and yields it.
+
+    `lake_time` must be timezone-aware (a naive value raises `ValueError`)
+    and is held in UTC; when `None`, T is 1 s after the newest `last_write`
+    of `READ_TABLES` and the newest rebuilt-whole build, so the same lake
+    state gives the same T. A call while a session is open joins it and
+    yields the open session; a joining call whose `lake_time` differs from
+    the open T raises `LakeTimeError`. Only the call that opened the
+    session closes it."""
+    global _SESSION
+    if lake_time is not None and lake_time.utcoffset() is None:
+        raise ValueError(
+            f"lake time {lake_time.isoformat()} has no UTC offset; give one, e.g. "
+            "2024-06-01T12:00:00+00:00"
+        )
+    requested = None if lake_time is None else lake_time.astimezone(UTC)
+    with _SESSION_LOCK:
+        session = _SESSION
+        opened = session is None
+        if session is None:
+            session = _open_session(requested)
+            _SESSION = session
+        elif requested is not None and requested != session.lake_time:
+            raise LakeTimeError(
+                f"a lake session at {session.lake_time.isoformat()} is open; cannot read at "
+                f"{requested.isoformat()} inside it"
+            )
+    try:
+        yield session
+    finally:
+        if opened:
+            with _SESSION_LOCK:
+                _SESSION = None
+
+
+def _quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _scraped_at_pin(lake_time: datetime) -> str:
+    """The `scraped_at <= T` condition, with T as a literal compared
+    directly (the form the lake detects as a pin)."""
+    return f"scraped_at <= CAST('{lake_time.astimezone(UTC).isoformat()}' AS TIMESTAMPTZ)"
+
+
+def _deduplicated_log_sql(
+    table: str, key_columns: list[str], lake_time: datetime, source_filter: str = ""
+) -> str:
+    """`table` as it stood at `lake_time`: the rows of `<table>_log` with
+    `scraped_at <= lake_time` (and `source_filter`, a condition on key
+    columns only, when given), keeping the latest write per
+    `key_columns`."""
+    if not key_columns:
+        raise LakeTimeError(f"the lake reports no key columns for {table}; cannot read it as of T")
+    keys = ", ".join(_quote_identifier(column) for column in key_columns)
+    condition = f"{source_filter} AND " if source_filter else ""
+    return (
+        "SELECT * EXCLUDE (_rn) FROM ("
+        f"SELECT *, row_number() OVER (PARTITION BY {keys} ORDER BY scraped_at DESC) AS _rn "
+        f"FROM {table}_log WHERE {condition}{_scraped_at_pin(lake_time)}"
+        ") WHERE _rn = 1"
+    )
+
+
+def _pinned_table_sql(session: LakeSession, table: str) -> str:
+    """The relation `_table_sql` gives for `table` inside `session`."""
+    lake_time = session.lake_time
+    if table == _TICKER_HISTORY_VIEW:
+        metadata = session._tables[_TICKER_HISTORY_TABLE]
+        if metadata.rebuilt_whole:
+            return table
+        links = _deduplicated_log_sql(
+            _TICKER_HISTORY_TABLE,
+            metadata.key_columns,
+            lake_time,
+            source_filter=f"source = '{_TICKER_HISTORY_SOURCE}'",
+        )
+        return (
+            "(SELECT security_id, source_symbol AS ticker, valid_from, valid_to "
+            f"FROM ({links}) WHERE is_active)"
+        )
+    if table not in session._tables:
+        raise KeyError(f"{table} is not in READ_TABLES")
+    metadata = session._tables[table]
+    if metadata.rebuilt_whole:
+        return table
+    row_time_column = _ROW_TIME_PIN_COLUMNS.get(table)
+    if row_time_column is not None:
+        naive_utc = lake_time.astimezone(UTC).replace(tzinfo=None).isoformat()
+        pin = f"{row_time_column} <= CAST('{naive_utc}' AS TIMESTAMP)"
+        return f"(SELECT * FROM {table} WHERE {pin})"
+    if table.endswith("_log"):
+        return f"(SELECT * FROM {table} WHERE {_scraped_at_pin(lake_time)})"
+    if metadata.kind == "append-only":
+        return f"(SELECT * FROM {table}_log WHERE {_scraped_at_pin(lake_time)})"
+    return f"({_deduplicated_log_sql(table, metadata.key_columns, lake_time)})"
+
+
+def _table_sql(table: str) -> str:
+    """The relation a query reads for `table`, to place after `FROM` or
+    `JOIN`: the bare table name outside a session, and inside one the
+    table as of the session's lake time (see the module docstring for the
+    read shape per table). A pinned relation is a parenthesized subquery,
+    so a caller that qualifies columns gives it an alias."""
+    session = _current_session()
+    return table if session is None else _pinned_table_sql(session, table)
+
+
+def _record_version(session: LakeSession, version: str | None) -> None:
+    """Records `version` as the session's lake version when it has none,
+    and raises `LakeTimeError` when it differs from the recorded one."""
+    if version is None:
+        return
+    with _SESSION_LOCK:
+        if session.lake_version is None:
+            session.lake_version = version
+            return
+        recorded = session.lake_version
+    if version != recorded:
+        raise LakeTimeError(
+            f"the lake version changed from {recorded} to {version} during the session at "
+            f"{session.lake_time.isoformat()}; its reads no longer come from one lake build"
+        )
+
+
 def _query(query: str, params: list[Any]) -> pd.DataFrame:
     """Runs one read-only `SELECT` with `?` placeholders bound to `params`
-    and returns every row as a DataFrame. Request failures propagate."""
-    return cast(pd.DataFrame, _lake().sql(query, params))
+    and returns every row as a DataFrame. Request failures propagate.
+    Inside a session, the lake refusing the read with HTTP 409 raises
+    `LakeTimeError` naming T and quoting the lake's detail (the read is
+    never retried unpinned), and a response from a different lake version
+    than the session's raises `LakeTimeError`."""
+    session = _current_session()
+    lake = _lake()
+    try:
+        frame = cast(pd.DataFrame, lake.sql(query, params))
+    except LakehouseError as error:
+        if session is not None and str(error).startswith(_HTTP_409_PREFIX):
+            raise LakeTimeError(
+                f"the lake refused a read pinned at lake time {session.lake_time.isoformat()}: "
+                f"{error}"
+            ) from error
+        raise
+    if session is not None:
+        _record_version(session, lake.last_version)
+    return frame
 
 
 def lake_provenance() -> LakeProvenance:
     """The lake's version and the UTC time its status was read, from
     `Lake.status()` and the service's health payload, plus the row count
-    of each adjustment table from `adjustment_table_row_count`. Raises
-    `EmptyAdjustmentTableError` when either adjustment table is empty."""
+    of each adjustment table from `adjustment_table_row_count`. Inside a
+    `lake_session` it also carries the session's lake time, rebuilt-whole
+    builds and row-time-pinned tables. Raises `EmptyAdjustmentTableError`
+    when either adjustment table is empty."""
     lake = _lake()
     status = lake.status()
     read_at = datetime.now(UTC)
     generated = status.get("generated_at")
+    session = _current_session()
     return LakeProvenance(
         lake_version=str(lake.health()["version"]),
         read_at=read_at,
@@ -97,13 +446,38 @@ def lake_provenance() -> LakeProvenance:
         adjustment_table_rows={
             table: adjustment_table_row_count(table) for table in get_args(AdjustmentTable)
         },
+        lake_time=None if session is None else session.lake_time,
+        rebuilt_whole_builds={} if session is None else dict(session.rebuilt_whole_builds),
+        row_time_pinned_tables=[] if session is None else session.row_time_pinned_tables(),
     )
+
+
+class _LakeTimeMemo[V]:
+    """Values read from one lake client at one lake time, keyed by name.
+    `values()` returns the dictionary for the current client and the open
+    session's lake time (`None` outside a session); a read at a different
+    lake time than the stored one starts from an empty dictionary, so no
+    value is reused across lake times."""
+
+    def __init__(self) -> None:
+        self._entries: WeakKeyDictionary[Lake, tuple[datetime | None, dict[str, V]]] = (
+            WeakKeyDictionary()
+        )
+
+    def values(self) -> dict[str, V]:
+        lake = _lake()
+        lake_time = current_lake_time()
+        entry = self._entries.get(lake)
+        if entry is None or entry[0] != lake_time:
+            entry = (lake_time, {})
+            self._entries[lake] = entry
+        return entry[1]
 
 
 AdjustmentTable = Literal["equity_adjustment_factors", "yahoo_split_close_basis"]
 
-# Row count per adjustment table, keyed by the lake client that answered.
-_ADJUSTMENT_TABLE_ROWS: WeakKeyDictionary[Lake, dict[str, int]] = WeakKeyDictionary()
+# Row count per adjustment table, for the lake client and lake time that answered.
+_ADJUSTMENT_TABLE_ROWS: _LakeTimeMemo[int] = _LakeTimeMemo()
 
 
 class EmptyAdjustmentTableError(RuntimeError):
@@ -114,16 +488,16 @@ class EmptyAdjustmentTableError(RuntimeError):
 
 def adjustment_table_row_count(table: AdjustmentTable) -> int:
     """The total row count of adjustment table `table`, from one
-    `count(*)` query. Read once per table and lake client and kept for the
-    life of the process. Raises `EmptyAdjustmentTableError` when the table
-    has no rows (that result is not kept, so a later call queries again)
-    and `ValueError` when `table` is not an adjustment table."""
+    `count(*)` query. Read once per table, lake client and lake time (see
+    `_LakeTimeMemo`) and kept while reads stay at that lake time. Raises
+    `EmptyAdjustmentTableError` when the table has no rows (that result is
+    not kept, so a later call queries again) and `ValueError` when `table`
+    is not an adjustment table."""
     if table not in get_args(AdjustmentTable):
         raise ValueError(f"{table!r} is not an adjustment table")
-    lake = _lake()
-    cached = _ADJUSTMENT_TABLE_ROWS.setdefault(lake, {})
+    cached = _ADJUSTMENT_TABLE_ROWS.values()
     if table not in cached:
-        frame = _query(f"SELECT count(*) AS row_count FROM {table}", [])
+        frame = _query(f"SELECT count(*) AS row_count FROM {_table_sql(table)}", [])
         rows = 0 if frame.empty else int(frame.iloc[0]["row_count"])
         if rows == 0:
             raise EmptyAdjustmentTableError(
@@ -149,7 +523,7 @@ def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
     universe rather than treating this as an empty membership list.
     Calls `assert_point_in_time` on the result for consistency with every
     other loader in this module; it is a no-op on a list of tickers."""
-    query = """
+    query = f"""
         SELECT DISTINCT ticker
         FROM (
             SELECT
@@ -159,8 +533,8 @@ def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
                         CASE WHEN h.security_id IS NULL THEN m.ticker END
                     ORDER BY m.start_date DESC, m.ticker
                 ) AS security_rank
-            FROM sp500_membership AS m
-            LEFT JOIN equity_ticker_history AS h
+            FROM {_table_sql("sp500_membership")} AS m
+            LEFT JOIN {_table_sql("equity_ticker_history")} AS h
               ON h.ticker = m.ticker
              AND h.valid_from <= ?
              AND (h.valid_to IS NULL OR h.valid_to > ?)
@@ -197,7 +571,7 @@ def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | N
     the latest `start_date` names the ticker. A counted span without a
     `security_id` is left out and named in one WARNING. Returns `None`
     when no span counts."""
-    query = """
+    query = f"""
         SELECT security_id, ticker
         FROM (
             SELECT
@@ -208,7 +582,7 @@ def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | N
                         CASE WHEN security_id IS NULL THEN ticker END
                     ORDER BY start_date DESC, ticker
                 ) AS security_rank
-            FROM sp500_price_coverage
+            FROM {_table_sql("sp500_price_coverage")}
             WHERE start_date <= ?
               AND (end_date IS NULL OR end_date > ?)
         ) AS ranked
@@ -338,14 +712,14 @@ def load_security_log_returns(
                factors.effective_date AS factor_date
         FROM (
             SELECT security_id, date, COALESCE(official_close, close) AS price
-            FROM equity_daily_from_bars
+            FROM {_table_sql("equity_daily_from_bars")}
             WHERE security_id IN ({placeholders})
               AND date BETWEEN ? AND ?
               AND COALESCE(official_close, close) > 0
         ) AS bars
         ASOF LEFT JOIN (
             SELECT security_id, effective_date, cum_factor
-            FROM equity_adjustment_factors
+            FROM {_table_sql("equity_adjustment_factors")}
             WHERE security_id IN ({placeholders})
               AND effective_date > ?
         ) AS factors
@@ -431,9 +805,9 @@ def split_adjustment_factor(ticker: str, quote_date: date) -> float:
     Raises `EmptyAdjustmentTableError` when `yahoo_split_close_basis` has
     no rows at all; a ticker with no rows of its own gets 1.0."""
     adjustment_table_row_count("yahoo_split_close_basis")
-    query = """
+    query = f"""
         SELECT ratio
-        FROM yahoo_split_close_basis
+        FROM {_table_sql("yahoo_split_close_basis")}
         WHERE ticker = ?
           AND ex_date > ?
           AND in_close_basis IS NOT FALSE
@@ -468,22 +842,22 @@ def _apply_split_adjustment(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
 # 2008, covering the years before `dolthub_option_chain` begins.
 _OPTION_CHAIN_HISTORY_UNDERLYINGS = frozenset({"SPY", "QQQ", "IWM"})
 
-# First `dolthub_option_chain` date per underlying, keyed by the lake
-# client that answered; a `None` value records an underlying with no rows.
-_FIRST_DOLTHUB_CHAIN_DATES: WeakKeyDictionary[Lake, dict[str, date | None]] = WeakKeyDictionary()
+# First `dolthub_option_chain` date per underlying, for the lake client and
+# lake time that answered; a `None` value records an underlying with no rows.
+_FIRST_DOLTHUB_CHAIN_DATES: _LakeTimeMemo[date | None] = _LakeTimeMemo()
 
 
 def _first_dolthub_chain_date(underlying: str) -> date | None:
     """The earliest snapshot `date` in `dolthub_option_chain` for
-    `underlying`, or `None` when it has no rows. Read once per underlying
-    and lake client and kept for the life of the process: the table only
-    grows forward, so its first date never moves."""
-    lake = _lake()
-    cached = _FIRST_DOLTHUB_CHAIN_DATES.setdefault(lake, {})
+    `underlying` as of the session's lake time (the current table outside
+    a session), or `None` when it has no rows. Read once per underlying,
+    lake client and lake time (see `_LakeTimeMemo`) and kept while reads
+    stay at that lake time."""
+    cached = _FIRST_DOLTHUB_CHAIN_DATES.values()
     if underlying not in cached:
-        query = """
+        query = f"""
             SELECT MIN(date) AS first
-            FROM dolthub_option_chain
+            FROM {_table_sql("dolthub_option_chain")}
             WHERE underlying = ?
         """
         frame = _query(query, [underlying])
@@ -545,12 +919,12 @@ def load_options_snapshot_from_lakehouse(
     query = f"""
         SELECT {date_column} AS date, expiration, option_type, strike, bid, ask,
                implied_volatility, delta, gamma, theta, vega, rho
-        FROM {table}
+        FROM {_table_sql(table)}
         WHERE underlying = ?
           AND {date_column} BETWEEN ? AND ?
           AND {date_column} = (
               SELECT MAX({date_column})
-              FROM {table}
+              FROM {_table_sql(table)}
               WHERE underlying = ?
                 AND {date_column} BETWEEN ? AND ?
           )
@@ -639,8 +1013,8 @@ def load_cot_positioning_from_lakehouse(
         query = f"""
             SELECT cot.report_date,
                    {net_position_expr} / cot.open_interest_all AS net_positioning_ratio
-            FROM {table} AS cot
-            JOIN cftc_cot_publication AS pub ON pub.report_date = cot.report_date
+            FROM {_table_sql(table)} AS cot
+            JOIN {_table_sql("cftc_cot_publication")} AS pub ON pub.report_date = cot.report_date
             WHERE cot.cftc_contract_market_code = ?
               AND cot.report_date BETWEEN ? AND ?
               AND cot.open_interest_all > 0
@@ -680,9 +1054,9 @@ def load_dividends_from_lakehouse(ticker: str, as_of_date: date) -> pd.Series | 
     is safe because a dividend is declared before its ex-date, so it is
     public by then. Returns `None` when no rows qualify. Self-asserts
     point-in-time on the ex-date index before returning."""
-    query = """
+    query = f"""
         SELECT ex_date, amount_split_adjusted
-        FROM equity_distributions
+        FROM {_table_sql("equity_distributions")}
         WHERE ticker = ? AND distribution_type = ? AND ex_date <= ?
         ORDER BY ex_date
     """
@@ -713,16 +1087,16 @@ def load_earnings_surprise_from_lakehouse(
     quarter's announcement is available yet as of `as_of_date`.
     Self-asserts point-in-time on the availability date before
     returning."""
-    query = """
+    query = f"""
         SELECT h.reported, h.estimate, c.date AS announcement_date, c."when" AS announced_when
         FROM (
             SELECT *
-            FROM dolthub_eps_history
+            FROM {_table_sql("dolthub_eps_history")}
             WHERE act_symbol = ? AND reported IS NOT NULL AND estimate IS NOT NULL
         ) h
         JOIN (
             SELECT *
-            FROM dolthub_earnings_calendar
+            FROM {_table_sql("dolthub_earnings_calendar")}
             WHERE act_symbol = ?
         ) c
         ON c.act_symbol = h.act_symbol
@@ -770,11 +1144,14 @@ def load_sic_code_from_lakehouse(ticker: str) -> str | None:
 
     Not point-in-time: the lake holds one current classification per
     ticker and no history of reclassifications, so a backtest date sees
-    the code as of the lake's last scrape. A company reclassified after
+    the code as of the lake's last scrape (at or before the session's lake
+    time inside a `lake_session`). A company reclassified after
     that date is grouped by its later industry. This is a known look-ahead
     limit of SIC-based pair screening, with no `as_of_date` gate possible
     until the lake carries classification history."""
-    frame = _query("SELECT sic FROM sec_sic_classification WHERE ticker = ?", [ticker])
+    frame = _query(
+        f"SELECT sic FROM {_table_sql('sec_sic_classification')} WHERE ticker = ?", [ticker]
+    )
     if frame.empty or pd.isna(frame.iloc[0]["sic"]):
         return None
     return str(frame.iloc[0]["sic"])
@@ -838,7 +1215,7 @@ def _equity_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFra
                adj_close AS close,
                close AS raw_close,
                volume
-        FROM instrument_prices
+        FROM {_table_sql("instrument_prices")}
         WHERE ticker IN ({placeholders})
           AND date BETWEEN ? AND ?
         ORDER BY ticker, date
@@ -882,7 +1259,7 @@ def _crypto_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFra
         FROM (
             SELECT symbol, open, close, volume,
                    timezone(?, open_time AT TIME ZONE 'UTC') AS local_time
-            FROM crypto_klines_1m
+            FROM {_table_sql("crypto_klines_1m")}
             WHERE symbol IN ({placeholders})
               AND open_time >= CAST(? AS TIMESTAMP)
               AND open_time < CAST(? AS TIMESTAMP)
@@ -1003,9 +1380,9 @@ def load_raw_close_from_lakehouse(
     close for `ticker` in that window. Self-asserts point-in-time on
     `date` before returning."""
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
-    query = """
+    query = f"""
         SELECT date, close
-        FROM instrument_prices
+        FROM {_table_sql("instrument_prices")}
         WHERE ticker = ?
           AND date BETWEEN ? AND ?
           AND close > 0
@@ -1029,14 +1406,14 @@ def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Seri
     as_of_date`; an observation with no version published by then is left
     out. The index is sorted and unique. Returns `None` if no rows remain.
     Self-asserts point-in-time on the date index before returning."""
-    query = """
+    query = f"""
         SELECT date, value
         FROM (
             SELECT date, value, ROW_NUMBER() OVER (
                 PARTITION BY date
                 ORDER BY realtime_start DESC
             ) AS rn
-            FROM fred_vintages
+            FROM {_table_sql("fred_vintages")}
             WHERE series_id = ? AND realtime_start <= ? AND date <= ?
         )
         WHERE rn = 1
@@ -1094,7 +1471,7 @@ def load_fama_french_factors_from_lakehouse(
     placeholders = ", ".join("?" for _ in factors)
     query = f"""
         SELECT date, portfolio, value
-        FROM famafrench_returns
+        FROM {_table_sql("famafrench_returns")}
         WHERE dataset = ? AND frequency = ?
           AND portfolio IN ({placeholders})
           AND last_day(
@@ -1128,7 +1505,8 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     Reads the `sec_company_facts_log` view, which keeps every scrape,
     because the deduplicated `sec_company_facts` view drops one of two
     facts that differ only in `period_start` until lake issue LK-13
-    lands. Rows identical apart from their scrape (`scraped_at`, `dt`,
+    lands. Inside a `lake_session` only scrapes at or before its lake time
+    are read. Rows identical apart from their scrape (`scraped_at`, `dt`,
     `table`) count once.
 
     A filing reports several period windows for one concept (current
@@ -1136,7 +1514,7 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     later filings repeat or restate earlier periods. Gated on when the
     filing became public, never the period it describes:
     `available_date` is set from the filing's latest acceptance time in
-    `sec_filings` (`_SEC_ACCEPTANCE_QUERY`) by `_sec_available_dates`,
+    `sec_filings` (`_sec_acceptance_query`) by `_sec_available_dates`,
     and only rows with `available_date <= as_of_date` are kept. Of
     those, each (`concept`, `unit`, `period_start`, `period_end`) keeps
     the row with the latest `available_date`, ties broken by the latest
@@ -1148,10 +1526,10 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
                x.fiscal_period, x.form, x.filed_date AS filed, f.accepted_at
         FROM (
             SELECT DISTINCT * EXCLUDE (scraped_at, dt, "table")
-            FROM sec_company_facts_log
+            FROM {_table_sql("sec_company_facts_log")}
             WHERE ticker = ? AND filed_date <= ?
         ) x
-        LEFT JOIN ({_SEC_ACCEPTANCE_QUERY}) f ON f.accession_number = x.accession_number
+        LEFT JOIN ({_sec_acceptance_query()}) f ON f.accession_number = x.accession_number
         ORDER BY filed
     """
     frame = _query(query, [ticker, as_of_date.isoformat()])
@@ -1175,14 +1553,17 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     return frame
 
 
-# One acceptance time per filing: `sec_filings` lists a filing once per
-# issuer ticker, sometimes with different `accepted_at` values, and the
-# latest one is the conservative availability.
-_SEC_ACCEPTANCE_QUERY = """
-    SELECT accession_number, max(accepted_at) AS accepted_at
-    FROM sec_filings
-    GROUP BY accession_number
-"""
+def _sec_acceptance_query() -> str:
+    """One acceptance time per filing, as a query over `sec_filings`:
+    the table lists a filing once per issuer ticker, sometimes with
+    different `accepted_at` values, and the latest one is the conservative
+    availability."""
+    return f"""
+        SELECT accession_number, max(accepted_at) AS accepted_at
+        FROM {_table_sql("sec_filings")}
+        GROUP BY accession_number
+    """
+
 
 # Decisions are taken at the NYSE close (16:00 America/New_York); an SEC
 # filing accepted before that time is public for that day's decision.
@@ -1240,11 +1621,11 @@ def load_short_interest_from_lakehouse(ticker: str, as_of_date: date) -> pd.Data
     dropped, because the lake keeps no pre-revision value. Only rows
     available on or before `as_of_date` are returned; `None` if none are.
     Self-asserts point-in-time on `dissemination_date` before returning."""
-    query = """
+    query = f"""
         SELECT settlement_date, revision_flag,
                current_short_position AS short_interest_shares,
                days_to_cover, average_daily_volume AS avg_daily_volume
-        FROM finra_short_interest
+        FROM {_table_sql("finra_short_interest")}
         WHERE symbol = ?
         ORDER BY settlement_date
     """
@@ -1290,13 +1671,14 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
     Reads the `sec_insider_transactions_log` view, which keeps every
     scrape, because the deduplicated `sec_insider_transactions` view
     collapses distinct lines of one filing into one row until lake issue
-    LK-14 lands. Rows identical apart from their scrape (`scraped_at`,
-    `dt`, `table`) count once, so two genuinely identical lines in one
-    filing also count once.
+    LK-14 lands. Inside a `lake_session` only scrapes at or before its
+    lake time are read. Rows identical apart from their scrape
+    (`scraped_at`, `dt`, `table`) count once, so two genuinely identical
+    lines in one filing also count once.
 
     The trade date is not when a trade became public; the filing is.
     `available_date` (datetime64) is set from the filing's latest EDGAR
-    acceptance time in `sec_filings` (`_SEC_ACCEPTANCE_QUERY`) by
+    acceptance time in `sec_filings` (`_sec_acceptance_query`) by
     `_sec_available_dates` (16:00 America/New_York, the close, is the
     decision time), and only rows with `available_date <= as_of_date`
     are returned. Returns `None` if no rows remain. Self-asserts
@@ -1308,10 +1690,10 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
                t.acquired_disposed, t.filed_date, f.accepted_at
         FROM (
             SELECT DISTINCT * EXCLUDE (scraped_at, dt, "table")
-            FROM sec_insider_transactions_log
+            FROM {_table_sql("sec_insider_transactions_log")}
             WHERE issuer_ticker = ? AND filed_date <= ?
         ) t
-        LEFT JOIN ({_SEC_ACCEPTANCE_QUERY}) f ON f.accession_number = t.accession_number
+        LEFT JOIN ({_sec_acceptance_query()}) f ON f.accession_number = t.accession_number
         ORDER BY t.filed_date, t.transaction_date
     """
     frame = _query(query, [ticker, as_of_date.isoformat()])
@@ -1363,7 +1745,7 @@ def load_option_quote_from_lakehouse(
     query = f"""
         SELECT {date_column} AS date, expiration, option_type, strike, bid, ask,
                implied_volatility, delta, gamma, theta, vega, rho
-        FROM {table}
+        FROM {_table_sql(table)}
         WHERE underlying = ?
           AND expiration = ?
           AND option_type = ?
@@ -1400,8 +1782,9 @@ def _first_and_last(frame: pd.DataFrame) -> tuple[date, date] | None:
 
 def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[date, date] | None:
     """The first and last date the lake holds for `source`, read from the
-    tables the matching loader reads, with no point-in-time gate.
-    `identifier` is a ticker for the per-ticker sources and `None` for a
+    tables the matching loader reads, with no point-in-time gate on the
+    data's own dates (inside a `lake_session`, the tables as they stood at
+    its lake time). `identifier` is a ticker for the per-ticker sources and `None` for a
     check over the whole table:
 
     - `options_chain`: snapshot `date`s in `dolthub_option_chain` for
@@ -1427,17 +1810,17 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
 
     Returns `None` when the lake holds no matching rows."""
     if source == "options_chain":
-        query = """
+        query = f"""
             SELECT MIN(date) AS first, MAX(date) AS last
-            FROM dolthub_option_chain
+            FROM {_table_sql("dolthub_option_chain")}
             WHERE underlying = ?
         """
         dolthub = _first_and_last(_query(query, [identifier]))
         if identifier not in _OPTION_CHAIN_HISTORY_UNDERLYINGS:
             return dolthub
-        history_query = """
+        history_query = f"""
             SELECT MIN(snapshot_date) AS first, MAX(snapshot_date) AS last
-            FROM option_chain_history
+            FROM {_table_sql("option_chain_history")}
             WHERE underlying = ?
         """
         if dolthub is None:
@@ -1457,8 +1840,9 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
                 continue
             query = f"""
                 SELECT MIN(pub.published_date) AS first, MAX(pub.published_date) AS last
-                FROM {table} AS cot
-                JOIN cftc_cot_publication AS pub ON pub.report_date = cot.report_date
+                FROM {_table_sql(table)} AS cot
+                JOIN {_table_sql("cftc_cot_publication")} AS pub
+                  ON pub.report_date = cot.report_date
                 WHERE cot.cftc_contract_market_code = ?
                   AND cot.open_interest_all > 0
                   AND pub.published_date IS NOT NULL
@@ -1466,27 +1850,27 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
             return _first_and_last(_query(query, [code]))
         return None
     if source == "earnings":
-        query = """
+        query = f"""
             SELECT MIN(date) AS first, MAX(date) AS last
-            FROM dolthub_earnings_calendar
+            FROM {_table_sql("dolthub_earnings_calendar")}
         """
         if identifier is None:
             return _first_and_last(_query(query, []))
         return _first_and_last(_query(query + " WHERE act_symbol = ?", [identifier]))
     if source == "dividends":
-        query = """
+        query = f"""
             SELECT MIN(ex_date) AS first, MAX(ex_date) AS last
-            FROM equity_distributions
+            FROM {_table_sql("equity_distributions")}
             WHERE distribution_type = ?
         """
         if identifier is None:
             return _first_and_last(_query(query, [_REGULAR_CASH]))
         return _first_and_last(_query(query + " AND ticker = ?", [_REGULAR_CASH, identifier]))
     if source == "sp500_membership":
-        query = """
+        query = f"""
             SELECT MIN(start_date) AS first,
                    MAX(COALESCE(end_date, CAST(? AS DATE))) AS last
-            FROM sp500_membership
+            FROM {_table_sql("sp500_membership")}
         """
         return _first_and_last(_query(query, [date.today().isoformat()]))
     raise ValueError(f"no coverage query for source {source!r}")

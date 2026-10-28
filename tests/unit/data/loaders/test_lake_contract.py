@@ -125,10 +125,15 @@ def test_every_public_loader_has_a_conformance_case() -> None:
 
 
 def test_every_table_in_loader_sql_is_a_contract_view() -> None:
-    """Each identifier after FROM or JOIN in the loader's SQL is a view in the frozen contract."""
+    """Each table the loader's SQL names, through `_table_sql` or `READ_TABLES`, is a view in the
+    frozen contract; `security_source_map` is the one read-table outside it, standing behind the
+    contract's `equity_ticker_history` view."""
     assert _CONTRACT["contract"] == "lakehouse-contract-v1"
     source = Path(inspect.getsourcefile(lakehouse_loader) or "").read_text()
-    tables = set(re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", source))
+    named = set(re.findall(r"_table_sql\(\s*[\"']([A-Za-z_][A-Za-z0-9_]*)[\"']", source))
+    read = set(lakehouse_loader.READ_TABLES) - {"security_source_map"}
 
-    assert tables
-    assert tables <= set(_CONTRACT["views"])
+    assert named
+    assert re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", source) == []
+    assert named | read <= set(_CONTRACT["views"])
+    assert named <= read | {"equity_ticker_history"}

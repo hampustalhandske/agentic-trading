@@ -52,6 +52,7 @@ from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
     load_price_history_with_fallback,
 )
+from agentic_trading.data.loaders.lakehouse_loader import lake_session
 from agentic_trading.data.loaders.macro_loader import load_risk_free_rate_series
 from agentic_trading.data.ticker_catalog import TICKER_GROUPS, TickerGroup, tickers_by_asset_class
 from agentic_trading.logging_config import configure_logging, get_logger
@@ -522,7 +523,9 @@ def _simulate_desk(
     fetches fresh market data and runs a fresh backtest for whatever
     tickers/dates/manager mode are currently selected. `on_day_complete`, if
     given, is forwarded straight to `BacktestEngine.run()` to drive a live
-    progress display — see `_run_simulation_with_progress()`.
+    progress display — see `_run_simulation_with_progress()`. Every lake
+    read the desk makes (prices, the engine run and the benchmarks) happens
+    inside one lake session at the default lake time.
 
     Each pod manager always sizes its own book via its own
     `PortfolioConstructor` (risk parity + volatility targeting) — no
@@ -530,51 +533,52 @@ def _simulate_desk(
     if start > end:
         start, end = end, start
 
-    analysts = _build_analysts()
-    managers = _build_managers(manager_mode, analysts)
-    commander = Commander(
-        managers=managers, weighting_strategy=ShrinkageWeight(Hedge()), parallel_workers=4
-    )
-    portfolio = Portfolio(cash=initial_cash, positions={})
-    track_record = TrackRecord()
-    market_data, source_label = _load_basket_data(
-        tuple(tickers),
-        start,
-        end,
-        warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
-    )
+    with lake_session():
+        analysts = _build_analysts()
+        managers = _build_managers(manager_mode, analysts)
+        commander = Commander(
+            managers=managers, weighting_strategy=ShrinkageWeight(Hedge()), parallel_workers=4
+        )
+        portfolio = Portfolio(cash=initial_cash, positions={})
+        track_record = TrackRecord()
+        market_data, source_label = _load_basket_data(
+            tuple(tickers),
+            start,
+            end,
+            warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+        )
 
-    engine = BacktestEngine(
-        commander=commander,
-        portfolio=portfolio,
-        track_record=track_record,
-        data_loader=lambda _assets, _start, _end: market_data,
-        start_date=start,
-        end_date=end,
-        assets=tickers,
-        market_data_source=source_label,
-        execution_lag_days=settings.firm.execution_lag_days,
-        risk_free_rate_series=load_risk_free_rate_series(start, end),
-    )
-    backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
+        engine = BacktestEngine(
+            commander=commander,
+            portfolio=portfolio,
+            track_record=track_record,
+            data_loader=lambda _assets, _start, _end: market_data,
+            start_date=start,
+            end_date=end,
+            assets=tickers,
+            market_data_source=source_label,
+            execution_lag_days=settings.firm.execution_lag_days,
+            risk_free_rate_series=load_risk_free_rate_series(start, end),
+        )
+        backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
 
-    return DeskRun(
-        tickers=tickers,
-        group_name=group_name,
-        manager_mode=manager_mode,
-        source_label=source_label,
-        manager_ids=[manager.agent_id for manager in managers],
-        analyst_ids=[analyst.agent_id for analyst in analysts],
-        price_history=market_data,
-        trade_blotter=_build_trade_blotter(
-            backtest_result.trade_log, backtest_result.decisions_by_day
-        ),
-        backtest_result=backtest_result,
-        track_record=track_record,
-        scoreboard=PerformanceScoreboard(track_record),
-        sp500_benchmark=_sp500_benchmark(start, end),
-        basket_benchmark=_basket_index_benchmark(market_data, tickers, start),
-    )
+        return DeskRun(
+            tickers=tickers,
+            group_name=group_name,
+            manager_mode=manager_mode,
+            source_label=source_label,
+            manager_ids=[manager.agent_id for manager in managers],
+            analyst_ids=[analyst.agent_id for analyst in analysts],
+            price_history=market_data,
+            trade_blotter=_build_trade_blotter(
+                backtest_result.trade_log, backtest_result.decisions_by_day
+            ),
+            backtest_result=backtest_result,
+            track_record=track_record,
+            scoreboard=PerformanceScoreboard(track_record),
+            sp500_benchmark=_sp500_benchmark(start, end),
+            basket_benchmark=_basket_index_benchmark(market_data, tickers, start),
+        )
 
 
 def _run_simulation_with_progress(

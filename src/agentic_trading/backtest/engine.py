@@ -5,7 +5,7 @@ import math
 import sqlite3
 import time
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -269,6 +269,12 @@ class BacktestEngine:
         return self._checkpoint_connection
 
     def _restore_checkpoint(self) -> dict[str, Any] | None:
+        """The checkpointed state to resume from, or `None` when not
+        resuming or the checkpoint holds no day yet. Raises `ValueError`
+        when the checkpoint's dates or assets differ from this backtest's,
+        and `LakeTimeError` when its stored lake time differs from the open
+        lake session's (`None` on either side meaning no session), since
+        the resumed days would read another lake state."""
         if not self.resume:
             return None
         connection = self._checkpoint()
@@ -284,6 +290,14 @@ class BacktestEngine:
         }
         if payload.get("config") != expected:
             raise ValueError("checkpoint configuration does not match this backtest")
+        stored_lake_time = payload.get("lake_time")
+        lake_time = lakehouse_loader.current_lake_time()
+        if stored_lake_time != lake_time:
+            raise lakehouse_loader.LakeTimeError(
+                f"checkpoint {self.checkpoint_path} was written at lake time "
+                f"{_lake_time_text(stored_lake_time)}, but this run reads at "
+                f"{_lake_time_text(lake_time)}; resume it at its own lake time"
+            )
         return payload
 
     def _underlying_spot(
@@ -922,6 +936,7 @@ class BacktestEngine:
                     ),
                     total_financing_cost=total_financing_cost,
                     total_option_premium_paid=total_option_premium_paid,
+                    lake_time=lakehouse_loader.current_lake_time(),
                 )
 
             if on_day_complete is not None:
@@ -1051,6 +1066,11 @@ class BacktestEngine:
             pod_costs=_pod_cost_attribution(pod_cost_days, len(portfolio_value_history)),
             unfactored_split_moves=lakehouse_loader.unfactored_split_move_registry(),
         )
+
+
+def _lake_time_text(lake_time: datetime | None) -> str:
+    """`lake_time` in ISO 8601, or "no lake session" for `None`."""
+    return "no lake session" if lake_time is None else lake_time.isoformat()
 
 
 def _contribution_deltas(

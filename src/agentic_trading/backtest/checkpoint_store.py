@@ -7,14 +7,15 @@ Each simulated day appends exactly that day's new rows to eight tables
 `sizing_diagnostics`, `pod_returns`, `pod_cost_days`) via `INSERT` — O(1) per day, O(n)
 total for a run of length n — and keeps a single small `cursor` row (next
 day index, portfolio state, signal health, pending decisions, the
-Commander's serialized risk state, and the run's own config for
-`_restore_checkpoint`'s match-check) as the only thing overwritten each
-day, since that piece stays small regardless of run length. Mirrors the
-append-only idiom `data/db.py` uses for the fetch log."""
+Commander's serialized risk state, the lake time the run reads at, and
+the run's own config for `_restore_checkpoint`'s match-check) as the only
+thing overwritten each day, since that piece stays small regardless of
+run length. Mirrors the append-only idiom `data/db.py` uses for the fetch
+log."""
 
 import json
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -103,7 +104,8 @@ CREATE TABLE IF NOT EXISTS cursor (
     pending_decisions TEXT NOT NULL,
     commander_risk_state TEXT,
     total_financing_cost REAL NOT NULL DEFAULT 0.0,
-    total_option_premium_paid REAL NOT NULL DEFAULT 0.0
+    total_option_premium_paid REAL NOT NULL DEFAULT 0.0,
+    lake_time TEXT
 )
 """
 # Columns added to a table after its first release, applied with `ALTER
@@ -115,6 +117,7 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("cursor", "commander_risk_state", "TEXT"),
     ("cursor", "total_financing_cost", "REAL NOT NULL DEFAULT 0.0"),
     ("cursor", "total_option_premium_paid", "REAL NOT NULL DEFAULT 0.0"),
+    ("cursor", "lake_time", "TEXT"),
 )
 
 
@@ -182,12 +185,15 @@ def append_day(
     sizing_diagnostics: list[SizingDiagnostics] | None = None,
     new_pod_returns: list[tuple[str, date, float]] | None = None,
     pod_cost_day: PodCostDay | None = None,
+    lake_time: datetime | None = None,
 ) -> None:
     """Appends exactly this simulated day's new rows — never touches a
     prior day's already-written rows — plus overwrites the single small
     `cursor` row with this day's resumability state. `commander_risk_state`
     is the Commander's `risk_state()` already dumped to JSON-compatible
     form, or `None` for a commander that carries no risk state.
+    `lake_time` is the lake time the run reads at (`None` for a run outside
+    a lake session), stored as ISO 8601.
     `sizing_diagnostics` are the day's per-pod sizing diagnostics, in pod
     order. `new_pod_returns` are the (pod id, date, return) entries first seen
     this day. `pod_cost_day` is the day's pod contributions and the fill
@@ -265,8 +271,8 @@ def append_day(
             INSERT INTO cursor
                 (id, next_day_index, start_date, end_date, assets, portfolio,
                  signal_health, pending_decisions, commander_risk_state,
-                 total_financing_cost, total_option_premium_paid)
-            VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 total_financing_cost, total_option_premium_paid, lake_time)
+            VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 next_day_index = excluded.next_day_index,
                 portfolio = excluded.portfolio,
@@ -274,7 +280,8 @@ def append_day(
                 pending_decisions = excluded.pending_decisions,
                 commander_risk_state = excluded.commander_risk_state,
                 total_financing_cost = excluded.total_financing_cost,
-                total_option_premium_paid = excluded.total_option_premium_paid
+                total_option_premium_paid = excluded.total_option_premium_paid,
+                lake_time = excluded.lake_time
             """,
             (
                 next_day_index,
@@ -287,6 +294,7 @@ def append_day(
                 None if commander_risk_state is None else json.dumps(commander_risk_state),
                 total_financing_cost,
                 total_option_premium_paid,
+                None if lake_time is None else lake_time.isoformat(),
             ),
         )
 
@@ -296,11 +304,12 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
     `BacktestEngine._restore_checkpoint()` (and any offline reader, e.g. the
     GUI's saved-run browser) needs — one read at startup, not per-day.
     Returns `None` if there's no cursor row yet (a fresh, never-checkpointed
-    run)."""
+    run). `lake_time` is the stored lake time as an aware `datetime`, or
+    `None` when the run read outside a lake session."""
     cursor_row = connection.execute(
         "SELECT next_day_index, start_date, end_date, assets, portfolio, "
         "signal_health, pending_decisions, commander_risk_state, total_financing_cost, "
-        "total_option_premium_paid FROM cursor WHERE id = 0"
+        "total_option_premium_paid, lake_time FROM cursor WHERE id = 0"
     ).fetchone()
     if cursor_row is None:
         return None
@@ -315,6 +324,7 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         commander_risk_state_json,
         total_financing_cost,
         total_option_premium_paid,
+        lake_time,
     ) = cursor_row
 
     portfolio_value_history = [
@@ -396,6 +406,7 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         ),
         "total_financing_cost": float(total_financing_cost),
         "total_option_premium_paid": float(total_option_premium_paid),
+        "lake_time": None if lake_time is None else datetime.fromisoformat(lake_time),
         "track_record": track_record,
         "decisions_by_day": decisions_by_day,
         "trade_log": trade_log,
@@ -406,3 +417,23 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         "pod_cost_days": pod_cost_days,
         "portfolio_value_history": portfolio_value_history,
     }
+
+
+def read_lake_time(db_path: Path) -> datetime | None:
+    """The lake time stored in the checkpoint file at `db_path`, read
+    without creating or changing the file. `None` when the file does not
+    exist, holds no cursor row yet, predates the `lake_time` column, or
+    records a run made outside a lake session."""
+    if not db_path.exists():
+        return None
+    connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(cursor)")}
+        if "lake_time" not in columns:
+            return None
+        row = connection.execute("SELECT lake_time FROM cursor WHERE id = 0").fetchone()
+    finally:
+        connection.close()
+    if row is None or row[0] is None:
+        return None
+    return datetime.fromisoformat(row[0])

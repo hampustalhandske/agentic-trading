@@ -13,7 +13,10 @@ volatility interpolated from the snapshot's surface. On or after expiry the
 mark is intrinsic value against the underlying's close on the last
 session on or before the expiry. Chain queries are cached in-process per
 (underlying, as_of_date) so marking several contracts on one underlying
-costs one lakehouse query per day.
+costs one lakehouse query per day. Every cache holds reads made at one
+lake time (the open `lake_session`'s, or unpinned outside one) and is
+emptied when reads move to another, so no mark reuses a read from a
+different lake time.
 
 Marks read the chain as of the mark date. Contract selection
 (`select_expiry`, `nearest_strike`, `list_expiries`) reads it as of
@@ -38,6 +41,7 @@ from agentic_trading.agents.schemas import OptionContract
 from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import (
     STRIKE_MATCH_TOLERANCE,
+    current_lake_time,
     load_fred_series_from_lakehouse,
     load_option_quote_from_lakehouse,
     load_options_snapshot_from_lakehouse,
@@ -64,6 +68,10 @@ _CHAIN_CACHE: dict[tuple[str, date], pd.DataFrame | None] = {}
 _RATE_CACHE: dict[date, float] = {}
 # Settlement close per (underlying, expiry); `None` when the lake has none.
 _SETTLEMENT_CLOSE_CACHE: dict[tuple[str, date], float | None] = {}
+# The lake time the cached entries were read at (`None` for unpinned
+# reads), or `_NO_READS` before the first read.
+_NO_READS = object()
+_cache_lake_time: object = _NO_READS
 
 
 class OptionMark(BaseModel):
@@ -92,6 +100,17 @@ def clear_cache() -> None:
     _CHAIN_CACHE.clear()
     _RATE_CACHE.clear()
     _SETTLEMENT_CLOSE_CACHE.clear()
+
+
+def _use_caches_at_current_lake_time() -> None:
+    """Empties every cache when the current lake time (`current_lake_time()`,
+    `None` outside a session) differs from the one the cached entries were
+    read at, and records it as the caches' lake time."""
+    global _cache_lake_time
+    lake_time = current_lake_time()
+    if _cache_lake_time is _NO_READS or _cache_lake_time != lake_time:
+        clear_cache()
+        _cache_lake_time = lake_time
 
 
 def published_chain_date(day: date) -> date:
@@ -126,6 +145,7 @@ def _query_rate(as_of_date: date) -> float:
 
 
 def _rate(as_of_date: date) -> float:
+    _use_caches_at_current_lake_time()
     if as_of_date not in _RATE_CACHE:
         _RATE_CACHE.clear()
         _RATE_CACHE[as_of_date] = _query_rate(as_of_date)
@@ -135,6 +155,7 @@ def _rate(as_of_date: date) -> float:
 def _snapshot(underlying: str, as_of_date: date) -> pd.DataFrame | None:
     """The cached latest snapshot for `underlying` as of `as_of_date`,
     `None` when there is none or it is older than the age window."""
+    _use_caches_at_current_lake_time()
     key = (underlying, as_of_date)
     if key not in _CHAIN_CACHE:
         oldest_kept = published_chain_date(as_of_date)
@@ -174,6 +195,7 @@ def _intrinsic(contract: OptionContract, spot: float) -> float:
 def _settlement_close(underlying: str, expiry: date) -> float | None:
     """The cached unadjusted close of `underlying` on its last session on
     or before `expiry` within `SETTLEMENT_CLOSE_LOOKBACK_DAYS`, or `None`."""
+    _use_caches_at_current_lake_time()
     key = (underlying, expiry)
     if key not in _SETTLEMENT_CLOSE_CACHE:
         _SETTLEMENT_CLOSE_CACHE[key] = load_raw_close_from_lakehouse(
@@ -314,6 +336,7 @@ def _last_quote_row(contract: OptionContract, as_of_date: date) -> pd.Series | N
     """The contract's own latest quote within `settings.options.max_mark_age_days`
     when the latest snapshot no longer lists its expiry (the historical
     chain carries three expiries per snapshot and rotates the near ones)."""
+    _use_caches_at_current_lake_time()
     key = (contract.contract_id, as_of_date)
     if key not in _QUOTE_CACHE:
         if len(_QUOTE_CACHE) > 4096:

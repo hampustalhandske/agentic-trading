@@ -1,7 +1,8 @@
 # cli.py
 
 import json
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 import typer
 
@@ -9,6 +10,7 @@ from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.roster import build_default_analysts, build_default_managers
 from agentic_trading.agents.schemas import BacktestResult
+from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystCommander
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
@@ -18,6 +20,7 @@ from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
     load_price_history_with_fallback,
 )
+from agentic_trading.data.loaders.lakehouse_loader import lake_session
 from agentic_trading.data.loaders.macro_loader import load_risk_free_rate_series
 
 # NOTE: adjust this import to wherever ticker_catalog.py actually lives in the
@@ -165,6 +168,55 @@ def _parse_date_flag(value: str, flag_name: str) -> date:
         ) from exc
 
 
+_LAKE_TIME_EXAMPLE = "2024-06-01T12:00:00+00:00"
+_LAKE_TIME_HELP = (
+    "Lake time T every lakehouse read sees, as ISO 8601 with a UTC offset "
+    f"(e.g. {_LAKE_TIME_EXAMPLE} or 2024-06-01T12:00:00Z). Rerun at an earlier run's "
+    "recorded lake_time to read the same lake state. Default: 1 s after the newest "
+    "write of the tables the run reads."
+)
+
+
+def _parse_lake_time_flag(value: str | None) -> datetime | None:
+    """The `--lake-time` value as an aware `datetime`, or `None` when the
+    flag was not given. A value that is not ISO 8601, or that has no UTC
+    offset, is a usage error."""
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"--lake-time must be ISO 8601 with a UTC offset (e.g. {_LAKE_TIME_EXAMPLE}), "
+            f"got {value!r}."
+        ) from exc
+    if parsed.utcoffset() is None:
+        raise typer.BadParameter(
+            f"--lake-time {value!r} has no UTC offset; add one, e.g. {_LAKE_TIME_EXAMPLE}."
+        )
+    return parsed
+
+
+def _checkpoint_lake_time(checkpoint_paths: list[str | None]) -> datetime | None:
+    """The lake time stored in the given checkpoint files (missing paths
+    and files without one are skipped), or `None` when none stores one.
+    Two checkpoints storing different lake times are a usage error: one
+    experiment reads at one lake time."""
+    stored = {
+        lake_time
+        for path in checkpoint_paths
+        if path is not None
+        and (lake_time := checkpoint_store.read_lake_time(Path(path))) is not None
+    }
+    if len(stored) > 1:
+        listed = ", ".join(sorted(lake_time.isoformat() for lake_time in stored))
+        raise typer.BadParameter(
+            f"the checkpoints were written at different lake times ({listed}); "
+            "resume them separately or pass --lake-time"
+        )
+    return next(iter(stored), None)
+
+
 def resolve_roster_after_preflight(
     analysts: list[AnalystAgent],
     assets: list[str],
@@ -277,10 +329,14 @@ def run(
         help="Auto-drop analysts that fail the real-data preflight check instead of "
         "prompting — required for scripted/CI use.",
     ),
+    lake_time: str | None = typer.Option(None, "--lake-time", help=_LAKE_TIME_HELP),
 ) -> None:
     """Wires together Portfolio, Commander, and BacktestEngine for the
     given assets and date range, runs the backtest, and prints a summary
-    of the resulting BacktestResult.
+    of the resulting BacktestResult. Every lakehouse read (the preflight,
+    the price history, the engine run and the provenance) happens inside
+    one lake session, at `--lake-time` or the default lake time, and the
+    provenance records it.
 
     Run with every argument given (assets + --start-date + --end-date) for a
     fully non-interactive, scriptable invocation — nothing is prompted, and a
@@ -301,6 +357,7 @@ def run(
         uv run agentic-trading-cli AAPL MSFT GOOGL \\
             --start-date 2023-01-01 --end-date 2023-12-31
     """
+    requested_lake_time = _parse_lake_time_flag(lake_time)
     # True whenever anything essential wasn't supplied on the command line —
     # this is also what gates the portfolio-construction prompt, so a fully
     # scripted invocation that omits --portfolio-construction silently
@@ -349,76 +406,79 @@ def run(
         parsed_start_date,
         parsed_end_date,
     )
-    analysts = resolve_roster_after_preflight(
-        build_default_analysts(),
-        resolved_assets,
-        parsed_start_date,
-        parsed_end_date,
-        warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
-        auto_confirm=yes,
-    )
-    managers = build_default_managers(analysts)
-    provenance = build_run_provenance(
-        {
-            "assets": resolved_assets,
-            "start_date": parsed_start_date.isoformat(),
-            "end_date": parsed_end_date.isoformat(),
-            "parallel_workers": parallel_workers,
-            "set": list(set_override),
-            "yes": yes,
-            "verbose": verbose,
-            "no_log": no_log,
-        },
-        [analyst.agent_id for analyst in analysts],
-        [manager.agent_id for manager in managers],
-    )
-    commander = Commander(
-        managers=managers,
-        weighting_strategy=ShrinkageWeight(Hedge()),
-        parallel_workers=parallel_workers,
-    )
-    # Pre-fetched once, lakehouse-only, rather than passed to
-    # BacktestEngine as a lazy callable: this way the CLI can log the
-    # source_label the run actually used, and the engine's data_loader
-    # stays a trivial pass-through.
-    market_data, source_label = load_price_history_with_fallback(
-        resolved_assets,
-        parsed_start_date,
-        parsed_end_date,
-        warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
-    )
-    logger.info("Market data source: %s", source_label)
-    engine = BacktestEngine(
-        commander=commander,
-        portfolio=Portfolio(cash=settings.firm.starting_cash, positions={}),
-        track_record=TrackRecord(),
-        data_loader=lambda _assets, _start, _end: market_data,
-        start_date=parsed_start_date,
-        end_date=parsed_end_date,
-        assets=resolved_assets,
-        market_data_source=source_label,
-        execution_lag_days=settings.firm.execution_lag_days,
-        risk_free_rate_series=load_risk_free_rate_series(parsed_start_date, parsed_end_date),
-    )
-    try:
-        result = engine.run()
-    except Exception:
-        logger.exception(
-            "CLI run failed for assets=%s (%s to %s)",
+    with lake_session(requested_lake_time) as session:
+        logger.info("Reading the lake at lake time %s", session.lake_time.isoformat())
+        analysts = resolve_roster_after_preflight(
+            build_default_analysts(),
             resolved_assets,
             parsed_start_date,
             parsed_end_date,
+            warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+            auto_confirm=yes,
         )
-        raise
-    typer.echo(
-        json.dumps(
+        managers = build_default_managers(analysts)
+        provenance = build_run_provenance(
             {
-                "provenance": provenance.model_dump(mode="json"),
-                "result": result.model_dump(mode="json"),
+                "assets": resolved_assets,
+                "start_date": parsed_start_date.isoformat(),
+                "end_date": parsed_end_date.isoformat(),
+                "parallel_workers": parallel_workers,
+                "set": list(set_override),
+                "yes": yes,
+                "verbose": verbose,
+                "no_log": no_log,
+                "lake_time": lake_time,
             },
-            indent=2,
+            [analyst.agent_id for analyst in analysts],
+            [manager.agent_id for manager in managers],
         )
-    )
+        commander = Commander(
+            managers=managers,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            parallel_workers=parallel_workers,
+        )
+        # Pre-fetched once, lakehouse-only, rather than passed to
+        # BacktestEngine as a lazy callable: this way the CLI can log the
+        # source_label the run actually used, and the engine's data_loader
+        # stays a trivial pass-through.
+        market_data, source_label = load_price_history_with_fallback(
+            resolved_assets,
+            parsed_start_date,
+            parsed_end_date,
+            warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+        )
+        logger.info("Market data source: %s", source_label)
+        engine = BacktestEngine(
+            commander=commander,
+            portfolio=Portfolio(cash=settings.firm.starting_cash, positions={}),
+            track_record=TrackRecord(),
+            data_loader=lambda _assets, _start, _end: market_data,
+            start_date=parsed_start_date,
+            end_date=parsed_end_date,
+            assets=resolved_assets,
+            market_data_source=source_label,
+            execution_lag_days=settings.firm.execution_lag_days,
+            risk_free_rate_series=load_risk_free_rate_series(parsed_start_date, parsed_end_date),
+        )
+        try:
+            result = engine.run()
+        except Exception:
+            logger.exception(
+                "CLI run failed for assets=%s (%s to %s)",
+                resolved_assets,
+                parsed_start_date,
+                parsed_end_date,
+            )
+            raise
+        typer.echo(
+            json.dumps(
+                {
+                    "provenance": provenance.model_dump(mode="json"),
+                    "result": result.model_dump(mode="json"),
+                },
+                indent=2,
+            )
+        )
 
 
 @experiment_app.command()
@@ -489,6 +549,12 @@ def experiment(
         help="Auto-drop analysts that fail the real-data preflight check instead of "
         "prompting — required for scripted/CI use.",
     ),
+    lake_time: str | None = typer.Option(
+        None,
+        "--lake-time",
+        help=_LAKE_TIME_HELP + " With --resume and no --lake-time, the lake time stored "
+        "in the checkpoints.",
+    ),
 ) -> None:
     """Run a calibration phase followed by a separate out-of-sample test phase.
 
@@ -496,6 +562,11 @@ def experiment(
     not train a machine-learning model.
     The test phase starts with fresh portfolio holdings but carries those
     learned weights forward. Both phases use strict real market data.
+
+    Both phases, the baselines and the provenance read the lake inside one
+    lake session: at `--lake-time` when given; otherwise, with `--resume`,
+    at the lake time stored in the checkpoints; otherwise at the default
+    lake time.
     """
     parsed_train_start = _parse_date_flag(train_start, "--train-start")
     parsed_train_end = _parse_date_flag(train_end, "--train-end")
@@ -505,6 +576,9 @@ def experiment(
         raise typer.BadParameter("--train-end must be before --test-start")
     if parsed_test_end <= parsed_test_start:
         raise typer.BadParameter("--test-end must be after --test-start")
+    requested_lake_time = _parse_lake_time_flag(lake_time)
+    if requested_lake_time is None and resume:
+        requested_lake_time = _checkpoint_lake_time([calibration_checkpoint, test_checkpoint])
 
     resolved_assets = [symbol.strip().upper() for symbol in assets]
     configure_logging(disable=True)
@@ -524,206 +598,212 @@ def experiment(
         f"{', '.join(sorted(excluded)) or 'none'}",
         err=True,
     )
-    analysts = resolve_roster_after_preflight(
-        analysts,
-        resolved_assets,
-        parsed_train_start,
-        parsed_test_end,
-        warmup_days=warmup_days,
-        auto_confirm=yes,
-    )
-    managers = build_default_managers(analysts)
-    provenance = build_run_provenance(
-        {
-            "assets": resolved_assets,
-            "train_start": parsed_train_start.isoformat(),
-            "train_end": parsed_train_end.isoformat(),
-            "test_start": parsed_test_start.isoformat(),
-            "test_end": parsed_test_end.isoformat(),
-            "warmup_days": warmup_days,
-            "parallel_workers": parallel_workers,
-            "commission_rate": resolved_commission_rate,
-            "slippage_bps": resolved_slippage_bps,
-            "execution_lag_days": resolved_execution_lag_days,
-            "calibration_checkpoint": calibration_checkpoint,
-            "test_checkpoint": test_checkpoint,
-            "resume": resume,
-            "include_baselines": include_baselines,
-            "include_isolated": include_isolated,
-            "exclude_analyst": sorted(excluded),
-            "set": list(set_override),
-            "yes": yes,
-        },
-        [analyst.agent_id for analyst in analysts],
-        [manager.agent_id for manager in managers],
-    )
-    commander = Commander(
-        managers=managers,
-        weighting_strategy=ShrinkageWeight(Hedge()),
-        parallel_workers=parallel_workers,
-    )
-    market_data, source_label = load_price_history_with_fallback(
-        resolved_assets,
-        parsed_train_start,
-        parsed_test_end,
-        warmup_days=warmup_days,
-    )
-    typer.echo(
-        f"Market data ready: {source_label}; {len(market_data)} aligned rows. "
-        "Starting calibration...",
-        err=True,
-    )
-    track_record = TrackRecord()
-
-    # Every Sharpe/Sortino/Information-Ratio this experiment reports (system,
-    # baselines, and any --include-isolated run) shares these two inputs, so
-    # they're loaded once here rather than per-engine: a real 3-month T-bill
-    # rate (FRED DGS3MO from the lakehouse) for excess-return Sharpe/Sortino, and an
-    # S&P 500 buy-and-hold's own daily returns as the market benchmark
-    # information_ratio is computed against.
-    risk_free_rate_series = load_risk_free_rate_series(parsed_train_start, parsed_test_end)
-    sp500_frame, _sp500_source = load_price_history_with_fallback(
-        [SP500_BENCHMARK_TICKER],
-        parsed_train_start,
-        parsed_test_end,
-        warmup_days=0,
-    )
-    benchmark_returns = sp500_frame[SP500_BENCHMARK_TICKER]["close"].dropna().pct_change().dropna()
-
-    def build_engine(start: date, end: date) -> BacktestEngine:
-        return BacktestEngine(
-            commander=commander,
-            portfolio=Portfolio(
-                cash=settings.firm.starting_cash,
-                positions={},
-                commission_rate=resolved_commission_rate,
-                slippage_bps=resolved_slippage_bps,
-            ),
-            track_record=track_record,
-            data_loader=lambda _assets, _start, _end: market_data,
-            start_date=start,
-            end_date=end,
-            assets=resolved_assets,
-            market_data_source=source_label,
-            execution_lag_days=resolved_execution_lag_days,
-            checkpoint_path=(
-                calibration_checkpoint if start == parsed_train_start else test_checkpoint
-            ),
-            resume=resume,
-            risk_free_rate_series=risk_free_rate_series,
-            benchmark_returns=benchmark_returns,
+    with lake_session(requested_lake_time) as session:
+        typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
+        analysts = resolve_roster_after_preflight(
+            analysts,
+            resolved_assets,
+            parsed_train_start,
+            parsed_test_end,
+            warmup_days=warmup_days,
+            auto_confirm=yes,
         )
-
-    def run_phase(label: str, start: date, end: date) -> BacktestResult:
-        def on_day_complete(
-            day_index: int, total_days: int, as_of_date: date, value: float
-        ) -> None:
-            typer.echo(
-                f"{label}: day {day_index + 1}/{total_days} ({as_of_date}) portfolio=${value:,.2f}",
-                err=True,
-            )
-
-        result = build_engine(start, end).run(on_day_complete=on_day_complete)
-        typer.echo(f"{label} complete. Starting next phase...", err=True)
-        return result
-
-    calibration_result = run_phase("CALIBRATION", parsed_train_start, parsed_train_end)
-    test_result = run_phase("TEST", parsed_test_start, parsed_test_end)
-    baseline_results: dict[str, dict[str, object]] = {}
-    if include_baselines:
-        for strategy in ("equal_weight", "buy_and_hold", "momentum", "volatility_target"):
-            baseline_engine = BacktestEngine(
-                commander=BaselineCommander(strategy),
-                portfolio=Portfolio(
-                    cash=settings.firm.starting_cash,
-                    positions={},
-                    commission_rate=resolved_commission_rate,
-                    slippage_bps=resolved_slippage_bps,
-                ),
-                track_record=TrackRecord(),
-                data_loader=lambda _assets, _start, _end: market_data,
-                start_date=parsed_test_start,
-                end_date=parsed_test_end,
-                assets=resolved_assets,
-                market_data_source=source_label,
-                execution_lag_days=resolved_execution_lag_days,
-                risk_free_rate_series=risk_free_rate_series,
-                benchmark_returns=benchmark_returns,
-            )
-            baseline_results[strategy] = baseline_engine.run().model_dump(mode="json")
-    isolated_results: dict[str, dict[str, object]] = {}
-    if include_isolated:
-        for analyst in analysts:
-            isolated_engine = BacktestEngine(
-                commander=SingleAnalystCommander(analyst),
-                portfolio=Portfolio(
-                    cash=settings.firm.starting_cash,
-                    positions={},
-                    commission_rate=resolved_commission_rate,
-                    slippage_bps=resolved_slippage_bps,
-                ),
-                track_record=TrackRecord(),
-                data_loader=lambda _assets, _start, _end: market_data,
-                start_date=parsed_test_start,
-                end_date=parsed_test_end,
-                assets=resolved_assets,
-                market_data_source=source_label,
-                execution_lag_days=resolved_execution_lag_days,
-                risk_free_rate_series=risk_free_rate_series,
-                benchmark_returns=benchmark_returns,
-            )
-            isolated_results[f"analyst:{analyst.agent_id}"] = isolated_engine.run().model_dump(
-                mode="json"
-            )
-        for manager in build_default_managers(analysts):
-            isolated_engine = BacktestEngine(
-                commander=Commander(
-                    managers=[manager],
-                    weighting_strategy=ShrinkageWeight(Hedge()),
-                    parallel_workers=parallel_workers,
-                ),
-                portfolio=Portfolio(
-                    cash=settings.firm.starting_cash,
-                    positions={},
-                    commission_rate=resolved_commission_rate,
-                    slippage_bps=resolved_slippage_bps,
-                ),
-                track_record=TrackRecord(),
-                data_loader=lambda _assets, _start, _end: market_data,
-                start_date=parsed_test_start,
-                end_date=parsed_test_end,
-                assets=resolved_assets,
-                market_data_source=source_label,
-                execution_lag_days=resolved_execution_lag_days,
-                risk_free_rate_series=risk_free_rate_series,
-                benchmark_returns=benchmark_returns,
-            )
-            isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump(
-                mode="json"
-            )
-    typer.echo(
-        json.dumps(
+        managers = build_default_managers(analysts)
+        provenance = build_run_provenance(
             {
-                "provenance": provenance.model_dump(mode="json"),
-                "experiment": {
-                    "assets": resolved_assets,
-                    "train_start": parsed_train_start.isoformat(),
-                    "train_end": parsed_train_end.isoformat(),
-                    "test_start": parsed_test_start.isoformat(),
-                    "test_end": parsed_test_end.isoformat(),
-                    "warmup_days": warmup_days,
-                    "excluded_analysts": sorted(excluded),
-                    "config_overrides": overrides,
-                },
-                "market_data_source": source_label,
-                "calibration": calibration_result.model_dump(mode="json"),
-                "test": test_result.model_dump(mode="json"),
-                "baselines": baseline_results,
-                "isolated": isolated_results,
+                "assets": resolved_assets,
+                "train_start": parsed_train_start.isoformat(),
+                "train_end": parsed_train_end.isoformat(),
+                "test_start": parsed_test_start.isoformat(),
+                "test_end": parsed_test_end.isoformat(),
+                "warmup_days": warmup_days,
+                "parallel_workers": parallel_workers,
+                "commission_rate": resolved_commission_rate,
+                "slippage_bps": resolved_slippage_bps,
+                "execution_lag_days": resolved_execution_lag_days,
+                "calibration_checkpoint": calibration_checkpoint,
+                "test_checkpoint": test_checkpoint,
+                "resume": resume,
+                "include_baselines": include_baselines,
+                "include_isolated": include_isolated,
+                "exclude_analyst": sorted(excluded),
+                "set": list(set_override),
+                "yes": yes,
+                "lake_time": lake_time,
             },
-            indent=2,
+            [analyst.agent_id for analyst in analysts],
+            [manager.agent_id for manager in managers],
         )
-    )
+        commander = Commander(
+            managers=managers,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            parallel_workers=parallel_workers,
+        )
+        market_data, source_label = load_price_history_with_fallback(
+            resolved_assets,
+            parsed_train_start,
+            parsed_test_end,
+            warmup_days=warmup_days,
+        )
+        typer.echo(
+            f"Market data ready: {source_label}; {len(market_data)} aligned rows. "
+            "Starting calibration...",
+            err=True,
+        )
+        track_record = TrackRecord()
+
+        # Every Sharpe/Sortino/Information-Ratio this experiment reports (system,
+        # baselines, and any --include-isolated run) shares these two inputs, so
+        # they're loaded once here rather than per-engine: a real 3-month T-bill
+        # rate (FRED DGS3MO from the lakehouse) for excess-return Sharpe/Sortino, and an
+        # S&P 500 buy-and-hold's own daily returns as the market benchmark
+        # information_ratio is computed against.
+        risk_free_rate_series = load_risk_free_rate_series(parsed_train_start, parsed_test_end)
+        sp500_frame, _sp500_source = load_price_history_with_fallback(
+            [SP500_BENCHMARK_TICKER],
+            parsed_train_start,
+            parsed_test_end,
+            warmup_days=0,
+        )
+        benchmark_returns = (
+            sp500_frame[SP500_BENCHMARK_TICKER]["close"].dropna().pct_change().dropna()
+        )
+
+        def build_engine(start: date, end: date) -> BacktestEngine:
+            return BacktestEngine(
+                commander=commander,
+                portfolio=Portfolio(
+                    cash=settings.firm.starting_cash,
+                    positions={},
+                    commission_rate=resolved_commission_rate,
+                    slippage_bps=resolved_slippage_bps,
+                ),
+                track_record=track_record,
+                data_loader=lambda _assets, _start, _end: market_data,
+                start_date=start,
+                end_date=end,
+                assets=resolved_assets,
+                market_data_source=source_label,
+                execution_lag_days=resolved_execution_lag_days,
+                checkpoint_path=(
+                    calibration_checkpoint if start == parsed_train_start else test_checkpoint
+                ),
+                resume=resume,
+                risk_free_rate_series=risk_free_rate_series,
+                benchmark_returns=benchmark_returns,
+            )
+
+        def run_phase(label: str, start: date, end: date) -> BacktestResult:
+            def on_day_complete(
+                day_index: int, total_days: int, as_of_date: date, value: float
+            ) -> None:
+                typer.echo(
+                    f"{label}: day {day_index + 1}/{total_days} ({as_of_date}) "
+                    f"portfolio=${value:,.2f}",
+                    err=True,
+                )
+
+            result = build_engine(start, end).run(on_day_complete=on_day_complete)
+            typer.echo(f"{label} complete. Starting next phase...", err=True)
+            return result
+
+        calibration_result = run_phase("CALIBRATION", parsed_train_start, parsed_train_end)
+        test_result = run_phase("TEST", parsed_test_start, parsed_test_end)
+        baseline_results: dict[str, dict[str, object]] = {}
+        if include_baselines:
+            for strategy in ("equal_weight", "buy_and_hold", "momentum", "volatility_target"):
+                baseline_engine = BacktestEngine(
+                    commander=BaselineCommander(strategy),
+                    portfolio=Portfolio(
+                        cash=settings.firm.starting_cash,
+                        positions={},
+                        commission_rate=resolved_commission_rate,
+                        slippage_bps=resolved_slippage_bps,
+                    ),
+                    track_record=TrackRecord(),
+                    data_loader=lambda _assets, _start, _end: market_data,
+                    start_date=parsed_test_start,
+                    end_date=parsed_test_end,
+                    assets=resolved_assets,
+                    market_data_source=source_label,
+                    execution_lag_days=resolved_execution_lag_days,
+                    risk_free_rate_series=risk_free_rate_series,
+                    benchmark_returns=benchmark_returns,
+                )
+                baseline_results[strategy] = baseline_engine.run().model_dump(mode="json")
+        isolated_results: dict[str, dict[str, object]] = {}
+        if include_isolated:
+            for analyst in analysts:
+                isolated_engine = BacktestEngine(
+                    commander=SingleAnalystCommander(analyst),
+                    portfolio=Portfolio(
+                        cash=settings.firm.starting_cash,
+                        positions={},
+                        commission_rate=resolved_commission_rate,
+                        slippage_bps=resolved_slippage_bps,
+                    ),
+                    track_record=TrackRecord(),
+                    data_loader=lambda _assets, _start, _end: market_data,
+                    start_date=parsed_test_start,
+                    end_date=parsed_test_end,
+                    assets=resolved_assets,
+                    market_data_source=source_label,
+                    execution_lag_days=resolved_execution_lag_days,
+                    risk_free_rate_series=risk_free_rate_series,
+                    benchmark_returns=benchmark_returns,
+                )
+                isolated_results[f"analyst:{analyst.agent_id}"] = isolated_engine.run().model_dump(
+                    mode="json"
+                )
+            for manager in build_default_managers(analysts):
+                isolated_engine = BacktestEngine(
+                    commander=Commander(
+                        managers=[manager],
+                        weighting_strategy=ShrinkageWeight(Hedge()),
+                        parallel_workers=parallel_workers,
+                    ),
+                    portfolio=Portfolio(
+                        cash=settings.firm.starting_cash,
+                        positions={},
+                        commission_rate=resolved_commission_rate,
+                        slippage_bps=resolved_slippage_bps,
+                    ),
+                    track_record=TrackRecord(),
+                    data_loader=lambda _assets, _start, _end: market_data,
+                    start_date=parsed_test_start,
+                    end_date=parsed_test_end,
+                    assets=resolved_assets,
+                    market_data_source=source_label,
+                    execution_lag_days=resolved_execution_lag_days,
+                    risk_free_rate_series=risk_free_rate_series,
+                    benchmark_returns=benchmark_returns,
+                )
+                isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump(
+                    mode="json"
+                )
+        typer.echo(
+            json.dumps(
+                {
+                    "provenance": provenance.model_dump(mode="json"),
+                    "experiment": {
+                        "assets": resolved_assets,
+                        "train_start": parsed_train_start.isoformat(),
+                        "train_end": parsed_train_end.isoformat(),
+                        "test_start": parsed_test_start.isoformat(),
+                        "test_end": parsed_test_end.isoformat(),
+                        "warmup_days": warmup_days,
+                        "excluded_analysts": sorted(excluded),
+                        "config_overrides": overrides,
+                    },
+                    "market_data_source": source_label,
+                    "calibration": calibration_result.model_dump(mode="json"),
+                    "test": test_result.model_dump(mode="json"),
+                    "baselines": baseline_results,
+                    "isolated": isolated_results,
+                },
+                indent=2,
+            )
+        )
 
 
 def main(args: list[str] | None = None) -> None:

@@ -16,7 +16,8 @@ environment (`LAKEHOUSE_API_URL`, `LAKEHOUSE_API_TOKEN`) unless given explicitly
     lake.ask("What was the score in Liverpool vs Arsenal on 11 May 2025?")["answer"]
 
 Dates come back as dates and timestamps as UTC timestamps. A query that fails part-way raises
-instead of returning a partial result.
+instead of returning a partial result. `lake.last_version` holds the `X-Lakehouse-Version` header
+of the most recent response (`None` before the first request or when the header is absent).
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import httpx
 import pyarrow as pa
 
 DEFAULT_URL = "http://localhost:8600"
+VERSION_HEADER = "X-Lakehouse-Version"
 
 
 class LakehouseError(RuntimeError):
@@ -74,6 +76,7 @@ class Lake:
             headers={"Authorization": f"Bearer {token}"},
             timeout=httpx.Timeout(timeout, connect=10.0),
         )
+        self.last_version: str | None = None
 
     # -- data -----------------------------------------------------------------------
 
@@ -95,6 +98,7 @@ class Lake:
     def _arrow_reader(self, query: str, params: list[Any] | None) -> Iterator[pa.RecordBatchStreamReader]:
         body = {"sql": query, "params": params or [], "format": "arrow"}
         with self._http.stream("POST", "/v1/sql", json=body) as resp:
+            self._record_version(resp)
             self._raise_for(resp)
             yield pa.ipc.open_stream(io.BufferedReader(_ByteStream(resp.iter_bytes())))
 
@@ -104,6 +108,7 @@ class Lake:
         body = {"sql": query, "params": params or [], "format": "parquet"}
         tmp = path.with_suffix(path.suffix + ".partial")
         with self._http.stream("POST", "/v1/sql", json=body) as resp:
+            self._record_version(resp)
             self._raise_for(resp)
             with tmp.open("wb") as fh:
                 for chunk in resp.iter_bytes():
@@ -126,6 +131,7 @@ class Lake:
     def ask(self, question: str, as_of: str | None = None, include_evidence: bool = False) -> dict[str, Any]:
         """A natural-language answer with the SQL it rests on (needs the `ask` scope)."""
         resp = self._http.post("/v1/ask", json={"question": question, "as_of": as_of, "include_evidence": include_evidence})
+        self._record_version(resp)
         self._raise_for(resp)
         return resp.json()
 
@@ -136,8 +142,14 @@ class Lake:
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         resp = self._http.get(path, params=params)
+        self._record_version(resp)
         self._raise_for(resp)
         return resp.json()
+
+    def _record_version(self, resp: httpx.Response) -> None:
+        """Sets `last_version` from `resp`'s `X-Lakehouse-Version` header (header names are
+        case-insensitive), or to `None` when the response carries none."""
+        self.last_version = resp.headers.get(VERSION_HEADER)
 
     @staticmethod
     def _raise_for(resp: httpx.Response) -> None:

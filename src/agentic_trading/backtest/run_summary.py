@@ -20,7 +20,9 @@ through as they are, and `execution_costs` gives the run's fill-cost
 totals by kind. Per-pod sizing diagnostics are reduced to each pod's
 binding-stage shares and mean final-to-target vol ratio, and unfactored
 split-sized moves to a count per security; the per-day and per-move
-entries are not kept."""
+entries are not kept. `lake` carries the lake state the run read: its
+lake time, the build of each rebuilt-whole table and the tables pinned on
+their own row time."""
 
 from collections import Counter
 from typing import Any
@@ -123,15 +125,28 @@ def _unfactored_split_move_counts(block: dict[str, Any]) -> dict[str, int]:
     return dict(Counter(str(move["security_id"]) for move in moves))
 
 
+def _lake_reading(experiment_result: dict[str, Any]) -> dict[str, Any]:
+    """`lake_time`, `rebuilt_whole_builds` and `row_time_pinned_tables`
+    from the payload's `provenance.lake`, with `None`, `{}` and `[]` for a
+    payload that does not carry them."""
+    lake = (experiment_result.get("provenance") or {}).get("lake") or {}
+    return {
+        "lake_time": lake.get("lake_time"),
+        "rebuilt_whole_builds": lake.get("rebuilt_whole_builds") or {},
+        "row_time_pinned_tables": lake.get("row_time_pinned_tables") or [],
+    }
+
+
 def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
     """The full `experiment_result.json` payload in, the compact summary
     out. `experiment_result` must have `experiment`, `market_data_source`,
     `calibration`, and `test` top-level keys
-    (as produced by `agentic-trading-experiment`); `baselines` is optional
-    since not every run includes it."""
+    (as produced by `agentic-trading-experiment`); `baselines` and
+    `provenance` are optional since not every payload carries them."""
     summary: dict[str, Any] = {
         "experiment": experiment_result["experiment"],
         "market_data_source": experiment_result["market_data_source"],
+        "lake": _lake_reading(experiment_result),
     }
     for period in ("calibration", "test"):
         block = experiment_result[period]
