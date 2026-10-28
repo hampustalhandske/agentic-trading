@@ -950,8 +950,9 @@ def load_options_snapshot_from_lakehouse(
     fatal. `strike`/`bid`/`ask`/`gamma`/`vega`/`theta`/`rho` are rescaled
     onto `instrument_prices`' continuously split-adjusted basis via
     `_apply_split_adjustment` before returning, since the raw chain is
-    archival and never itself adjusted for a later split. Self-asserts
-    point-in-time on `date` before returning."""
+    archival and never itself adjusted for a later split. Rows are sorted
+    on every returned column. Self-asserts point-in-time on `date` before
+    returning."""
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
     window_end = as_of_date.isoformat()
     table, date_column = _option_chain_source(ticker, as_of_date)
@@ -967,6 +968,8 @@ def load_options_snapshot_from_lakehouse(
               WHERE underlying = ?
                 AND {date_column} BETWEEN ? AND ?
           )
+        ORDER BY expiration, option_type, strike, bid, ask, implied_volatility, delta, gamma,
+                 theta, vega, rho
     """
     frame = _query(query, [ticker, window_start, window_end, ticker, window_start, window_end])
     if frame.empty:
@@ -1557,9 +1560,10 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     and only rows with `available_date <= as_of_date` are kept. Of
     those, each (`concept`, `unit`, `period_start`, `period_end`) keeps
     the row with the latest `available_date`, ties broken by the latest
-    `filed`. Returns `None` if no rows remain. Self-asserts
-    point-in-time on `filed` (the SQL gate) and on `available_date`
-    before returning."""
+    `filed`; the query sorts on every column it returns, so which of two
+    tied rows is kept never depends on the order the lake stores them in.
+    Returns `None` if no rows remain. Self-asserts point-in-time on
+    `filed` (the SQL gate) and on `available_date` before returning."""
     query = f"""
         SELECT x.concept, x.unit, x.period_start, x.period_end, x.value, x.fiscal_year,
                x.fiscal_period, x.form, x.filed_date AS filed, f.accepted_at
@@ -1569,7 +1573,8 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
             WHERE ticker = ? AND filed_date <= ?
         ) x
         LEFT JOIN ({_sec_acceptance_query()}) f ON f.accession_number = x.accession_number
-        ORDER BY filed
+        ORDER BY filed, concept, unit, period_start, period_end, fiscal_year, fiscal_period,
+                 form, accepted_at, value
     """
     frame = _query(query, [ticker, as_of_date.isoformat()])
     if frame.empty:
@@ -1720,9 +1725,9 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
     acceptance time in `sec_filings` (`_sec_acceptance_query`) by
     `_sec_available_dates` (16:00 America/New_York, the close, is the
     decision time), and only rows with `available_date <= as_of_date`
-    are returned. Returns `None` if no rows remain. Self-asserts
-    point-in-time on `filed_date` (the SQL gate) and on `available_date`
-    before returning."""
+    are returned, sorted on every returned column. Returns `None` if no
+    rows remain. Self-asserts point-in-time on `filed_date` (the SQL gate)
+    and on `available_date` before returning."""
     query = f"""
         SELECT t.owner_cik, t.owner_name, t.is_officer, t.is_director, t.is_ten_percent_owner,
                t.transaction_date, t.transaction_code, t.shares, t.price_per_share,
@@ -1733,7 +1738,9 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
             WHERE issuer_ticker = ? AND filed_date <= ?
         ) t
         LEFT JOIN ({_sec_acceptance_query()}) f ON f.accession_number = t.accession_number
-        ORDER BY t.filed_date, t.transaction_date
+        ORDER BY t.filed_date, t.transaction_date, t.owner_cik, t.owner_name, t.transaction_code,
+                 t.acquired_disposed, t.shares, t.price_per_share, t.is_officer, t.is_director,
+                 t.is_ten_percent_owner, f.accepted_at
     """
     frame = _query(query, [ticker, as_of_date.isoformat()])
     if frame.empty:
