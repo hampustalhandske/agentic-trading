@@ -251,6 +251,10 @@ def test_options_snapshot_leaves_an_unsplit_ticker_unchanged(fake_lake: Any) -> 
         date_columns=("date", "expiration"),
     )
     fake_lake.add("yahoo_split_close_basis", _splits_table("AAPL", []), date_columns=("ex_date",))
+    fake_lake._connection.execute(
+        "INSERT INTO yahoo_split_close_basis (ticker, ratio, in_close_basis) "
+        "VALUES ('ZZUNREL', 0.5, TRUE)"
+    )
 
     result = lakehouse_loader.load_options_snapshot_from_lakehouse("AAPL", date(2024, 4, 1))
 

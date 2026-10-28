@@ -4,8 +4,10 @@
 
 `tests/fixtures/lakehouse_contract_v1.json` lists every view the loaders read
 and each view's column names and DuckDB types. Registering those views as
-empty typed tables and running every loader proves each SQL statement binds
-against the contract's names and types.
+typed tables and running every loader proves each SQL statement binds
+against the contract's names and types. Every table is empty except the two
+adjustment tables, which hold one unrelated row each because the loaders
+refuse to read an empty adjustment table.
 """
 
 import inspect
@@ -81,12 +83,22 @@ _EMPTY_CASES: dict[str, Callable[[], Any]] = {
 
 
 def _register_contract(fake_lake: Any) -> None:
-    """Creates every contract view as an empty table with its exact column types."""
+    """Creates every contract view as an empty table with its exact column types, except
+    that each adjustment table holds one row for an unrelated security, so the loaders'
+    empty-adjustment-table guard passes."""
     for view, columns in _CONTRACT["views"].items():
         quoted = {
             f'"{name}"': ("VARCHAR" if kind == '"NULL"' else kind) for name, kind in columns.items()
         }
         fake_lake.add_empty(view, quoted)
+    fake_lake._connection.execute(
+        "INSERT INTO equity_adjustment_factors (ticker, effective_date, cum_factor, security_id) "
+        "VALUES ('ZZUNREL', DATE '2000-01-03', 0.5, 999)"
+    )
+    fake_lake._connection.execute(
+        "INSERT INTO yahoo_split_close_basis (ticker, ex_date, ratio) "
+        "VALUES ('ZZUNREL', DATE '2000-01-03', 0.5)"
+    )
 
 
 @pytest.mark.parametrize("case", list(_EMPTY_CASES), ids=list(_EMPTY_CASES))

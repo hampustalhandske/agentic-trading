@@ -71,6 +71,9 @@ def lake(fake_lake: Any) -> Any:
     fake_lake.add_empty("sp500_price_coverage", _COVERAGE)
     fake_lake.add_empty("equity_daily_from_bars", _BARS)
     fake_lake.add_empty("equity_adjustment_factors", _FACTORS)
+    fake_lake._connection.execute(
+        "INSERT INTO equity_adjustment_factors VALUES ('ZZUNREL', DATE '2000-01-03', 2.0, 0.5, 999)"
+    )
     return fake_lake
 
 

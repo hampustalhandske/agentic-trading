@@ -20,7 +20,7 @@ to the caller."""
 
 from datetime import UTC, date, datetime
 from functools import cache
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 from weakref import WeakKeyDictionary
 
 import numpy as np
@@ -43,11 +43,15 @@ class LakeProvenance(BaseModel):
     """Which lake build a run read, and when: `lake_version` is the git
     commit of the running service, `read_at` the UTC time the status was
     read, and `status_generated_at` the timestamp the lake stamped on its
-    own status document (`None` when the lake has not written one yet)."""
+    own status document (`None` when the lake has not written one yet).
+    `adjustment_table_rows` maps each price-adjustment table
+    (`equity_adjustment_factors`, `yahoo_split_close_basis`) to its total
+    row count."""
 
     lake_version: str
     read_at: datetime
     status_generated_at: datetime | None
+    adjustment_table_rows: dict[str, int] = {}
 
 
 def _required_env(name: str) -> str:
@@ -77,7 +81,9 @@ def _query(query: str, params: list[Any]) -> pd.DataFrame:
 
 def lake_provenance() -> LakeProvenance:
     """The lake's version and the UTC time its status was read, from
-    `Lake.status()` and the service's health payload."""
+    `Lake.status()` and the service's health payload, plus the row count
+    of each adjustment table from `adjustment_table_row_count`. Raises
+    `EmptyAdjustmentTableError` when either adjustment table is empty."""
     lake = _lake()
     status = lake.status()
     read_at = datetime.now(UTC)
@@ -86,7 +92,43 @@ def lake_provenance() -> LakeProvenance:
         lake_version=str(lake.health()["version"]),
         read_at=read_at,
         status_generated_at=datetime.fromisoformat(generated) if generated else None,
+        adjustment_table_rows={
+            table: adjustment_table_row_count(table) for table in get_args(AdjustmentTable)
+        },
     )
+
+
+AdjustmentTable = Literal["equity_adjustment_factors", "yahoo_split_close_basis"]
+
+# Row count per adjustment table, keyed by the lake client that answered.
+_ADJUSTMENT_TABLE_ROWS: WeakKeyDictionary[Lake, dict[str, int]] = WeakKeyDictionary()
+
+
+class EmptyAdjustmentTableError(RuntimeError):
+    """An adjustment table (`equity_adjustment_factors` or
+    `yahoo_split_close_basis`) holds no rows, so every price read through
+    it would come back unadjusted."""
+
+
+def adjustment_table_row_count(table: AdjustmentTable) -> int:
+    """The total row count of adjustment table `table`, from one
+    `count(*)` query. Read once per table and lake client and kept for the
+    life of the process. Raises `EmptyAdjustmentTableError` when the table
+    has no rows (that result is not kept, so a later call queries again)
+    and `ValueError` when `table` is not an adjustment table."""
+    if table not in get_args(AdjustmentTable):
+        raise ValueError(f"{table!r} is not an adjustment table")
+    lake = _lake()
+    cached = _ADJUSTMENT_TABLE_ROWS.setdefault(lake, {})
+    if table not in cached:
+        frame = _query(f"SELECT count(*) AS row_count FROM {table}", [])
+        rows = 0 if frame.empty else int(frame.iloc[0]["row_count"])
+        if rows == 0:
+            raise EmptyAdjustmentTableError(
+                f"{table} has no rows; prices read through it would be unadjusted"
+            )
+        cached[table] = rows
+    return cached[table]
 
 
 def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
@@ -190,6 +232,43 @@ def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | N
     return members or None
 
 
+# Shares received per share held in the split sizes the lake records; a
+# reverse split is the reciprocal. Splits smaller than 3-for-2 move the
+# price by less than many ordinary trading days, so they are not listed.
+_SPLIT_SHARE_RATIOS = (1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.0, 8.0, 10.0, 15.0, 20.0)
+# Largest distance, in log price, between a one-day move and a split
+# ratio for the move to count as split-sized: room for the day's ordinary
+# market move on top of the split.
+_SPLIT_MOVE_LOG_TOLERANCE = 0.05
+
+
+def unfactored_split_moves(
+    returns: dict[int, pd.Series], factor_dates: dict[int, set[date]]
+) -> list[tuple[int, date, float]]:
+    """One-day moves in `returns` (log returns per `security_id`, on a
+    `DatetimeIndex`) whose size matches a forward or reverse split in
+    `_SPLIT_SHARE_RATIOS` within `_SPLIT_MOVE_LOG_TOLERANCE`, on a date
+    that is not in the security's `factor_dates` (the `effective_date`s of
+    its adjustment-factor rows). Each entry is `(security_id, date,
+    ratio)`, where `ratio` is the day's price over the previous day's
+    (0.5 for an unadjusted 2-for-1 split), ordered by security and date.
+    A move on a factor date is never returned: the factor row is the
+    split's adjustment."""
+    split_logs = np.log(np.array(_SPLIT_SHARE_RATIOS))
+    flagged: list[tuple[int, date, float]] = []
+    for security_id in sorted(returns):
+        covered = factor_dates.get(security_id, set())
+        series = returns[security_id].sort_index()
+        for stamp, log_return in series.items():
+            day = pd.Timestamp(cast(Any, stamp)).date()
+            if day in covered or not np.isfinite(log_return):
+                continue
+            distance = np.min(np.abs(abs(float(log_return)) - split_logs))
+            if distance <= _SPLIT_MOVE_LOG_TOLERANCE:
+                flagged.append((security_id, day, float(np.exp(log_return))))
+    return flagged
+
+
 def load_security_log_returns(
     security_ids: list[int], start: date, end: date
 ) -> dict[int, pd.Series]:
@@ -213,13 +292,22 @@ def load_security_log_returns(
     returns in the range has no key. Factor rows dated after `end` set
     the price level but cancel in every return, so no return depends on
     data after `end`. Self-asserts point-in-time on every series against
-    `end` before returning."""
+    `end` before returning.
+
+    Raises `EmptyAdjustmentTableError` when `equity_adjustment_factors`
+    has no rows at all; a security with no factor rows of its own is read
+    unadjusted. Logs one WARNING listing every split-sized move
+    `unfactored_split_moves` finds on a date with no factor row for the
+    security, using the factor `effective_date`s the price read joined;
+    the returned series are not changed."""
     if not security_ids:
         return {}
+    adjustment_table_row_count("equity_adjustment_factors")
     placeholders = ", ".join("?" for _ in security_ids)
     query = f"""
         SELECT bars.security_id, bars.date,
-               bars.price * COALESCE(factors.cum_factor, 1.0) AS price
+               bars.price * COALESCE(factors.cum_factor, 1.0) AS price,
+               factors.effective_date AS factor_date
         FROM (
             SELECT security_id, date, COALESCE(official_close, close) AS price
             FROM equity_daily_from_bars
@@ -263,7 +351,31 @@ def load_security_log_returns(
         ).sort_index()
         assert_point_in_time(series, end)
         result[int(cast(int, security_id))] = series
+    _warn_unfactored_split_moves(result, frame)
     return result
+
+
+def _warn_unfactored_split_moves(returns: dict[int, pd.Series], frame: pd.DataFrame) -> None:
+    """Logs one WARNING naming each `(security_id, date, ratio)` that
+    `unfactored_split_moves` flags in `returns`. `frame` is the joined
+    bar/factor read, whose non-null `factor_date` values are each
+    security's factor `effective_date`s."""
+    dated = frame.dropna(subset=["factor_date"])
+    factor_dates: dict[int, set[date]] = {
+        int(cast(int, security_id)): {pd.Timestamp(day).date() for day in group["factor_date"]}
+        for security_id, group in dated.groupby("security_id")
+    }
+    flagged = unfactored_split_moves(returns, factor_dates)
+    if flagged:
+        listed = ", ".join(
+            f"({security_id}, {day.isoformat()}, {ratio:.4f})"
+            for security_id, day, ratio in flagged
+        )
+        logger.warning(
+            "split-sized one-day moves with no adjustment factor on that date "
+            "(security_id, date, ratio): %s",
+            listed,
+        )
 
 
 def split_adjustment_factor(ticker: str, quote_date: date) -> float:
@@ -282,7 +394,11 @@ def split_adjustment_factor(ticker: str, quote_date: date) -> float:
     `in_close_basis` is false is a split Yahoo's close does not reflect,
     so it is skipped and the strike lands on the close's actual basis;
     rows where it is true or null count. Spin-offs Yahoo writes as
-    fractional splits count too, because the close is adjusted for them."""
+    fractional splits count too, because the close is adjusted for them.
+
+    Raises `EmptyAdjustmentTableError` when `yahoo_split_close_basis` has
+    no rows at all; a ticker with no rows of its own gets 1.0."""
+    adjustment_table_row_count("yahoo_split_close_basis")
     query = """
         SELECT ratio
         FROM yahoo_split_close_basis

@@ -94,6 +94,9 @@ def lake(fake_lake: Any) -> Any:
         "yahoo_split_close_basis",
         {"ticker": "VARCHAR", "ex_date": "DATE", "ratio": "DOUBLE", "in_close_basis": "BOOLEAN"},
     )
+    fake_lake._connection.execute(
+        "INSERT INTO yahoo_split_close_basis VALUES ('ZZUNREL', DATE '2000-01-03', 0.5, TRUE)"
+    )
     return fake_lake
 
 

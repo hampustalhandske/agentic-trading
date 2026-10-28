@@ -261,6 +261,9 @@ def _lake_chain_expiring_on(fake_lake: Any, underlying: str, day: date, strike: 
         "yahoo_split_close_basis",
         {"ticker": "VARCHAR", "ex_date": "DATE", "ratio": "DOUBLE", "in_close_basis": "BOOLEAN"},
     )
+    fake_lake._connection.execute(
+        "INSERT INTO yahoo_split_close_basis VALUES ('ZZUNREL', DATE '2000-01-03', 0.5, TRUE)"
+    )
 
 
 def test_lagged_chain_listing_only_todays_expiry_selects_no_put(
