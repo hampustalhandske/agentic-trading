@@ -49,8 +49,8 @@ def assert_point_in_time(
     `None`. For a `DataFrame`/`Series`, the dates checked come from
     `date_column` if given (coerced to datetime if not already), or from
     the index otherwise; an empty frame/series is a no-op. `list[str]` is
-    a no-op — it's the shape `load_sp500_constituents_asof` returns
-    (tickers, not dates), so there is nothing here to check. `None` is
+    a no-op — a list of tickers carries no dates, so there is nothing
+    here to check. `None` is
     also a no-op — many loaders return `None` to mean "no coverage."
 
     Comparison is by calendar date, not timestamp, since some loaders

@@ -22,8 +22,6 @@ the table (`Lake.describe`, read once when the session opens):
   filtered on its own row time `open_time <= T`;
 - a log view read directly (`sec_company_facts_log`,
   `sec_insider_transactions_log`) is filtered on `scraped_at <= T`;
-- the `equity_ticker_history` view is rebuilt from
-  `security_source_map_log` as of T;
 - a rebuilt-whole table holds only its current build, so it is read
   unpinned and its build time is recorded in the session.
 
@@ -115,9 +113,7 @@ def _lake() -> Lake:
     return Lake(base_url=_required_env(_URL_ENV_VAR), token=_required_env(_TOKEN_ENV_VAR))
 
 
-# Every table the loader's queries read. `equity_ticker_history` is a
-# compatibility view over `security_source_map`, so the session reads the
-# metadata of the table behind it.
+# Every table the loader's queries read.
 READ_TABLES: tuple[str, ...] = (
     "cftc_cot_disaggregated",
     "cftc_cot_publication",
@@ -138,7 +134,6 @@ READ_TABLES: tuple[str, ...] = (
     "sec_filings",
     "sec_insider_transactions_log",
     "sec_sic_classification",
-    "security_source_map",
     "sp500_membership",
     "sp500_price_coverage",
     "yahoo_split_close_basis",
@@ -147,12 +142,6 @@ READ_TABLES: tuple[str, ...] = (
 # Tables with no `scraped_at`, pinned on their own row-time column (naive
 # UTC) instead.
 _ROW_TIME_PIN_COLUMNS = {"crypto_klines_1m": "open_time"}
-
-# `equity_ticker_history` is `security_source_map` restricted to this
-# source's active links, with `source_symbol` as `ticker`.
-_TICKER_HISTORY_VIEW = "equity_ticker_history"
-_TICKER_HISTORY_TABLE = "security_source_map"
-_TICKER_HISTORY_SOURCE = "us_equity_bars_5m"
 
 # Prefix of the lake client's error text for an HTTP 409, the status the
 # lake answers a pin it cannot serve with.
@@ -363,21 +352,16 @@ def _scraped_at_pin(lake_time: datetime) -> str:
     return f"scraped_at <= CAST('{lake_time.astimezone(UTC).isoformat()}' AS TIMESTAMPTZ)"
 
 
-def _deduplicated_log_sql(
-    table: str, key_columns: list[str], lake_time: datetime, source_filter: str = ""
-) -> str:
+def _deduplicated_log_sql(table: str, key_columns: list[str], lake_time: datetime) -> str:
     """`table` as it stood at `lake_time`: the rows of `<table>_log` with
-    `scraped_at <= lake_time` (and `source_filter`, a condition on key
-    columns only, when given), keeping the latest write per
-    `key_columns`."""
+    `scraped_at <= lake_time`, keeping the latest write per `key_columns`."""
     if not key_columns:
         raise LakeTimeError(f"the lake reports no key columns for {table}; cannot read it as of T")
     keys = ", ".join(_quote_identifier(column) for column in key_columns)
-    condition = f"{source_filter} AND " if source_filter else ""
     return (
         "SELECT * EXCLUDE (_rn) FROM ("
         f"SELECT *, row_number() OVER (PARTITION BY {keys} ORDER BY scraped_at DESC) AS _rn "
-        f"FROM {table}_log WHERE {condition}{_scraped_at_pin(lake_time)}"
+        f"FROM {table}_log WHERE {_scraped_at_pin(lake_time)}"
         ") WHERE _rn = 1"
     )
 
@@ -385,20 +369,6 @@ def _deduplicated_log_sql(
 def _pinned_table_sql(session: LakeSession, table: str) -> str:
     """The relation `_table_sql` gives for `table` inside `session`."""
     lake_time = session.lake_time
-    if table == _TICKER_HISTORY_VIEW:
-        metadata = session._tables[_TICKER_HISTORY_TABLE]
-        if metadata.rebuilt_whole:
-            return table
-        links = _deduplicated_log_sql(
-            _TICKER_HISTORY_TABLE,
-            metadata.key_columns,
-            lake_time,
-            source_filter=f"source = '{_TICKER_HISTORY_SOURCE}'",
-        )
-        return (
-            "(SELECT security_id, source_symbol AS ticker, valid_from, valid_to "
-            f"FROM ({links}) WHERE is_active)"
-        )
     if table not in session._tables:
         raise KeyError(f"{table} is not in READ_TABLES")
     metadata = session._tables[table]
@@ -544,51 +514,6 @@ def adjustment_table_row_count(table: AdjustmentTable) -> int:
             )
         cached[table] = rows
     return cached[table]
-
-
-def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
-    """Point-in-time S&P 500 membership on `as_of_date`, one ticker per
-    company, sorted.
-
-    A `sp500_membership` row counts when `start_date <= as_of_date <
-    end_date`; a null `end_date` means still a member. Each counted row is
-    keyed by the security its ticker belongs to on that date, from the
-    `equity_ticker_history` row with `valid_from <= as_of_date < valid_to`
-    (null `valid_to` means still valid), so a renamed company yields only
-    the ticker it traded under on the date. A ticker with no such history
-    row is kept and keyed by itself. When several counted rows resolve to
-    one security, the row with the latest `start_date` wins. Returns
-    `None` when no row counts; callers fall back to a smaller static
-    universe rather than treating this as an empty membership list.
-    Calls `assert_point_in_time` on the result for consistency with every
-    other loader in this module; it is a no-op on a list of tickers."""
-    query = f"""
-        SELECT DISTINCT ticker
-        FROM (
-            SELECT
-                m.ticker,
-                ROW_NUMBER() OVER (
-                    PARTITION BY h.security_id,
-                        CASE WHEN h.security_id IS NULL THEN m.ticker END
-                    ORDER BY m.start_date DESC, m.ticker
-                ) AS security_rank
-            FROM {_table_sql("sp500_membership")} AS m
-            LEFT JOIN {_table_sql("equity_ticker_history")} AS h
-              ON h.ticker = m.ticker
-             AND h.valid_from <= ?
-             AND (h.valid_to IS NULL OR h.valid_to > ?)
-            WHERE m.start_date <= ?
-              AND (m.end_date IS NULL OR m.end_date > ?)
-        ) AS ranked
-        WHERE security_rank = 1
-    """
-    as_of = as_of_date.isoformat()
-    result = _query(query, [as_of, as_of, as_of, as_of])
-    if result.empty:
-        return None
-    tickers = sorted(result["ticker"].tolist())
-    assert_point_in_time(tickers, as_of_date)
-    return tickers
 
 
 class IndexMember(BaseModel):

@@ -125,7 +125,7 @@ def _seed_klines(lake: Any) -> None:
 
 
 def test_interface_names_and_read_tables() -> None:
-    """READ_TABLES lists the 23 tables the loader reads and LakeTimeError is a RuntimeError."""
+    """READ_TABLES lists the 22 tables the loader reads and LakeTimeError is a RuntimeError."""
     names = set(ll.READ_TABLES)
     base = {
         "sp500_membership",
@@ -153,9 +153,8 @@ def test_interface_names_and_read_tables() -> None:
     }
 
     assert issubclass(ll.LakeTimeError, RuntimeError)
-    assert len(ll.READ_TABLES) == len(names) == 23
+    assert len(ll.READ_TABLES) == len(names) == 22
     assert base <= names
-    assert names & {"equity_ticker_history", "security_source_map"}
 
 
 def test_lake_session_explicit_time_nesting_and_validation(fake_lake: Any) -> None:
@@ -389,45 +388,6 @@ def test_crypto_klines_are_pinned_on_their_own_row_time(fake_lake: Any) -> None:
     assert late is not None and late["BTC-USD"]["close"].tolist() == [21_123.45]
 
 
-def test_ticker_history_link_rewritten_inactive_before_t_is_absent(fake_lake: Any) -> None:
-    """is_active applies after the dedupe, so a link deactivated before T stays off."""
-    columns = ["security_id", "source", "source_symbol", "valid_from", "valid_to", "is_active"]
-    source = "us_equity_bars_5m"
-
-    def link(symbol: str, active: bool) -> pd.DataFrame:
-        row = (1, source, symbol, "2000-01-01", "2100-01-01", active)
-        return pd.DataFrame([row], columns=columns)
-
-    _seed_versions(
-        fake_lake,
-        "security_source_map",
-        [
-            (_B1, pd.concat([link("OLD", True), link("NEW", True)])),
-            (_B2, link("OLD", False)),
-            (_AFTER, link("OLD", True)),
-        ],
-        ["source", "source_symbol", "valid_from"],
-        ("valid_from", "valid_to"),
-    )
-    fake_lake.add_view(
-        "equity_ticker_history",
-        "SELECT security_id, source_symbol AS ticker, valid_from, valid_to "
-        f"FROM security_source_map WHERE source = '{source}' AND is_active",
-    )
-    membership = pd.DataFrame(
-        {"ticker": ["OLD", "NEW"], "start_date": ["2010-01-01"] * 2, "end_date": ["2100-01-01"] * 2}
-    )
-    fake_lake.add("sp500_membership", membership, ("start_date", "end_date"))
-    as_of = date(2024, 1, 2)
-
-    current = ll.load_sp500_constituents_asof(as_of)
-    with ll.lake_session(_T):
-        pinned = ll.load_sp500_constituents_asof(as_of)
-
-    assert current == ["NEW"]
-    assert pinned == ["NEW", "OLD"]
-
-
 def test_rebuilt_whole_table_reads_unpinned_and_records_its_build(fake_lake: Any) -> None:
     """A rebuilt-whole table is read unpinned and its build recorded; an earlier T raises."""
     _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
@@ -488,12 +448,9 @@ def _pin_problems(query: str, params: list[Any]) -> list[str]:
 
 
 def _sweep_lake(lake: Any) -> None:
-    """Every contract view as an empty table with a one-row log, the rebuilt six flagged, and a
-    security_source_map behind equity_ticker_history."""
+    """Every contract view as an empty table with a one-row log, the rebuilt six flagged."""
     unkeyed = {"scraped_at", "dt", "table", "when"}
     for view, columns in _CONTRACT.items():
-        if view == "equity_ticker_history":
-            continue
         typed = {f'"{n}"': ("VARCHAR" if k == '"NULL"' else k) for n, k in columns.items()}
         row_time = view == "crypto_klines_1m"
         lake.add_empty(
@@ -508,22 +465,6 @@ def _sweep_lake(lake: Any) -> None:
             lake._connection.execute(
                 f"INSERT INTO {view}_log (scraped_at) VALUES (CAST(? AS TIMESTAMPTZ))", [_B1]
             )
-    source_map = {
-        "security_id": "BIGINT",
-        "source": "VARCHAR",
-        "source_symbol": "VARCHAR",
-        "valid_from": "DATE",
-        "valid_to": "DATE",
-        "is_active": "BOOLEAN",
-    }
-    lake.add_empty(
-        "security_source_map", source_map, key_columns=["source", "source_symbol", "valid_from"]
-    )
-    lake.add_view(
-        "equity_ticker_history",
-        "SELECT security_id, source_symbol AS ticker, valid_from, valid_to "
-        "FROM security_source_map",
-    )
     factors = pd.DataFrame(
         {
             "ticker": ["ZZ"],
@@ -541,7 +482,6 @@ def test_every_public_loader_sql_is_pinned_inside_a_session(fake_lake: Any) -> N
     _sweep_lake(fake_lake)
     day, window = date(2024, 3, 15), (date(2024, 3, 1), date(2024, 3, 15))
     calls = {
-        "constituents": lambda: ll.load_sp500_constituents_asof(day),
         "member_securities": lambda: ll.load_sp500_member_securities_asof(day),
         "log_returns": lambda: ll.load_security_log_returns([1], *window),
         "split_factor": lambda: ll.split_adjustment_factor("AAPL", day),

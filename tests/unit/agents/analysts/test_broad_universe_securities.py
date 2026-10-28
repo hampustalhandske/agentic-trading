@@ -50,7 +50,6 @@ def _install(
     monkeypatch.setattr(module, "load_sp500_member_securities_asof", lambda d: roster)
     monkeypatch.setattr(module, "load_security_log_returns", returns)
     monkeypatch.setattr(module, "load_price_history_from_lakehouse", _forbidden, raising=False)
-    monkeypatch.setattr(module, "load_sp500_constituents_asof", _forbidden, raising=False)
     return calls
 
 
