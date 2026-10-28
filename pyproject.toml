@@ -87,7 +87,7 @@ module = "agentic_trading.*"
 disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
-module = ["quantcore.*", "scipy.*"]
+module = ["quantcore.*", "scipy.*", "exchange_calendars.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
