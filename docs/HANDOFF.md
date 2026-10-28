@@ -55,6 +55,8 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-82 | cash earns the risk-free rate at the previous bar's rate; benchmark accrues the same; `run` and dashboard pass the series | 3d846b5 |
 | AT-81 | idle-pod share and cash share recorded per day and per period; allocation unchanged | 2575e4d |
 | AT-80 | exclusions re-measured after LK-50: 1.5-4.9% (was 4.4-8.8%) | 2575e4d |
+| AT-83 part 1 | per-pod return, vol, Sharpe, drawdown over the whole run | bfa56ee |
+| AT-83 study | per-pod ex-ante vol after each sizing stage and the binding stage | 9fd7a0f |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
 2017-12-29) are verified. edgelab-62 runs the counted runs with `warmup`
@@ -75,14 +77,18 @@ defaults. No post-result cost version was registered.
 
 ## In progress
 
-- None.
+- AT-83 binding-constraint study: 30 names (20 large caps, SPY, SHY/IEF/TLT,
+  HYG/LQD, GC=F/CL=F, EURUSD=X/USDJPY=X), 2016. The first run was stopped
+  for low system memory before it finished; restart on the owner's word
+  and ask database-57 for a fresh lake hold. Then part 2
+  (`firm.target_annualized_vol` 0.10), then AT-40.
 
 ## Next steps, in order
 
 1. When LK-13 and LK-14 land, move company facts and insider transactions
    back from the `_log` views to the current views.
-2. AT-80: re-measure again when LK-51 (LDOS before 2013-09-30, off by
-   x2.47) and LK-52 (YHOO/AABA and 20 renamed members) land. AT-68 is
+2. AT-80: re-measure again when LK-52 (YHOO/AABA and 20 renamed members)
+   lands; LK-51 (LDOS) landed in lake 7303df0. AT-68 is
    blocked by LK-49 (no usable declaration date; LK-48).
 4. AT-40 ledger: shared format with pitch-edge (PE-21); the two
    conformance vectors are the acceptance tests and are written first.

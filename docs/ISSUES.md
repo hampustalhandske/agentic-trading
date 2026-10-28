@@ -927,7 +927,7 @@ Paths are relative to `src/agentic_trading/`.
 
 
 ### AT-80 S&P universe priced from `instrument_prices`, which lacks a quarter of members
-- Status: done (residual gap on LK-51 and LK-52)
+- Status: done (residual gap on LK-52)
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5, 2026-10-28, while checking LK-50 with edgelab-62
@@ -963,7 +963,7 @@ Paths are relative to `src/agentic_trading/`.
   | 2016 | 1.7% | 2.8% | 2.0% |
   | 2017 | 1.1% | 2.2% | 1.5% |
 
-  Exclusions roughly halve, to 1.5-4.9%. What remains is LK-52 (YHOO/AABA and 20 renamed members such as TRV, WM and MSI before 2008). LDOS returns before 2013-09-30 are off by x2.47 until LK-51. The exclusion rate must still be stated with any result from these two analysts.
+  Exclusions roughly halve, to 1.5-4.9%. What remains is LK-52 (YHOO/AABA and 20 renamed members such as TRV, WM and MSI before 2008). LDOS returns before 2013-09-30 were off by x2.47; LK-51 (lake 7303df0) corrects them. The exclusion rate must still be stated with any result from these two analysts.
 - Commits: 7b37814
 
 ### AT-81 Pods that hold nothing take a share of firm capital
@@ -1027,4 +1027,5 @@ Paths are relative to `src/agentic_trading/`.
   | tail_hedge | -1.09% | 3.70% | -1.94 | 1.79% |
 
   Every active pod runs at 3.7-7.1% vol against its 0.15 target. Part 2 finds out why (name caps on a 3-asset universe, Kelly, component-VaR caps) before scaling the firm.
-- Commits: bfa56ee (part 1)
+- Binding-constraint study (edgelab-3f's condition: a 20-50 name universe over at least a year, the share of days each constraint binds, per pod): `PortfolioConstructor.last_diagnostics()` records the ex-ante vol after each sizing stage and the stage with the largest drop; `BacktestResult.sizing_diagnostics` and `run_summary` (`sizing_binding_shares`, `sizing_vol_ratio`) carry them per pod. Sizing unchanged: the AT-78 window before and after (lake 0be26c680fad) has identical trades, costs and premium, NAV equal to 1e-15.
+- Commits: bfa56ee (part 1), 9fd7a0f (sizing diagnostics)
