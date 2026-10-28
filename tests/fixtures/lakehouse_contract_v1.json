@@ -1,4 +1,7 @@
 {
+ "additions": {
+  "yahoo_split_close_basis": "added on top of contract v1 by lake commit 11e1960 (LK-41)"
+ },
  "contract": "lakehouse-contract-v1",
  "frozen_on": "2026-10-27",
  "views": {
@@ -93,26 +96,6 @@
    "ex_date": "DATE",
    "scraped_at": "TIMESTAMP WITH TIME ZONE",
    "table": "VARCHAR"
-  },
-  "equity_splits": {
-   "applied": "BOOLEAN",
-   "dollar_volume_multiple": "DOUBLE",
-   "dt": "DATE",
-   "evidence": "VARCHAR",
-   "ex_date": "DATE",
-   "observed_close_ratio": "DOUBLE",
-   "observed_ratio": "DOUBLE",
-   "prior_close": "DOUBLE",
-   "ratio": "DOUBLE",
-   "scraped_at": "TIMESTAMP WITH TIME ZONE",
-   "security_id": "BIGINT",
-   "share_volume_scaling": "DOUBLE",
-   "source_ex_date": "DATE",
-   "source_ticker": "VARCHAR",
-   "sources": "VARCHAR",
-   "status": "VARCHAR",
-   "table": "VARCHAR",
-   "ticker": "VARCHAR"
   },
   "famafrench_returns": {
    "dataset": "VARCHAR",
@@ -223,6 +206,19 @@
    "renamed_to": "VARCHAR",
    "scraped_at": "TIMESTAMP WITH TIME ZONE",
    "start_date": "DATE",
+   "table": "VARCHAR",
+   "ticker": "VARCHAR"
+  },
+  "yahoo_split_close_basis": {
+   "c0": "DOUBLE",
+   "c1": "DOUBLE",
+   "dt": "DATE",
+   "evidence": "VARCHAR",
+   "ex_date": "DATE",
+   "in_close_basis": "BOOLEAN",
+   "observed_move": "DOUBLE",
+   "ratio": "DOUBLE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
    "table": "VARCHAR",
    "ticker": "VARCHAR"
   }

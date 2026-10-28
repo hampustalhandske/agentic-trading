@@ -178,8 +178,7 @@ def _splits_table(ticker: str, ratios: list[float]) -> pd.DataFrame:
             "ticker": pd.Series([ticker] * len(ratios), dtype="string"),
             "ex_date": ["2024-06-10"] * len(ratios),
             "ratio": pd.Series(ratios, dtype=float),
-            "sources": pd.Series(["dolthub,yahoo"] * len(ratios), dtype="string"),
-            "status": pd.Series(["confirmed"] * len(ratios), dtype="string"),
+            "in_close_basis": pd.Series([True] * len(ratios), dtype="boolean"),
         }
     )
 
@@ -200,7 +199,9 @@ def test_options_snapshot_rescales_a_pre_split_strike_onto_todays_basis(
         ),
         date_columns=("date", "expiration"),
     )
-    fake_lake.add("equity_splits", _splits_table("NVDA", [0.1]), date_columns=("ex_date",))
+    fake_lake.add(
+        "yahoo_split_close_basis", _splits_table("NVDA", [0.1]), date_columns=("ex_date",)
+    )
 
     result = lakehouse_loader.load_options_snapshot_from_lakehouse("NVDA", date(2024, 4, 1))
 
@@ -226,7 +227,7 @@ def test_options_snapshot_leaves_an_unsplit_ticker_unchanged(fake_lake: Any) -> 
         ).assign(underlying="AAPL"),
         date_columns=("date", "expiration"),
     )
-    fake_lake.add("equity_splits", _splits_table("AAPL", []), date_columns=("ex_date",))
+    fake_lake.add("yahoo_split_close_basis", _splits_table("AAPL", []), date_columns=("ex_date",))
 
     result = lakehouse_loader.load_options_snapshot_from_lakehouse("AAPL", date(2024, 4, 1))
 

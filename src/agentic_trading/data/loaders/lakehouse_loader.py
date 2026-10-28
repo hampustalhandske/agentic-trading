@@ -114,38 +114,31 @@ def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
     return tickers
 
 
-_COUNTED_SPLIT_STATUSES = ("confirmed", "before_first_bar", "inferred")
-
-
 def _split_adjustment_factor(ticker: str, quote_date: date) -> float:
-    """Cumulative `1 / ratio` of every stock split for `ticker` with an
-    ex-date after `quote_date`, read from the lake's `equity_splits`
-    (`ratio` is new price over old price, so a 4-for-1 split is 0.25).
-    `dolthub_option_chain` strikes and premiums are quoted as traded and
-    never adjusted, while `instrument_prices` closes are adjusted for
-    every split; dividing a chain row quoted before a later split by this
-    factor puts it on the same basis as the underlying's spot.
+    """Factor that moves an option-chain row quoted on `quote_date` onto
+    the basis of `ticker`'s `instrument_prices` close: the product of
+    `1 / ratio` over the ticker's rows in the lake's
+    `yahoo_split_close_basis` with an ex-date after `quote_date` (`ratio`
+    is old shares per new share, so a 4-for-1 split is 0.25 and
+    contributes 4.0). Returns 1.0 when no such row exists; a missing or
+    non-positive `ratio` contributes nothing.
 
-    Counts rows whose `status` is in `_COUNTED_SPLIT_STATUSES` and keeps
-    one row per ex-date, preferring a row whose `sources` include yahoo.
-    Rejected duplicates and spin-offs reclassified out of the split list
-    never count. Returns 1.0 when no such split exists."""
-    placeholders = ", ".join("?" for _ in _COUNTED_SPLIT_STATUSES)
-    query = f"""
+    `dolthub_option_chain` strikes and premiums are quoted as traded and
+    never adjusted, while `instrument_prices` closes are split-adjusted by
+    Yahoo; dividing a chain row by this factor puts its strike and
+    premiums on the same basis as the underlying's close. A row whose
+    `in_close_basis` is false is a split Yahoo's close does not reflect,
+    so it is skipped and the strike lands on the close's actual basis;
+    rows where it is true or null count. Spin-offs Yahoo writes as
+    fractional splits count too, because the close is adjusted for them."""
+    query = """
         SELECT ratio
-        FROM (
-            SELECT ratio, ROW_NUMBER() OVER (
-                PARTITION BY ex_date
-                ORDER BY (sources LIKE '%yahoo%') DESC, sources
-            ) AS rn
-            FROM equity_splits
-            WHERE ticker = ?
-              AND ex_date > ?
-              AND status IN ({placeholders})
-        )
-        WHERE rn = 1
+        FROM yahoo_split_close_basis
+        WHERE ticker = ?
+          AND ex_date > ?
+          AND in_close_basis IS NOT FALSE
     """
-    frame = _query(query, [ticker, quote_date.isoformat(), *_COUNTED_SPLIT_STATUSES])
+    frame = _query(query, [ticker, quote_date.isoformat()])
     factor = 1.0
     for ratio in frame["ratio"]:
         if ratio and ratio > 0:
