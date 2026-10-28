@@ -261,7 +261,19 @@ def test_options_snapshot_leaves_an_unsplit_ticker_unchanged(fake_lake: Any) -> 
 
 def test_cot_positioning_reads_the_cftc_table_by_contract_code(fake_lake: Any) -> None:
     """Gold maps to its CFTC contract code in `cftc_cot_disaggregated`; the
-    ratio is managed-money net over open interest, gated on report_date + 3 days."""
+    ratio is managed-money net over open interest, gated on each report's
+    `cftc_cot_publication` release."""
+    fake_lake.add(
+        "cftc_cot_publication",
+        pd.DataFrame(
+            {
+                "report_date": ["2024-01-02", "2024-01-09"],
+                "published_date": ["2024-01-05", "2024-01-12"],
+                "published_at": pd.to_datetime(["2024-01-05 20:30", "2024-01-12 20:30"], utc=True),
+            }
+        ),
+        date_columns=("report_date", "published_date"),
+    )
     fake_lake.add(
         "cftc_cot_disaggregated",
         pd.DataFrame(
@@ -279,7 +291,7 @@ def test_cot_positioning_reads_the_cftc_table_by_contract_code(fake_lake: Any) -
     result = lakehouse_loader.load_cot_positioning_from_lakehouse("GC=F", date(2024, 1, 10))
 
     assert result is not None
-    # The 2024-01-09 report is not yet public on 2024-01-10 (report_date + 3 days).
+    # The 2024-01-09 report is not yet public on 2024-01-10 (released 2024-01-12).
     assert list(result) == [pytest.approx(0.2)]
     assert lakehouse_loader.load_cot_positioning_from_lakehouse("AAPL", date(2024, 1, 10)) is None
 

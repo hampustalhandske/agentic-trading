@@ -31,7 +31,8 @@ _EURUSD_CODE = "099741"
 
 
 def _seed_tff(lake: Any) -> None:
-    """Two ZB=F reports, one EURUSD=X report, and one ZB=F row with no open interest."""
+    """Two ZB=F reports, one EURUSD=X report, one ZB=F row with no open interest,
+    and each report's release the following Friday."""
     lake.add(
         "cftc_cot_tff",
         pd.DataFrame(
@@ -45,10 +46,29 @@ def _seed_tff(lake: Any) -> None:
         ),
         date_columns=("report_date",),
     )
+    lake.add(
+        "cftc_cot_publication",
+        pd.DataFrame(
+            {
+                "report_date": ["2019-01-01", "2024-12-31", "2025-06-03", "2015-01-06"],
+                "published_date": ["2019-01-04", "2025-01-03", "2025-06-06", "2015-01-09"],
+                "published_at": pd.to_datetime(
+                    [
+                        "2019-01-04 20:30",
+                        "2025-01-03 20:30",
+                        "2025-06-06 20:30",
+                        "2015-01-09 20:30",
+                    ],
+                    utc=True,
+                ),
+            }
+        ),
+        date_columns=("report_date", "published_date"),
+    )
 
 
 def test_treasury_etf_resolves_to_its_future(fake_lake: Any) -> None:
-    """TLT's coverage is ZB=F's report dates shifted by the publication lag."""
+    """TLT's coverage is the span of ZB=F's published dates."""
     _seed_tff(fake_lake)
 
     assert lakehouse_loader.source_coverage("cftc_cot", "TLT") == (

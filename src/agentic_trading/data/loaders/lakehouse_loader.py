@@ -436,9 +436,6 @@ _COT_TFF_CODES = {
     "ZN=F": "043602",
     "ZB=F": "020601",
 }
-# Calendar days from a COT report's Tuesday `report_date` to its estimated
-# public release the following Friday.
-_COT_PUBLICATION_LAG_DAYS = 3
 # Treasury ETFs have no COT category of their own; each reads the
 # positioning of the Treasury future it tracks. Every other ticker the COT
 # tables cover (commodities, FX and rate futures) is its own COT ticker.
@@ -461,10 +458,13 @@ def load_cot_positioning_from_lakehouse(
     two tables (commodities in `cftc_cot_disaggregated`, FX/rate-futures
     in `cftc_cot_tff`), selected by its CFTC contract-market code.
 
-    Point-in-time: COT reports have a real publication lag — the
-    Tuesday-dated `report_date` isn't released until the following
-    Friday. Gates on `report_date + _COT_PUBLICATION_LAG_DAYS` as the
-    estimated availability date.
+    Point-in-time: each report is gated on its row in
+    `cftc_cot_publication`, joined on `report_date`. A report whose
+    `published_at` is set (always 15:30 New York time, before the close)
+    is available from its `published_date`; one without a `published_at`
+    is available only from the day after its `published_date`. A report
+    with no publication row, or a null `published_date` (every report
+    before 2000), is never available.
 
     Returns `None` if `ticker` has no COT coverage at all — callers
     should treat that as "no positioning read available," not an
@@ -489,17 +489,23 @@ def load_cot_positioning_from_lakehouse(
         if code is None:
             continue
         query = f"""
-            SELECT report_date, {net_position_expr} / open_interest_all AS net_positioning_ratio
-            FROM {table}
-            WHERE cftc_contract_market_code = ?
-              AND report_date BETWEEN ? AND ?
-              AND date_add(
-                  CAST(report_date AS DATE), INTERVAL {_COT_PUBLICATION_LAG_DAYS} DAY
-              ) <= ?
-              AND open_interest_all > 0
-            ORDER BY report_date
+            SELECT cot.report_date,
+                   {net_position_expr} / cot.open_interest_all AS net_positioning_ratio
+            FROM {table} AS cot
+            JOIN cftc_cot_publication AS pub ON pub.report_date = cot.report_date
+            WHERE cot.cftc_contract_market_code = ?
+              AND cot.report_date BETWEEN ? AND ?
+              AND cot.open_interest_all > 0
+              AND (
+                  (pub.published_at IS NOT NULL AND pub.published_date <= ?)
+                  OR (pub.published_at IS NULL AND pub.published_date < ?)
+              )
+            ORDER BY cot.report_date
         """
-        frame = _query(query, [code, window_start, availability_cutoff, availability_cutoff])
+        frame = _query(
+            query,
+            [code, window_start, availability_cutoff, availability_cutoff, availability_cutoff],
+        )
         if not frame.empty:
             frame["report_date"] = pd.to_datetime(frame["report_date"])
             series = frame.set_index("report_date")["net_positioning_ratio"]
@@ -1256,11 +1262,12 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
       `snapshot_date`s before its first dolthub date (all of them when it
       has no dolthub rows), the two tables' ranges joined as the option
       loaders read them.
-    - `cftc_cot`: `report_date + _COT_PUBLICATION_LAG_DAYS` of the rows
-      with positive open interest for the COT ticker of `identifier`
-      (its `DEFAULT_COT_TICKER_BY_ASSET` future, else itself), from
-      whichever of `cftc_cot_disaggregated` / `cftc_cot_tff` holds that
-      ticker's contract-market code; `None` when it has no code.
+    - `cftc_cot`: `cftc_cot_publication.published_date`s of the rows
+      with positive open interest and a non-null `published_date` for the
+      COT ticker of `identifier` (its `DEFAULT_COT_TICKER_BY_ASSET`
+      future, else itself), from whichever of `cftc_cot_disaggregated` /
+      `cftc_cot_tff` holds that ticker's contract-market code, joined on
+      `report_date`; `None` when it has no code.
     - `earnings`: announcement `date`s in `dolthub_earnings_calendar`,
       over every symbol when `identifier` is `None`, else for that symbol.
     - `dividends`: ex-dates of regular cash distributions in
@@ -1301,18 +1308,14 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
             if code is None:
                 continue
             query = f"""
-                SELECT MIN(report_date) AS first, MAX(report_date) AS last
-                FROM {table}
-                WHERE cftc_contract_market_code = ? AND open_interest_all > 0
+                SELECT MIN(pub.published_date) AS first, MAX(pub.published_date) AS last
+                FROM {table} AS cot
+                JOIN cftc_cot_publication AS pub ON pub.report_date = cot.report_date
+                WHERE cot.cftc_contract_market_code = ?
+                  AND cot.open_interest_all > 0
+                  AND pub.published_date IS NOT NULL
             """
-            reported = _first_and_last(_query(query, [code]))
-            if reported is None:
-                return None
-            lag = pd.Timedelta(days=_COT_PUBLICATION_LAG_DAYS)
-            return (
-                (pd.Timestamp(reported[0]) + lag).date(),
-                (pd.Timestamp(reported[1]) + lag).date(),
-            )
+            return _first_and_last(_query(query, [code]))
         return None
     if source == "earnings":
         query = """

@@ -1,5 +1,6 @@
 {
  "additions": {
+  "cftc_cot_publication": "added on top of contract v1 by lake commit fa44af5 (LK-15)",
   "yahoo_split_close_basis": "added on top of contract v1 by lake commit 11e1960 (LK-41)"
  },
  "contract": "lakehouse-contract-v1",
@@ -29,6 +30,18 @@
    "table": "VARCHAR",
    "total_reportable_long": "BIGINT",
    "total_reportable_short": "BIGINT"
+  },
+  "cftc_cot_publication": {
+   "basis": "VARCHAR",
+   "dt": "DATE",
+   "note": "VARCHAR",
+   "published_at": "TIMESTAMP WITH TIME ZONE",
+   "published_date": "DATE",
+   "report_date": "DATE",
+   "rule_date": "DATE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "source_url": "VARCHAR",
+   "table": "VARCHAR"
   },
   "cftc_cot_tff": {
    "asset_manager_long": "BIGINT",
