@@ -637,7 +637,7 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-57 Price levels shown to agents include later splits and dividends
-- Status: in-progress
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M24)
@@ -645,7 +645,7 @@ Paths are relative to `src/agentic_trading/`.
 - Acceptance: levels shown to agents are as-traded or as-of-adjusted. Only returns use the total-return series.
 - Blocked-by / Blocks: none
 - Note (2026-10-28 audit of absolute levels): no universe price filter, penny-stock rule, price-level or round-number rule, or dollar-volume threshold exists in agents or universe code. Moneyness bands are fractions of spot and ATM is nearest strike to a same-basis spot, so agent signals are scale-invariant. Equities trade fractional shares with a percentage commission, so their fills are invariant too. The level-dependent rules are all in the option fill path (`backtest/portfolio.py::apply_option_decision`): `min_premium_per_share` checked against a rescaled pre-split premium, whole-contract rounding and `commission_per_contract` on rescaled contracts. These stay a must and are fixed by converting to as-traded units with the decision day's split factor. The full as-traded option book with OCC adjustments is forwarded to edgelab-62 for the adapter. Participation uses dividend-adjusted share counts against split-adjusted volume, which overstates participation (conservative) and is left.
-- Commits: none
+- Commits: cf7352c (option fill path in as-traded units via the fill day's split factor). The full as-traded option book with OCC adjustments is edgelab's, via the adapter.
 
 ### AT-58 Membership counts the removal day; renames read as new names
 - Status: open
