@@ -5,7 +5,7 @@ from typing import Literal
 import pandas as pd
 
 from agentic_trading.agents._market_math import clamp
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import load_earnings_surprise_from_lakehouse
 from agentic_trading.logging_config import get_logger
@@ -41,6 +41,15 @@ class EarningsSurpriseAnalyst(AnalystAgent):
     persisting at full strength indefinitely."""
 
     agent_id: str = "earnings_surprise_analyst"
+    data_requirements: tuple[DataRequirement, ...] = (
+        DataRequirement(
+            source="earnings",
+            identifier="all",
+            asset_scoped=False,
+            description="Earnings announcement calendar",
+            lookback_days=_DRIFT_WINDOW_DAYS,
+        ),
+    )
 
     def generate_signal(
         self,

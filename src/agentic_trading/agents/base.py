@@ -4,16 +4,18 @@
 Contains the abstract base classes for all agents in the system, both analysts and managers.
 """
 
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Literal
 
 import pandas as pd
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr
 
 from agentic_trading.agents._market_math import wide_log_returns
 from agentic_trading.agents.portfolio_construction import PodView, PortfolioConstructor
 from agentic_trading.agents.schemas import AgentSignal, ManagerSignal, PortfolioDecision
+from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.weighting import WeightingStrategy
@@ -91,7 +93,14 @@ class DataRequirement(BaseModel):
     `asset_scoped=False` means the requirement doesn't vary by ticker
     (e.g. one FRED series every asset's analyst call shares); `True`
     means it must be checked per run ticker, with `identifier` as a
-    `"{ticker}"` template the preflight substitutes."""
+    `"{ticker}"` template the preflight substitutes.
+
+    `lookback_days` is how many calendar days before a decision date the
+    analyst reads this source, so the preflight requires coverage from
+    `start_date - lookback_days`; `0` means only data dated on or before
+    each decision date itself. `None` means the analyst reads the source
+    as far back as the run's price history, so coverage is required from
+    the start of the run's warm-up."""
 
     source: Literal[
         "fred",
@@ -99,21 +108,43 @@ class DataRequirement(BaseModel):
         "sec_edgar_facts",
         "finra_short_interest",
         "sec_insider_transactions",
+        "options_chain",
+        "cftc_cot",
+        "earnings",
+        "dividends",
+        "sp500_membership",
+        "sec_sic",
     ]
     identifier: str
     asset_scoped: bool
     description: str
+    lookback_days: int | None = Field(default=None, ge=0)
+
+
+def calendar_days_for_sessions(sessions: int) -> int:
+    """Calendar days spanned by `sessions` trading sessions (or business-day
+    observations, such as a daily FRED series), at
+    `settings.firm.trading_days_per_year` sessions per 365.25-day year,
+    rounded up — the `lookback_days` of a requirement read as a trailing
+    window of `sessions` observations."""
+    return math.ceil(sessions * 365.25 / settings.firm.trading_days_per_year)
 
 
 class AnalystAgent(Agent):
     """Layer-1 analyst agent scaffold, every concrete analyst implements this"""
 
-    # Declarative real-data dependencies beyond `market_data`. Empty for
-    # any analyst that only reads `market_data` or an already-graceful
-    # lakehouse table (price, options, dividends, COT, earnings, SIC —
-    # all `None`-on-miss with no live-API cost) — only analysts reading
-    # a source that can be genuinely missing for a given run declare one.
+    # Declarative real-data dependencies beyond `market_data`: every lake
+    # source the analyst reads other than prices, which the backtest's own
+    # price load already guarantees. Empty for an analyst that reads only
+    # `market_data`.
     data_requirements: tuple[DataRequirement, ...] = ()
+
+    def covers_asset(self, asset: str) -> bool:
+        """Whether this instance produces a real signal for `asset`. The
+        preflight checks an `asset_scoped` requirement only against run
+        tickers for which this is True. True for every asset unless an
+        analyst limits an instance to a set of assets and overrides it."""
+        return True
 
     @abstractmethod
     def generate_signal(

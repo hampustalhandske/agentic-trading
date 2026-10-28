@@ -126,8 +126,8 @@ def test_non_crypto_ticker_still_reads_instrument_prices(fake_lake: Any) -> None
     fake_lake.add(
         "instrument_prices",
         pd.DataFrame(
-            [("AAPL", "2023-06-14", 183.0, 183.5, 183.4, 1_000_000)],
-            columns=["ticker", "date", "open", "close", "adj_close", "volume"],
+            [("AAPL", "2023-06-14", 183.0, 184.0, 182.0, 183.5, 183.4, 1_000_000)],
+            columns=["ticker", "date", "open", "high", "low", "close", "adj_close", "volume"],
         ),
         date_columns=("date",),
     )

@@ -4,11 +4,11 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 from quantcore.core.stochastic import cir_fit, simulate_cir_paths
 
 from agentic_trading.agents._market_math import RefitCache, clamp, derived_seed
-from agentic_trading.agents.base import AnalystAgent, DataRequirement
+from agentic_trading.agents.base import AnalystAgent, DataRequirement, calendar_days_for_sessions
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import load_fred_series_from_lakehouse
@@ -40,10 +40,16 @@ class CIRRateRegimeAnalyst(AnalystAgent):
 
     rate_sensitivity: float = -1.0
     _refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)
-    data_requirements: tuple[DataRequirement, ...] = (
-        DataRequirement(
-            source="fred", identifier=DGS3MO, asset_scoped=False, description="FRED DGS3MO"
-        ),
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=lambda: (
+            DataRequirement(
+                source="fred",
+                identifier=DGS3MO,
+                asset_scoped=False,
+                description="FRED DGS3MO",
+                lookback_days=calendar_days_for_sessions(settings.analysts.risk_window_long),
+            ),
+        )
     )
 
     def generate_signal(

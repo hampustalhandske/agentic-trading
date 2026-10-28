@@ -5,13 +5,14 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 
 from agentic_trading.agents._market_math import clamp, market_slice, raw_spot
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
+    options_chain_requirements,
     real_atm_options_by_expiration,
 )
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal, SignalStatus
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
@@ -57,6 +58,9 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
     `MAX_CONFIDENCE`."""
 
     agent_id: str = "greeks_delta_hedge_analyst"
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=options_chain_requirements
+    )
 
     _log_gamma_history: dict[str, dict[date, float]] = PrivateAttr(default_factory=dict)
 

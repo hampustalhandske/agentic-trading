@@ -1,5 +1,6 @@
 # sec_fundamentals_analyst.py
 
+import math
 from typing import Literal
 
 import numpy as np
@@ -103,12 +104,16 @@ class SecFundamentalsAnalyst(AnalystAgent):
 
     concept: str = DEFAULT_CONCEPT
     trailing_filings: int = DEFAULT_TRAILING_FILINGS
+    # The latest `DEFAULT_TRAILING_FILINGS` quarters before the decision
+    # date; an instance changing `trailing_filings` should also override
+    # this.
     data_requirements: tuple[DataRequirement, ...] = (
         DataRequirement(
             source="sec_edgar_facts",
             identifier="{ticker}",
             asset_scoped=True,
             description="SEC EDGAR company facts",
+            lookback_days=math.ceil(DEFAULT_TRAILING_FILINGS * _DAYS_PER_QUARTER),
         ),
     )
 

@@ -6,20 +6,19 @@ import numpy as np
 import pandas as pd
 
 from agentic_trading.agents._market_math import clamp
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
-from agentic_trading.data.loaders.lakehouse_loader import load_cot_positioning_from_lakehouse
+from agentic_trading.data.loaders.lakehouse_loader import (
+    DEFAULT_COT_LOOKBACK_DAYS,
+    DEFAULT_COT_TICKER_BY_ASSET,
+    load_cot_positioning_from_lakehouse,
+)
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 _RISK_WINDOW = 52  # ~1 year of weekly COT reports
 _MIN_OBSERVATIONS = 12
-# COT's `ticker` column already matches this project's own convention for
-# commodities and FX/rate futures (e.g. GC=F, EURUSD=X) — only Treasury
-# ETFs need remapping to the futures contract COT actually tracks
-# positioning for (no COT category exists for a bond ETF itself).
-DEFAULT_COT_TICKER_BY_ASSET: dict[str, str] = {"SHY": "ZT=F", "IEF": "ZN=F", "TLT": "ZB=F"}
 
 
 class COTPositioningAnalyst(AnalystAgent):
@@ -35,16 +34,31 @@ class COTPositioningAnalyst(AnalystAgent):
     `cot_ticker_by_asset` remaps `asset` to whatever ticker COT actually
     tracks positioning for (only needed for the Rates pod's Treasury
     ETFs, which have no COT category of their own — see
-    `DEFAULT_COT_TICKER_BY_ASSET`); defaults to `asset` itself, which
-    already matches COT's own ticker convention for commodities and FX."""
+    `lakehouse_loader.DEFAULT_COT_TICKER_BY_ASSET`, the mapping the
+    preflight coverage check also resolves through); defaults to `asset`
+    itself, which already matches COT's own ticker convention for
+    commodities and FX."""
 
     agent_id: str = "cot_positioning_analyst"
+    data_requirements: tuple[DataRequirement, ...] = (
+        DataRequirement(
+            source="cftc_cot",
+            identifier="{ticker}",
+            asset_scoped=True,
+            description="CFTC Commitment of Traders positioning",
+            lookback_days=DEFAULT_COT_LOOKBACK_DAYS,
+        ),
+    )
 
     cot_ticker_by_asset: dict[str, str] = DEFAULT_COT_TICKER_BY_ASSET
     # Restricts this instance to one asset class so two instances in the
     # same pod (commodities and FX) never read the same COT series twice;
     # `None` covers whatever the pod hands it.
     covered_assets: tuple[str, ...] | None = None
+
+    def covers_asset(self, asset: str) -> bool:
+        """True when `covered_assets` is `None` or lists `asset`."""
+        return self.covered_assets is None or asset in self.covered_assets
 
     def generate_signal(
         self,
@@ -53,7 +67,7 @@ class COTPositioningAnalyst(AnalystAgent):
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
         cot_ticker = self.cot_ticker_by_asset.get(asset, asset)
-        if self.covered_assets is not None and asset not in self.covered_assets:
+        if not self.covers_asset(asset):
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,

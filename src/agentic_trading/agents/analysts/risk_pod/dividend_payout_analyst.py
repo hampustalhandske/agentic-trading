@@ -5,7 +5,7 @@ from typing import Literal
 import pandas as pd
 
 from agentic_trading.agents._market_math import clamp
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import load_dividends_from_lakehouse
 from agentic_trading.logging_config import get_logger
@@ -33,6 +33,16 @@ class DividendPayoutAnalyst(AnalystAgent):
     signal rather than only its price impact."""
 
     agent_id: str = "dividend_payout_analyst"
+    # No `lookback_days`: the two most recent payouts are read whatever
+    # their age, so there is no fixed window short of the warm-up.
+    data_requirements: tuple[DataRequirement, ...] = (
+        DataRequirement(
+            source="dividends",
+            identifier="all",
+            asset_scoped=False,
+            description="Regular cash dividend history",
+        ),
+    )
 
     def generate_signal(
         self,

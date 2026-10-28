@@ -14,7 +14,7 @@ from agentic_trading.agents._market_math import (
     clamp,
     load_fixed_universe_returns,
 )
-from agentic_trading.agents.base import AnalystAgent, DataRequirement
+from agentic_trading.agents.base import AnalystAgent, DataRequirement, calendar_days_for_sessions
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import (
     load_fama_french_factors_from_lakehouse,
@@ -82,13 +82,25 @@ class FamaMacbethAnalyst(AnalystAgent):
     _universe_refit_cache: RefitCache = PrivateAttr(
         default_factory=lambda: RefitCache(refit_interval_days=5)
     )
-    data_requirements: tuple[DataRequirement, ...] = (
-        DataRequirement(
-            source="ken_french_factors",
-            identifier="3factor",
-            asset_scoped=False,
-            description="Ken French 3-factor returns",
-        ),
+    # Factors over the `_RISK_WINDOW` reference dates; membership only as
+    # of each decision date.
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=lambda: (
+            DataRequirement(
+                source="ken_french_factors",
+                identifier="3factor",
+                asset_scoped=False,
+                description="Ken French 3-factor returns",
+                lookback_days=calendar_days_for_sessions(_RISK_WINDOW),
+            ),
+            DataRequirement(
+                source="sp500_membership",
+                identifier="all",
+                asset_scoped=False,
+                description="S&P 500 membership history",
+                lookback_days=0,
+            ),
+        )
     )
 
     def generate_signal(

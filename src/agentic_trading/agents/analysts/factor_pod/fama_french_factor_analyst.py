@@ -5,10 +5,11 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from pydantic import Field
 from quantcore.statistics.regression import factor_loadings
 
 from agentic_trading.agents._market_math import clamp, log_return_series
-from agentic_trading.agents.base import AnalystAgent, DataRequirement
+from agentic_trading.agents.base import AnalystAgent, DataRequirement, calendar_days_for_sessions
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import load_fama_french_factors_from_lakehouse
@@ -55,13 +56,21 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
     agent_id: str = "fama_french_factor_analyst"
 
     model: str = "3factor"
-    data_requirements: tuple[DataRequirement, ...] = (
-        DataRequirement(
-            source="ken_french_factors",
-            identifier="3factor",
-            asset_scoped=False,
-            description="Ken French 3-factor returns",
-        ),
+    # The regression's trailing `risk_window_long` days and the 12-1
+    # momentum leg's `MOMENTUM_LOOKBACK_DAYS`; the unconditional premium
+    # averages whatever older history exists.
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=lambda: (
+            DataRequirement(
+                source="ken_french_factors",
+                identifier="3factor",
+                asset_scoped=False,
+                description="Ken French 3-factor returns",
+                lookback_days=calendar_days_for_sessions(
+                    max(settings.analysts.risk_window_long, MOMENTUM_LOOKBACK_DAYS)
+                ),
+            ),
+        )
     )
 
     def generate_signal(

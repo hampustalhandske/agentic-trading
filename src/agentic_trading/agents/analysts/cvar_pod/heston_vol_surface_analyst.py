@@ -4,13 +4,15 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from pydantic import Field
 
 from agentic_trading.agents._market_math import clamp, market_slice, raw_spot
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
     annualized_garch_volatility,
+    options_chain_requirements,
     real_atm_options_by_expiration,
 )
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal, SignalStatus
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
@@ -81,6 +83,9 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
     The agent id is kept so scoreboard history stays continuous."""
 
     agent_id: str = "heston_vol_surface_analyst"
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=options_chain_requirements
+    )
 
     def _flat(
         self,

@@ -171,17 +171,21 @@ def resolve_roster_after_preflight(
     start_date: date,
     end_date: date,
     *,
+    warmup_days: int,
     auto_confirm: bool,
 ) -> list[AnalystAgent]:
     """Runs `check_data_availability` against the final roster/ticker
-    list, prints a report for anything that can't run fully with real
-    lakehouse data, and — unless `auto_confirm` — asks once (a single
+    list over the run window plus its `warmup_days` of history, prints a
+    report for anything that can't run fully with real lakehouse data,
+    and — unless `auto_confirm` — asks once (a single
     batched prompt covering every failing analyst, not one per analyst)
     whether to drop them and continue. Exits the process on a decline,
     or on any failure at all when `auto_confirm` is False and the run
     isn't interactive enough to ask (Typer's `confirm` itself handles
     the actual prompting)."""
-    report = check_data_availability(analysts, assets, start_date, end_date)
+    report = check_data_availability(
+        analysts, assets, start_date, end_date, warmup_days=warmup_days
+    )
     if not report.failing_analyst_ids:
         return analysts
 
@@ -356,6 +360,7 @@ def run(
         resolved_assets,
         parsed_start_date,
         parsed_end_date,
+        warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
         auto_confirm=yes,
     )
     managers = build_default_managers(analysts)
@@ -536,6 +541,7 @@ def experiment(
         resolved_assets,
         parsed_train_start,
         parsed_test_end,
+        warmup_days=warmup_days,
         auto_confirm=yes,
     )
     managers = build_default_managers(analysts)

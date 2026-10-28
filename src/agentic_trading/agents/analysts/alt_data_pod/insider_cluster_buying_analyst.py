@@ -3,6 +3,7 @@
 from typing import Literal
 
 import pandas as pd
+from pydantic import Field
 
 from agentic_trading.agents._market_math import clamp
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, is_likely_equity
@@ -30,13 +31,16 @@ class InsiderClusterBuyingAnalyst(AnalystAgent):
 
     agent_id: str = "insider_cluster_buying_analyst"
 
-    data_requirements: tuple[DataRequirement, ...] = (
-        DataRequirement(
-            source="sec_insider_transactions",
-            identifier="{ticker}",
-            asset_scoped=True,
-            description="SEC Form 4 insider transactions",
-        ),
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=lambda: (
+            DataRequirement(
+                source="sec_insider_transactions",
+                identifier="{ticker}",
+                asset_scoped=True,
+                description="SEC Form 4 insider transactions",
+                lookback_days=settings.analysts.insider_window_days,
+            ),
+        )
     )
 
     def _flat(

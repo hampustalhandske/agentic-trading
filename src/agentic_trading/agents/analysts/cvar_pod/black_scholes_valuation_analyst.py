@@ -6,7 +6,7 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 from quantcore.pricing import black_scholes_call, black_scholes_put
 
 from agentic_trading.agents._market_math import (
@@ -17,9 +17,10 @@ from agentic_trading.agents._market_math import (
     raw_spot,
 )
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
+    options_chain_requirements,
     real_atm_options_by_expiration,
 )
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
@@ -44,6 +45,9 @@ class BlackScholesValuationAnalyst(AnalystAgent):
     `RefitCache`'s docstring."""
 
     agent_id: str = "black_scholes_valuation_analyst"
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=options_chain_requirements
+    )
 
     _time_to_maturity: float = 0.25
     _refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)

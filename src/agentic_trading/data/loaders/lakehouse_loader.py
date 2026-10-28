@@ -20,7 +20,7 @@ to the caller."""
 
 from datetime import UTC, date, datetime
 from functools import cache
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -183,8 +183,14 @@ def _apply_split_adjustment(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return frame
 
 
+# Calendar days before `as_of_date` within which
+# `load_options_snapshot_from_lakehouse` looks for the latest snapshot by
+# default: chain coverage is not daily-dense.
+DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS = 10
+
+
 def load_options_snapshot_from_lakehouse(
-    ticker: str, as_of_date: date, lookback_days: int = 10
+    ticker: str, as_of_date: date, lookback_days: int = DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS
 ) -> pd.DataFrame | None:
     """Real historical options-chain rows (strike, expiration, bid, ask,
     implied_volatility, delta, gamma, theta, vega, rho — no open interest,
@@ -246,10 +252,21 @@ _COT_TFF_CODES = {
     "ZN=F": "043602",
     "ZB=F": "020601",
 }
+# Calendar days from a COT report's Tuesday `report_date` to its estimated
+# public release the following Friday.
+_COT_PUBLICATION_LAG_DAYS = 3
+# Treasury ETFs have no COT category of their own; each reads the
+# positioning of the Treasury future it tracks. Every other ticker the COT
+# tables cover (commodities, FX and rate futures) is its own COT ticker.
+DEFAULT_COT_TICKER_BY_ASSET: dict[str, str] = {"SHY": "ZT=F", "IEF": "ZN=F", "TLT": "ZB=F"}
+# Calendar days of reports before `as_of_date` that
+# `load_cot_positioning_from_lakehouse` returns by default: a little over
+# a year of weekly reports.
+DEFAULT_COT_LOOKBACK_DAYS = 400
 
 
 def load_cot_positioning_from_lakehouse(
-    ticker: str, as_of_date: date, lookback_days: int = 400
+    ticker: str, as_of_date: date, lookback_days: int = DEFAULT_COT_LOOKBACK_DAYS
 ) -> pd.Series | None:
     """Net speculative positioning as a fraction of open interest, from
     CFTC Commitment of Traders reports — `managed_money_long -
@@ -262,8 +279,8 @@ def load_cot_positioning_from_lakehouse(
 
     Point-in-time: COT reports have a real publication lag — the
     Tuesday-dated `report_date` isn't released until the following
-    Friday. Gates on `report_date + 3 days` as the estimated
-    availability date.
+    Friday. Gates on `report_date + _COT_PUBLICATION_LAG_DAYS` as the
+    estimated availability date.
 
     Returns `None` if `ticker` has no COT coverage at all — callers
     should treat that as "no positioning read available," not an
@@ -292,7 +309,9 @@ def load_cot_positioning_from_lakehouse(
             FROM {table}
             WHERE cftc_contract_market_code = ?
               AND report_date BETWEEN ? AND ?
-              AND date_add(CAST(report_date AS DATE), INTERVAL 3 DAY) <= ?
+              AND date_add(
+                  CAST(report_date AS DATE), INTERVAL {_COT_PUBLICATION_LAG_DAYS} DAY
+              ) <= ?
               AND open_interest_all > 0
             ORDER BY report_date
         """
@@ -463,11 +482,21 @@ def _equity_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFra
     """Daily `ticker`/`date`/`open`/`close`/`raw_close`/`volume` rows from
     `instrument_prices` for `tickers` between `start` and `end`
     inclusive: `close` is `adj_close`, `open` is the raw open scaled by
-    `adj_close / close`, `raw_close` the unadjusted close."""
+    `adj_close / close`, `raw_close` the unadjusted close.
+
+    A row whose raw open lies outside its raw `[low, high]` range
+    (boundaries included as valid), or whose raw low exceeds its raw
+    high, has an inconsistent bar, so its `open` is NaN; the rest of the
+    row is kept. A row with a null raw low or high keeps its open. Logs
+    one WARNING naming each ticker with masked rows and its count when
+    any row is masked."""
     placeholders = ", ".join("?" for _ in tickers)
     query = f"""
         SELECT ticker, date,
                CASE WHEN close > 0 THEN open * adj_close / close ELSE NULL END AS open,
+               open AS raw_open,
+               high AS raw_high,
+               low AS raw_low,
                adj_close AS close,
                close AS raw_close,
                volume
@@ -476,7 +505,19 @@ def _equity_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFra
           AND date BETWEEN ? AND ?
         ORDER BY ticker, date
     """
-    return _query(query, [*tickers, start.isoformat(), end.isoformat()])
+    frame = _query(query, [*tickers, start.isoformat(), end.isoformat()])
+    raw_open = frame["raw_open"].astype(float)
+    raw_high = frame["raw_high"].astype(float)
+    raw_low = frame["raw_low"].astype(float)
+    inconsistent = (raw_open < raw_low) | (raw_open > raw_high) | (raw_low > raw_high)
+    if inconsistent.any():
+        frame.loc[inconsistent, "open"] = np.nan
+        masked_by_ticker = frame.loc[inconsistent, "ticker"].value_counts().sort_index()
+        logger.warning(
+            "Masked the open of rows outside their raw low-high range: %s",
+            ", ".join(f"{ticker}: {count}" for ticker, count in masked_by_ticker.items()),
+        )
+    return frame[["ticker", "date", "open", "close", "raw_close", "volume"]]
 
 
 def _crypto_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFrame:
@@ -558,7 +599,11 @@ def load_price_history_from_lakehouse(
     scales the raw `open` by the same `adj_close / close` factor so the
     open the engine fills at and the close it marks at are on one price
     basis (an unadjusted open against an adjusted close would book the
-    whole dividend-adjustment gap as a loss on every fill).
+    whole dividend-adjustment gap as a loss on every fill). A row whose
+    raw open lies outside its raw low-high range, or whose low exceeds
+    its high, gets a NaN `open` and keeps every other field (see
+    `_equity_price_rows`, which logs one WARNING per call with the masked
+    count per ticker); the engine does not fill on such a day.
     Self-asserts point-in-time on the combined frame's date index against
     `end` before returning.
     """
@@ -827,6 +872,8 @@ def _sec_available_dates(filed: pd.Series, accepted_at: pd.Series) -> pd.Series:
 # and then the next session is the conservative day it is known at the
 # close.
 _FINRA_DISSEMINATION_LAG_SESSIONS = 8
+# FINRA short interest settles twice a month (mid-month and month-end).
+FINRA_SETTLEMENTS_PER_YEAR = 24
 # `finra_short_interest.revision_flag` value marking a row FINRA revised
 # after first publication.
 _FINRA_REVISED = "R"
@@ -998,3 +1045,94 @@ def load_option_quote_from_lakehouse(
     frame = frame.iloc[[0]]
     assert_point_in_time(frame, as_of_date, date_column="date")
     return frame
+
+
+CoverageSource = Literal["options_chain", "cftc_cot", "earnings", "dividends", "sp500_membership"]
+
+
+def _first_and_last(frame: pd.DataFrame) -> tuple[date, date] | None:
+    """The `first`/`last` dates of a one-row `MIN`/`MAX` result, or `None`
+    when the aggregate matched no rows (both values null)."""
+    if frame.empty or pd.isna(frame.iloc[0]["first"]) or pd.isna(frame.iloc[0]["last"]):
+        return None
+    return pd.Timestamp(frame.iloc[0]["first"]).date(), pd.Timestamp(frame.iloc[0]["last"]).date()
+
+
+def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[date, date] | None:
+    """The first and last date the lake holds for `source`, read from the
+    tables the matching loader reads, with no point-in-time gate.
+    `identifier` is a ticker for the per-ticker sources and `None` for a
+    check over the whole table:
+
+    - `options_chain`: snapshot `date`s in `dolthub_option_chain` for
+      underlying `identifier`.
+    - `cftc_cot`: `report_date + _COT_PUBLICATION_LAG_DAYS` of the rows
+      with positive open interest for the COT ticker of `identifier`
+      (its `DEFAULT_COT_TICKER_BY_ASSET` future, else itself), from
+      whichever of `cftc_cot_disaggregated` / `cftc_cot_tff` holds that
+      ticker's contract-market code; `None` when it has no code.
+    - `earnings`: announcement `date`s in `dolthub_earnings_calendar`,
+      over every symbol when `identifier` is `None`, else for that symbol.
+    - `dividends`: ex-dates of regular cash distributions in
+      `equity_distributions`, over every ticker when `identifier` is
+      `None`, else for that ticker.
+    - `sp500_membership`: the earliest `start_date` and the latest
+      `end_date` in `sp500_membership`, an open membership span counting
+      as today; `identifier` is not used.
+
+    Returns `None` when the lake holds no matching rows."""
+    if source == "options_chain":
+        query = """
+            SELECT MIN(date) AS first, MAX(date) AS last
+            FROM dolthub_option_chain
+            WHERE underlying = ?
+        """
+        return _first_and_last(_query(query, [identifier]))
+    if source == "cftc_cot":
+        cot_ticker = DEFAULT_COT_TICKER_BY_ASSET.get(identifier or "", identifier or "")
+        for table, codes in (
+            ("cftc_cot_disaggregated", _COT_DISAGGREGATED_CODES),
+            ("cftc_cot_tff", _COT_TFF_CODES),
+        ):
+            code = codes.get(cot_ticker)
+            if code is None:
+                continue
+            query = f"""
+                SELECT MIN(report_date) AS first, MAX(report_date) AS last
+                FROM {table}
+                WHERE cftc_contract_market_code = ? AND open_interest_all > 0
+            """
+            reported = _first_and_last(_query(query, [code]))
+            if reported is None:
+                return None
+            lag = pd.Timedelta(days=_COT_PUBLICATION_LAG_DAYS)
+            return (
+                (pd.Timestamp(reported[0]) + lag).date(),
+                (pd.Timestamp(reported[1]) + lag).date(),
+            )
+        return None
+    if source == "earnings":
+        query = """
+            SELECT MIN(date) AS first, MAX(date) AS last
+            FROM dolthub_earnings_calendar
+        """
+        if identifier is None:
+            return _first_and_last(_query(query, []))
+        return _first_and_last(_query(query + " WHERE act_symbol = ?", [identifier]))
+    if source == "dividends":
+        query = """
+            SELECT MIN(ex_date) AS first, MAX(ex_date) AS last
+            FROM equity_distributions
+            WHERE distribution_type = ?
+        """
+        if identifier is None:
+            return _first_and_last(_query(query, [_REGULAR_CASH]))
+        return _first_and_last(_query(query + " AND ticker = ?", [_REGULAR_CASH, identifier]))
+    if source == "sp500_membership":
+        query = """
+            SELECT MIN(start_date) AS first,
+                   MAX(COALESCE(end_date, CAST(? AS DATE))) AS last
+            FROM sp500_membership
+        """
+        return _first_and_last(_query(query, [date.today().isoformat()]))
+    raise ValueError(f"no coverage query for source {source!r}")

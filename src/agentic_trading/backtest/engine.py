@@ -624,18 +624,31 @@ class BacktestEngine:
                         if self.execution_lag_days
                         else prices[decision.asset]
                     )
-                    adv_shares, daily_vol = _liquidity_inputs(
-                        raw_market_data, decision.asset, as_of_timestamp
-                    )
-                    trade_log.append(
-                        self.portfolio.apply_decision(
-                            decision,
-                            fill_price,
-                            portfolio_value,
-                            adv_shares=adv_shares,
-                            daily_vol=daily_vol,
+                    # A NaN or non-positive fill price (an open the loader
+                    # masked as inconsistent with its bar, or a missing
+                    # bar) leaves shares and cash as they are and records
+                    # no trade; the signals are still scored on the day's
+                    # close-to-close return, as for an unmarked option.
+                    if math.isfinite(fill_price) and fill_price > 0.0:
+                        adv_shares, daily_vol = _liquidity_inputs(
+                            raw_market_data, decision.asset, as_of_timestamp
                         )
-                    )
+                        trade_log.append(
+                            self.portfolio.apply_decision(
+                                decision,
+                                fill_price,
+                                portfolio_value,
+                                adv_shares=adv_shares,
+                                daily_vol=daily_vol,
+                            )
+                        )
+                    else:
+                        logger.warning(
+                            "Day %s: no fillable price for %s (got %s) — decision not executed.",
+                            as_of_timestamp.date().isoformat(),
+                            decision.asset,
+                            fill_price,
+                        )
                     realized_return = log_returns[decision.asset]
                 # The first simulated day has a NaN log_return (no prior close
                 # to diff against) — treat it as flat rather than letting NaN

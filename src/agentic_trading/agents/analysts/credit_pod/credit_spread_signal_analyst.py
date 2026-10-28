@@ -4,9 +4,10 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from pydantic import Field
 
 from agentic_trading.agents._market_math import clamp
-from agentic_trading.agents.base import AnalystAgent, DataRequirement
+from agentic_trading.agents.base import AnalystAgent, DataRequirement, calendar_days_for_sessions
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import load_fred_series_from_lakehouse
 from agentic_trading.data.loaders.macro_loader import BAMLH0A0HYM2
@@ -35,13 +36,16 @@ class CreditSpreadSignalAnalyst(AnalystAgent):
     regardless of `as_of_date`, not silently wrong."""
 
     agent_id: str = "credit_spread_signal_analyst"
-    data_requirements: tuple[DataRequirement, ...] = (
-        DataRequirement(
-            source="fred",
-            identifier=BAMLH0A0HYM2,
-            asset_scoped=False,
-            description="FRED BAMLH0A0HYM2",
-        ),
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=lambda: (
+            DataRequirement(
+                source="fred",
+                identifier=BAMLH0A0HYM2,
+                asset_scoped=False,
+                description="FRED BAMLH0A0HYM2",
+                lookback_days=calendar_days_for_sessions(_RISK_WINDOW),
+            ),
+        )
     )
 
     def generate_signal(

@@ -13,7 +13,7 @@ from agentic_trading.agents.analysts.stat_arb_pod.pairs_cointegration_analyst im
     spread_confidence,
     spread_direction,
 )
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
@@ -38,6 +38,14 @@ class KalmanHedgeRatioAnalyst(AnalystAgent):
     pair with different partners or none at all."""
 
     agent_id: str = "kalman_hedge_ratio_analyst"
+    data_requirements: tuple[DataRequirement, ...] = (
+        DataRequirement(
+            source="sec_sic",
+            identifier="{ticker}",
+            asset_scoped=True,
+            description="SEC industry classification (SIC code)",
+        ),
+    )
 
     partner_ticker_by_asset: dict[str, str] = Field(default_factory=dict)
     _refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)

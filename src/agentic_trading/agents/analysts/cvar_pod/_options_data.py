@@ -21,7 +21,12 @@ import numpy as np
 import pandas as pd
 
 from agentic_trading.agents._market_math import RefitCache, conditional_daily_volatility
-from agentic_trading.data.loaders.lakehouse_loader import load_options_snapshot_from_lakehouse
+from agentic_trading.agents.base import DataRequirement
+from agentic_trading.config import settings
+from agentic_trading.data.loaders.lakehouse_loader import (
+    DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS,
+    load_options_snapshot_from_lakehouse,
+)
 from agentic_trading.data.loaders.option_marks import published_chain_date
 from agentic_trading.logging_config import get_logger
 
@@ -49,6 +54,23 @@ def annualized_garch_volatility(
         returns, _GARCH_REFIT_CACHE, f"{agent_id}:{asset}", as_of_date, agent_id
     )
     return daily_volatility * float(np.sqrt(TRADING_DAYS_PER_YEAR))
+
+
+def options_chain_requirements() -> tuple[DataRequirement, ...]:
+    """The option-chain `DataRequirement` of every analyst reading
+    `real_atm_options_by_expiration`: the snapshot it sees on a decision
+    date is at most `settings.options.publication_lag_days` plus
+    `DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS` calendar days old."""
+    return (
+        DataRequirement(
+            source="options_chain",
+            identifier="{ticker}",
+            asset_scoped=True,
+            description="Option chain snapshots",
+            lookback_days=settings.options.publication_lag_days
+            + DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS,
+        ),
+    )
 
 
 def real_atm_options_by_expiration(

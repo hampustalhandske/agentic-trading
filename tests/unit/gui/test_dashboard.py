@@ -931,6 +931,8 @@ def _price_table(tickers: list[str]) -> pd.DataFrame:
                     "ticker": ticker,
                     "date": days.date,
                     "open": close,
+                    "high": close,
+                    "low": close,
                     "close": close,
                     "adj_close": close,
                     "volume": 1_000_000.0,

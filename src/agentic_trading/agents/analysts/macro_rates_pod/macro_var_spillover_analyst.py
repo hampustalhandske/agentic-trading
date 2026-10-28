@@ -54,7 +54,9 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
     _refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)
     # Reflects the default configuration (macro_series_ids=(VIXCLS,),
     # use_yield_curve_slope=True) — an instance customizing either field
-    # away from its default should also override this.
+    # away from its default should also override this. No `lookback_days`:
+    # the VAR system joins the series with the asset's whole return
+    # history in `market_data`, so it reads them back to the warm-up start.
     data_requirements: tuple[DataRequirement, ...] = (
         DataRequirement(
             source="fred", identifier=VIXCLS, asset_scoped=False, description="FRED VIXCLS"
