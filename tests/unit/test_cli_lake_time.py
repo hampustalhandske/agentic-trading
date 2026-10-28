@@ -193,6 +193,43 @@ def test_experiment_uses_one_lake_time_for_calibration_and_test(cli_lake: Any) -
     assert datetime.fromisoformat(lake["lake_time"]) == _T
 
 
+def _rebuild_splits(lake: Any) -> BacktestResult:
+    splits = pd.DataFrame(
+        {"ticker": ["AAA"], "ex_date": ["2024-01-02"], "ratio": [0.25], "in_close_basis": [True]}
+    )
+    lake.add(
+        "yahoo_split_close_basis",
+        splits,
+        ("ex_date",),
+        scraped_at="2024-06-01T13:00:00Z",
+        rebuilt_whole=True,
+    )
+    return _result()
+
+
+@pytest.mark.parametrize("command", ["run", "experiment"])
+def test_a_rebuild_during_the_run_fails_it_before_any_result_is_printed(
+    cli_lake: Any, command: str
+) -> None:
+    """A rebuilt-whole table rebuilt while the engine runs fails the command, naming the table,
+    and no result JSON reaches stdout."""
+    seen: dict[str, list[Any]] = {}
+    with _stubbed_cli(seen) as engine_cls:
+        engine_cls.return_value.run.side_effect = lambda *a, **k: _rebuild_splits(cli_lake)
+        if command == "run":
+            result = runner.invoke(app, [*_RUN_ARGS, "--lake-time", "2024-06-01T12:00:00Z"])
+        else:
+            result = runner.invoke(
+                experiment_app, [*_EXPERIMENT_ARGS, "--lake-time", "2024-06-01T12:00:00Z"]
+            )
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, ll.LakeTimeError)
+    assert "yahoo_split_close_basis" in str(result.exception)
+    assert '"result"' not in result.stdout
+    assert ll.current_lake_time() is None
+
+
 class _Commander:
     def decide(self, market_data, as_of_date, scoreboard, instrument_returns=None):
         return [

@@ -731,3 +731,49 @@ def test_lake_provenance_carries_lake_time_builds_and_row_time_tables(fake_lake:
         "yahoo_split_close_basis": datetime(2024, 5, 2, tzinfo=UTC),
     }
     assert inside.row_time_pinned_tables == ["crypto_klines_1m"]
+
+
+def test_a_rebuilt_whole_table_rebuilt_during_the_session_raises_at_the_check(
+    fake_lake: Any,
+) -> None:
+    """`verify_rebuilt_whole_builds` re-reads each build and names a table rebuilt since T."""
+    _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
+
+    with ll.lake_session(_T):
+        ll.verify_rebuilt_whole_builds()
+        _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.5, True)], "2024-05-25T00:00:00Z")
+        with pytest.raises(ll.LakeTimeError, match="yahoo_split_close_basis") as error:
+            ll.verify_rebuilt_whole_builds()
+        _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
+    assert "2024-05-20" in str(error.value) and "2024-05-25" in str(error.value)
+
+
+def test_closing_a_session_checks_the_builds_and_outside_one_the_check_is_a_no_op(
+    fake_lake: Any,
+) -> None:
+    """The opening `lake_session` call checks the builds when its block ends without an error."""
+    _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
+    ll.verify_rebuilt_whole_builds()
+
+    with pytest.raises(ll.LakeTimeError, match="yahoo_split_close_basis"):
+        with ll.lake_session(_T):
+            _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.5, True)], "2024-05-25T00:00:00Z")
+    assert ll.current_lake_time() is None
+
+    with pytest.raises(ZeroDivisionError), ll.lake_session(_T):
+        _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.75, True)], "2024-05-30T00:00:00Z")
+        raise ZeroDivisionError
+    assert ll.current_lake_time() is None
+
+
+def test_a_row_time_table_written_during_the_session_raises_at_the_check(fake_lake: Any) -> None:
+    """crypto_klines_1m has no log, so a new `last_write` during the session fails the check."""
+    _seed_klines(fake_lake)
+
+    with ll.lake_session(_T):
+        ll.verify_rebuilt_whole_builds()
+        fake_lake.last_write_overrides["crypto_klines_1m"] = "2024-06-02T00:00:00Z"
+        with pytest.raises(ll.LakeTimeError, match="crypto_klines_1m") as error:
+            ll.verify_rebuilt_whole_builds()
+        fake_lake.last_write_overrides.clear()
+    assert "last write" in str(error.value)

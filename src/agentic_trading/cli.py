@@ -20,7 +20,10 @@ from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
     load_price_history_with_fallback,
 )
-from agentic_trading.data.loaders.lakehouse_loader import lake_session
+from agentic_trading.data.loaders.lakehouse_loader import (
+    lake_session,
+    verify_rebuilt_whole_builds,
+)
 from agentic_trading.data.loaders.macro_loader import load_risk_free_rate_series
 
 # NOTE: adjust this import to wherever ticker_catalog.py actually lives in the
@@ -470,6 +473,7 @@ def run(
                 parsed_end_date,
             )
             raise
+        verify_rebuilt_whole_builds()
         typer.echo(
             json.dumps(
                 {
@@ -781,6 +785,7 @@ def experiment(
                 isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump(
                     mode="json"
                 )
+        verify_rebuilt_whole_builds()
         typer.echo(
             json.dumps(
                 {

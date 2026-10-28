@@ -19,6 +19,7 @@ fresh instances despite this session-wide disabling.
 
 import json
 import math
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,6 +71,9 @@ class FakeLake:
 
     def __init__(self) -> None:
         self._connection = duckdb.connect(database=":memory:")
+        # One connection holds one pending result, so concurrent reads (pool
+        # workers inside a lake session) take turns.
+        self._sql_lock = threading.Lock()
         self.fixed_result: pd.DataFrame | None = None
         self.error: Exception | None = None
         self.calls: list[tuple[str, list[Any]]] = []
@@ -226,7 +230,8 @@ class FakeLake:
             raise self.error
         if self.fixed_result is not None:
             return self.fixed_result
-        return self._connection.execute(query, params or []).df()
+        with self._sql_lock:
+            return self._connection.execute(query, params or []).df()
 
 
 _REAL_LAKE_ACCESSOR = lakehouse_loader._lake

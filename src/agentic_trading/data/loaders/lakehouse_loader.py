@@ -287,7 +287,8 @@ def lake_session(lake_time: datetime | None = None) -> Iterator[LakeSession]:
     state gives the same T. A call while a session is open joins it and
     yields the open session; a joining call whose `lake_time` differs from
     the open T raises `LakeTimeError`. Only the call that opened the
-    session closes it."""
+    session closes it, and when its block ends without an error it first
+    runs `verify_rebuilt_whole_builds`."""
     global _SESSION
     if lake_time is not None and lake_time.utcoffset() is None:
         raise ValueError(
@@ -308,10 +309,48 @@ def lake_session(lake_time: datetime | None = None) -> Iterator[LakeSession]:
             )
     try:
         yield session
+        if opened:
+            verify_rebuilt_whole_builds()
     finally:
         if opened:
             with _SESSION_LOCK:
                 _SESSION = None
+
+
+def verify_rebuilt_whole_builds() -> None:
+    """Checks that no table the open session reads at its current state
+    changed during the session, and raises `LakeTimeError` naming each one
+    that did. Those tables carry no `scraped_at` pin, so a change would
+    otherwise alter the data a run reads without an error: a rebuilt-whole
+    table is compared by its build (re-read from the table), a row-time
+    pinned table (`_ROW_TIME_PIN_COLUMNS`) by the `last_write` the lake
+    reports for it. Does nothing outside a session."""
+    session = _current_session()
+    if session is None:
+        return
+    lake = _lake()
+    changed = []
+    for table, metadata in sorted(session._tables.items()):
+        if metadata.rebuilt_whole:
+            recorded = session.rebuilt_whole_builds.get(table)
+            current = _rebuilt_whole_build(lake, table)
+            label = "build"
+        elif table in _ROW_TIME_PIN_COLUMNS:
+            recorded = metadata.last_write
+            current = LakeTableMetadata.model_validate(lake.describe(table)).last_write
+            label = "last write"
+        else:
+            continue
+        if current != recorded:
+            before = "none" if recorded is None else recorded.isoformat()
+            after = "none" if current is None else current.isoformat()
+            changed.append(f"{table} ({label} {before} when the session opened, now {after})")
+    if changed:
+        raise LakeTimeError(
+            f"tables read at their current state changed during the session at "
+            f"{session.lake_time.isoformat()}: {'; '.join(changed)}; the run read more than one "
+            "state of them"
+        )
 
 
 def _quote_identifier(name: str) -> str:
