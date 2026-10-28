@@ -42,6 +42,13 @@ from agentic_trading.scoring.track_record import TrackRecord
 
 logger = get_logger(__name__)
 
+# Largest absolute daily excess return still treated as zero. A book that
+# only ever holds cash earns exactly the benchmark accrual, so its excess
+# returns are floating-point residue (around 1e-17); Sharpe and Sortino of
+# that series are meaningless (zero or near-zero variance gives a division
+# by zero or noise), and the run reports 0.0 for both instead.
+ZERO_EXCESS_RETURN_TOLERANCE = 1e-12
+
 # Called after each simulated day completes, with (day_index, total_days,
 # as_of_date, portfolio_value) — the hook a caller (the GUI) uses to drive a
 # live progress display. Safe to have this call UI code: unlike the GUI's
@@ -114,12 +121,16 @@ class BacktestEngine:
         self.execution_lag_days = execution_lag_days
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
         self.resume = resume
-        # Daily decimal rate, indexed by calendar date (e.g.
-        # `data/loaders/macro_loader.py::load_risk_free_rate_series`) — the
-        # excess return every Sharpe/Sortino below is computed against. A
-        # missing day (and a fully-omitted series) both default to 0.0
-        # rather than raising, so a caller that doesn't care about this
-        # (e.g. a unit test building a bare BacktestEngine) is unaffected.
+        # Daily decimal rate (annual rate / trading_days_per_year), indexed
+        # by calendar date (e.g.
+        # `data/loaders/macro_loader.py::load_risk_free_rate_series`). The
+        # rate in force on a valuation date is what cash earns, what
+        # borrowed cash and short-option margin pay (plus the margin
+        # spread), and what the Sharpe/Sortino benchmark accrues over the
+        # gap to the next valuation date. A missing day (and a
+        # fully-omitted series) both default to 0.0 rather than raising, so
+        # a caller that doesn't care about this (e.g. a unit test building
+        # a bare BacktestEngine) is unaffected.
         self.risk_free_rate_series = risk_free_rate_series
         # Daily decimal return, indexed by calendar date (e.g. an S&P 500
         # buy-and-hold's own pct_change()) — the benchmark
@@ -133,22 +144,32 @@ class BacktestEngine:
         self._option_last_mid: dict[str, float] = {}
         self._unpriced_underlyings_warned: set[str] = set()
 
-    def _risk_free_rate_array(self, return_dates: list[date]) -> np.ndarray:
-        """Daily decimal risk-free rate for each of `return_dates`, from
-        `self.risk_free_rate_series` — 0.0 for any date it doesn't cover
-        (including when it's `None` entirely), so a caller that never
-        supplied one gets the same behavior this method replaced."""
-        if self.risk_free_rate_series is None:
-            return np.zeros(len(return_dates))
-        return np.array(
-            [float(self.risk_free_rate_series.get(pd.Timestamp(day), 0.0)) for day in return_dates]
-        )
-
     def _risk_free_rate_annual(self, day: date) -> float:
-        """Annualized risk-free rate on `day`, re-annualized from the daily
-        decimal `risk_free_rate_series` (0.0 when absent) — the base the
-        margin spread is added to when financing a negative cash balance."""
-        return float(self._risk_free_rate_array([day])[0]) * settings.firm.trading_days_per_year
+        """Annualized risk-free rate in force on `day`: the daily decimal
+        `risk_free_rate_series` value times `settings.firm.trading_days_per_year`,
+        floored at 0.0 (the same floor `Portfolio.apply_financing` applies),
+        and 0.0 when the series is absent or does not cover `day`."""
+        if self.risk_free_rate_series is None:
+            return 0.0
+        daily_rate = float(self.risk_free_rate_series.get(pd.Timestamp(day), 0.0))
+        return max(daily_rate * settings.firm.trading_days_per_year, 0.0)
+
+    def _risk_free_accrual_array(self, valuation_dates: list[date]) -> np.ndarray:
+        """Risk-free accrual over each gap between consecutive
+        `valuation_dates`: for the return ending on date t with previous
+        valuation date t-1, `rf_annual(t-1) * calendar_days(t-1, t) / 365`.
+        That is simple actual/365 interest at the rate in force when the
+        period starts, exactly what `Portfolio.apply_financing` credits a
+        positive cash balance over the same gap, so an all-cash book's
+        excess return is zero. One entry per consecutive pair (length
+        `len(valuation_dates) - 1`, empty for fewer than two dates)."""
+        return np.array(
+            [
+                self._risk_free_rate_annual(previous) * (current - previous).days / 365.0
+                for previous, current in itertools.pairwise(valuation_dates)
+            ],
+            dtype=np.float64,
+        )
 
     def _commander_risk_state(self) -> CommanderRiskState | None:
         """The commander's current risk state, or `None` for a commander
@@ -562,18 +583,27 @@ class BacktestEngine:
             unfilled_before = len(unfilled_orders)
             trade_log.extend(self.portfolio.settle_expired(marks, as_of_timestamp.date()))
             portfolio_value = self.portfolio.total_value(prices, marks)
-            # Financing accrues over the calendar days since the previous
-            # simulated day (a Friday-to-Monday gap costs three days), on
-            # the book carried across that gap — charged after the mark so
-            # the day's recorded value already reflects it.
+            # Financing (net of the interest cash earns) accrues over the
+            # calendar days since the previous simulated day (a
+            # Friday-to-Monday gap accrues three days), on the book carried
+            # across that gap, at the risk-free rate in force on the
+            # previous valuation date, when the gap starts. It is booked
+            # after the mark so the day's recorded value already reflects it.
+            previous_valuation_date = (
+                portfolio_value_history[-1][0] if portfolio_value_history else None
+            )
             days_held = (
-                (as_of_timestamp.date() - portfolio_value_history[-1][0]).days
-                if portfolio_value_history
+                (as_of_timestamp.date() - previous_valuation_date).days
+                if previous_valuation_date is not None
                 else 0
             )
             financing_cost = self.portfolio.apply_financing(
                 prices,
-                self._risk_free_rate_annual(as_of_timestamp.date()),
+                (
+                    self._risk_free_rate_annual(previous_valuation_date)
+                    if previous_valuation_date is not None
+                    else 0.0
+                ),
                 days_held,
                 spots=underlying_prices,
             )
@@ -773,11 +803,12 @@ class BacktestEngine:
                 for previous, current in itertools.pairwise(portfolio_values)
             ]
 
-        # Each daily_returns[i] is the return realized moving from days[i]
-        # to days[i+1] — i.e. it's attributable to days[i+1], the date
-        # whose risk-free rate/benchmark return it should be compared
-        # against below.
-        return_dates = [day.date() for day in days[1:]]
+        # Each daily_returns[i] is the return realized moving from
+        # valuation date i to valuation date i+1, so it's attributable to
+        # the later date (the one the benchmark return is compared on) and
+        # its risk-free accrual covers the calendar gap between the two.
+        valuation_dates = [day for day, _ in portfolio_value_history]
+        return_dates = valuation_dates[1:]
 
         if len(daily_returns) < 2 or float(np.std(daily_returns, ddof=1)) == 0.0:
             # A flat (zero-variance) return series makes every ratio here
@@ -793,9 +824,15 @@ class BacktestEngine:
         else:
             returns_array = np.array(daily_returns, dtype=np.float64)
             try:
-                excess_returns_array = returns_array - self._risk_free_rate_array(return_dates)
-                final_sharpe_ratio = float(sharpe_ratio(excess_returns_array))
-                final_sortino_ratio = float(sortino_ratio(excess_returns_array))
+                excess_returns_array = returns_array - self._risk_free_accrual_array(
+                    valuation_dates
+                )
+                if np.all(np.abs(excess_returns_array) <= ZERO_EXCESS_RETURN_TOLERANCE):
+                    final_sharpe_ratio = 0.0
+                    final_sortino_ratio = 0.0
+                else:
+                    final_sharpe_ratio = float(sharpe_ratio(excess_returns_array))
+                    final_sortino_ratio = float(sortino_ratio(excess_returns_array))
                 # Calmar is annualized raw return over max drawdown with no
                 # excess-return concept (quantcore's own definition) — no
                 # risk-free adjustment applies here.

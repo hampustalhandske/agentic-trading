@@ -52,6 +52,7 @@ from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
     load_price_history_with_fallback,
 )
+from agentic_trading.data.loaders.macro_loader import load_risk_free_rate_series
 from agentic_trading.data.ticker_catalog import TICKER_GROUPS, TickerGroup, tickers_by_asset_class
 from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
@@ -553,6 +554,7 @@ def _simulate_desk(
         assets=tickers,
         market_data_source=source_label,
         execution_lag_days=settings.firm.execution_lag_days,
+        risk_free_rate_series=load_risk_free_rate_series(start, end),
     )
     backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
 

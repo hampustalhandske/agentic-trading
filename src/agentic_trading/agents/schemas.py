@@ -282,9 +282,11 @@ class BacktestResult(BaseModel):
     signal_health: dict[str, dict[str, int]] = Field(default_factory=dict)
     market_data_source: str | None = None
     source_performance: dict[str, dict[str, float]] = Field(default_factory=dict)
-    # Cumulative commission paid across `trade_log` and cumulative financing
-    # (stock borrow on short notional plus margin interest on negative cash)
-    # charged over the run, both already deducted from portfolio value.
+    # Cumulative commission paid across `trade_log`, and cumulative net
+    # financing over the run: stock borrow on short notional plus margin
+    # interest on negative cash and short-option margin, minus the
+    # risk-free interest earned on positive cash (negative when the credit
+    # is larger). Both are already reflected in portfolio value.
     total_transaction_cost: float = 0.0
     total_financing_cost: float = 0.0
     # Net premium outflow across every option buy/sell fill in `trade_log`

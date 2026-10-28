@@ -406,6 +406,7 @@ def run(
         assets=resolved_assets,
         market_data_source=source_label,
         execution_lag_days=settings.firm.execution_lag_days,
+        risk_free_rate_series=load_risk_free_rate_series(parsed_start_date, parsed_end_date),
     )
     try:
         result = engine.run()

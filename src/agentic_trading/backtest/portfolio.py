@@ -368,15 +368,22 @@ class Portfolio(BaseModel):
         days_held: int,
         spots: dict[str, float] | None = None,
     ) -> float:
-        """Charges `days_held` calendar days of financing to cash and returns
-        the amount charged: stock borrow on the total short notional (at
-        `prices`) at `settings.firm.short_borrow_rate_annual`, plus margin
-        interest at `risk_free_rate_annual + settings.firm.margin_spread_annual`
-        on a negative cash balance and on short-option margin (per short
+        """Accrues `days_held` calendar days of financing on cash and returns
+        the net charge: charges minus the interest credited, negative when
+        the credit is larger. Cash changes by minus the returned amount.
+
+        Charges are stock borrow on the total short notional (at `prices`)
+        at `settings.firm.short_borrow_rate_annual`, plus margin interest at
+        `risk_free_rate_annual + settings.firm.margin_spread_annual` on a
+        negative cash balance and on short-option margin (per short
         position, |contracts| x (last mid + `short_margin_fraction` x
         underlying spot) x multiplier; the spot comes from `spots`, then
-        `prices`, and counts as 0 when neither has the underlying). A flat
-        book with non-negative cash, or a zero-day gap, costs nothing."""
+        `prices`, and counts as 0 when neither has the underlying). The
+        credit is interest at `risk_free_rate_annual` on a positive cash
+        balance. Short-sale proceeds sit in that cash, so a short earns the
+        risk-free rate net of its borrow charge. Every accrual is simple
+        actual/365 interest; a negative `risk_free_rate_annual` counts as
+        0. A zero-day gap returns 0.0 and leaves cash unchanged."""
         if days_held <= 0:
             return 0.0
         short_notional = sum(
@@ -400,13 +407,20 @@ class Portfolio(BaseModel):
             cost += short_borrow_cost(
                 short_notional, settings.firm.short_borrow_rate_annual, days_held
             )
-        margin_rate = max(risk_free_rate_annual, 0.0) + settings.firm.margin_spread_annual
+        risk_free_rate = max(risk_free_rate_annual, 0.0)
+        margin_rate = risk_free_rate + settings.firm.margin_spread_annual
         if borrowed_cash > 0.0:
             cost += margin_financing_cost(borrowed_cash, margin_rate, days_held)
         if short_option_margin > 0.0:
             cost += margin_financing_cost(short_option_margin, margin_rate, days_held)
-        self.cash -= cost
-        return cost
+        # The deposit credit is the same simple actual/365 carry as a margin
+        # charge, so it reuses quantcore's formula with the sign flipped.
+        credit = (
+            margin_financing_cost(self.cash, risk_free_rate, days_held) if self.cash > 0.0 else 0.0
+        )
+        net_cost = cost - credit
+        self.cash -= net_cost
+        return net_cost
 
     def total_value(
         self, prices: dict[str, float], option_marks: dict[str, OptionMark] | None = None

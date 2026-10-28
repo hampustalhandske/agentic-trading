@@ -964,6 +964,11 @@ def test_ticker_multiselect_changes_the_basket_that_runs(
         )
 
     monkeypatch.setattr(dashboard_module, "_load_basket_data", _explicit_test_data)
+    # The app runs as a fresh script that imports the loader at run time,
+    # so the stub goes on the loader's own module.
+    monkeypatch.setattr(
+        "agentic_trading.data.loaders.macro_loader.load_risk_free_rate_series", lambda _s, _e: None
+    )
     preflight_lake.add(
         "instrument_prices",
         _price_table([*dashboard_module.TICKER_GROUPS[0].symbols, "NVDA"]),

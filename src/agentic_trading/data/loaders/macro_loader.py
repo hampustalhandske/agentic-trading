@@ -31,8 +31,9 @@ TRADING_DAYS_PER_YEAR = 252
 
 
 def load_risk_free_rate_series(start_date: date, end_date: date) -> pd.Series:
-    """Daily-equivalent risk-free rate for excess-return performance
-    metrics (Sharpe, Sortino), derived from FRED's 3-month T-bill
+    """Daily-equivalent risk-free rate for the backtest engine's cash
+    interest, margin interest and excess-return performance metrics
+    (Sharpe, Sortino), derived from FRED's 3-month T-bill
     secondary-market rate (`DGS3MO`, quoted as an annualized percent)
     as stored in the lakehouse.
 
@@ -42,9 +43,9 @@ def load_risk_free_rate_series(start_date: date, end_date: date) -> pd.Series:
     callers can align it against any trading-day index without gaps. It
     is never filled backwards: every day carries a rate observed on or
     before it. This is a backtest's own after-the-fact performance report,
-    not a trading signal `generate_signal` reads live — the rate a Sharpe
-    ratio should subtract for a return realized on a given day is that
-    day's real rate, so the series is read as published by `end_date`.
+    not a trading signal `generate_signal` reads live — the rate in force
+    on a given day is that day's real rate, so the series is read as
+    published by `end_date`.
 
     Raises `ValueError` if the lakehouse has no `DGS3MO` observations, or
     if `start_date` precedes the first observation (the message names

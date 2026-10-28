@@ -37,6 +37,13 @@ from agentic_trading.provenance import RunProvenance
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _no_risk_free_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stubs the CLI's risk-free series loader (no lake in unit tests); a
+    test that inspects it patches it again itself."""
+    monkeypatch.setattr("agentic_trading.cli.load_risk_free_rate_series", lambda _s, _e: None)
+
+
 def _fake_backtest_result() -> BacktestResult:
     return BacktestResult(
         start_date=date(2024, 1, 2),

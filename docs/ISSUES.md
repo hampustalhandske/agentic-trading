@@ -91,14 +91,19 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: dadea7a. Gated on a one-month publication lag (a day's value is public at the end of the following month), not `famafrench_vintages`: the lake keeps no daily vintages, so daily values are today's revised history, stated in the loader. First-seen dates exist in `famafrench_returns_log` from 2026-09-27.
 
 ### AT-6 COT availability ignores holiday weeks
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M22)
 - Evidence: [M] `lakehouse_loader.py:293` uses `report_date + 3 days`. 79 of 1,059 GC=F reports are exposed 1-4 days early. The exact date is in `etl.publication.cftc_cot_published_at`.
-- Acceptance: the code follows `cftc_cot_published_at`, shifting to the next business day per holiday. The 2018-12-31 report is absent as of 2019-01-04 and present as of 2019-01-07.
+- Acceptance: the loader and the preflight coverage gate on `cftc_cot_publication`. A report with a `published_at` (15:30 ET, before the close) is usable on its `published_date`; one without a time is usable the next day; one without a `published_date` (before 2000) is never usable. The 2018-12-11 report is present as of 2018-12-14. The 2018-12-31 report (shutdown catch-up, published 2019-02-05 with no time) is absent as of 2019-02-05 and present as of 2019-02-06.
 - Blocked-by / Blocks: LK-15, landed 2026-10-28 (lake fa44af5): `cftc_cot_publication` has one row per `report_date` with `published_date` (null before 2000), `published_at` and `basis`. Gate with `JOIN cftc_cot_publication USING (report_date) WHERE published_date <= ?`; the API's describe() still says +3 days.
-- Commits: none
+- Resolution: both COT tables join `cftc_cot_publication` on `report_date`, and `source_coverage("cftc_cot", ...)` spans the published dates. Live (lake dcd547bb3bcc) [V]:
+  - ZN=F: the 2018-12-11 report is present as of 2018-12-14. The 2018-12-31 report is absent as of 2019-01-07 and 2019-02-05, and present as of 2019-02-06.
+  - GC=F (its table starts 2006-06-13), 1,063 reports: 952 are usable on the same day as under the +3-day rule, 111 later, none earlier. Of the 111, 76 are holiday weeks at 1-4 days late (64 of them published the Monday rather than the Friday). The other 35 are shutdown and incident catch-ups at 5-47 days late, in 2013, 2018-19, 2023 and 2025. 34 of the 111 have no release time.
+  - The audit's 79 of 1,059 counted only holiday weeks.
+  - Coverage reports the raw `published_date`. For an untimed release that is one day before the report is usable, which is immaterial for a run's start.
+- Commits: 21d5668
 
 ### AT-7 FINRA short interest: no holiday calendar; revisions overwrite undated
 - Status: done
@@ -948,10 +953,24 @@ Paths are relative to `src/agentic_trading/`.
 
 ### AT-81 Pods that hold nothing take a share of firm capital
 - Status: open
-- Priority: should
-- Gate: held (Commander allocation; owner to decide with AT-77)
+- Priority: must (M6)
+- Gate: data (edgelab-3f, 2026-10-28: the numbers are wrong today)
 - Raised by: agentic-trading-c5, 2026-10-28, during the AT-78 A/B
 - Evidence: [V] On AAPL, XOM and SPY (2016-01-04 to 2016-02-29) the rates, cross-asset and credit pods cover none of the traded assets and post a realised 0.0 every day, yet `_risk_budget_weights` funds them. In the inverse-vol warm-up their zero vol hits the peer floor (`commander.min_relative_vol_floor` × median vol), so each takes about 0.20 (days 5-10, about 60% of capital idle). Once cross-pod risk parity runs, each is sized as an average pod, about 0.10 (about 30% idle). Same on quantcore 450a5a2 and a041d0d. With one varying pod beside idle ones, cross-pod risk parity cannot run, and the floor gives the idle pods most of the capital: 0.91 for one idle pod against one varying pod at equal trailing-performance weight. The floor is right for a pod that has a book but low vol, and wrong for one with no book.
-- Acceptance: capital goes only to pods with a non-empty book on the day (or whose analysts cover a traded asset), the rest renormalised. Report firm gross and NAV on the AT-78 window before and after.
+- Decision (edgelab-3f, 2026-10-28): keep the allocation and hold the idle-pod share as cash at the risk-free rate (AT-82). Re-allocating to active pods would scale firm risk with the number of idle pods.
+- Acceptance: the allocation is unchanged. Each period's result reports the idle-pod share (capital allocated to pods with an empty book on the day) and the cash share of NAV. The rule is documented in the Commander.
 - Blocked-by / Blocks: none
 - Commits: none
+
+### AT-82 Positive cash earns nothing while Sharpe subtracts the risk-free rate
+- Status: done
+- Priority: must (M6)
+- Gate: data (edgelab-3f, 2026-10-28: small engine change inside the AT-77 hold)
+- Raised by: agentic-trading-c5, 2026-10-28, during AT-81
+- Evidence: [C] `Portfolio.apply_financing` charges a negative cash balance at the risk-free rate plus `firm.margin_spread_annual` and credits a positive one nothing. The engine's Sharpe and Sortino subtract the daily risk-free rate. On the AT-78 window firm gross is 5-17% of NAV, so most NAV is cash that earns 0 and is charged the risk-free rate in every risk-adjusted number.
+- Acceptance: positive cash earns the same point-in-time risk-free rate, actual/365, at the rate in force at the previous valuation date (edgelab's convention). Debits and the benchmark in excess returns accrue the same way over the same calendar gap. Short proceeds sit in cash, so a short nets the risk-free rate minus borrow. `total_financing_cost` is net. A flat all-cash book earns the risk-free rate, and its excess-return Sharpe is about 0. edgelab applies the same rule (B6 reconciliation).
+- Blocked-by / Blocks: AT-81
+- Resolution: `Portfolio.apply_financing` credits positive cash at the risk-free rate, actual/365, and returns the net charge. Every accrual over a gap uses the rate in force on the previous valuation date: the credit, the debits and the benchmark. Excess returns subtract `rf(t-1) * calendar_days / 365`, which is exactly what cash earned over the gap. A book whose excess returns are all within 1e-12 of 0 reports Sharpe and Sortino of 0.0. The single-phase `run` command and the dashboard now pass the DGS3MO series too; only `experiment` did before, so their Sharpe had been raw, not excess. Tests: `test_cash_interest.py` (a cash book compounds to exactly the risk-free rate, zero excess) and `test_cash_interest_rate_timing.py` (a rate step accrues from the next gap).
+  - Live (lake dcd547bb3bcc) on AAPL, XOM, SPY, 2016-01-04 to 2016-02-29, without and then with the series [V]: final NAV 9,799,497.83 → 9,803,826.08, Sharpe -2.8141 → -2.8143, Sortino -3.2991 → -3.2994, net financing +262.16 → -4,080.11 (about 4.3k of interest on about $9.3M cash, DGS3MO 0.20-0.35%).
+  - Sharpe barely moves at near-zero rates. At a 5% rate the cash share would add about 5% a year to raw return and to the benchmark alike.
+- Commits: pending
