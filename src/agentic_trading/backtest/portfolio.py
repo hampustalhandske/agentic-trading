@@ -117,6 +117,57 @@ class Portfolio(BaseModel):
             impact_bps=impact_bps,
         )
 
+    def _option_target_contracts(
+        self,
+        decision: PortfolioDecision,
+        mark: OptionMark,
+        portfolio_value: float,
+        spot: float | None,
+        split_factor: float,
+    ) -> float:
+        """The split-adjusted contract count `decision.target_weight` maps
+        to at `mark.mid`: whole as-traded contracts, capped so the
+        underlying notional stays within `settings.options.max_notional_fraction`
+        of NAV when `spot` is known. `mark.mid` must be positive."""
+        multiplier = float(settings.options.contract_multiplier)
+        as_traded_mid = mark.mid * split_factor
+        target_as_traded = round(
+            decision.target_weight * portfolio_value / (as_traded_mid * multiplier)
+        )
+        if spot is not None and spot > 0.0:
+            max_as_traded = int(
+                settings.options.max_notional_fraction
+                * portfolio_value
+                / (spot * split_factor * multiplier)
+            )
+            target_as_traded = max(-max_as_traded, min(max_as_traded, target_as_traded))
+        return target_as_traded * split_factor
+
+    def option_target_differs_from_held(
+        self,
+        decision: PortfolioDecision,
+        mark: OptionMark,
+        portfolio_value: float,
+        spot: float | None = None,
+        split_factor: float = 1.0,
+    ) -> bool:
+        """Whether `decision` asks for a contract count other than the one
+        held, sized at `mark.mid` exactly as `apply_option_decision` sizes
+        it. A mark with no positive mid cannot size a target, so any
+        non-zero target weight or held position counts as different."""
+        if decision.instrument is None:
+            raise ValueError(
+                "option_target_differs_from_held requires a decision with an instrument"
+            )
+        position = self.option_positions.get(decision.instrument.contract_id)
+        current_contracts = position.contracts if position is not None else 0.0
+        if mark.mid <= 0.0:
+            return decision.target_weight != 0.0 or current_contracts != 0.0
+        target_contracts = self._option_target_contracts(
+            decision, mark, portfolio_value, spot, split_factor
+        )
+        return target_contracts != current_contracts
+
     def apply_option_decision(
         self,
         decision: PortfolioDecision,
@@ -187,17 +238,9 @@ class Portfolio(BaseModel):
             return _hold()
 
         as_traded_mid = mark.mid * split_factor
-        target_as_traded = round(
-            decision.target_weight * portfolio_value / (as_traded_mid * multiplier)
+        target_contracts = self._option_target_contracts(
+            decision, mark, portfolio_value, spot, split_factor
         )
-        if spot is not None and spot > 0.0:
-            max_as_traded = int(
-                settings.options.max_notional_fraction
-                * portfolio_value
-                / (spot * split_factor * multiplier)
-            )
-            target_as_traded = max(-max_as_traded, min(max_as_traded, target_as_traded))
-        target_contracts = target_as_traded * split_factor
         if (
             current_contracts != 0
             and target_contracts != 0

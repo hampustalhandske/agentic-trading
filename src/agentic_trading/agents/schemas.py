@@ -235,6 +235,24 @@ class AgentWeight(BaseModel):
     weight: float = Field(ge=0.0, le=1.0)
 
 
+class UnfilledOrder(BaseModel):
+    """A decision the backtest engine could not execute on `as_of_date`, the
+    day the order failed to fill.
+
+    `reason` is `no_fill_price` (an equity whose fill price was missing,
+    NaN or non-positive; `price` is the value seen), `no_option_mark` (an
+    option with no mark that day; `price` is None) or
+    `untradeable_option_mark` (an option whose mark was not tradeable while
+    the target differed from the held position; `price` is the mark's mid).
+    """
+
+    as_of_date: date
+    asset: str
+    target_weight: float
+    reason: Literal["no_fill_price", "no_option_mark", "untradeable_option_mark"]
+    price: float | None = None
+
+
 class BacktestResult(BaseModel):
     """Summary of a completed backtest run.
 
@@ -259,6 +277,8 @@ class BacktestResult(BaseModel):
     final_profit_factor: float
     decisions_by_day: dict[date, list[PortfolioDecision]] = Field(default_factory=dict)
     trade_log: list[TradeRecord] = Field(default_factory=list)
+    # Decisions the engine skipped rather than executed, in fill order.
+    unfilled_orders: list[UnfilledOrder] = Field(default_factory=list)
     signal_health: dict[str, dict[str, int]] = Field(default_factory=dict)
     market_data_source: str | None = None
     source_performance: dict[str, dict[str, float]] = Field(default_factory=dict)

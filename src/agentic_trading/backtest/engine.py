@@ -28,6 +28,7 @@ from agentic_trading.agents.schemas import (
     PerformanceRecord,
     PortfolioDecision,
     TradeRecord,
+    UnfilledOrder,
 )
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.portfolio import OptionPosition, Portfolio
@@ -417,6 +418,11 @@ class BacktestEngine:
             if checkpoint
             else []
         )
+        unfilled_orders = (
+            [UnfilledOrder.model_validate(order) for order in checkpoint.get("unfilled_orders", [])]
+            if checkpoint
+            else []
+        )
         signal_health = checkpoint.get("signal_health", {}) if checkpoint else {}
         pending_decisions = (
             [
@@ -553,6 +559,7 @@ class BacktestEngine:
                 if spot is not None:
                     underlying_prices[underlying] = spot
             trades_before = len(trade_log)
+            unfilled_before = len(unfilled_orders)
             trade_log.extend(self.portfolio.settle_expired(marks, as_of_timestamp.date()))
             portfolio_value = self.portfolio.total_value(prices, marks)
             # Financing accrues over the calendar days since the previous
@@ -598,20 +605,50 @@ class BacktestEngine:
                             as_of_timestamp.date(),
                             decision.asset,
                         )
+                        unfilled_orders.append(
+                            UnfilledOrder(
+                                as_of_date=as_of_timestamp.date(),
+                                asset=decision.asset,
+                                target_weight=decision.target_weight,
+                                reason="no_option_mark",
+                                price=None,
+                            )
+                        )
                     else:
+                        fill_spot = self._underlying_spot(
+                            raw_market_data,
+                            decision.instrument.underlying,
+                            as_of_timestamp,
+                            "open" if self.execution_lag_days else "close",
+                        )
+                        split_factor = lakehouse_loader.split_adjustment_factor(
+                            decision.instrument.underlying, as_of_timestamp.date()
+                        )
+                        if (
+                            not fill_mark.tradeable
+                            and self.portfolio.option_target_differs_from_held(
+                                decision,
+                                fill_mark,
+                                portfolio_value,
+                                spot=fill_spot,
+                                split_factor=split_factor,
+                            )
+                        ):
+                            unfilled_orders.append(
+                                UnfilledOrder(
+                                    as_of_date=as_of_timestamp.date(),
+                                    asset=decision.asset,
+                                    target_weight=decision.target_weight,
+                                    reason="untradeable_option_mark",
+                                    price=fill_mark.mid,
+                                )
+                            )
                         option_trade = self.portfolio.apply_option_decision(
                             decision,
                             fill_mark,
                             portfolio_value,
-                            spot=self._underlying_spot(
-                                raw_market_data,
-                                decision.instrument.underlying,
-                                as_of_timestamp,
-                                "open" if self.execution_lag_days else "close",
-                            ),
-                            split_factor=lakehouse_loader.split_adjustment_factor(
-                                decision.instrument.underlying, as_of_timestamp.date()
-                            ),
+                            spot=fill_spot,
+                            split_factor=split_factor,
                         )
                         trade_log.append(option_trade)
                         total_option_premium_paid -= option_trade.premium
@@ -648,6 +685,15 @@ class BacktestEngine:
                             as_of_timestamp.date().isoformat(),
                             decision.asset,
                             fill_price,
+                        )
+                        unfilled_orders.append(
+                            UnfilledOrder(
+                                as_of_date=as_of_timestamp.date(),
+                                asset=decision.asset,
+                                target_weight=decision.target_weight,
+                                reason="no_fill_price",
+                                price=fill_price,
+                            )
                         )
                     realized_return = log_returns[decision.asset]
                 # The first simulated day has a NaN log_return (no prior close
@@ -701,6 +747,7 @@ class BacktestEngine:
                     new_track_record=self.track_record.entries_since(track_record_count_before),
                     decisions=decisions,
                     new_trades=trade_log[trades_before:],
+                    new_unfilled_orders=unfilled_orders[unfilled_before:],
                     next_day_index=day_index + 1,
                     start_date=self.start_date,
                     end_date=self.end_date,
@@ -808,6 +855,7 @@ class BacktestEngine:
             final_profit_factor=final_profit_factor,
             decisions_by_day=decisions_by_day,
             trade_log=trade_log,
+            unfilled_orders=unfilled_orders,
             signal_health=signal_health,
             market_data_source=self.market_data_source,
             source_performance=self._source_performance(),

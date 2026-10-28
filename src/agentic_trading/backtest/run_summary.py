@@ -16,6 +16,7 @@ analyst/manager skill), and `pod_return_history` (each pod's own real,
 weighted daily return — small, one number per pod per day, not one row
 per asset per day like the fields this strips)."""
 
+from collections import Counter
 from typing import Any
 
 PERIOD_METRIC_KEYS = (
@@ -30,6 +31,16 @@ PERIOD_METRIC_KEYS = (
     "final_hit_rate",
     "final_profit_factor",
 )
+
+
+def _unfilled_order_counts(block: dict[str, Any]) -> dict[str, Any]:
+    """`unfilled_orders` (their count) and `unfilled_orders_by_reason` for a
+    period or baseline block; both are 0 / `{}` when the block has none."""
+    orders = block.get("unfilled_orders") or []
+    return {
+        "unfilled_orders": len(orders),
+        "unfilled_orders_by_reason": dict(Counter(order["reason"] for order in orders)),
+    }
 
 
 def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
@@ -48,9 +59,13 @@ def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
         summary[period]["signal_health"] = block["signal_health"]
         summary[period]["source_performance"] = block["source_performance"]
         summary[period]["pod_return_history"] = block.get("pod_return_history", {})
+        summary[period].update(_unfilled_order_counts(block))
 
     summary["baselines"] = {
-        name: {key: block[key] for key in PERIOD_METRIC_KEYS}
+        name: {
+            **{key: block[key] for key in PERIOD_METRIC_KEYS},
+            **_unfilled_order_counts(block),
+        }
         for name, block in experiment_result.get("baselines", {}).items()
     }
     return summary

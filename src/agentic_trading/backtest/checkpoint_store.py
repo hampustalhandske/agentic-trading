@@ -2,9 +2,9 @@
 
 """Append-only SQLite-backed backtest checkpoint.
 
-Each simulated day appends exactly that day's new rows to three tables
-(`track_record`, `decisions`, `trades`) via `INSERT` — O(1) per day, O(n)
-total for a run of length n — and keeps a single small `cursor` row (next
+Each simulated day appends exactly that day's new rows to four tables
+(`track_record`, `decisions`, `trades`, `unfilled_orders`) via `INSERT` —
+O(1) per day, O(n) total for a run of length n — and keeps a single small `cursor` row (next
 day index, portfolio state, signal health, pending decisions, the
 Commander's serialized risk state, and the run's own config for
 `_restore_checkpoint`'s match-check) as the only
@@ -18,7 +18,12 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from agentic_trading.agents.schemas import PerformanceRecord, PortfolioDecision, TradeRecord
+from agentic_trading.agents.schemas import (
+    PerformanceRecord,
+    PortfolioDecision,
+    TradeRecord,
+    UnfilledOrder,
+)
 
 _CREATE_TRACK_RECORD = """
 CREATE TABLE IF NOT EXISTS track_record (
@@ -40,6 +45,12 @@ CREATE TABLE IF NOT EXISTS decisions (
 """
 _CREATE_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
+    as_of_date TEXT NOT NULL,
+    payload TEXT NOT NULL
+)
+"""
+_CREATE_UNFILLED_ORDERS = """
+CREATE TABLE IF NOT EXISTS unfilled_orders (
     as_of_date TEXT NOT NULL,
     payload TEXT NOT NULL
 )
@@ -98,6 +109,7 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
     connection.execute(_CREATE_TRACK_RECORD)
     connection.execute(_CREATE_DECISIONS)
     connection.execute(_CREATE_TRADES)
+    connection.execute(_CREATE_UNFILLED_ORDERS)
     connection.execute(_CREATE_PORTFOLIO_VALUE)
     connection.execute(_CREATE_CURSOR)
     _add_missing_columns(connection)
@@ -106,6 +118,7 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
             connection.execute("DELETE FROM track_record")
             connection.execute("DELETE FROM decisions")
             connection.execute("DELETE FROM trades")
+            connection.execute("DELETE FROM unfilled_orders")
             connection.execute("DELETE FROM portfolio_value")
             connection.execute("DELETE FROM cursor")
     return connection
@@ -128,6 +141,7 @@ def append_day(
     commander_risk_state: dict[str, Any] | None = None,
     total_financing_cost: float = 0.0,
     total_option_premium_paid: float = 0.0,
+    new_unfilled_orders: list[UnfilledOrder] | None = None,
 ) -> None:
     """Appends exactly this simulated day's new rows — never touches a
     prior day's already-written rows — plus overwrites the single small
@@ -169,6 +183,13 @@ def append_day(
             [
                 (as_of_date.isoformat(), json.dumps(trade.model_dump(mode="json")))
                 for trade in new_trades
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO unfilled_orders (as_of_date, payload) VALUES (?, ?)",
+            [
+                (as_of_date.isoformat(), json.dumps(order.model_dump(mode="json")))
+                for order in new_unfilled_orders or []
             ],
         )
         connection.execute(
@@ -263,6 +284,12 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
             "SELECT as_of_date, payload FROM trades ORDER BY as_of_date"
         )
     ]
+    unfilled_orders = [
+        json.loads(payload)
+        for _as_of_date_str, payload in connection.execute(
+            "SELECT as_of_date, payload FROM unfilled_orders ORDER BY as_of_date"
+        )
+    ]
     return {
         "next_day_index": next_day_index,
         "config": {
@@ -281,5 +308,6 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         "track_record": track_record,
         "decisions_by_day": decisions_by_day,
         "trade_log": trade_log,
+        "unfilled_orders": unfilled_orders,
         "portfolio_value_history": portfolio_value_history,
     }
