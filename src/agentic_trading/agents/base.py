@@ -17,6 +17,7 @@ from agentic_trading.agents.portfolio_construction import PodView, PortfolioCons
 from agentic_trading.agents.schemas import (
     AgentSignal,
     ManagerSignal,
+    ManagerState,
     PortfolioDecision,
     SizingDiagnostics,
 )
@@ -393,3 +394,26 @@ class ManagerAgent(Agent):
         if diagnostics is None:
             return None
         return diagnostics.model_copy(update={"manager_id": self.agent_id})
+
+    def manager_state(self) -> ManagerState:
+        """A copy of what this manager carries between days: yesterday's
+        sized weights and its portfolio constructor's state, with
+        `tail_hedge` `None`."""
+        return ManagerState(
+            previous_weights=dict(self._previous_weights),
+            constructor=self.portfolio_constructor.state(),
+        )
+
+    def restore_manager_state(self, state: ManagerState) -> None:
+        """Replaces this manager's carried state with a copy of `state`.
+        Raises `ValueError` when `state` carries tail-hedge state, which
+        only the tail-hedge manager holds."""
+        if state.tail_hedge is not None:
+            raise ValueError(f"{self.agent_id} holds no tail-hedge state")
+        self._restore_shared_state(state)
+
+    def _restore_shared_state(self, state: ManagerState) -> None:
+        """Restores the state every manager carries: yesterday's sized
+        weights and the constructor's state."""
+        self._previous_weights = dict(state.previous_weights)
+        self.portfolio_constructor.restore_state(state.constructor)

@@ -11,8 +11,10 @@ from agentic_trading.agents.base import ManagerAgent
 from agentic_trading.agents.schemas import (
     AgentSignal,
     ManagerSignal,
+    ManagerState,
     OptionContract,
     PortfolioDecision,
+    TailHedgeState,
 )
 from agentic_trading.config import settings
 from agentic_trading.data.loaders import option_marks
@@ -60,8 +62,8 @@ class TailHedgeManager(ManagerAgent):
     the day, and its contract count stays scaled by that cut while it is
     held. With no headroom the sleeve opens nothing (no put and no
     short-SPY fallback, SPY at 0.0) and a held put is kept to expiry
-    instead of rolled. The commitments live on the instance only and are
-    not part of any checkpointed state.
+    instead of rolled. The commitments, the held put and its scale are
+    part of `manager_state()`, which the Commander checkpoints.
 
     `scale_factor` always returns 1.0, deliberately not the EWMA-vol
     dampening every other pod's `scale_factor` uses: the analyst's own
@@ -90,6 +92,33 @@ class TailHedgeManager(ManagerAgent):
         return float(
             sum(weight for opened, weight in self._commitments if window_start < opened <= as_of)
         )
+
+    def manager_state(self) -> ManagerState:
+        """The base manager's state plus a copy of the held put, its scale
+        and the premium commitments."""
+        return (
+            super()
+            .manager_state()
+            .model_copy(
+                update={
+                    "tail_hedge": TailHedgeState(
+                        held_contract_id=self._held_contract_id,
+                        held_scale=self._held_scale,
+                        commitments=list(self._commitments),
+                    )
+                }
+            )
+        )
+
+    def restore_manager_state(self, state: ManagerState) -> None:
+        """Replaces this manager's carried state with a copy of `state`; a
+        `state` without tail-hedge state leaves the sleeve as a fresh one
+        (no put held, no commitments)."""
+        self._restore_shared_state(state)
+        tail_hedge = state.tail_hedge if state.tail_hedge is not None else TailHedgeState()
+        self._held_contract_id = tail_hedge.held_contract_id
+        self._held_scale = tail_hedge.held_scale
+        self._commitments = list(tail_hedge.commitments)
 
     def scale_factor(
         self,

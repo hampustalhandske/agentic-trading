@@ -20,6 +20,7 @@ from agentic_trading.agents.base import ManagerAgent
 from agentic_trading.agents.schemas import (
     MAX_LEVERAGE,
     ManagerSignal,
+    ManagerState,
     OptionContract,
     PodState,
     PortfolioDecision,
@@ -48,14 +49,17 @@ class CommanderRiskState(BaseModel):
     """Everything stateful a `Commander` carries between simulated days
     that isn't recoverable from `market_data` alone: which pods the
     drawdown breaker currently has cut, each pod's trailing realized
-    return series, and each pod's most recent target-weight vector (what
-    tomorrow's pod return is measured against). Serializable through
+    return series, each pod's most recent target-weight vector (what
+    tomorrow's pod return is measured against), and each manager's own
+    carried state keyed by its `agent_id` (`manager_states`; empty in a
+    payload written before managers carried any). Serializable through
     `model_dump(mode="json")`/`model_validate` so a run can be
     checkpointed and resumed with `Commander.restore_risk_state`."""
 
     tripped_pods: list[str] = Field(default_factory=list)
     pod_return_history: dict[str, list[tuple[date, float]]] = Field(default_factory=dict)
     last_pod_weights: dict[str, dict[str, float]] = Field(default_factory=dict)
+    manager_states: dict[str, ManagerState] = Field(default_factory=dict)
 
 
 def _construct_pod_portfolio(
@@ -758,11 +762,23 @@ class Commander:
             tripped_pods=sorted(self.drawdown_breaker.tripped),
             pod_return_history=self._pod_return_tracker.history,
             last_pod_weights=self._pod_return_tracker.last_weights,
+            manager_states={manager.agent_id: manager.manager_state() for manager in self.managers},
         )
 
     def restore_risk_state(self, state: CommanderRiskState) -> None:
+        """Restores the breaker, the pod return tracker and each manager
+        named in `state.manager_states`; a manager not named keeps its
+        state. Raises `ValueError`, before restoring anything, when
+        `state.manager_states` names an `agent_id` this Commander does not
+        run."""
+        managers = {manager.agent_id: manager for manager in self.managers}
+        unknown = sorted(set(state.manager_states) - set(managers))
+        if unknown:
+            raise ValueError(f"checkpoint carries state for unknown managers: {unknown}")
         self.drawdown_breaker.restore(set(state.tripped_pods))
         self._pod_return_tracker.restore(state.pod_return_history, state.last_pod_weights)
+        for agent_id, manager_state in state.manager_states.items():
+            managers[agent_id].restore_manager_state(manager_state)
 
     def decide(
         self,

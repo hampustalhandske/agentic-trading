@@ -404,6 +404,40 @@ class SizingDiagnostics(BaseModel):
     binding_stage: SizingStage | None
 
 
+class ConstructorState(BaseModel):
+    """What one `PortfolioConstructor` carries from one `construct` call to
+    the next: the pod's own realised daily returns (`own_return_history`,
+    read by the Kelly overlay), the day of its last full rebalance (`None`
+    before the first) and the trading days since then."""
+
+    own_return_history: list[tuple[date, float]] = Field(default_factory=list)
+    last_rebalance_date: date | None = None
+    days_since_last_rebalance: int = 0
+
+
+class TailHedgeState(BaseModel):
+    """What the tail-hedge manager carries between days: the put it holds
+    (`None` when it holds none), that put's premium weight as a fraction of
+    its uncapped weight, and the (open date, premium weight) of every put
+    opened, which the premium cap's trailing window reads."""
+
+    held_contract_id: str | None = None
+    held_scale: float = 1.0
+    commitments: list[tuple[date, float]] = Field(default_factory=list)
+
+
+class ManagerState(BaseModel):
+    """Everything one manager carries between days that moves its next
+    decision: yesterday's sized weights (`previous_weights`, read by the
+    no-trade band), its portfolio constructor's state, and the tail-hedge
+    state for the tail-hedge manager (`None` for every other manager).
+    Checkpointed per manager in `CommanderRiskState.manager_states`."""
+
+    previous_weights: dict[str, float] = Field(default_factory=dict)
+    constructor: ConstructorState = Field(default_factory=ConstructorState)
+    tail_hedge: TailHedgeState | None = None
+
+
 class BacktestResult(BaseModel):
     """Summary of a completed backtest run.
 

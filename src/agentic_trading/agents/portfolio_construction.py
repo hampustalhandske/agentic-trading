@@ -26,7 +26,12 @@ from quantcore.portfolio.optimization import (
     unconstrained_mean_variance_weights,
 )
 
-from agentic_trading.agents.schemas import MAX_LEVERAGE, SizingDiagnostics, SizingStage
+from agentic_trading.agents.schemas import (
+    MAX_LEVERAGE,
+    ConstructorState,
+    SizingDiagnostics,
+    SizingStage,
+)
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -171,6 +176,27 @@ class PortfolioConstructor:
         `construct()` call. `None` before any call, and after a call that
         sized nothing (no views, or `returns_history` missing an asset)."""
         return self._last_diagnostics
+
+    def state(self) -> ConstructorState:
+        """A copy of what this constructor carries between `construct()`
+        calls: its own realised return history and its rebalance clock."""
+        return ConstructorState(
+            own_return_history=[(day.date(), value) for day, value in self._own_return_history],
+            last_rebalance_date=(
+                None if self._last_rebalance_date is None else self._last_rebalance_date.date()
+            ),
+            days_since_last_rebalance=self._days_since_last_rebalance,
+        )
+
+    def restore_state(self, state: ConstructorState) -> None:
+        """Replaces this constructor's carried state with a copy of `state`."""
+        self._own_return_history = [
+            (pd.Timestamp(day), value) for day, value in state.own_return_history
+        ]
+        self._last_rebalance_date = (
+            None if state.last_rebalance_date is None else pd.Timestamp(state.last_rebalance_date)
+        )
+        self._days_since_last_rebalance = state.days_since_last_rebalance
 
     @staticmethod
     def _annualized_vol(weights: np.ndarray, cov_matrix: np.ndarray) -> float:
