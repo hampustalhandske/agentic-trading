@@ -637,14 +637,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-57 Price levels shown to agents include later splits and dividends
-- Status: deferred
+- Status: in-progress
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M24)
 - Evidence: [M] `lakehouse_loader.py:505-523` takes the latest-scrape `adj_close`. 349 AAPL dates differ across scrapes. Levels such as ATM strikes, share counts and ADV embed corporate actions after as_of. Returns are unaffected.
 - Acceptance: levels shown to agents are as-traded or as-of-adjusted. Only returns use the total-return series.
 - Blocked-by / Blocks: none
-- Note (2026-10-28 analysis): every agent decision that reads a price level compares two levels on one basis (moneyness, model against market option price, VIX index levels), so a later split or dividend factor cancels and the decision is unchanged. Two level effects remain, both in execution, not in signals: (1) before a split, option positions are counted in rescaled contracts, so `commission_per_contract` is charged on split-factor-times-too-many contracts; (2) order shares are computed at the dividend-adjusted close against split-adjusted volume, which overstates participation by up to the dividend factor (conservative). The clean fix is an as-traded option book with OCC contract adjustments at each split, which belongs to the execution engine and moves to edgelab with AT-77.
+- Note (2026-10-28 audit of absolute levels): no universe price filter, penny-stock rule, price-level or round-number rule, or dollar-volume threshold exists in agents or universe code. Moneyness bands are fractions of spot and ATM is nearest strike to a same-basis spot, so agent signals are scale-invariant. Equities trade fractional shares with a percentage commission, so their fills are invariant too. The level-dependent rules are all in the option fill path (`backtest/portfolio.py::apply_option_decision`): `min_premium_per_share` checked against a rescaled pre-split premium, whole-contract rounding and `commission_per_contract` on rescaled contracts. These stay a must and are fixed by converting to as-traded units with the decision day's split factor. The full as-traded option book with OCC adjustments is forwarded to edgelab-62 for the adapter. Participation uses dividend-adjusted share counts against split-adjusted volume, which overstates participation (conservative) and is left.
 - Commits: none
 
 ### AT-58 Membership counts the removal day; renames read as new names
