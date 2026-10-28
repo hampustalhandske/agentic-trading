@@ -139,6 +139,13 @@ class PortfolioDecision(BaseModel):
     `instrument.contract_id` and `target_weight` is the signed premium
     notional over NAV (long positive, short negative) rather than a
     share-notional weight.
+
+    `hold_contracts` marks an option row whose contract the book should
+    keep at the count it already holds: with a position held and a
+    non-zero `target_weight`, the book trades nothing whatever the
+    weight, mark or NAV. A `target_weight` of 0.0 still closes the
+    position, and with nothing held the row sizes from `target_weight`
+    as an unflagged one does.
     """
 
     asset: str
@@ -146,6 +153,7 @@ class PortfolioDecision(BaseModel):
     target_weight: float = Field(ge=-MAX_LEVERAGE, le=MAX_LEVERAGE)
     contributing_signals: list[ManagerSignal]
     instrument: OptionContract | None = None
+    hold_contracts: bool = False
 
     @model_validator(mode="after")
     def _instrument_matches_asset(self) -> "PortfolioDecision":

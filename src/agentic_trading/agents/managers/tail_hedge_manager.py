@@ -58,12 +58,14 @@ class TailHedgeManager(ManagerAgent):
     the base class sized, so protection never disappears silently.
 
     New puts are bounded by `settings.options.tail_hedge_annual_premium_cap`:
-    an open or roll commits at most the cap minus `premium_committed` on
-    the day, and its contract count stays scaled by that cut while it is
-    held. With no headroom the sleeve opens nothing (no put and no
-    short-SPY fallback, SPY at 0.0) and a held put is kept to expiry
-    instead of rolled. The commitments, the held put and its scale are
-    part of `manager_state()`, which the Commander checkpoints.
+    an open, roll or reopen commits at most the cap minus
+    `premium_committed` on the day. On every later day the held put's row
+    carries `hold_contracts`, so the book keeps the contract count it
+    opened with until the put is rolled, closed or expires. With no
+    headroom the sleeve opens nothing (no put and no short-SPY fallback,
+    SPY at 0.0) and a held put is kept to expiry instead of rolled. The
+    commitments, the held put and its scale are part of
+    `manager_state()`, which the Commander checkpoints.
 
     `scale_factor` always returns 1.0, deliberately not the EWMA-vol
     dampening every other pod's `scale_factor` uses: the analyst's own
@@ -205,7 +207,11 @@ class TailHedgeManager(ManagerAgent):
         option_rows: list[PortfolioDecision] = []
         if held is not None and held != selected:
             option_rows.append(_option_decision(held, day, 0.0, equity.contributing_signals))
-        option_rows.append(_option_decision(selected, day, weight, equity.contributing_signals))
+        option_rows.append(
+            _option_decision(
+                selected, day, weight, equity.contributing_signals, hold_contracts=selected == held
+            )
+        )
         self._held_contract_id = selected
 
         return _zero_underlying(decisions, underlying) + option_rows
@@ -297,7 +303,11 @@ def _days_to_expiry(contract_id: str, day: date) -> int:
 
 
 def _option_decision(
-    contract_id: str, day: date, weight: float, signals: list[ManagerSignal]
+    contract_id: str,
+    day: date,
+    weight: float,
+    signals: list[ManagerSignal],
+    hold_contracts: bool = False,
 ) -> PortfolioDecision:
     return PortfolioDecision(
         asset=contract_id,
@@ -305,6 +315,7 @@ def _option_decision(
         target_weight=weight,
         contributing_signals=signals,
         instrument=OptionContract.parse(contract_id),
+        hold_contracts=hold_contracts,
     )
 
 

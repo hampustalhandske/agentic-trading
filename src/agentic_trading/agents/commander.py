@@ -912,12 +912,14 @@ class Commander:
         # by contract id. A core pod's option row is scaled by the pod's
         # allocation like its equity rows; the tail-hedge pod sizes its
         # put premium against firm NAV from the same budget fraction its
-        # allocation is, so its option rows pass through at face value.
-        # MAX_LEVERAGE stays the final backstop.
+        # allocation is, so its option rows pass through at face value,
+        # each with its own `hold_contracts` flag. MAX_LEVERAGE stays the
+        # final backstop.
         core_weight: dict[str, float] = dict.fromkeys(assets, 0.0)
         hedge_weight: dict[str, float] = dict.fromkeys(assets, 0.0)
         core_options: dict[str, tuple[OptionContract, float]] = {}
         hedge_options: dict[str, tuple[OptionContract, float]] = {}
+        hedge_holds: dict[str, bool] = {}
         combined_signals: dict[str, list[ManagerSignal]] = {asset: [] for asset in assets}
         for manager_id, decisions in pod_decisions:
             allocation = pod_allocations.get(manager_id, 0.0)
@@ -938,6 +940,8 @@ class Commander:
                     )
                     _, held = option_book.get(decision.asset, (decision.instrument, 0.0))
                     option_book[decision.asset] = (decision.instrument, held + weight)
+                    if is_hedge:
+                        hedge_holds[decision.asset] = decision.hold_contracts
                 contributions[decision.asset] = contributions.get(decision.asset, 0.0) + weight
 
         # Firm limits run on the delta-equivalent book; whatever scaling
@@ -976,6 +980,7 @@ class Commander:
                 target_weight=_clamp(weight),
                 contributing_signals=combined_signals.get(contract_id, []),
                 instrument=contract,
+                hold_contracts=hedge_holds.get(contract_id, False),
             )
             for contract_id, (contract, weight) in {**limited_options, **hedge_options}.items()
         ]

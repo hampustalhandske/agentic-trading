@@ -163,14 +163,18 @@ class Portfolio(BaseModel):
     ) -> bool:
         """Whether `decision` asks for a contract count other than the one
         held, sized at `mark.mid` exactly as `apply_option_decision` sizes
-        it. A mark with no positive mid cannot size a target, so any
-        non-zero target weight or held position counts as different."""
+        it. A `hold_contracts` row with a non-zero target weight on a held
+        contract never differs. A mark with no positive mid cannot size a
+        target, so any non-zero target weight or held position counts as
+        different."""
         if decision.instrument is None:
             raise ValueError(
                 "option_target_differs_from_held requires a decision with an instrument"
             )
         position = self.option_positions.get(decision.instrument.contract_id)
         current_contracts = position.contracts if position is not None else 0.0
+        if _keeps_held_count(decision, current_contracts):
+            return False
         if mark.mid <= 0.0:
             return decision.target_weight != 0.0 or current_contracts != 0.0
         target_contracts = self._option_target_contracts(
@@ -194,7 +198,9 @@ class Portfolio(BaseModel):
         `spread_cost` is |delta contracts| x |fill price - mid| x the
         contract multiplier. A mark whose `tradeable` flag is false is a
         hold, leaving cash and positions unchanged, whatever bid/ask it
-        carries. Any fill needs a two-sided quote with at least
+        carries, and so is a `hold_contracts` decision with a non-zero
+        target weight on a contract already held. Any fill needs a
+        two-sided quote with at least
         `settings.options.min_premium_per_share` of as-traded premium (a
         close to zero needs only a bid), and a contract count is capped so
         its underlying notional stays within
@@ -247,7 +253,12 @@ class Portfolio(BaseModel):
                 instrument=contract,
             )
 
-        if not mark.tradeable or mark.is_expired or mark.mid <= 0.0:
+        if (
+            _keeps_held_count(decision, current_contracts)
+            or not mark.tradeable
+            or mark.is_expired
+            or mark.mid <= 0.0
+        ):
             return _hold()
 
         as_traded_mid = mark.mid * split_factor
@@ -459,3 +470,10 @@ class Portfolio(BaseModel):
             + sum(quantity * prices[asset] for asset, quantity in self.positions.items())
             + option_value
         )
+
+
+def _keeps_held_count(decision: PortfolioDecision, current_contracts: float) -> bool:
+    """Whether `decision` asks the book to keep the `current_contracts` it
+    holds: a `hold_contracts` row with a non-zero target weight on a
+    contract with a position held."""
+    return decision.hold_contracts and current_contracts != 0.0 and decision.target_weight != 0.0
