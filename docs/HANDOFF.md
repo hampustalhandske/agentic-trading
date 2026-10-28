@@ -47,6 +47,7 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-60 | stale option quotes re-marked from the current surface; missing rate raises | 1e2316b |
 | AT-63 | catalog trades SPY/IWM, not ^GSPC/^RUT; `USDJPY=X` | 7384697 |
 | AT-64, AT-66 | preflight per source and lookback; inconsistent opens masked, unfillable orders skipped | 072c364 |
+| AT-79 | SPY/QQQ/IWM option chains from `option_chain_history` before DoltHub | 3a8f250 |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
 2017-12-29) are verified. edgelab-62 runs the counted runs with `warmup`
@@ -67,8 +68,7 @@ defaults. No post-result cost version was registered.
 
 ## In progress
 
-- AT-79: tests in `tests/unit/data/loaders/test_option_chain_history.py`; implementer running (SPY/QQQ/IWM read `option_chain_history` before their first DoltHub date).
-- AT-80: test-writer running; design from database-57 is in ISSUES (bars by `security_id`, `official_close`, `equity_adjustment_factors`, membership from `sp500_price_coverage`). The three views are vendored in the contract fixture (uncommitted).
+- AT-80: tests in `tests/unit/data/loaders/test_sp500_member_prices.py` and `tests/unit/agents/analysts/test_broad_universe_securities.py` (uncommitted); implementer running; design from database-57 is in ISSUES (bars by `security_id`, `official_close`, `equity_adjustment_factors`, membership from `sp500_price_coverage`).
 
 ## Next steps, in order
 

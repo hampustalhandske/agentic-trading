@@ -874,14 +874,15 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-79 Pre-2019 options from `option_chain_history` (SPY, QQQ, IWM)
-- Status: open
+- Status: done
 - Priority: should
 - Gate: data
 - Raised by: database-57 consumer audit 2026-10-28
 - Evidence: `dolthub_option_chain` starts 2019-02; `option_chain_history` holds SPY, QQQ and IWM full chains with open interest from 2008 to 2025-12. The 2010-2017 test window has no options today.
 - Acceptance: option analysts read `option_chain_history` for SPY, QQQ and IWM before 2019. Each row is a 16:00 ET end-of-day snapshot on `snapshot_date`, usable at that close; fills use bid/ask, never `mark` (wrong for deep in-the-money contracts in early years). Coverage per analyst in 2010-2017 is reported. The table is static and ends 2025-12-12; `option_chain_snapshots` resumes 2026-09-27, so the gap between them is stated, not filled.
 - Blocked-by / Blocks: narrows LK-37 to single names before 2019
-- Commits: none
+- Resolution: SPY, QQQ and IWM read `option_chain_history` before their first DoltHub date (SPY 2019-02-09; QQQ and IWM always, to 2025-12). Coverage 2010-2017: SPY has a usable snapshot on every sampled session (96 of 96, one per month), 17 expiries on 2012-06-15. That serves the CVaR options analysts and the tail-hedge put on SPY. Their other underlyings (AAPL, MSFT and the rest) still start 2019 (LK-37). QQQ and IWM are in no pod's scope. Agents still read the chain one session late (`options.publication_lag_days`), which is conservative for an end-of-day snapshot. The gap from 2025-12-15 to 2026-09-27 is unfilled for QQQ and IWM.
+- Commits: 3a8f250
 
 
 ### AT-80 S&P universe priced from `instrument_prices`, which lacks a quarter of members
