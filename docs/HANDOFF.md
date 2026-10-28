@@ -40,6 +40,7 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-15, AT-19, AT-21 | crypto at the US close; split-strike match; stale options hold | d335c7b |
 | AT-16, AT-18 | regressions joined by date (drop names, not dates); options on the strikes' spot | 5a5b134 |
 | AT-17 | resolved by AT-1's close-basis rescale | aec97fa |
+| AT-59, AT-67 | agents' option chains lagged a day; settlement at the expiry close | 2caf7bf |
 | AT-77 | asks 1 and 2 approved: edgelab executes; LLM scope event-desk then macro | 119b15a |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
@@ -69,9 +70,9 @@ Nothing in flight.
    back from the `_log` views to the current views.
 2. AT-6 waits for LK-15 (COT `published_at`); until then the `+3 days`
    gate stands.
-3. Remaining data and point-in-time musts: AT-57, 59, 67 next (coordinator's
-   order), then AT-38, 39,
-   57..60, 62..64, 66..68, AT-79, AT-78 (re-pin quantcore to a041d0d).
+3. Remaining data and point-in-time musts: AT-38, 39, 58, 60, 62..64, 66,
+   68, AT-79, AT-78 (re-pin quantcore to a041d0d). AT-57 is deferred to
+   the edgelab engine (analysis in ISSUES).
 4. AT-40 ledger: shared format with pitch-edge (PE-21); the two
    conformance vectors are the acceptance tests and are written first.
 5. AT-77: measure OmniRoute route costs once its key is in `.env`.

@@ -658,14 +658,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-59 Same-day DoltHub chain despite a 1-4 day publication lag
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S1)
 - Evidence: [I] `lakehouse_loader.py:210-217` and `option_marks.py:256` use a snapshot dated t at close t. The lake says DoltHub publishes 1 to 4 days later.
 - Acceptance: a configurable `option_publication_lag_days`, default 1.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: 2caf7bf. Applied to agent reads only (ATM helper, cvar and tail-hedge contract selection); engine marks and fills use quotes on or before the mark date.
 
 ### AT-60 Stale-IV marks up to 45 days; silent 0.0 rate
 - Status: open
@@ -738,14 +738,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-67 Option expiry can settle at a later day's spot
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S10)
 - Evidence: [C] `option_marks.py:244` settles at the first run day on or after expiry. If the expiry day is missing from the run calendar or is a holiday, the spot is from a later day.
 - Acceptance: settlement uses the last close on or before expiry.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: 2caf7bf. Settlement close from instrument_prices.close (the strikes' basis), last session on or before expiry within 10 days, else the passed spot. Verified live: XOM expiry 2020-01-20 (holiday) settles on the 2020-01-17 close 68.56.
 
 ### AT-68 Dividend signal fires on ex-date, weeks after declaration
 - Status: open
