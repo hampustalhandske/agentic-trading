@@ -186,3 +186,40 @@ def test_rows_come_back_in_one_order_whatever_the_stored_order(
     backward = read(list(reversed(rows)))
 
     pd.testing.assert_frame_equal(forward, backward)
+
+
+@pytest.mark.parametrize("pinned", [False, True], ids=["unpinned", "pinned"])
+def test_of_two_same_day_filings_for_one_period_the_later_accepted_value_wins(
+    fake_lake: Any, pinned: bool
+) -> None:
+    """Two filings on one day, both public before the close, report one period differently: the
+    one EDGAR accepted later wins, whatever their forms and the stored order."""
+    early = _fact("Revenues", 100.0, "8-K") | {"accession_number": "ACC-EARLY"}
+    late = _fact("Revenues", 105.0, "10-Q") | {"accession_number": "ACC-LATE"}
+    accepted = pd.DataFrame(
+        {
+            "accession_number": ["ACC-EARLY", "ACC-LATE"],
+            "accepted_at": [
+                pd.Timestamp("2023-05-05 09:00", tz="America/New_York"),
+                pd.Timestamp("2023-05-05 11:00", tz="America/New_York"),
+            ],
+        }
+    )
+
+    def read(stored: list[dict[str, Any]]) -> list[float]:
+        fake_lake.add(
+            "sec_company_facts_log",
+            pd.DataFrame(stored),
+            date_columns=("dt", "filed_date", "period_start", "period_end"),
+        )
+        fake_lake.add("sec_filings", accepted)
+        if pinned:
+            with ll.lake_session(_T):
+                frame = ll.load_company_facts_from_lakehouse("AAPL", date(2024, 6, 30))
+        else:
+            frame = ll.load_company_facts_from_lakehouse("AAPL", date(2024, 6, 30))
+        assert frame is not None
+        return list(frame["value"])
+
+    assert read([early, late]) == [105.0]
+    assert read([late, early]) == [105.0]

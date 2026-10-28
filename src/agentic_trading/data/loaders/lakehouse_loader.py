@@ -1560,8 +1560,9 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     and only rows with `available_date <= as_of_date` are kept. Of
     those, each (`concept`, `unit`, `period_start`, `period_end`) keeps
     the row with the latest `available_date`, ties broken by the latest
-    `filed`; the query sorts on every column it returns, so which of two
-    tied rows is kept never depends on the order the lake stores them in.
+    `filed`, then the latest EDGAR acceptance; the query sorts on every
+    column it returns, so which of two tied rows is kept never depends on
+    the order the lake stores them in.
     Returns `None` if no rows remain. Self-asserts point-in-time on
     `filed` (the SQL gate) and on `available_date` before returning."""
     query = f"""
@@ -1573,8 +1574,8 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
             WHERE ticker = ? AND filed_date <= ?
         ) x
         LEFT JOIN ({_sec_acceptance_query()}) f ON f.accession_number = x.accession_number
-        ORDER BY filed, concept, unit, period_start, period_end, fiscal_year, fiscal_period,
-                 form, accepted_at, value
+        ORDER BY filed, concept, unit, period_start, period_end, accepted_at, fiscal_year,
+                 fiscal_period, form, value
     """
     frame = _query(query, [ticker, as_of_date.isoformat()])
     if frame.empty:
