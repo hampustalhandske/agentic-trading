@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from agentic_trading.data.loaders.lakehouse_loader import IndexMember
+
 FACTORS = ["Mkt-RF", "SMB", "HML"]
 
 
@@ -80,6 +82,23 @@ def test_fama_french_regression_joins_returns_and_stale_factors_by_date(monkeypa
     assert abs(result[0][1] - positional[1]) > 0.1
 
 
+def _patch_member_returns(monkeypatch, mod, tickers: list[str], frame: pd.DataFrame) -> None:
+    """Serves `tickers` as S&P members (security ids by position) whose
+    returns are `frame`'s `log_return` columns, gaps dropped as the
+    security-keyed loader returns them."""
+    members = [IndexMember(security_id=i, ticker=t) for i, t in enumerate(tickers)]
+    monkeypatch.setattr(mod, "load_sp500_member_securities_asof", lambda *_a: members)
+    monkeypatch.setattr(
+        mod,
+        "load_security_log_returns",
+        lambda ids, *_a, **_k: {
+            m.security_id: frame[(m.ticker, "log_return")].dropna()
+            for m in members
+            if m.security_id in ids and m.ticker in frame.columns.get_level_values(0)
+        },
+    )
+
+
 def _universe_frame(
     n_tickers: int, n_days: int, seed: int, hole: tuple[str, int]
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -106,7 +125,7 @@ def test_fama_macbeth_stages_use_date_joined_panel(monkeypatch) -> None:
 
     frame, factors = _universe_frame(35, 100, seed=10, hole=("T000", 60))
     tickers = list(frame.columns.get_level_values(0).unique())
-    monkeypatch.setattr(mod, "load_sp500_constituents_asof", lambda *_a: tickers)
+    _patch_member_returns(monkeypatch, mod, tickers, frame)
     monkeypatch.setattr(mod, "load_price_history_from_lakehouse", lambda *_a, **_k: frame)
     monkeypatch.setattr(mod, "load_fama_french_factors_from_lakehouse", lambda *_a, **_k: factors)
     loadings_calls = _recorder(monkeypatch, mod, "factor_loadings")
@@ -155,8 +174,7 @@ def test_network_centrality_correlations_use_date_joined_returns(monkeypatch) ->
     wide.iloc[n_days - 20, 0] = np.nan
     tickers = list(wide.columns)
     frame = pd.concat({t: pd.DataFrame({"log_return": wide[t]}) for t in tickers}, axis=1)
-    monkeypatch.setattr(mod, "load_sp500_constituents_asof", lambda *_a: tickers)
-    monkeypatch.setattr(mod, "load_price_history_from_lakehouse", lambda *_a, **_k: frame)
+    _patch_member_returns(monkeypatch, mod, tickers, frame)
 
     analyst = mod.LeadLagNetworkCentralityAnalyst()
     signal = analyst.generate_signal("T000", pd.DataFrame(), dates[-1])
@@ -188,7 +206,7 @@ def test_fama_macbeth_drops_a_gappy_universe_ticker_not_its_date(monkeypatch) ->
 
     frame, factors = _universe_frame(35, 100, seed=20, hole=("T005", 60))
     tickers = list(frame.columns.get_level_values(0).unique())
-    monkeypatch.setattr(mod, "load_sp500_constituents_asof", lambda *_a: tickers)
+    _patch_member_returns(monkeypatch, mod, tickers, frame)
     monkeypatch.setattr(mod, "load_price_history_from_lakehouse", lambda *_a, **_k: frame)
     monkeypatch.setattr(mod, "load_fama_french_factors_from_lakehouse", lambda *_a, **_k: factors)
     loadings_calls = _recorder(monkeypatch, mod, "factor_loadings")
@@ -229,8 +247,7 @@ def test_network_centrality_drops_a_gappy_universe_ticker_not_its_date(monkeypat
     wide.iloc[n_days - 20, wide.columns.get_loc("T005")] = np.nan
     tickers = list(wide.columns)
     frame = pd.concat({t: pd.DataFrame({"log_return": wide[t]}) for t in tickers}, axis=1)
-    monkeypatch.setattr(mod, "load_sp500_constituents_asof", lambda *_a: tickers)
-    monkeypatch.setattr(mod, "load_price_history_from_lakehouse", lambda *_a, **_k: frame)
+    _patch_member_returns(monkeypatch, mod, tickers, frame)
 
     signal = mod.LeadLagNetworkCentralityAnalyst().generate_signal(
         "T000", pd.DataFrame(), dates[-1]

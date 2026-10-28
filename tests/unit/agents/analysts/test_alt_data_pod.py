@@ -10,6 +10,7 @@ from agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst imp
     DEFAULT_UNIVERSE,
     LeadLagNetworkCentralityAnalyst,
 )
+from agentic_trading.data.loaders.lakehouse_loader import IndexMember
 
 
 def _calendar_market_data() -> pd.DataFrame:
@@ -65,7 +66,7 @@ def _lead_lag_universe_returns(n: int = 71) -> dict[str, pd.Series]:
 
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
-    "load_sp500_constituents_asof"
+    "load_sp500_member_securities_asof"
 )
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
@@ -87,7 +88,7 @@ def test_lead_lag_network_centrality_analyst_follows_its_leader(mock_load, mock_
 
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
-    "load_sp500_constituents_asof"
+    "load_sp500_member_securities_asof"
 )
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
@@ -109,7 +110,7 @@ def test_lead_lag_network_centrality_analyst_flat_with_insufficient_history(
 
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
-    "load_sp500_constituents_asof"
+    "load_sp500_member_securities_asof"
 )
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
@@ -132,11 +133,11 @@ def test_lead_lag_network_centrality_analyst_flat_when_universe_download_fails(
 
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
-    "load_price_history_from_lakehouse"
+    "load_security_log_returns"
 )
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
-    "load_sp500_constituents_asof"
+    "load_sp500_member_securities_asof"
 )
 def test_lead_lag_network_centrality_analyst_prefers_real_sp500_membership(
     mock_members, mock_prices
@@ -145,16 +146,17 @@ def test_lead_lag_network_centrality_analyst_prefers_real_sp500_membership(
     with enough usable names, that broad universe is used instead of the
     5-name DEFAULT_UNIVERSE fallback."""
     broad_universe = [f"TCK{i}" for i in range(35)]
-    mock_members.return_value = broad_universe
+    members = [
+        IndexMember(security_id=i, ticker=ticker)
+        for i, ticker in enumerate([*broad_universe, "AAPL"])
+    ]
+    mock_members.return_value = members
     rng = np.random.default_rng(0)
     dates = pd.bdate_range("2023-01-01", periods=260)
-    frames = {}
-    for ticker in [*broad_universe, "AAPL"]:
-        returns = rng.normal(0.0, 0.01, len(dates))
-        frames[ticker] = pd.DataFrame(
-            {"open": 100.0, "close": 100.0, "log_return": returns}, index=dates
-        )
-    mock_prices.return_value = pd.concat(frames, axis=1)
+    mock_prices.return_value = {
+        member.security_id: pd.Series(rng.normal(0.0, 0.01, len(dates)), index=dates)
+        for member in members
+    }
 
     signal = LeadLagNetworkCentralityAnalyst().generate_signal(
         "AAPL", pd.DataFrame(), pd.Timestamp("2024-01-15")

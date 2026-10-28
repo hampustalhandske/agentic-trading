@@ -134,6 +134,138 @@ def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
     return tickers
 
 
+class IndexMember(BaseModel):
+    """One S&P 500 member on a date: the lake's `security_id` for the
+    company and the `ticker` it traded under on that date."""
+
+    security_id: int
+    ticker: str
+
+
+def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | None:
+    """Point-in-time S&P 500 membership on `as_of_date` as securities, one
+    `IndexMember` per `security_id`, sorted by ticker.
+
+    Reads `sp500_price_coverage`, whose spans are keyed by `security_id`:
+    a span counts when `start_date <= as_of_date < end_date`, and a null
+    `end_date` means still a member. When several counted spans share one
+    security (a rename recorded as two overlapping spans), the span with
+    the latest `start_date` names the ticker. A counted span without a
+    `security_id` is left out and named in one WARNING. Returns `None`
+    when no span counts."""
+    query = """
+        SELECT security_id, ticker
+        FROM (
+            SELECT
+                security_id,
+                ticker,
+                ROW_NUMBER() OVER (
+                    PARTITION BY security_id,
+                        CASE WHEN security_id IS NULL THEN ticker END
+                    ORDER BY start_date DESC, ticker
+                ) AS security_rank
+            FROM sp500_price_coverage
+            WHERE start_date <= ?
+              AND (end_date IS NULL OR end_date > ?)
+        ) AS ranked
+        WHERE security_rank = 1
+        ORDER BY ticker
+    """
+    as_of = as_of_date.isoformat()
+    result = _query(query, [as_of, as_of])
+    if result.empty:
+        return None
+    unresolved = result["security_id"].isna()
+    if unresolved.any():
+        logger.warning(
+            "S&P 500 members on %s without a security_id, left out: %s",
+            as_of,
+            sorted(result.loc[unresolved, "ticker"].tolist()),
+        )
+    resolved = result.loc[~unresolved]
+    members = [
+        IndexMember(security_id=int(security_id), ticker=str(ticker))
+        for security_id, ticker in zip(resolved["security_id"], resolved["ticker"], strict=True)
+    ]
+    return members or None
+
+
+def load_security_log_returns(
+    security_ids: list[int], start: date, end: date
+) -> dict[int, pd.Series]:
+    """Daily split- and distribution-adjusted log returns per security,
+    keyed by `security_id`, from `equity_daily_from_bars` bars dated
+    `start` to `end` inclusive. One query serves every id in
+    `security_ids`.
+
+    A bar's price is `official_close`, or `close` when that is null,
+    times the `cum_factor` of the security's `equity_adjustment_factors`
+    row with the smallest `effective_date` strictly after the bar's date
+    (1.0 when there is none); bars and factors are joined on
+    `security_id`, never on ticker. A bar whose price is null or not
+    positive counts as missing. The return on day d is the log of d's
+    price over the previous bar's price, and exists only when the
+    security has bars on d and on the NYSE session immediately before d,
+    both inside the range; a gap never yields a multi-day return, and the
+    first bar in the range has none.
+
+    Each series has an ascending `DatetimeIndex`. A security with no
+    returns in the range has no key. Factor rows dated after `end` set
+    the price level but cancel in every return, so no return depends on
+    data after `end`. Self-asserts point-in-time on every series against
+    `end` before returning."""
+    if not security_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in security_ids)
+    query = f"""
+        SELECT bars.security_id, bars.date,
+               bars.price * COALESCE(factors.cum_factor, 1.0) AS price
+        FROM (
+            SELECT security_id, date, COALESCE(official_close, close) AS price
+            FROM equity_daily_from_bars
+            WHERE security_id IN ({placeholders})
+              AND date BETWEEN ? AND ?
+              AND COALESCE(official_close, close) > 0
+        ) AS bars
+        ASOF LEFT JOIN (
+            SELECT security_id, effective_date, cum_factor
+            FROM equity_adjustment_factors
+            WHERE security_id IN ({placeholders})
+              AND effective_date > ?
+        ) AS factors
+          ON factors.security_id = bars.security_id
+         AND bars.date < factors.effective_date
+        ORDER BY bars.security_id, bars.date
+    """
+    ids = [int(security_id) for security_id in security_ids]
+    params = [*ids, start.isoformat(), end.isoformat(), *ids, start.isoformat()]
+    frame = _query(query, params)
+    if frame.empty:
+        return {}
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame.drop_duplicates(["security_id", "date"])
+    previous_date = frame.groupby("security_id")["date"].shift(1)
+    session_after = {
+        stamp: pd.Timestamp(next_session(stamp.date()))
+        for stamp in pd.DatetimeIndex(previous_date.dropna().unique())
+    }
+    consecutive = previous_date.map(session_after) == frame["date"]
+    log_price = pd.Series(np.log(frame["price"].to_numpy(dtype=np.float64)), index=frame.index)
+    frame["log_return"] = log_price - log_price.groupby(frame["security_id"]).shift(1)
+    returns = frame.loc[consecutive]
+
+    result: dict[int, pd.Series] = {}
+    for security_id, group in returns.groupby("security_id"):
+        series = pd.Series(
+            group["log_return"].to_numpy(dtype=np.float64),
+            index=pd.DatetimeIndex(group["date"]),
+            name="log_return",
+        ).sort_index()
+        assert_point_in_time(series, end)
+        result[int(cast(int, security_id))] = series
+    return result
+
+
 def split_adjustment_factor(ticker: str, quote_date: date) -> float:
     """Factor that moves an option-chain row quoted on `quote_date` onto
     the basis of `ticker`'s `instrument_prices` close: the product of

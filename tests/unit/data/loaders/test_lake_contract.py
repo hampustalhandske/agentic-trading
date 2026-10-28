@@ -28,6 +28,12 @@ _END = date(2024, 3, 15)
 
 _EMPTY_CASES: dict[str, Callable[[], Any]] = {
     "load_sp500_constituents_asof": lambda: lakehouse_loader.load_sp500_constituents_asof(_AS_OF),
+    "load_sp500_member_securities_asof": lambda: lakehouse_loader.load_sp500_member_securities_asof(
+        _AS_OF
+    ),
+    "load_security_log_returns": lambda: (
+        lakehouse_loader.load_security_log_returns([1], _START, _END) or None
+    ),
     "load_options_snapshot_from_lakehouse": lambda: (
         lakehouse_loader.load_options_snapshot_from_lakehouse("AAPL", _AS_OF)
     ),

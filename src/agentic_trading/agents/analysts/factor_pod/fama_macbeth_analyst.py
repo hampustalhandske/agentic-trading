@@ -19,7 +19,8 @@ from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import (
     load_fama_french_factors_from_lakehouse,
     load_price_history_from_lakehouse,
-    load_sp500_constituents_asof,
+    load_security_log_returns,
+    load_sp500_member_securities_asof,
 )
 from agentic_trading.logging_config import get_logger
 
@@ -59,8 +60,9 @@ class FamaMacbethAnalyst(AnalystAgent):
     reference dates; the rationale reports how many tickers were kept.
 
     `universe` is resolved fresh each call as the real, point-in-time
-    S&P 500 membership as of `as_of_date` (`data/loaders/lakehouse_loader.py`),
-    not a fixed list — Fama-MacBeth's statistical power comes from
+    S&P 500 membership as of `as_of_date`, each member priced by its
+    lake `security_id` (`_load_broad_lakehouse_universe`), not a fixed
+    list — Fama-MacBeth's statistical power comes from
     genuine cross-sectional breadth (hundreds of names, the way the
     original methodology and institutional usage both run it), which a
     handful of megacaps cannot provide regardless of which five are
@@ -211,37 +213,47 @@ class FamaMacbethAnalyst(AnalystAgent):
     def _load_broad_lakehouse_universe(
         self, as_of_date: pd.Timestamp
     ) -> tuple[tuple[str, ...], dict[str, pd.Series]] | None:
-        """The expensive fetch `_universe_refit_cache` gates: real,
-        point-in-time S&P 500 membership plus a single batch lakehouse
-        query for all of their trailing, date-indexed returns. Returns
-        `None` (not raises) on any failure, so a cache miss during a
-        lakehouse outage degrades to the fixed-universe fallback for
-        `refit_interval_days` rather than retrying every day."""
-        lakehouse_universe = load_sp500_constituents_asof(as_of_date.date())
-        if lakehouse_universe is None:
+        """The expensive fetch `_universe_refit_cache` gates: the
+        point-in-time S&P 500 members on `as_of_date` as securities
+        (`load_sp500_member_securities_asof`) and one batch query for
+        their trailing 250 calendar days of split- and
+        distribution-adjusted log returns by `security_id`
+        (`load_security_log_returns`). Returns `(tickers, returns)` with
+        both keyed by each member's ticker on `as_of_date`.
+
+        A member needs at least `_RISK_WINDOW // 2` returns: a thin series
+        would empty the caller's date-joined panel for every asset that
+        day, not just its own. Members left out, including those with no
+        returns at all, are counted in one INFO line. Returns `None` when
+        the lake has no membership for the date or fewer than
+        `_MIN_UNIVERSE_SIZE` members qualify, so the caller uses the
+        fixed-universe fallback for `refit_interval_days`. A failed lake
+        request propagates."""
+        members = load_sp500_member_securities_asof(as_of_date.date())
+        if members is None:
             return None
         window_start = (as_of_date - timedelta(days=250)).date()
-        frame = load_price_history_from_lakehouse(
-            lakehouse_universe, window_start, as_of_date.date()
+        returns_by_security = load_security_log_returns(
+            [member.security_id for member in members], window_start, as_of_date.date()
         )
-        if frame is None:
-            return None
-        # A ticker present in the frame isn't necessarily usable — a
-        # corrupted or thin price series (some lakehouse rows carry a real
-        # `close` but a broken all-zero `adj_close`, masked to NaN by the
-        # loader) can leave a ticker with almost no real return
-        # observations. Filtering on this before the caller's date join
-        # matters: an all-NaN ticker included here would empty the
-        # inner-joined panel for every asset that day, not just its own.
-        candidate_returns = {
-            str(ticker): frame[(ticker, "log_return")].dropna()
-            for ticker in frame.columns.get_level_values(0).unique()
-        }
-        universe_returns = {
-            ticker: returns
-            for ticker, returns in candidate_returns.items()
-            if returns.size >= _RISK_WINDOW // 2
-        }
+        min_returns = _RISK_WINDOW // 2
+        universe_returns: dict[str, pd.Series] = {}
+        for member in members:
+            returns = returns_by_security.get(member.security_id)
+            if returns is not None and returns.size >= min_returns:
+                universe_returns[member.ticker] = returns
+        excluded = len(members) - len(universe_returns)
+        if excluded:
+            logger.info(
+                "%s: left %d of %d S&P 500 members on %s out of the cross-section for "
+                "fewer than %d returns since %s",
+                self.agent_id,
+                excluded,
+                len(members),
+                as_of_date.date(),
+                min_returns,
+                window_start,
+            )
         if len(universe_returns) < _MIN_UNIVERSE_SIZE:
             return None
         return tuple(universe_returns), universe_returns
