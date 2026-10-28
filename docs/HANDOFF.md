@@ -50,6 +50,7 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-79 | SPY/QQQ/IWM option chains from `option_chain_history` before DoltHub | 3a8f250 |
 | AT-66 follow-up | unfilled orders recorded and counted per run | ebb98a0 |
 | AT-80 | S&P cross-section priced by security from `equity_daily_from_bars` | 7b37814 |
+| AT-78 | quantcore a041d0d (0.3.0); flat assets and pods; stress-test zero variance | pending |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
 2017-12-29) are verified. edgelab-62 runs the counted runs with `warmup`
@@ -70,16 +71,16 @@ defaults. No post-result cost version was registered.
 
 ## In progress
 
-- AT-78: `pyproject.toml`/`uv.lock` re-pinned to quantcore a041d0d (0.3.0), uncommitted. 0.3.0 changes APIs: `FactorLoadingsResult` instead of a tuple, `ConvergenceError` instead of `converged`, and covariance inputs need positive variances. An implementer is porting (13 tests failed before the port). The baseline before the re-pin: `agentic-trading-cli AAPL XOM SPY --start-date 2016-01-04 --end-date 2016-02-29 --yes --no-log` on 55de545, lake version 3221b45705b9, gave Sharpe -2.9034, final NAV 9,791,065.51 and 193 trades (scratchpad `at78_before.clean.json`). Rerun the same command after the port at the same lake version and report every number that moves (coordinator's condition). The quantcore changelog is in the uv git cache, `checkouts/c25289b1a1625e82/a041d0d/CHANGELOG.md`.
+- None. AT-78's A/B results are in ISSUES. The material change is Engle-Granger p-values, about three times larger (matching statsmodels): admissible pair-quarters over 2010-2017 fall from 31 to 13. The idle-pod capital found during the A/B is filed as AT-81 (held).
 
 ## Next steps, in order
 
 1. When LK-13 and LK-14 land, move company facts and insider transactions
    back from the `_log` views to the current views.
-2. AT-6 waits for LK-15 (COT `published_at`); until then the `+3 days`
-   gate stands.
-3. AT-78: re-pin quantcore to a041d0d and record every numeric change.
-   AT-80's residual exclusions (table in ISSUES) shrink when LK-50 lands;
+2. AT-6: LK-15 landed (lake fa44af5). Gate COT on
+   `cftc_cot_publication.published_date` (join on `report_date`); skip
+   rows before 2000, where it is null.
+3. AT-80's residual exclusions (table in ISSUES) shrink when LK-50 lands;
    re-measure then. AT-68 is blocked by LK-49 (no
    usable declaration date; LK-48).
 4. AT-40 ledger: shared format with pitch-edge (PE-21); the two
@@ -108,3 +109,11 @@ defaults. No post-result cost version was registered.
   the date column. A full-table aggregate through `/v1/sql` runs out of
   memory: query it by underlying and a date window.
 - Never let an agent run `git stash` while another agent edits the tree.
+- A/B across a dependency pin: check the old pin out in a scratch
+  `git worktree` at HEAD with its own `uv sync --locked`, and symlink `.env`
+  into it. Run both sides in parallel and check that both provenance
+  blocks show the same `lake_version`. database-57 will hold the lake still
+  on request.
+- The stat-arb manager rescreens pairs each quarter and overwrites the
+  roster's partner map. "No partner ticker configured" means no pair was
+  admitted, not that the wiring is broken.

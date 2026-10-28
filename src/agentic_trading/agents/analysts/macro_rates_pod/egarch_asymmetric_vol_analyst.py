@@ -6,12 +6,14 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from pydantic import PrivateAttr
+from quantcore.risk import ConvergenceError
 from quantcore.risk.egarch import EGARCHParams, egarch_11_variance, egarch_fit
 
 from agentic_trading.agents._market_math import RefitCache, clamp, market_slice
 from agentic_trading.agents.analysts.macro_rates_pod._garch_checks import (
     check_egarch_params,
     check_sigma_path,
+    fit_or_convergence_error,
 )
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.schemas import AgentSignal, SignalStatus
@@ -28,15 +30,17 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
     to the last `settings.analysts.risk_window_garch` returns of the asset,
     re-fitting at most once every `garch_refit_interval_days` per asset
     and computing the conditional-variance path daily from the cached
-    parameters. Signals from the sign and magnitude of the fitted leverage
-    term's realized contribution on the most recent observation — a
-    strongly negative recent shock combined with a positive fitted gamma
-    signals elevated near-term downside vol.
+    parameters; a fit that raises `ConvergenceError` is cached the same
+    way, so it is not retried before the interval ends. Signals from the
+    sign and magnitude of the fitted leverage term's realized contribution
+    on the most recent observation — a strongly negative recent shock
+    combined with a positive fitted gamma signals elevated near-term
+    downside vol.
 
     Stays flat, with the failing check named in the rationale, whenever
     the window is shorter than `min_garch_observations`, the fit fails or
-    does not converge, the parameters fail `check_egarch_params`, or the
-    computed path fails `check_sigma_path`."""
+    does not converge (`ConvergenceError`), the parameters fail
+    `check_egarch_params`, or the computed path fails `check_sigma_path`."""
 
     agent_id: str = "egarch_asymmetric_vol_analyst"
     _refit_cache: RefitCache = PrivateAttr(
@@ -77,8 +81,8 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
             )
 
         try:
-            fitted: EGARCHParams = self._refit_cache.get_or_refit(
-                asset, as_of_date, lambda: egarch_fit(returns)
+            fitted: EGARCHParams | ConvergenceError = self._refit_cache.get_or_refit(
+                asset, as_of_date, lambda: fit_or_convergence_error(egarch_fit, returns)
             )
         except (RuntimeError, ValueError) as exc:
             logger.debug(
@@ -88,6 +92,20 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
                 exc,
             )
             return self._flat(asset, as_of_date, "EGARCH MLE fit failed", "error")
+
+        if isinstance(fitted, ConvergenceError):
+            logger.debug(
+                "%s: EGARCH MLE fit did not converge for %s (%s) — returning flat.",
+                self.agent_id,
+                asset,
+                fitted.optimizer_message,
+            )
+            return self._flat(
+                asset,
+                as_of_date,
+                "EGARCH parameters rejected: MLE fit did not converge",
+                "unavailable",
+            )
 
         sample_std = float(np.std(returns, ddof=1))
         failed_check = check_egarch_params(fitted, sample_std)

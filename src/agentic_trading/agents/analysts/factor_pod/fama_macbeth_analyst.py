@@ -171,8 +171,7 @@ class FamaMacbethAnalyst(AnalystAgent):
             excess = joined_returns[ticker].to_numpy(dtype=np.float64) - risk_free
             # quantcore returns the intercept (alpha) first; only the per-
             # factor loadings belong in the cross-sectional stage.
-            loadings, _t_stats = factor_loadings(excess, factor_matrix)
-            betas_by_ticker[ticker] = loadings[1:]
+            betas_by_ticker[ticker] = factor_loadings(excess, factor_matrix).loadings[1:]
             panel_returns.append(excess)
 
         panel = np.column_stack(panel_returns)

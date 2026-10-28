@@ -259,7 +259,6 @@ def test_egarch_analyst_uses_real_mle_fitted_parameters(monkeypatch) -> None:
     mod.EGARCHAsymmetricVolAnalyst().generate_signal("AAPL", market_data, dates[-1])
 
     fitted = mod.egarch_fit(returns[-settings.analysts.risk_window_garch :])
-    assert fitted.converged
     assert captured["omega"] == pytest.approx(fitted.omega)
     assert captured["alpha"] == pytest.approx(fitted.alpha)
     assert captured["gamma"] == pytest.approx(fitted.gamma)
@@ -287,7 +286,6 @@ def test_gjr_garch_analyst_uses_real_mle_fitted_parameters(monkeypatch) -> None:
     mod.GJRGARCHCrashRiskAnalyst().generate_signal("AAPL", market_data, dates[-1])
 
     fitted = mod.gjr_garch_fit(returns[-settings.analysts.risk_window_garch :])
-    assert fitted.converged
     assert captured["omega"] == pytest.approx(fitted.omega)
     assert captured["alpha"] == pytest.approx(fitted.alpha)
     assert captured["gamma"] == pytest.approx(fitted.gamma)
@@ -324,12 +322,19 @@ def test_garch_analysts_return_flat_below_minimum_observations(
 
 
 def test_egarch_analyst_returns_flat_on_non_convergent_fit(monkeypatch) -> None:
+    from quantcore.risk import ConvergenceError
+
     from agentic_trading.agents.analysts.macro_rates_pod import egarch_asymmetric_vol_analyst as mod
 
-    class _NonConvergent:
-        converged = False
+    def _non_convergent(returns):
+        raise ConvergenceError(
+            "no start converged",
+            params=(-0.05, 0.1, -0.05, 0.9),
+            log_likelihood=0.0,
+            optimizer_message="Iteration limit reached",
+        )
 
-    monkeypatch.setattr(mod, "egarch_fit", lambda returns: _NonConvergent())
+    monkeypatch.setattr(mod, "egarch_fit", _non_convergent)
     market_data, dates = _garch_market_data(_simulated_gjr_returns(1))
 
     signal = mod.EGARCHAsymmetricVolAnalyst().generate_signal("AAPL", market_data, dates[-1])
@@ -340,12 +345,19 @@ def test_egarch_analyst_returns_flat_on_non_convergent_fit(monkeypatch) -> None:
 
 
 def test_gjr_garch_analyst_returns_flat_on_non_convergent_fit(monkeypatch) -> None:
+    from quantcore.risk import ConvergenceError
+
     from agentic_trading.agents.analysts.macro_rates_pod import gjr_garch_crash_risk_analyst as mod
 
-    class _NonConvergent:
-        converged = False
+    def _non_convergent(returns):
+        raise ConvergenceError(
+            "no start converged",
+            params=(1e-6, 0.05, 0.1, 0.8),
+            log_likelihood=0.0,
+            optimizer_message="Iteration limit reached",
+        )
 
-    monkeypatch.setattr(mod, "gjr_garch_fit", lambda returns: _NonConvergent())
+    monkeypatch.setattr(mod, "gjr_garch_fit", _non_convergent)
     market_data, dates = _garch_market_data(_simulated_gjr_returns(1))
 
     signal = mod.GJRGARCHCrashRiskAnalyst().generate_signal("AAPL", market_data, dates[-1])
@@ -363,7 +375,7 @@ def test_egarch_analyst_returns_flat_on_over_persistent_fit(monkeypatch) -> None
     from agentic_trading.agents.analysts.macro_rates_pod import egarch_asymmetric_vol_analyst as mod
 
     over_persistent = EGARCHParams(
-        omega=-0.05, alpha=0.1, gamma=-0.05, beta=0.999, log_likelihood=0.0, converged=True
+        omega=-0.05, alpha=0.1, gamma=-0.05, beta=0.999, log_likelihood=0.0
     )
     monkeypatch.setattr(mod, "egarch_fit", lambda returns: over_persistent)
     monkeypatch.setattr(
@@ -387,7 +399,7 @@ def test_gjr_garch_analyst_returns_flat_on_over_persistent_fit(monkeypatch) -> N
     from agentic_trading.agents.analysts.macro_rates_pod import gjr_garch_crash_risk_analyst as mod
 
     over_persistent = GJRGARCHParams(
-        omega=1e-6, alpha=0.05, gamma=0.1, beta=0.9, log_likelihood=0.0, converged=True
+        omega=1e-6, alpha=0.05, gamma=0.1, beta=0.9, log_likelihood=0.0
     )
     monkeypatch.setattr(mod, "gjr_garch_fit", lambda returns: over_persistent)
     monkeypatch.setattr(

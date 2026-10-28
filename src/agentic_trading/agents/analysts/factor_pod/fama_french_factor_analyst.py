@@ -118,10 +118,13 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
 
         # quantcore returns the intercept (alpha) first, then one loading
         # per factor column — drop the intercept so positions line up with
-        # `factor_columns`, then gate each loading on its own significance.
-        loadings, loading_t_stats = factor_loadings(excess_returns, factor_matrix)
+        # `factor_columns`, then gate each loading on its own Newey-West
+        # t-stat (lag count from quantcore's sample-size rule).
+        regression = factor_loadings(excess_returns, factor_matrix)
         betas = np.where(
-            np.abs(loading_t_stats[1:]) >= settings.analysts.t_stat_threshold, loadings[1:], 0.0
+            np.abs(regression.t_stats[1:]) >= settings.analysts.t_stat_threshold,
+            regression.loadings[1:],
+            0.0,
         )
         if not np.any(betas):
             return AgentSignal(

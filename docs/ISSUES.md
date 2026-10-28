@@ -97,7 +97,7 @@ Paths are relative to `src/agentic_trading/`.
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M22)
 - Evidence: [M] `lakehouse_loader.py:293` uses `report_date + 3 days`. 79 of 1,059 GC=F reports are exposed 1-4 days early. The exact date is in `etl.publication.cftc_cot_published_at`.
 - Acceptance: the code follows `cftc_cot_published_at`, shifting to the next business day per holiday. The 2018-12-31 report is absent as of 2019-01-04 and present as of 2019-01-07.
-- Blocked-by / Blocks: with LK-15
+- Blocked-by / Blocks: LK-15, landed 2026-10-28 (lake fa44af5): `cftc_cot_publication` has one row per `report_date` with `published_date` (null before 2000), `published_at` and `basis`. Gate with `JOIN cftc_cot_publication USING (report_date) WHERE published_date <= ?`; the API's describe() still says +3 days.
 - Commits: none
 
 ### AT-7 FINRA short interest: no holiday calendar; revisions overwrite undated
@@ -864,14 +864,50 @@ Paths are relative to `src/agentic_trading/`.
   - Asks (section 9): (1) approve one engine and the deletion of ours; (2) approve the LLM scope; (3) approve the budget.
 
 ### AT-78 Re-pin quantcore forward to edgelab's a041d0d
-- Status: open
+- Status: done (AT-72's numpy/scipy declaration still open: `uv add` not approved)
 - Priority: should
 - Gate: data
 - Raised by: agentic-trading-c5 with edgelab-62, 2026-10-27
 - Evidence: edgelab pins a041d0d (2026-10-13), six commits ahead of our 450a5a2 (2026-09-19), an ancestor. Known numeric changes: "numerical results changed" (47fa8b9), exact ARIMA likelihood, cointegration rewrite.
 - Acceptance: pin a041d0d in `pyproject.toml` (with AT-72), run the full suite, and record every numeric change.
 - Blocked-by / Blocks: paired with EL-26 (one quantcore sha across both projects); blocks AT-77 step 3
-- Commits: none
+- Resolution: pinned a041d0d (quantcore 0.3.0) and ported to its API.
+  - `factor_loadings` now returns a result object.
+  - EGARCH and GJR fits raise `ConvergenceError`. A fit with a best attempt is cached as non-converged for the refit interval; one without a best attempt is an error and is retried.
+  - `risk_parity_weights` needs strictly positive variances, and the closed-form Ledoit-Wolf returns exact zeros for a constant column. So an asset whose returns never vary is sized at 0.0 and left out of its pod's covariance. A pod whose returns never vary is left out of cross-pod risk parity and sized as an average risk-parity pod.
+  - The firm stress test sets correlations with a zero-variance asset to 0. With 0/0 = NaN there, the stress limit could never bind.
+  - Before and after ran on one lake version (bd2c2e6d2a54-dirty, held still by database-57) and one commit (57cbce8), with only the pin and the port differing. The old-pin rerun reproduced the 3221b45705b9 baseline to the last digit.
+  - AAPL, XOM, SPY, 2016-01-04 to 2016-02-29 [V]:
+
+  | Number | 450a5a2 | a041d0d | Why |
+  |---|---|---|---|
+  | Sharpe | -2.9034 | -2.8237 | path |
+  | Sortino | -3.3988 | -3.3084 | path |
+  | Max drawdown | 0.028664 | 0.027907 | path (the new running-peak-at-1.0 rule changes nothing here) |
+  | Calmar | -4.8447 | -4.5179 | +0.286 CAGR default (same path), +0.040 path |
+  | Hit rate | 0.4737 | 0.4737 | none |
+  | Profit factor | 0.6167 | 0.6235 | path |
+  | Final NAV | 9,791,065.51 | 9,798,831.49 | path |
+  | Transaction cost | 13,228.94 | 13,078.87 | path |
+  | Financing cost | 272.69 | 261.35 | path |
+  | Option premium | 176,099 | 176,567 | path |
+  | Trades / unfilled | 193 / 0 | 193 / 0 | none |
+
+  - "Path" is sizing. Every analyst signal is identical to 12 decimals except VAR spillover, which flips direction on 2 days at zero confidence (`var_fit` degrees-of-freedom fix). Target weights differ from the first day by about 0.1% relative, while pod allocations are still equal. That is the pods' covariance step: Ledoit-Wolf with 1/T and closed form, risk parity by Newton, min-variance as an exact QP. The cross-pod allocation reads the same Ledoit-Wolf once it starts.
+  - ARIMA, pairs and Kalman do not trade on this universe: Ljung-Box finds no serial dependence, and no pair is held.
+  - MSFT, ADBE, BA, CAT over the same window and lake [V]:
+    - Sharpe -4.4224 to -4.9644, hit rate 0.3947 to 0.3421, final NAV 9,828,651.17 to 9,822,638.51, transaction cost 12,245.79 to 12,795.18.
+    - On top of the sizing change, ARIMA(2,1,2) on BA changes its forecast on 4 days and flips direction on 2 (exact MLE in place of CSS).
+    - VAR spillover flips 11 directions, all at zero confidence.
+    - The LK-50 rebuild of `equity_daily_from_bars` went live at 04:10Z, partway through this pair (04:06 to 04:17). Both sides ran in parallel, and the analysts that read that table (Fama-MacBeth, network centrality) gave identical signals on both. The 3-asset pair ran before it (03:57 to 04:04).
+  - Cointegration [V]: the 10 candidate pairs were scored quarterly over 2010-2017 (117 verdicts). Hedge ratios and half-lives are unchanged. Engle-Granger p-values rise in 116 of 117 (median +0.149), so pair-quarters that pass admission (p < 0.05, half-life 5-60 days) fall from 31 to 13. The new p-values match statsmodels 0.15 `coint` on 3 of 4 checked pairs; the fourth differs by lag choice. The old p-values were about three times too small, so the stat-arb pod admitted pairs on false cointegration under 450a5a2.
+  - Not exercised by either window: the change to Kalman's prior mean (only held pairs run it), and the fitter preferring a converged start (EGARCH and GJR output matched to 4 decimals).
+  - Review notes, accepted as they are:
+    - An asset held after a view-direction day that goes flat is closed at once, without the no-trade band.
+    - A cached `ConvergenceError` cannot be pickled. Nothing pickles analyst caches today.
+    - ARIMA non-convergence under exact MLE is status `error` and is refit daily; no such case occurred in either window.
+  - The first A/B found a port bug, fixed before commit: a flat pod left out of risk parity took its raw trailing-performance weight. The three idle pods (rates, cross-asset, credit) then held 75% of capital, and gross fell 40%. It is now sized as an average pod (`test_commander_flat_pods.py`). The idle-pod capital that remains on both pins is AT-81.
+- Commits: pending
 
 ### AT-79 Pre-2019 options from `option_chain_history` (SPY, QQQ, IWM)
 - Status: done
@@ -909,3 +945,13 @@ Paths are relative to `src/agentic_trading/`.
 
   "No bars" is mostly LK-50's source gaps (pre-rename tickers, CMCSA). The rest are mostly entrants with no bars before they joined the index. Both shrink when the lake fills from Yahoo and before entry (LK-50); until then the exclusion rate must be stated with any result from these two analysts.
 - Commits: 7b37814
+
+### AT-81 Pods that hold nothing take a share of firm capital
+- Status: open
+- Priority: should
+- Gate: held (Commander allocation; owner to decide with AT-77)
+- Raised by: agentic-trading-c5, 2026-10-28, during the AT-78 A/B
+- Evidence: [V] On AAPL, XOM and SPY (2016-01-04 to 2016-02-29) the rates, cross-asset and credit pods cover none of the traded assets and post a realised 0.0 every day, yet `_risk_budget_weights` funds them. In the inverse-vol warm-up their zero vol hits the peer floor (`commander.min_relative_vol_floor` × median vol), so each takes about 0.20 (days 5-10, about 60% of capital idle). Once cross-pod risk parity runs, each is sized as an average pod, about 0.10 (about 30% idle). Same on quantcore 450a5a2 and a041d0d. With one varying pod beside idle ones, cross-pod risk parity cannot run, and the floor gives the idle pods most of the capital: 0.91 for one idle pod against one varying pod at equal trailing-performance weight. The floor is right for a pod that has a book but low vol, and wrong for one with no book.
+- Acceptance: capital goes only to pods with a non-empty book on the day (or whose analysts cover a traded asset), the rest renormalised. Report firm gross and NAV on the AT-78 window before and after.
+- Blocked-by / Blocks: none
+- Commits: none

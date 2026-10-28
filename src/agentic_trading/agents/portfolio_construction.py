@@ -245,6 +245,18 @@ class PortfolioConstructor:
             for asset in views
         }
 
+    def _view_direction_book(
+        self, assets: list[str], views: dict[str, PodView]
+    ) -> dict[str, float]:
+        """`_bootstrap_weights_from_views` followed by the net-leverage trim:
+        the whole book this pod runs when it has no covariance it can
+        risk-budget with."""
+        bootstrap_weights = self._bootstrap_weights_from_views(views)
+        trimmed = self._apply_net_leverage_trim(
+            np.array([bootstrap_weights[asset] for asset in assets])
+        )
+        return dict(zip(assets, trimmed.tolist(), strict=True))
+
     def _record_own_realized_return(
         self,
         previous_weights: dict[str, float] | None,
@@ -490,7 +502,14 @@ class PortfolioConstructor:
         asset at weight 0.0 (never omits a key) if `returns_history` is
         missing an asset entirely (a real data gap, not just a
         not-enough-history-yet timing issue) — the caller still needs
-        one `PortfolioDecision` per asset regardless."""
+        one `PortfolioDecision` per asset regardless.
+
+        An asset whose returns do not vary at all over `returns_history`
+        (every observation equal, e.g. a flat price series) has no
+        measurable risk: it is sized at 0.0, with a warning, and left out
+        of the covariance estimate and every stage after it. When no asset
+        varies, the whole book is sized off view direction alone, as with
+        too little history."""
         assets = list(views.keys())
         if not assets:
             return {}
@@ -520,15 +539,44 @@ class PortfolioConstructor:
                 min_observations,
                 len(assets),
             )
-            bootstrap_weights = self._bootstrap_weights_from_views(views)
-            trimmed = self._apply_net_leverage_trim(
-                np.array([bootstrap_weights[asset] for asset in assets])
+            return self._view_direction_book(assets, views)
+
+        returns_matrix = returns_history[assets].to_numpy(dtype=np.float64)
+        flat_assets = [
+            asset
+            for asset, column in zip(assets, returns_matrix.T, strict=True)
+            if np.all(column == column[0])
+        ]
+        if len(flat_assets) == len(assets):
+            logger.warning(
+                "PortfolioConstructor: no asset in %s has any return variation over %d "
+                "observation(s) as of %s — no covariance to risk-budget with, sizing off "
+                "view direction alone.",
+                assets,
+                len(returns_history),
+                as_of_date.date(),
             )
-            return dict(zip(assets, trimmed.tolist(), strict=True))
+            return self._view_direction_book(assets, views)
+        if flat_assets:
+            logger.warning(
+                "PortfolioConstructor: %s have no return variation over %d observation(s) as "
+                "of %s — sized at 0.0 and left out of the covariance estimate.",
+                flat_assets,
+                len(returns_history),
+                as_of_date.date(),
+            )
+            # Every remaining asset varies, so this nested call runs the full
+            # pipeline below exactly once for the reduced book.
+            varying_weights = self.construct(
+                {asset: view for asset, view in views.items() if asset not in flat_assets},
+                returns_history,
+                as_of_date,
+                previous_weights,
+            )
+            return {asset: varying_weights.get(asset, 0.0) for asset in assets}
 
         self._record_own_realized_return(previous_weights, returns_history, as_of_date)
 
-        returns_matrix = returns_history[assets].to_numpy(dtype=np.float64)
         cov_matrix = ledoit_wolf_shrinkage(returns_matrix)
         posterior_returns = self._black_litterman_expected_returns(assets, views, cov_matrix)
 

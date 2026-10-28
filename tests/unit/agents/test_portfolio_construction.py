@@ -103,22 +103,33 @@ def test_leverage_tracks_target_annualized_vol_below_the_cap() -> None:
     target_annualized_vol rather than sitting at some fixed fraction of
     leverage_cap — the Bridgewater-style volatility-targeting mechanism,
     not a flat Kelly-esque fraction."""
-    calm_returns = pd.DataFrame({"AAPL": np.full(120, 0.0001), "MSFT": np.full(120, -0.0001)})
-    constructor = PortfolioConstructor(
-        method="risk_parity", leverage_cap=2.5, target_annualized_vol=0.15
-    )
+    rng = np.random.default_rng(0)
 
-    result = constructor.construct(
-        views=_views({"AAPL": 0.3, "MSFT": -0.1}),
-        returns_history=calm_returns,
-        as_of_date=pd.Timestamp("2024-06-01"),
-    )
+    def _gross(daily_std: float) -> float:
+        returns = pd.DataFrame(
+            {
+                "AAPL": rng.normal(0.0001, daily_std, 120),
+                "MSFT": rng.normal(-0.0001, daily_std, 120),
+            }
+        )
+        constructor = PortfolioConstructor(
+            method="risk_parity", leverage_cap=2.5, target_annualized_vol=0.15
+        )
+        result = constructor.construct(
+            views=_views({"AAPL": 0.3, "MSFT": -0.1}),
+            returns_history=returns,
+            as_of_date=pd.Timestamp("2024-06-01"),
+        )
+        return sum(abs(weight) for weight in result.values())
 
-    gross_leverage = sum(abs(weight) for weight in result.values())
-    # A near-zero-variance universe would imply near-infinite leverage
-    # under pure vol-targeting — leverage_cap is exactly the backstop that
-    # must bind here.
-    assert gross_leverage <= 2.5 + 1e-6
+    calm_gross = _gross(0.0005)
+    noisy_gross = _gross(0.01)
+
+    # A very low-variance universe implies far more than 2.5x leverage
+    # under pure vol-targeting, so leverage_cap is the backstop that binds;
+    # a noisier universe gets less leverage.
+    assert calm_gross <= 2.5 + 1e-6
+    assert noisy_gross < calm_gross
 
 
 def test_leverage_cap_must_be_within_max_leverage() -> None:

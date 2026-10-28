@@ -23,13 +23,13 @@ logger = get_logger(__name__)
 
 LJUNG_BOX_MAX_LAGS = 10
 LJUNG_BOX_SIGNIFICANCE = 0.05
-# CSS estimation needs roughly a year of daily returns for stable
-# low-order coefficient estimates.
+# Roughly a year of daily returns gives stable low-order coefficient
+# estimates.
 ARIMA_WINDOW = 250
 # Search grid for select_arima_order — small on purpose (a daily-return
 # series rarely needs higher-order AR/MA terms, and a wider grid mostly
 # just risks overfitting the trailing window's own noise). Every extra
-# grid cell costs a full CSS fit.
+# grid cell costs a full exact-likelihood fit.
 MAX_P = 2
 MAX_Q = 2
 # Log price is I(1) by construction (its first difference is the return
@@ -39,11 +39,13 @@ ORDER_SELECTION_CRITERION = "aic"
 
 
 class ARIMAForecastAnalyst(AnalystAgent):
-    """Fits a low-order ARIMA model on the last `ARIMA_WINDOW` trailing log
-    prices and forecasts `forecast_horizon` days ahead. Two Ljung-Box
-    gates bracket the fit: a pre-fit test on the return series (no serial
-    dependence means nothing to forecast) and a post-fit test on the CSS
-    residuals (`quantcore.time_series.arima.arima_residuals`; residual
+    """Fits a low-order ARIMA model by exact Gaussian maximum likelihood
+    (`quantcore.time_series.arima.arima_fit`'s default) on the last
+    `ARIMA_WINDOW` trailing log prices and forecasts `forecast_horizon`
+    days ahead. Two Ljung-Box gates bracket the fit: a pre-fit test on the
+    return series (no serial dependence means nothing to forecast) and a
+    post-fit test on the conditional (CSS) residuals at the fitted
+    coefficients (`quantcore.time_series.arima.arima_residuals`; residual
     autocorrelation means the order is misspecified and the forecast is
     not trusted). The order is re-identified every
     `settings.analysts.arima_order_reselect_days` on the return series

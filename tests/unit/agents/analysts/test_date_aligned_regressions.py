@@ -72,14 +72,14 @@ def test_fama_french_regression_joins_returns_and_stale_factors_by_date(monkeypa
     (y, x), result = calls[0]
     np.testing.assert_allclose(y, expected_y, atol=1e-12)
     np.testing.assert_allclose(x, expected_x, atol=1e-12)
-    np.testing.assert_allclose(result[0], expected, atol=1e-9)
+    np.testing.assert_allclose(result.loadings, expected, atol=1e-9)
     assert signal.sample_count == len(joined)
 
     length = len(stale)
     positional_y = window.to_numpy()[-length:] - stale["RF"].to_numpy()
     positional = _ols(positional_y, stale[FACTORS].to_numpy())
     assert abs(positional[1] - expected[1]) > 0.1
-    assert abs(result[0][1] - positional[1]) > 0.1
+    assert abs(result.loadings[1] - positional[1]) > 0.1
 
 
 def _patch_member_returns(monkeypatch, mod, tickers: list[str], frame: pd.DataFrame) -> None:

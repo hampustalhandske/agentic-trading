@@ -178,17 +178,36 @@ def _cross_pod_risk_parity_weights(
     shrinks it with `ledoit_wolf_shrinkage`, and sizes with
     `risk_parity_weights` — the same two functions each pod's own
     `PortfolioConstructor` already uses one layer down, reused here
-    *across* pods. Returns `None` (caller falls back to the simpler
-    per-pod inverse-vol mechanism) if there are fewer than 2 qualifying
-    pods, or if there isn't strictly more overlapping history (`T`) than
-    qualifying pods (`k`) — `ledoit_wolf_shrinkage`'s own `T > k`
-    requirement, same threshold shape as `PortfolioConstructor`'s
-    `MIN_OBSERVATIONS_FOR_COVARIANCE` check one layer down."""
+    *across* pods. A pod whose overlapping returns do not vary at all
+    (every day the same, e.g. a pod holding nothing) has no measurable
+    risk: it is left out, with a log line, and has no key in the result.
+    Returns `None` (caller falls back to the simpler per-pod inverse-vol
+    mechanism) if there are fewer than 2 qualifying pods, if there isn't
+    strictly more overlapping history (`T`) than qualifying pods (`k`) —
+    `ledoit_wolf_shrinkage`'s own `T > k` requirement, same threshold
+    shape as `PortfolioConstructor`'s `MIN_OBSERVATIONS_FOR_COVARIANCE`
+    check one layer down — or if fewer than 2 pods with varying returns
+    remain."""
     if len(qualifying) < 2:
         return None
     overlapping = pd.DataFrame({m: pod_return_history[m] for m in qualifying}).dropna()
     if len(overlapping) <= len(qualifying):
         return None
+    flat_pods = [
+        manager_id
+        for manager_id in overlapping.columns
+        if bool(np.all(overlapping[manager_id] == overlapping[manager_id].iloc[0]))
+    ]
+    if flat_pods:
+        logger.info(
+            "Commander: %s have no return variation over %d overlapping day(s) — left out "
+            "of cross-pod risk parity.",
+            flat_pods,
+            len(overlapping),
+        )
+        overlapping = overlapping.drop(columns=flat_pods)
+        if overlapping.shape[1] < 2:
+            return None
     cov_matrix = ledoit_wolf_shrinkage(overlapping.to_numpy(dtype=np.float64))
     weights = risk_parity_weights(cov_matrix)
     return dict(zip(overlapping.columns, weights.tolist(), strict=True))
@@ -214,8 +233,11 @@ def _risk_budget_weights(
     already uses one layer down. A pod with no trailing history at all
     yet gets `weighting_strategy`'s own trailing-performance weight
     directly, in both cases — a per-pod bootstrap, not an all-or-nothing
-    gate. Every pod that produces any real signal at all ends up with a
-    nonzero share; the whole allocation is normalized together so gross
+    gate. A qualifying pod that risk parity leaves out for having no
+    return variation is sized as an average risk-parity pod: its
+    trailing-performance weight times `1 / (pods in risk parity)`. Every
+    pod that produces any real signal at all ends
+    up with a nonzero share; the whole allocation is normalized together so gross
     weight still sums to 1.0. Returns `{}` only if every pod's weight
     comes out exactly zero (e.g. a fully untested `weighting_strategy`),
     the signal `Commander.decide()` uses as a last-resort equal-weight
@@ -230,9 +252,10 @@ def _risk_budget_weights(
 
     risk_parity = _cross_pod_risk_parity_weights(pod_return_history, qualifying)
     if risk_parity is not None:
+        average_share = 1.0 / len(risk_parity)
         raw_weights = {
             manager_id: (
-                risk_parity[manager_id] * bootstrap.get(manager_id, 0.0)
+                risk_parity.get(manager_id, average_share) * bootstrap.get(manager_id, 0.0)
                 if manager_id in qualifying
                 else bootstrap.get(manager_id, 0.0)
             )
@@ -484,7 +507,15 @@ def _apply_firm_limits(
                 )
 
     variances = np.diag(cov_matrix)
-    corr_matrix = cov_matrix / np.sqrt(np.outer(variances, variances))
+    # A zero-variance asset has zero stressed variance, so its correlations
+    # never enter the stressed covariance; they are 0 rather than 0 / 0.
+    volatility_products = np.sqrt(np.outer(variances, variances))
+    corr_matrix = np.divide(
+        cov_matrix,
+        volatility_products,
+        out=np.zeros_like(cov_matrix),
+        where=volatility_products > 0.0,
+    )
     shocked_corr = np.sign(corr_matrix) * np.maximum(
         np.abs(corr_matrix), firm.stress_correlation_shock
     )

@@ -1,8 +1,10 @@
 # _garch_checks.py
 
 import math
+from collections.abc import Callable
 
 import numpy as np
+from quantcore.risk import ConvergenceError
 from quantcore.risk.egarch import EGARCHParams, GJRGARCHParams
 
 from agentic_trading.config import settings
@@ -20,6 +22,24 @@ MAX_SIGMA_PATH_RANGE_RATIO = 20.0
 FINAL_SIGMA_RATIO_BOUNDS = (0.2, 5.0)
 
 
+def fit_or_convergence_error[FittedParams: (EGARCHParams, GJRGARCHParams)](
+    fit: Callable[[np.ndarray], FittedParams], returns: np.ndarray
+) -> FittedParams | ConvergenceError:
+    """Runs `fit(returns)` (`egarch_fit` or `gjr_garch_fit`) and returns the
+    fitted parameters, or the `ConvergenceError` it raised when no starting
+    point converged but a best attempt exists (`params` set). Returning the
+    error as a value lets `RefitCache` keep a non-converged outcome for the
+    whole refit interval, like any fit. A `ConvergenceError` without a best
+    attempt (no starting point gave a finite likelihood) is re-raised, as is
+    every other exception."""
+    try:
+        return fit(returns)
+    except ConvergenceError as exc:
+        if exc.params is None:
+            raise
+        return exc
+
+
 def _ratio_outside(value: float, reference: float, bounds: tuple[float, float]) -> bool:
     if not math.isfinite(value) or reference <= 0.0:
         return True
@@ -29,13 +49,11 @@ def _ratio_outside(value: float, reference: float, bounds: tuple[float, float]) 
 
 def check_gjr_params(fitted: GJRGARCHParams, sample_std: float) -> str | None:
     """Returns the name of the first sanity check a GJR-GARCH(1,1) fit
-    fails, or None if it passes all of them: convergence, positivity and
+    fails, or None if it passes all of them: positivity and
     non-negativity constraints on the coefficients, persistence
     `alpha + beta + gamma/2` at most `max_garch_persistence`, and the
     implied unconditional vol within `UNCONDITIONAL_VOL_RATIO_BOUNDS` of
     `sample_std`."""
-    if not fitted.converged:
-        return "MLE fit did not converge"
     if fitted.omega <= 0.0:
         return "omega <= 0"
     if fitted.alpha < 0.0 or fitted.beta < 0.0:
@@ -53,12 +71,10 @@ def check_gjr_params(fitted: GJRGARCHParams, sample_std: float) -> str | None:
 
 def check_egarch_params(fitted: EGARCHParams, sample_std: float) -> str | None:
     """Returns the name of the first sanity check an EGARCH(1,1) fit fails,
-    or None if it passes all of them: convergence, beta within
+    or None if it passes all of them: beta within
     `[MIN_EGARCH_BETA, max_garch_persistence]`, and the implied
     unconditional vol `exp(omega / (2 (1 - beta)))` within
     `UNCONDITIONAL_VOL_RATIO_BOUNDS` of `sample_std`."""
-    if not fitted.converged:
-        return "MLE fit did not converge"
     if fitted.beta < MIN_EGARCH_BETA:
         return f"beta {fitted.beta:.4f} below minimum"
     if fitted.beta > settings.analysts.max_garch_persistence:
