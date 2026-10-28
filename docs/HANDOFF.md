@@ -3,7 +3,7 @@
 Where agentic-trading work stands, for a session resuming cold. Read this,
 then `docs/ISSUES.md` for each issue's acceptance and commits.
 
-Updated: 2026-10-27, branch `dev`. Nothing is pushed; never push.
+Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 
 ## Operating rules
 
@@ -34,6 +34,7 @@ Updated: 2026-10-27, branch `dev`. Nothing is pushed; never push.
 | AT-2 | FRED from `fred_vintages`, latest version published by as-of | dadea7a |
 | AT-5 | Fama-French daily values public at the end of the next month | dadea7a |
 | AT-65 | risk-free series forward-filled only; raises before first value | dadea7a |
+| AT-4, AT-37 | run provenance block; loaders tested against lake contract v1 | 9ed37ed |
 | AT-77 | asks 1 and 2 approved: edgelab executes; LLM scope event-desk then macro | 119b15a |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
@@ -45,8 +46,6 @@ roll (source gap LK-43).
 
 ## In progress
 
-- AT-4: every read goes through `/v1/sql` and `lake_provenance()` exists.
-  Remaining: each run records the lake version and read time, with AT-37.
 - AT-1 follow-up: move the factor to `yahoo_splits` and count rows where
   `in_close_basis IS NOT FALSE`. Blocked by LK-41; `yahoo_splits` has no
   `in_close_basis` column yet. Check with
@@ -71,4 +70,9 @@ roll (source gap LK-43).
 - `fred_vintages` DGS3MO and DGS10 vintages start 2005-06-28; a run ending
   before then has no risk-free series. VIXCLS starts 2010-11-22;
   BAMLH0A0HYM2 2023-09-29, so the credit analyst is unavailable 2010-2017.
+- Lake contract v1 is frozen (lake commit 7eaacba). The views we read are
+  vendored in `tests/fixtures/lakehouse_contract_v1.json`; regenerate them
+  from the lake's `docs/contract-v1.json` when a new contract is frozen.
+  Security ids: equity_ticker_history (ticker and date, inclusive),
+  futures contract_code with futures_roll_calendar, options by OSI.
 - The first lake request after 15 idle minutes can take up to 60 s.

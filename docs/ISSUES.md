@@ -71,14 +71,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: 3ff8eff
 
 ### AT-4 Every loader reads lake Parquet by path; no lake T or version recorded
-- Status: in-progress
+- Status: done
 - Priority: must (M2, M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-E4)
 - Evidence: [V] every `read_parquet` in `lakehouse_loader.py` (lines 100, 144, 208, 213, 288, 331, 387, 394, 438, 515, 594, 660, 712, 758, 808, 858). Path reads see raw append logs, including flagged ranges, superseded keys and private tables.
 - Acceptance: no `read_parquet` or `glob` against `LAKE_DIR` remains (a grep test). Every query goes through `/v1/sql` against the typed views, and the lake T and version are recorded.
 - Blocked-by / Blocks: none
-- Commits: 3ff8eff (every read on /v1/sql; `lake_provenance()` added). Remaining: each run records the lake version and read time, with AT-37.
+- Commits: 3ff8eff (every read on /v1/sql), 9ed37ed (each run records the lake version as reported, read time and contract `lakehouse-contract-v1`; a test binds every loader's SQL to the contract's views and types).
 
 ### AT-5 Fama-French gated on factor date, not publication or vintage
 - Status: done
@@ -420,7 +420,7 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-37 No run provenance
-- Status: open
+- Status: done
 - Priority: must (M2, M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (R-M1)
@@ -428,7 +428,7 @@ Paths are relative to `src/agentic_trading/`.
 - Acceptance: `run` and `experiment` output a `provenance` block: git sha and dirty flag, quantcore sha, `settings.model_dump()`, all CLI args, final analyst and manager ids, seeds, and a lake fingerprint. A test asserts the keys.
 - Blocked-by / Blocks: none
 - Note: the design note replaces this with the registry and ledger (section 8) if AT-77 is approved.
-- Commits: none
+- Commits: 9ed37ed. Seeds are constants in analyst code (42), so the git sha pins them; no separate seeds field.
 
 ### AT-38 `experiment` ignores `--set firm.commission_rate/slippage_bps/execution_lag_days` but records them
 - Status: open
