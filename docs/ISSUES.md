@@ -183,24 +183,24 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-15 Crypto daily close is about 4 hours after the US close
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M10)
 - Evidence: [M] Yahoo BTC close is at 23:59 UTC. Median error 3.4 bp against 23:59 UTC and 39 bp against the US close. BTC moved 2.9% between the two on 2023-06-14. FX closes are believed to be London evening [I].
 - Acceptance: every decision price is sampled at the decision timestamp (BTC at 16:00 America/New_York from `crypto_klines_1m`, or crypto excluded). BTC's 2023-06-14 decision price is within 5 bp of 25,874.6.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: d335c7b. BTC-USD/ETH-USD from crypto_klines_1m (BTCUSDT/ETHUSDT): open 09:30 ET, close 15:59 ET minute, NYSE sessions only. Verified live: BTC 2023-06-14 close 25,874.59.
 
 ### AT-16 Cross-sectional and factor regressions align series by position, not date
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M15)
 - Evidence: [C] `agents/analysts/factor_pod/fama_macbeth_analyst.py:118-128,180-183`; `fama_french_factor_analyst.py:87-101`; `network_centrality_analyst.py:91-92,173-181`. A frozen factor table ends weeks before as_of and shifts every pairing.
 - Acceptance: every regression uses a date-indexed inner join. A test with a 1-day hole in one ticker gives loadings equal to the date-joined computation.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: 5a5b134. Fama-French: inner join on dates, sample_count = joined rows. Fama-MacBeth and network centrality: balanced panel on the asset's dates, dropping universe names with a gap, not dates. Live AAPL 2024-06-28: Fama-MacBeth active with 482 of 484 names over 120 dates; network active with 484 names over 61 dates.
 
 ### AT-17 Option spot is spin-off/dividend adjusted while strikes are as quoted
 - Status: done
@@ -213,24 +213,24 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: 99edc18 (AT-1). Resolved on the opposite basis to the acceptance: strikes are rescaled onto Yahoo's close basis, which counts spin-offs Yahoo writes as fractional splits, and `raw_spot` reads that same Yahoo close. Verified live: GE 2023-01-03 median strike 52.33 against spot 52.94; T 2022-04-08 18.13 against 18.23. Both sides scale by one factor, so moneyness and implied volatility are unchanged.
 
 ### AT-18 CVaR analysts choose ATM against the dividend-adjusted close
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M7)
 - Evidence: [M] `black_scholes_valuation_analyst.py:75`, `greeks_delta_hedge_analyst.py:97`, `heston_vol_surface_analyst.py:115` pass `adj_close`; `_options_data.py:74` picks the nearest strike. `adj_close/close` on 2020-01-02: XOM 0.742, JPM 0.836, AAPL 0.962.
 - Acceptance: analysts use the same spot basis as the strikes (AT-17). XOM's ATM strike on 2020-01-02 is within one strike step of the as-traded close 70.90.
 - Blocked-by / Blocks: depends on AT-17
-- Commits: none
+- Commits: 5a5b134. Spot is raw_spot (the strikes' basis). Verified live: XOM 2020-01-02 spot 70.90, ATM strikes 71.5 and 70.0.
 
 ### AT-19 A held option never matches its post-split strike after a non-integer split
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M5)
 - Evidence: [M] exact strike match at `lakehouse_loader.py:876` and `option_marks.py:162`. TSLA 3-for-1: listed strike 208.33, rescaled 208.333333, so the held contract falls back to a stale IV.
 - Acceptance: contract identity carries across a split (as-quoted OSI symbol plus an adjustment record, or a half-cent match). A TSLA call opened on 2022-08-24 gets a quoted, non-model mark on 2022-08-26. Superseded by the close/reopen pair rule.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: d335c7b. Strike match tolerance 0.005 in the quote loader and option_marks; a TSLA 625 call rescaled to 208.3333 matches the listed 208.33.
 
 ### AT-20 Next-open option fills use that day's end-of-day chain quote
 - Status: open
@@ -244,7 +244,7 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: none
 
 ### AT-21 Option fills ignore `tradeable` and fill on quotes up to 45 days old
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data (moves to edgelab if AT-77 is approved; see Note)
 - Raised by: agentic-trading-c5 audit 2026-10-27 (X-M10)
@@ -252,7 +252,7 @@ Paths are relative to `src/agentic_trading/`.
 - Acceptance: `apply_option_decision` holds when `not mark.tradeable`. A 20-day-old quote returns action "hold" and leaves cash unchanged.
 - Blocked-by / Blocks: none
 - Note: the design note lists AT-21 under both "survive" and "moves to edgelab". It is filed as a move (option fill quotes).
-- Commits: none
+- Commits: d335c7b. A mark with tradeable false is a hold; a position whose only quote is stale is held to expiry and settled at intrinsic.
 
 ### AT-22 Futures traded as one cash security
 - Status: open
