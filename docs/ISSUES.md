@@ -41,14 +41,14 @@ Paths are relative to `src/agentic_trading/`.
 ## Entries
 
 ### AT-1 Option split rescale multiplies every raw write of `dolthub_stock_splits`
-- Status: in-progress
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-E1)
 - Evidence: [V] `data/loaders/lakehouse_loader.py:130-159` has no dedup on `scraped_at`. Factors: AAPL 1.2e24 (true 4), NVDA 1e40 (10), TSLA 1.2e19 (3), AMZN/GOOGL 1.2e104 (20). CVaR results since 2026-09-18 are invalid.
 - Acceptance: `_split_adjustment_factor` returns exactly 4.0 (AAPL 2020-08-28), 10.0 (NVDA 2024-06-07), 3.0 (TSLA 2022-08-01), 20.0 (AMZN, GOOGL the day before their 2022 ex-dates). Source is `equity_splits` with `applied`. A unit test writes one split row three times.
 - Blocked-by / Blocks: none. Done first and alone.
-- Commits: 6f56fa2 (factor magnitude). Follow-up: instrument_prices close is adjusted by Yahoo's own split list, so the factor moves to `yahoo_splits`, which also carries spin-offs written as fractional splits. 13 of its rows are measured as not adjusted in Yahoo's close; two of them (AVB 2026-08-17, SSP 2025-12-08) have option chains quoted before the split. Blocked-by LK-41 (`yahoo_splits.in_close_basis`: false for the 13, null where untestable); the factor then counts rows where `in_close_basis IS NOT FALSE`.
+- Commits: 6f56fa2 (factor magnitude), 99edc18 (factor from `yahoo_split_close_basis`, LK-41: product of 1/ratio over later splits with `in_close_basis IS NOT FALSE`; AVB 2026-08-17 and SSP 2025-12-08 excluded; verified live).
 
 ### AT-2 FRED read as latest value, not `fred_vintages`
 - Status: done

@@ -29,7 +29,7 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 |---|---|---|
 | AT-76 | formatting | f08cc35 |
 | — | `docs/ISSUES.md` (AT-1..79) | 061d13f |
-| AT-1 | split factor magnitude from `equity_splits` | 6f56fa2 |
+| AT-1 | split factor on Yahoo's close basis (`yahoo_split_close_basis`) | 6f56fa2, 99edc18 |
 | AT-3, AT-61 | every loader reads through the lake's `/v1/sql` API | 3ff8eff |
 | AT-2 | FRED from `fred_vintages`, latest version published by as-of | dadea7a |
 | AT-5 | Fama-French daily values public at the end of the next month | dadea7a |
@@ -44,22 +44,40 @@ survivorship coverage 0.89-0.91 (verdict capped, LK-44), Moskowitz without
 CL/NG/HO/RB (deferred energy contracts are EIA settles only), ZN/ZB 6-day
 roll (source gap LK-43).
 
+A1 counted results (edgelab `runs/2026-10-27-a1`): the four S&P baselines
+are graded "not assessable" until edgelab fixes EL-35 (membership-interval
+coverage) and reruns them. Readings so far: reversal loses net of costs,
+JT momentum and the ML ranker show no edge, Ang low-volatility looks
+strong but random entry matches it a quarter of the time (p 0.25), so
+unknown. Moskowitz failed on the 2014-03-18 ZN/ZB gap because a roll fills
+two sessions after its decision; the folder now rolls at 10 days
+(v1.1.0) and awaits edgelab's rerun.
+
 ## In progress
 
-- AT-1 follow-up: move the factor to `yahoo_splits` and count rows where
-  `in_close_basis IS NOT FALSE`. Blocked by LK-41; `yahoo_splits` has no
-  `in_close_basis` column yet. Check with
-  `SELECT column_name FROM (DESCRIBE yahoo_splits)`.
+- AT-7, AT-8, AT-9, AT-11 (one batch, Opus implementer after a
+  test-writer). Agreed with database-57:
+  - AT-7: gate on settlement + 8 NYSE sessions (+1 day), holiday-aware;
+    the lake counts weekdays (LK-47). Rows with `revision_flag='R'` are
+    available only from the next dissemination; originals are not in the
+    log.
+  - AT-8: "After market close" or null `when` is available the next
+    trading day.
+  - AT-9: SEC filings available on `filed_date` only if `accepted_at`
+    (join `sec_filings` on `accession_number`) is before 16:00 ET,
+    otherwise the next trading day.
+  - AT-11: read `sec_insider_transactions_log` with DISTINCT over every
+    column except scraped_at, dt and table until LK-14 lands (the `_log`
+    views are a supported read).
+  - Needs an NYSE session calendar (exchange_calendars XNYS is the plan).
 
 ## Next steps, in order
 
-1. If LK-41 has landed: test-writer specs the `yahoo_splits` factor (AVB
-   2026-08-17 and SSP 2025-12-08 excluded as not in the close basis), then
-   an implementer moves `_split_adjustment_factor` and deletes the
-   `equity_splits` path.
+1. The AT-7/8/9/11 batch above, then AT-10 (discrete quarters from
+   company facts) and AT-12 (dividends from `equity_distributions`).
 2. AT-6 waits for LK-15 (COT `published_at`); until then the `+3 days`
    gate stands.
-3. Remaining data and point-in-time musts: AT-7..12, 15..19, 21, 37..39,
+3. Remaining data and point-in-time musts: AT-15..19, 21, 38, 39,
    57..60, 62..64, 66..68, AT-79, AT-78 (re-pin quantcore to a041d0d).
 4. AT-40 ledger: shared format with pitch-edge (PE-21); the two
    conformance vectors are the acceptance tests and are written first.
