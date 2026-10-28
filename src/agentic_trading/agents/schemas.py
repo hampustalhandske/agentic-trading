@@ -13,6 +13,12 @@ from agentic_trading.config import settings
 # for one were missing, and "error" means producing one failed.
 SignalStatus = Literal["active", "unavailable", "error"]
 
+# A pod's state on one day. "unavailable": none of the pod's decisions
+# carries an active signal (its data or analysts produced nothing).
+# "no_position": at least one active signal, yet every decision has weight
+# 0. "holding": anything else.
+PodState = Literal["holding", "no_position", "unavailable"]
+
 # The firm-wide gross-leverage ceiling every pod manager's own
 # PortfolioConstructor is hard-clipped to (a Bridgewater-style
 # volatility-targeting sanity backstop, not the primary sizing lever —
@@ -240,12 +246,19 @@ class CapitalUsage(BaseModel):
 
     `idle_pod_share` is the fraction of firm capital allocated to pods
     that held no position that day (`None` when the commander does not
-    report it). `cash_share` is cash divided by net asset value after the
+    report it); it is the sum of `unavailable_pod_share` (pods whose data
+    or analysts produced no active signal) and `no_position_pod_share`
+    (pods whose active signals produced no position). `pod_states` maps
+    each pod to its `PodState` that day, empty when the commander does not
+    report it. `cash_share` is cash divided by net asset value after the
     day's fills and financing."""
 
     as_of_date: date
     idle_pod_share: float | None
     cash_share: float
+    unavailable_pod_share: float | None = None
+    no_position_pod_share: float | None = None
+    pod_states: dict[str, PodState] = {}
 
 
 class PodPerformance(BaseModel):

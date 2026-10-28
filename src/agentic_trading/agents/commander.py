@@ -21,6 +21,7 @@ from agentic_trading.agents.schemas import (
     MAX_LEVERAGE,
     ManagerSignal,
     OptionContract,
+    PodState,
     PortfolioDecision,
     SizingDiagnostics,
 )
@@ -69,6 +70,23 @@ def _construct_pod_portfolio(
     the caller even though its copy of `manager` does not."""
     decisions = manager.construct_portfolio(assets, market_data, as_of_date, scoreboard)
     return manager.agent_id, decisions, manager.last_sizing_diagnostics()
+
+
+def _pod_state(decisions: list[PortfolioDecision]) -> PodState:
+    """A pod's state from its decisions: "holding" when any target weight,
+    option rows included, is nonzero; otherwise "unavailable" when no
+    decision carries an active signal (including no decisions), and
+    "no_position" when one does. The idle states are exactly the pods
+    `idle_pod_share` counts."""
+    if any(decision.target_weight != 0.0 for decision in decisions):
+        return "holding"
+    if not any(
+        signal.status == "active"
+        for decision in decisions
+        for signal in decision.contributing_signals
+    ):
+        return "unavailable"
+    return "no_position"
 
 
 def _today_log_returns(market_data: pd.DataFrame, as_of_date: pd.Timestamp) -> dict[str, float]:
@@ -663,6 +681,9 @@ class Commander:
         self.parallel_backend = parallel_backend
         self._executor: Executor | None = None
         self._idle_pod_share: float | None = None
+        self._unavailable_pod_share: float | None = None
+        self._no_position_pod_share: float | None = None
+        self._pod_states: dict[str, PodState] = {}
         self._sizing_diagnostics: list[SizingDiagnostics] = []
         self._pod_contributions: dict[str, dict[str, float]] = {}
         self._pod_return_tracker = _PodReturnTracker(pod_returns_lookback_days)
@@ -691,8 +712,35 @@ class Commander:
         when every decision it produced that day, option rows included,
         has a zero target weight, or when it produced none. The share is
         the sum of the idle pods' final allocations, after the tail-hedge
-        carve-out and the drawdown-breaker multipliers."""
+        carve-out and the drawdown-breaker multipliers.
+
+        It equals `unavailable_pod_share() + no_position_pod_share()`.
+        Both kinds of idle pod keep their allocation as cash earning the
+        risk-free rate; neither is re-allocated to the other pods. An
+        unavailable pod's data or analysts could not produce a signal; a
+        no-position pod's signals produced no position."""
         return self._idle_pod_share
+
+    def unavailable_pod_share(self) -> float | None:
+        """The share of firm capital allocated to unavailable pods on the
+        most recent `decide()` call, or `None` before any call. A pod is
+        unavailable when every decision has a zero target weight and none
+        carries an active `ManagerSignal`, including when it produced no
+        decisions. The allocation stays as cash and is not re-allocated."""
+        return self._unavailable_pod_share
+
+    def no_position_pod_share(self) -> float | None:
+        """The share of firm capital allocated to no-position pods on the
+        most recent `decide()` call, or `None` before any call. A pod has
+        no position when it has at least one active signal but every
+        decision, option rows included, has a zero target weight. The
+        allocation stays as cash and is not re-allocated."""
+        return self._no_position_pod_share
+
+    def pod_states(self) -> dict[str, PodState]:
+        """Each pod's state on the most recent `decide()` call, in manager
+        order; empty before any call."""
+        return dict(self._pod_states)
 
     def sizing_diagnostics(self) -> list[SizingDiagnostics]:
         """The sizing diagnostics from the most recent `decide()` call, one
@@ -740,8 +788,12 @@ class Commander:
         An idle pod (one holding nothing today) keeps its allocation; its
         share of capital stays as cash earning the risk-free rate, and it
         is not re-allocated to the active pods. Re-allocating would make
-        firm risk scale with the number of idle pods. `idle_pod_share()`
-        reports that share.
+        firm risk scale with the number of idle pods. This holds for both
+        kinds of idle pod: an unavailable pod (its data or analysts could
+        not produce a signal) and a no-position pod (its signals produced
+        no position). `pod_states()`, `unavailable_pod_share()` and
+        `no_position_pod_share()` report the split; `idle_pod_share()`
+        reports their sum.
         """
         self._sizing_diagnostics = []
         self._pod_contributions = {}
@@ -824,6 +876,18 @@ class Commander:
         ).items():
             pod_allocations[manager_id] = pod_allocations.get(manager_id, 0.0) * multiplier
 
+        pod_states = {manager_id: _pod_state(decisions) for manager_id, decisions in pod_decisions}
+        self._pod_states = pod_states
+        self._unavailable_pod_share = sum(
+            pod_allocations.get(manager_id, 0.0)
+            for manager_id, state in pod_states.items()
+            if state == "unavailable"
+        )
+        self._no_position_pod_share = sum(
+            pod_allocations.get(manager_id, 0.0)
+            for manager_id, state in pod_states.items()
+            if state == "no_position"
+        )
         self._idle_pod_share = sum(
             pod_allocations.get(manager_id, 0.0)
             for manager_id, decisions in pod_decisions

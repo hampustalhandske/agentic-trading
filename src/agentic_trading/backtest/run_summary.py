@@ -48,16 +48,28 @@ def _unfilled_order_counts(block: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _capital_usage_means(block: dict[str, Any]) -> dict[str, float | None]:
-    """`mean_idle_pod_share` (over the days that report one) and
+def _capital_usage_means(block: dict[str, Any]) -> dict[str, Any]:
+    """`mean_idle_pod_share`, `mean_unavailable_pod_share` and
+    `mean_no_position_pod_share` (each over the days that report one) and
     `mean_cash_share` for a period or baseline block; each is `None` when
-    the block has no values to average."""
+    the block has no values to average. `pod_state_days` maps each pod to
+    the number of days it spent in each state (`{}` when none reported)."""
     usage = block.get("capital_usage") or []
-    idle = [entry["idle_pod_share"] for entry in usage if entry["idle_pod_share"] is not None]
-    cash = [entry["cash_share"] for entry in usage]
+
+    def mean_of(key: str) -> float | None:
+        values = [entry[key] for entry in usage if entry.get(key) is not None]
+        return sum(values) / len(values) if values else None
+
+    state_days: dict[str, Counter[str]] = {}
+    for entry in usage:
+        for pod_id, state in (entry.get("pod_states") or {}).items():
+            state_days.setdefault(pod_id, Counter())[state] += 1
     return {
-        "mean_idle_pod_share": sum(idle) / len(idle) if idle else None,
-        "mean_cash_share": sum(cash) / len(cash) if cash else None,
+        "mean_idle_pod_share": mean_of("idle_pod_share"),
+        "mean_unavailable_pod_share": mean_of("unavailable_pod_share"),
+        "mean_no_position_pod_share": mean_of("no_position_pod_share"),
+        "mean_cash_share": mean_of("cash_share"),
+        "pod_state_days": {pod_id: dict(counts) for pod_id, counts in state_days.items()},
     }
 
 

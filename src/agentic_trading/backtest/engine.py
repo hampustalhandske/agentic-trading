@@ -863,10 +863,20 @@ class BacktestEngine:
 
             pending_decisions = decisions
             idle_pod_share_fn = getattr(self.commander, "idle_pod_share", None)
+            unavailable_share_fn = getattr(self.commander, "unavailable_pod_share", None)
+            no_position_share_fn = getattr(self.commander, "no_position_pod_share", None)
+            pod_states_fn = getattr(self.commander, "pod_states", None)
             capital_usage.append(
                 CapitalUsage(
                     as_of_date=as_of_timestamp.date(),
                     idle_pod_share=idle_pod_share_fn() if callable(idle_pod_share_fn) else None,
+                    unavailable_pod_share=(
+                        unavailable_share_fn() if callable(unavailable_share_fn) else None
+                    ),
+                    no_position_pod_share=(
+                        no_position_share_fn() if callable(no_position_share_fn) else None
+                    ),
+                    pod_states=pod_states_fn() if callable(pod_states_fn) else {},
                     cash_share=(
                         self.portfolio.cash / portfolio_value
                         if math.isfinite(portfolio_value) and portfolio_value > 0.0
