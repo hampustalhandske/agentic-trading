@@ -160,7 +160,6 @@ def _delta(commander: _Plain, pod: str, asset: str, decide_day: date) -> float:
 def _expected_costs(result: BacktestResult, commander: _Plain, pods: list[str]) -> dict[str, float]:
     """Pro-rata split of each AAPL fill over the decide that produced it."""
     expected: dict[str, float] = defaultdict(float)
-    days = sorted(commander.by_day)
     for trade in result.trade_log:
         if trade.asset != "AAPL" or trade.action not in ("buy", "sell"):
             continue
