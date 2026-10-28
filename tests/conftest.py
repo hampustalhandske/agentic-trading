@@ -18,6 +18,7 @@ fresh instances despite this session-wide disabling.
 """
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from typing import Any
 
 import duckdb
@@ -28,7 +29,9 @@ from agentic_trading.logging_config import configure_logging
 
 configure_logging(disable=True)
 
+from agentic_trading import provenance  # noqa: E402
 from agentic_trading.data.loaders import lakehouse_loader  # noqa: E402
+from agentic_trading.data.loaders.lakehouse_loader import LakeProvenance  # noqa: E402
 
 
 class FakeLake:
@@ -86,6 +89,21 @@ def _block_real_lake(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     yield
     monkeypatch.undo()
     _REAL_LAKE_ACCESSOR.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _stub_run_provenance_lake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gives `build_run_provenance` a fixed lake build so CLI tests that
+    don't care about provenance never reach the lake's status endpoint."""
+    monkeypatch.setattr(
+        provenance,
+        "lake_provenance",
+        lambda: LakeProvenance(
+            lake_version="test-lake",
+            read_at=datetime(2024, 1, 1, tzinfo=UTC),
+            status_generated_at=None,
+        ),
+    )
 
 
 @pytest.fixture

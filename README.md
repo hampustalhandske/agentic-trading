@@ -127,7 +127,7 @@ uv run agentic-trading-experiment AAPL MSFT ... \
 ```
 
 `config.temporary_overrides({...})` does the same inside a sweep script.
-Overrides are recorded in the experiment JSON.
+Overrides are recorded in the experiment JSON, and both `agentic-trading-cli` and `agentic-trading-experiment` print a `provenance` block (git sha and dirty flag, quantcore sha, full settings, CLI arguments, roster ids, lake version).
 
 ## Running it
 

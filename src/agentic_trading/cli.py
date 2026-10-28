@@ -30,6 +30,7 @@ from agentic_trading.data.ticker_catalog import (
     tickers_by_asset_class,
 )
 from agentic_trading.logging_config import configure_logging, get_logger
+from agentic_trading.provenance import build_run_provenance
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
 
@@ -345,8 +346,24 @@ def run(
         parsed_end_date,
         auto_confirm=yes,
     )
+    managers = build_default_managers(analysts)
+    provenance = build_run_provenance(
+        {
+            "assets": resolved_assets,
+            "start_date": parsed_start_date.isoformat(),
+            "end_date": parsed_end_date.isoformat(),
+            "parallel_workers": parallel_workers,
+            "parallel_backend": parallel_backend,
+            "set": list(set_override),
+            "yes": yes,
+            "verbose": verbose,
+            "no_log": no_log,
+        },
+        [analyst.agent_id for analyst in analysts],
+        [manager.agent_id for manager in managers],
+    )
     commander = Commander(
-        managers=build_default_managers(analysts),
+        managers=managers,
         weighting_strategy=ShrinkageWeight(Hedge()),
         parallel_workers=parallel_workers,
         parallel_backend=parallel_backend,  # type: ignore[arg-type]
@@ -383,7 +400,15 @@ def run(
             parsed_end_date,
         )
         raise
-    typer.echo(result.model_dump_json(indent=2))
+    typer.echo(
+        json.dumps(
+            {
+                "provenance": provenance.model_dump(mode="json"),
+                "result": result.model_dump(mode="json"),
+            },
+            indent=2,
+        )
+    )
 
 
 @experiment_app.command()
@@ -490,8 +515,34 @@ def experiment(
         parsed_test_end,
         auto_confirm=yes,
     )
+    managers = build_default_managers(analysts)
+    provenance = build_run_provenance(
+        {
+            "assets": resolved_assets,
+            "train_start": parsed_train_start.isoformat(),
+            "train_end": parsed_train_end.isoformat(),
+            "test_start": parsed_test_start.isoformat(),
+            "test_end": parsed_test_end.isoformat(),
+            "warmup_days": warmup_days,
+            "parallel_workers": parallel_workers,
+            "parallel_backend": parallel_backend,
+            "commission_rate": commission_rate,
+            "slippage_bps": slippage_bps,
+            "execution_lag_days": execution_lag_days,
+            "calibration_checkpoint": calibration_checkpoint,
+            "test_checkpoint": test_checkpoint,
+            "resume": resume,
+            "include_baselines": include_baselines,
+            "include_isolated": include_isolated,
+            "exclude_analyst": sorted(excluded),
+            "set": list(set_override),
+            "yes": yes,
+        },
+        [analyst.agent_id for analyst in analysts],
+        [manager.agent_id for manager in managers],
+    )
     commander = Commander(
-        managers=build_default_managers(analysts),
+        managers=managers,
         weighting_strategy=ShrinkageWeight(Hedge()),
         parallel_workers=parallel_workers,
         parallel_backend=parallel_backend,  # type: ignore[arg-type]
@@ -639,6 +690,7 @@ def experiment(
     typer.echo(
         json.dumps(
             {
+                "provenance": provenance.model_dump(mode="json"),
                 "experiment": {
                     "assets": resolved_assets,
                     "train_start": parsed_train_start.isoformat(),
