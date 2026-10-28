@@ -714,14 +714,15 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: 7384697
 
 ### AT-64 Preflight checks five sources and ignores the warm-up
-- Status: open
+- Status: done
 - Priority: should
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S7)
 - Evidence: [I] `backtest/preflight.py:93-138` checks fred, ken_french, SEC facts, FINRA and insider against `start_date`, not the warm-up start. Options, COT, earnings, dividends, membership and SIC are never checked.
 - Acceptance: preflight covers every source an analyst reads, from the warm-up start.
 - Blocked-by / Blocks: none
-- Commits: none
+- Resolution: every analyst declares each lake source it reads with the lookback its code uses; options and COT skip unlisted tickers, earnings and dividends are table-wide, SIC is undated. Live on 2010-01-04..2017-12-29 (38 analysts, 6 s), 7 analysts fail, each on a real gap (options from 2019, BAMLH0A0HYM2 from 2023, earnings calendar from 2020, SEC facts from 2009-07 against a 731-day lookback, FINRA from 2018).
+- Commits: 072c364
 
 ### AT-65 Risk-free series backfilled before its first value
 - Status: done
@@ -734,14 +735,15 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: dadea7a. No backfill; a start before the first DGS3MO observation raises ValueError naming that date, rather than returning missing days.
 
 ### AT-66 Open used for fills with no OHLC sanity check
-- Status: open
+- Status: done
 - Priority: should
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S9)
 - Evidence: [I] `lakehouse_loader.py:507`. The lake reports about 4,000 rows with inconsistent OHLC; `open` is used with no `low <= open <= high` check.
 - Acceptance: rows failing the check are masked, and the count is logged.
 - Blocked-by / Blocks: none
-- Commits: none
+- Resolution: 1,828 lake rows since 2000 have an open outside [low, high], mostly Yahoo FX rows with open equal to close. Those opens load as NaN with one warning per load (live: EURUSD=X 15 in 2022-2024); the engine skips a fill at a NaN or non-positive price.
+- Commits: 072c364
 
 ### AT-67 Option expiry can settle at a later day's spot
 - Status: done
@@ -760,7 +762,7 @@ Paths are relative to `src/agentic_trading/`.
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S11)
 - Evidence: [I] the gate is `ex_date`: safe, but late. Dividends are announced at declaration.
 - Acceptance: the signal gates on the declaration date.
-- Blocked-by / Blocks: LK-49 (point-in-time declaration dates, lake scout). `nasdaq_dividend_calendar.announcement_date` is not usable: LK-48 (14,302 rows carry the 2026 backfill date) and about 20% coverage of `equity_distributions` since 2013. The `ex_date` gate stays until LK-49 lands.
+- Blocked-by / Blocks: LK-49 (point-in-time declaration dates, lake scout). `nasdaq_dividend_calendar.announcement_date` is not usable: it matches only about 20% of `equity_distributions` rows since 2013. LK-48 (fake backfill dates) is fixed in the lake, and those dates are now null. The `ex_date` gate stays until LK-49 lands.
 - Commits: none
 
 ### AT-69 Dead scripts, symbols and test references
@@ -879,4 +881,16 @@ Paths are relative to `src/agentic_trading/`.
 - Evidence: `dolthub_option_chain` starts 2019-02; `option_chain_history` holds SPY, QQQ and IWM full chains with open interest from 2008 to 2025-12. The 2010-2017 test window has no options today.
 - Acceptance: option analysts read `option_chain_history` for SPY, QQQ and IWM before 2019. Each row is a 16:00 ET end-of-day snapshot on `snapshot_date`, usable at that close; fills use bid/ask, never `mark` (wrong for deep in-the-money contracts in early years). Coverage per analyst in 2010-2017 is reported. The table is static and ends 2025-12-12; `option_chain_snapshots` resumes 2026-09-27, so the gap between them is stated, not filled.
 - Blocked-by / Blocks: narrows LK-37 to single names before 2019
+- Commits: none
+
+
+### AT-80 S&P universe priced from `instrument_prices`, which lacks a quarter of members
+- Status: open
+- Priority: must (M6)
+- Gate: data
+- Raised by: agentic-trading-c5, 2026-10-28, while checking LK-50 with edgelab-62
+- Evidence: [V] `instrument_prices` holds 824 equity tickers. Of the S&P 500 members on 30 June each year, the share with a price that month: 2010 0.667, 2011 0.670, 2012 0.696, 2013 0.712, 2014 0.719, 2015 0.737, 2016 0.770, 2017 0.796. Missing names include leavers (AABA, CELG, BRCM) and live names (BK, CMA, DFS, AVB and EA have only a few 2026 rows). The `FB` ticker there starts 2025-06-26 and is a different security from Facebook (META holds 2012 on). Fama-MacBeth and network centrality build their cross-sections from these prices, so their universes are biased towards survivors.
+- Acceptance: the S&P universe analysts price members by `security_id` from a source with full member coverage (`equity_daily_from_bars` covers 92.5% of member-sessions since 1996; see LK-50), adjusted for splits and distributions by security. Coverage per year over 2010-2017 is reported, and a member without prices is reported, never silently dropped.
+- Design (database-57, 2026-10-28): raw prices from `equity_daily_from_bars` by `security_id` (as traded, regular session). Returns use `official_close` where present, since the last-bucket `close` differs by more than 0.1% on 8-16% of large-cap sessions. Adjust with `equity_adjustment_factors`: per (security_id, date), take `cum_factor` from the row with the smallest `effective_date` strictly after the date, else 1.0. Join on security_id, never ticker. Volume times 1/`split_factor` is in current shares. `sp500_membership` names a span by the current ticker, and a reused ticker can merge two companies (AGN 1996-2020), so membership must resolve to security_id. `sp500_price_coverage` is safe for the coverage report, but within-span share must be computed until LK-50 adds it. The LK-50 Yahoo fill lands in the same view with a `source` column.
+- Blocked-by / Blocks: LK-50 fills source gaps (not blocking; the design holds before and after)
 - Commits: none

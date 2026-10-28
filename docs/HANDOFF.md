@@ -46,6 +46,7 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-38, AT-39, AT-58, AT-62 | experiment options resolve after `--set`; derived MC seeds; membership by security, end exclusive; SIC limit documented | d29f8a3 |
 | AT-60 | stale option quotes re-marked from the current surface; missing rate raises | 1e2316b |
 | AT-63 | catalog trades SPY/IWM, not ^GSPC/^RUT; `USDJPY=X` | 7384697 |
+| AT-64, AT-66 | preflight per source and lookback; inconsistent opens masked, unfillable orders skipped | 072c364 |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
 2017-12-29) are verified. edgelab-62 runs the counted runs with `warmup`
@@ -66,7 +67,8 @@ defaults. No post-result cost version was registered.
 
 ## In progress
 
-Nothing in flight.
+- AT-79: tests in `tests/unit/data/loaders/test_option_chain_history.py`; implementer running (SPY/QQQ/IWM read `option_chain_history` before their first DoltHub date).
+- AT-80: test-writer running; design from database-57 is in ISSUES (bars by `security_id`, `official_close`, `equity_adjustment_factors`, membership from `sp500_price_coverage`). The three views are vendored in the contract fixture (uncommitted).
 
 ## Next steps, in order
 
@@ -74,10 +76,9 @@ Nothing in flight.
    back from the `_log` views to the current views.
 2. AT-6 waits for LK-15 (COT `published_at`); until then the `+3 days`
    gate stands.
-3. Remaining data issues: AT-64 (preflight covers every source from the
-   warm-up start), AT-66 (mask OHLC rows failing low <= open <= high),
-   AT-79 (SPY/QQQ/IWM options from `option_chain_history` before 2019),
-   AT-78 (re-pin quantcore to a041d0d). AT-68 is blocked by LK-49 (no
+3. Remaining data issues: AT-79 and AT-80 (in progress), then AT-78
+   (re-pin quantcore to a041d0d; run after the implementers finish, since
+   it re-syncs the venv). AT-68 is blocked by LK-49 (no
    usable declaration date; LK-48).
 4. AT-40 ledger: shared format with pitch-edge (PE-21); the two
    conformance vectors are the acceptance tests and are written first.
