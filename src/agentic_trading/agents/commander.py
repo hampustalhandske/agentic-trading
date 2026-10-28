@@ -664,6 +664,7 @@ class Commander:
         self._executor: Executor | None = None
         self._idle_pod_share: float | None = None
         self._sizing_diagnostics: list[SizingDiagnostics] = []
+        self._pod_contributions: dict[str, dict[str, float]] = {}
         self._pod_return_tracker = _PodReturnTracker(pod_returns_lookback_days)
         self.drawdown_breaker = (
             drawdown_breaker if drawdown_breaker is not None else _DrawdownBreaker()
@@ -699,6 +700,16 @@ class Commander:
         pod's `manager_id`. Empty before any call."""
         return list(self._sizing_diagnostics)
 
+    def pod_contributions(self) -> dict[str, dict[str, float]]:
+        """Each pod's contribution to every asset it decided on in the most
+        recent `decide()` call, keyed by pod id then asset (option rows by
+        contract id): the pod's final allocation times its target weight,
+        before firm limits, the short-premium cap and the leverage clamp. A
+        tail-hedge option row counts at its target weight, the face value
+        the firm book takes it at. Several rows of one pod for one asset
+        are summed. Empty before any call."""
+        return {pod_id: dict(weights) for pod_id, weights in self._pod_contributions.items()}
+
     def risk_state(self) -> CommanderRiskState:
         return CommanderRiskState(
             tripped_pods=sorted(self.drawdown_breaker.tripped),
@@ -733,6 +744,7 @@ class Commander:
         reports that share.
         """
         self._sizing_diagnostics = []
+        self._pod_contributions = {}
         if market_data.empty or not self.managers:
             return []
 
@@ -837,16 +849,21 @@ class Commander:
             is_hedge = manager_id == TAIL_HEDGE_MANAGER_ID
             book = hedge_weight if is_hedge else core_weight
             option_book = hedge_options if is_hedge else core_options
+            contributions = self._pod_contributions.setdefault(manager_id, {})
             for decision in decisions:
                 combined_signals.setdefault(decision.asset, []).extend(
                     decision.contributing_signals
                 )
                 if decision.instrument is None:
-                    book[decision.asset] += allocation * decision.target_weight
-                    continue
-                weight = decision.target_weight if is_hedge else allocation * decision.target_weight
-                _, held = option_book.get(decision.asset, (decision.instrument, 0.0))
-                option_book[decision.asset] = (decision.instrument, held + weight)
+                    weight = allocation * decision.target_weight
+                    book[decision.asset] += weight
+                else:
+                    weight = (
+                        decision.target_weight if is_hedge else allocation * decision.target_weight
+                    )
+                    _, held = option_book.get(decision.asset, (decision.instrument, 0.0))
+                    option_book[decision.asset] = (decision.instrument, held + weight)
+                contributions[decision.asset] = contributions.get(decision.asset, 0.0) + weight
 
         # Firm limits run on the delta-equivalent book; whatever scaling
         # they impose on an underlying applies to its option rows too.

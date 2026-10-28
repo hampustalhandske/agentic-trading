@@ -267,6 +267,64 @@ class PodPerformance(BaseModel):
     max_drawdown: float
 
 
+class PodCostAttribution(BaseModel):
+    """One pod's share of a run's fill costs, and how much its book moved.
+
+    A pod's contribution to an asset is the Commander's allocation to the
+    pod times the pod's target weight, before firm limits (a tail-hedge
+    option row counts at its face value). The `transaction_cost` and
+    premium of each fill a decision produced are split across pods pro
+    rata to |change in contribution| to the filled asset on that decision,
+    against the commander's previous decision. A fill on which no pod's
+    contribution changed, every fill of a commander that reports no
+    contributions, and the transaction cost of an expiry settlement are
+    charged to the `"commander"` entry.
+
+    `transaction_cost` is the commission, slippage and impact charged to
+    the pod. `option_premium_paid` is the net option premium charged to it
+    (paid minus received; expiry settlements excluded). `turnover` is the
+    sum over decisions and assets of |change in contribution|, times
+    trading days per year over the number of valuation days. `trading_days`
+    counts the decisions on which any of the pod's contributions changed.
+    `sign_changes` counts, per asset, each time a nonzero contribution
+    takes the opposite sign of the last nonzero one (a pass through zero
+    counts once). The `"commander"` entry has zero `turnover`,
+    `trading_days` and `sign_changes`."""
+
+    transaction_cost: float = 0.0
+    option_premium_paid: float = 0.0
+    turnover: float = 0.0
+    trading_days: int = 0
+    sign_changes: int = 0
+
+
+class PodCostDay(BaseModel):
+    """One valuation day's inputs to `PodCostAttribution`.
+
+    `contributions` maps pod id to asset to the pod's contribution on that
+    day's decision, with zero contributions left out (a pod with none maps
+    to `{}`); `None` when the commander does not report contributions.
+    `transaction_cost` and `option_premium_paid` are what that day's fills
+    charged each pod id (and `"commander"`), with ids charged nothing left
+    out."""
+
+    as_of_date: date
+    contributions: dict[str, dict[str, float]] | None
+    transaction_cost: dict[str, float] = Field(default_factory=dict)
+    option_premium_paid: dict[str, float] = Field(default_factory=dict)
+
+
+class UnfactoredSplitMove(BaseModel):
+    """A split-sized one-day move in a security's adjusted log returns on a
+    date with no adjustment-factor row for the security. `ratio` is the
+    day's price over the previous day's (0.5 for an unadjusted 2-for-1
+    split)."""
+
+    security_id: int
+    as_of_date: date
+    ratio: float
+
+
 class UnfilledOrder(BaseModel):
     """A decision the backtest engine could not execute on `as_of_date`, the
     day the order failed to fill.
@@ -381,3 +439,11 @@ class BacktestResult(BaseModel):
     pod_return_history: dict[str, list[tuple[date, float]]] = Field(default_factory=dict)
     # Per-pod return, vol, Sharpe and drawdown computed from `pod_return_history`.
     pod_performance: dict[str, PodPerformance] = Field(default_factory=dict)
+    # Fill costs, option premium and turnover per pod id, plus a
+    # `"commander"` entry for costs no pod's contribution change explains.
+    # Transaction costs over every entry sum to `total_transaction_cost`,
+    # and premium to `total_option_premium_paid`.
+    pod_costs: dict[str, PodCostAttribution] = Field(default_factory=dict)
+    # Split-sized moves the run's lakehouse reads found with no adjustment
+    # factor, one per (security, date), sorted by security then date.
+    unfactored_split_moves: list[UnfactoredSplitMove] = Field(default_factory=list)

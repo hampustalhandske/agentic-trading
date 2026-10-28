@@ -18,6 +18,7 @@ A loader returns `None` only when its query succeeds and finds no rows. A
 failed request (`LakehouseError`, connection or timeout errors) propagates
 to the caller."""
 
+import threading
 from datetime import UTC, date, datetime
 from functools import cache
 from typing import Any, Literal, cast, get_args
@@ -27,6 +28,7 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel
 
+from agentic_trading.agents.schemas import UnfactoredSplitMove
 from agentic_trading.config import _env_value
 from agentic_trading.data.lakehouse_client import Lake
 from agentic_trading.data.point_in_time import assert_point_in_time
@@ -241,6 +243,31 @@ _SPLIT_SHARE_RATIOS = (1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.0, 8.0, 10.0, 15.0, 20.0)
 # market move on top of the split.
 _SPLIT_MOVE_LOG_TOLERANCE = 0.05
 
+# Every split-sized move `_warn_unfactored_split_moves` has flagged in this
+# process, keyed by (security_id, date) to its price ratio; analysts read
+# prices from worker threads, so every access holds the lock.
+_UNFACTORED_SPLIT_MOVES: dict[tuple[int, date], float] = {}
+_UNFACTORED_SPLIT_MOVES_LOCK = threading.Lock()
+
+
+def unfactored_split_move_registry() -> list[UnfactoredSplitMove]:
+    """Every distinct (security_id, date) split-sized move flagged by a
+    `load_security_log_returns` read since the registry was last cleared,
+    sorted by security then date. A move flagged again by a later read
+    keeps the ratio it was first flagged with."""
+    with _UNFACTORED_SPLIT_MOVES_LOCK:
+        entries = sorted(_UNFACTORED_SPLIT_MOVES.items())
+    return [
+        UnfactoredSplitMove(security_id=security_id, as_of_date=day, ratio=ratio)
+        for (security_id, day), ratio in entries
+    ]
+
+
+def clear_unfactored_split_move_registry() -> None:
+    """Empties the registry `unfactored_split_move_registry` reads."""
+    with _UNFACTORED_SPLIT_MOVES_LOCK:
+        _UNFACTORED_SPLIT_MOVES.clear()
+
 
 def unfactored_split_moves(
     returns: dict[int, pd.Series], factor_dates: dict[int, set[date]]
@@ -298,8 +325,9 @@ def load_security_log_returns(
     has no rows at all; a security with no factor rows of its own is read
     unadjusted. Logs one WARNING listing every split-sized move
     `unfactored_split_moves` finds on a date with no factor row for the
-    security, using the factor `effective_date`s the price read joined;
-    the returned series are not changed."""
+    security, using the factor `effective_date`s the price read joined,
+    and adds each to `unfactored_split_move_registry`; the returned series
+    are not changed."""
     if not security_ids:
         return {}
     adjustment_table_row_count("equity_adjustment_factors")
@@ -357,7 +385,8 @@ def load_security_log_returns(
 
 def _warn_unfactored_split_moves(returns: dict[int, pd.Series], frame: pd.DataFrame) -> None:
     """Logs one WARNING naming each `(security_id, date, ratio)` that
-    `unfactored_split_moves` flags in `returns`. `frame` is the joined
+    `unfactored_split_moves` flags in `returns`, and adds each to the
+    registry `unfactored_split_move_registry` reads. `frame` is the joined
     bar/factor read, whose non-null `factor_date` values are each
     security's factor `effective_date`s."""
     dated = frame.dropna(subset=["factor_date"])
@@ -367,6 +396,9 @@ def _warn_unfactored_split_moves(returns: dict[int, pd.Series], frame: pd.DataFr
     }
     flagged = unfactored_split_moves(returns, factor_dates)
     if flagged:
+        with _UNFACTORED_SPLIT_MOVES_LOCK:
+            for security_id, day, ratio in flagged:
+                _UNFACTORED_SPLIT_MOVES.setdefault((security_id, day), ratio)
         listed = ", ".join(
             f"({security_id}, {day.isoformat()}, {ratio:.4f})"
             for security_id, day, ratio in flagged

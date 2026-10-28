@@ -27,6 +27,8 @@ from agentic_trading.agents.schemas import (
     CapitalUsage,
     OptionContract,
     PerformanceRecord,
+    PodCostAttribution,
+    PodCostDay,
     PodPerformance,
     PortfolioDecision,
     SizingDiagnostics,
@@ -70,7 +72,10 @@ class CommanderLike(Protocol):
     A commander may additionally expose `risk_state() -> CommanderRiskState`
     and `restore_risk_state(state)`; the engine checkpoints/restores that
     state and reports its pod return history when present, and simply
-    skips it otherwise."""
+    skips it otherwise. A commander may also expose `pod_contributions()
+    -> dict[str, dict[str, float]]` (pod id to asset to the pod's
+    contribution on the latest decision); the engine splits fill costs
+    across pods by it, and charges every fill to `"commander"` without it."""
 
     def decide(
         self,
@@ -191,6 +196,18 @@ class BacktestEngine:
         if payload is None or restore is None:
             return
         restore(CommanderRiskState.model_validate(payload))
+
+    def _pod_contributions(self) -> dict[str, dict[str, float]] | None:
+        """The commander's pod contributions on its latest decision with
+        zero entries left out, or `None` for a commander that doesn't
+        report them."""
+        pod_contributions = getattr(self.commander, "pod_contributions", None)
+        if not callable(pod_contributions):
+            return None
+        return {
+            pod_id: {asset: float(weight) for asset, weight in weights.items() if weight != 0.0}
+            for pod_id, weights in pod_contributions().items()
+        }
 
     def _new_pod_returns(
         self,
@@ -404,6 +421,7 @@ class BacktestEngine:
             "Backtest starting: assets=%s, %s to %s", self.assets, self.start_date, self.end_date
         )
         run_started_at = time.perf_counter()
+        lakehouse_loader.clear_unfactored_split_move_registry()
         raw_market_data = self.data_loader(self.assets, self.start_date, self.end_date)
         if raw_market_data.empty:
             logger.warning(
@@ -423,6 +441,7 @@ class BacktestEngine:
                 final_calmar_ratio=0.0,
                 final_hit_rate=0.0,
                 final_profit_factor=0.0,
+                unfactored_split_moves=lakehouse_loader.unfactored_split_move_registry(),
             )
 
         days = [
@@ -474,6 +493,11 @@ class BacktestEngine:
                 SizingDiagnostics.model_validate(entry)
                 for entry in checkpoint.get("sizing_diagnostics", [])
             ]
+            if checkpoint
+            else []
+        )
+        pod_cost_days = (
+            [PodCostDay.model_validate(entry) for entry in checkpoint.get("pod_cost_days", [])]
             if checkpoint
             else []
         )
@@ -543,6 +567,27 @@ class BacktestEngine:
                 (time.perf_counter() - day_started_at) * 1000,
             )
             decisions_by_day[as_of_timestamp.date()] = decisions
+            contributions = self._pod_contributions()
+            # The contribution changes the day's fills are split by: today's
+            # decision against the previous one, or with a one-day lag the
+            # previous decision (whose fills execute today) against the one
+            # before it.
+            if self.execution_lag_days:
+                fill_deltas = (
+                    _contribution_deltas(
+                        pod_cost_days[-2].contributions if len(pod_cost_days) > 1 else {},
+                        pod_cost_days[-1].contributions,
+                    )
+                    if pod_cost_days
+                    else None
+                )
+            else:
+                fill_deltas = _contribution_deltas(
+                    pod_cost_days[-1].contributions if pod_cost_days else {}, contributions
+                )
+            day_pod_costs = PodCostDay(
+                as_of_date=as_of_timestamp.date(), contributions=contributions
+            )
             new_pod_returns = self._new_pod_returns(
                 as_of_timestamp.date(), pod_return_history, seen_pod_returns
             )
@@ -627,7 +672,10 @@ class BacktestEngine:
                     underlying_prices[underlying] = spot
             trades_before = len(trade_log)
             unfilled_before = len(unfilled_orders)
-            trade_log.extend(self.portfolio.settle_expired(marks, as_of_timestamp.date()))
+            expired = self.portfolio.settle_expired(marks, as_of_timestamp.date())
+            trade_log.extend(expired)
+            for trade in expired:
+                _charge(day_pod_costs.transaction_cost, trade.transaction_cost, None)
             portfolio_value = self.portfolio.total_value(prices, marks)
             # Financing (net of the interest cash earns) accrues over the
             # calendar days since the previous simulated day (a
@@ -728,6 +776,7 @@ class BacktestEngine:
                         )
                         trade_log.append(option_trade)
                         total_option_premium_paid -= option_trade.premium
+                        _charge_fill(day_pod_costs, option_trade, fill_deltas)
                     realized_return = self._option_realized_return(
                         decision.asset, option_marks.get(decision.asset)
                     )
@@ -746,15 +795,15 @@ class BacktestEngine:
                         adv_shares, daily_vol = _liquidity_inputs(
                             raw_market_data, decision.asset, as_of_timestamp
                         )
-                        trade_log.append(
-                            self.portfolio.apply_decision(
-                                decision,
-                                fill_price,
-                                portfolio_value,
-                                adv_shares=adv_shares,
-                                daily_vol=daily_vol,
-                            )
+                        equity_trade = self.portfolio.apply_decision(
+                            decision,
+                            fill_price,
+                            portfolio_value,
+                            adv_shares=adv_shares,
+                            daily_vol=daily_vol,
                         )
+                        trade_log.append(equity_trade)
+                        _charge_fill(day_pod_costs, equity_trade, fill_deltas)
                     else:
                         logger.warning(
                             "Day %s: no fillable price for %s (got %s) — decision not executed.",
@@ -830,6 +879,7 @@ class BacktestEngine:
                 sizing_diagnostics_fn() if callable(sizing_diagnostics_fn) else []
             )
             sizing_diagnostics.extend(day_sizing_diagnostics)
+            pod_cost_days.append(day_pod_costs)
             connection = self._checkpoint()
             if connection is not None:
                 risk_state = self._commander_risk_state()
@@ -844,6 +894,7 @@ class BacktestEngine:
                     capital_usage=capital_usage[-1],
                     sizing_diagnostics=day_sizing_diagnostics,
                     new_pod_returns=new_pod_returns,
+                    pod_cost_day=day_pod_costs,
                     next_day_index=day_index + 1,
                     start_date=self.start_date,
                     end_date=self.end_date,
@@ -972,7 +1023,112 @@ class BacktestEngine:
             total_option_premium_paid=total_option_premium_paid,
             pod_return_history=pod_return_history,
             pod_performance=pod_performance,
+            pod_costs=_pod_cost_attribution(pod_cost_days, len(portfolio_value_history)),
+            unfactored_split_moves=lakehouse_loader.unfactored_split_move_registry(),
         )
+
+
+def _contribution_deltas(
+    previous: dict[str, dict[str, float]] | None,
+    current: dict[str, dict[str, float]] | None,
+) -> dict[str, dict[str, float]] | None:
+    """|current - previous| contribution per asset then pod, keeping only
+    nonzero changes; a pod or asset missing from either side counts as 0.0
+    there, and a `None` `previous` as no contributions. `None` when
+    `current` is `None` (the commander reports no contributions)."""
+    if current is None:
+        return None
+    previous = previous or {}
+    deltas: dict[str, dict[str, float]] = {}
+    for pod_id in dict.fromkeys([*previous, *current]):
+        before = previous.get(pod_id, {})
+        now = current.get(pod_id, {})
+        for asset in dict.fromkeys([*before, *now]):
+            delta = abs(now.get(asset, 0.0) - before.get(asset, 0.0))
+            if delta > 0.0:
+                deltas.setdefault(asset, {})[pod_id] = delta
+    return deltas
+
+
+def _charge(totals: dict[str, float], amount: float, shares: dict[str, float] | None) -> None:
+    """Adds `amount` to `totals`, split across pod ids pro rata to `shares`
+    (each pod's |contribution change|), or all to `"commander"` when
+    `shares` is `None`, empty or sums to zero. A zero `amount` adds
+    nothing."""
+    if amount == 0.0:
+        return
+    total = sum(shares.values()) if shares else 0.0
+    if not shares or total <= 0.0:
+        totals["commander"] = totals.get("commander", 0.0) + amount
+        return
+    for pod_id, share in shares.items():
+        totals[pod_id] = totals.get(pod_id, 0.0) + amount * share / total
+
+
+def _charge_fill(
+    day: PodCostDay, trade: TradeRecord, deltas: dict[str, dict[str, float]] | None
+) -> None:
+    """Splits `trade`'s transaction cost and net premium paid (the negated
+    signed `premium`) into `day` by the contribution changes to
+    `trade.asset` in `deltas`, the decision that produced the fill."""
+    shares = deltas.get(trade.asset) if deltas is not None else None
+    _charge(day.transaction_cost, trade.transaction_cost, shares)
+    _charge(day.option_premium_paid, -trade.premium, shares)
+
+
+def _pod_cost_attribution(
+    days: list[PodCostDay], observed_days: int
+) -> dict[str, PodCostAttribution]:
+    """Each pod's `PodCostAttribution` over `days`, plus a `"commander"`
+    entry when any cost was charged to it. Costs are the sums of the daily
+    charges in day order. Turnover, trading days and sign changes come
+    from each day's contributions against the previous day's;
+    `observed_days` (the number of valuation days) annualises turnover."""
+    pod_ids: dict[str, None] = {}
+    moved: dict[str, float] = {}
+    trading_days: dict[str, int] = {}
+    sign_changes: dict[str, int] = {}
+    last_sign: dict[tuple[str, str], bool] = {}
+    transaction_cost: dict[str, float] = {}
+    option_premium_paid: dict[str, float] = {}
+    previous: dict[str, dict[str, float]] | None = None
+    for day in days:
+        if day.contributions is not None:
+            pod_ids.update(dict.fromkeys(day.contributions))
+            deltas = _contribution_deltas(previous, day.contributions) or {}
+            pods_moved: dict[str, None] = {}
+            for by_pod in deltas.values():
+                for pod_id, delta in by_pod.items():
+                    moved[pod_id] = moved.get(pod_id, 0.0) + delta
+                    pods_moved[pod_id] = None
+            for pod_id in pods_moved:
+                trading_days[pod_id] = trading_days.get(pod_id, 0) + 1
+            for pod_id, weights in day.contributions.items():
+                for asset, weight in weights.items():
+                    if weight == 0.0:
+                        continue
+                    positive = weight > 0.0
+                    if last_sign.get((pod_id, asset), positive) != positive:
+                        sign_changes[pod_id] = sign_changes.get(pod_id, 0) + 1
+                    last_sign[(pod_id, asset)] = positive
+        previous = day.contributions
+        for pod_id, amount in day.transaction_cost.items():
+            transaction_cost[pod_id] = transaction_cost.get(pod_id, 0.0) + amount
+        for pod_id, amount in day.option_premium_paid.items():
+            option_premium_paid[pod_id] = option_premium_paid.get(pod_id, 0.0) + amount
+    pod_ids.update(dict.fromkeys(transaction_cost))
+    pod_ids.update(dict.fromkeys(option_premium_paid))
+    annualise = settings.firm.trading_days_per_year / observed_days if observed_days else 0.0
+    return {
+        pod_id: PodCostAttribution(
+            transaction_cost=transaction_cost.get(pod_id, 0.0),
+            option_premium_paid=option_premium_paid.get(pod_id, 0.0),
+            turnover=moved.get(pod_id, 0.0) * annualise,
+            trading_days=trading_days.get(pod_id, 0),
+            sign_changes=sign_changes.get(pod_id, 0),
+        )
+        for pod_id in pod_ids
+    }
 
 
 def _pod_performance(returns: list[float]) -> PodPerformance:

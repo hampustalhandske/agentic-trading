@@ -1,6 +1,6 @@
 # tail_hedge_manager.py
 
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 from pydantic import PrivateAttr
@@ -29,6 +29,11 @@ _DAYS_PER_YEAR = 365.0
 # premium budget buys is logged against a nominal NAV large enough for
 # contract rounding not to dominate; every logged figure is a fraction.
 _NOMINAL_NAV = 1_000_000.0
+# Calendar days in the trailing window the premium cap is measured over.
+_PREMIUM_CAP_WINDOW_DAYS = 365
+# Headroom under the premium cap at or below this is treated as none, so
+# floating-point residue never opens a put.
+_MIN_PREMIUM_HEADROOM = 1e-12
 
 
 class TailHedgeManager(ManagerAgent):
@@ -50,6 +55,14 @@ class TailHedgeManager(ManagerAgent):
     usable chain the sleeve falls back to the short-SPY equity weight
     the base class sized, so protection never disappears silently.
 
+    New puts are bounded by `settings.options.tail_hedge_annual_premium_cap`:
+    an open or roll commits at most the cap minus `premium_committed` on
+    the day, and its contract count stays scaled by that cut while it is
+    held. With no headroom the sleeve opens nothing (no put and no
+    short-SPY fallback, SPY at 0.0) and a held put is kept to expiry
+    instead of rolled. The commitments live on the instance only and are
+    not part of any checkpointed state.
+
     `scale_factor` always returns 1.0, deliberately not the EWMA-vol
     dampening every other pod's `scale_factor` uses: the analyst's own
     VIX z-score already *is* the risk-regime read this sleeve exists to
@@ -62,6 +75,21 @@ class TailHedgeManager(ManagerAgent):
     # The put contract currently held, `None` when the sleeve is in its
     # equity fallback or has not yet bought protection.
     _held_contract_id: str | None = PrivateAttr(default=None)
+    # The held put's premium weight as a fraction of its uncapped weight:
+    # below 1.0 when the premium cap cut it at open.
+    _held_scale: float = PrivateAttr(default=1.0)
+    # (open date, premium weight) of every put opened, in date order.
+    _commitments: list[tuple[date, float]] = PrivateAttr(default_factory=list)
+
+    def premium_committed(self, as_of: date) -> float:
+        """The premium, as a fraction of NAV at each open, committed to
+        puts opened in the trailing `_PREMIUM_CAP_WINDOW_DAYS` days ending
+        on `as_of` (open date after `as_of` minus the window, and on or
+        before `as_of`). 0.0 when none were opened."""
+        window_start = as_of - timedelta(days=_PREMIUM_CAP_WINDOW_DAYS)
+        return float(
+            sum(weight for opened, weight in self._commitments if window_start < opened <= as_of)
+        )
 
     def scale_factor(
         self,
@@ -95,6 +123,24 @@ class TailHedgeManager(ManagerAgent):
         budget = settings.commander.tail_hedge_budget_fraction * confidence
         held = self._held_contract_id
         rolling = held is None or _days_to_expiry(held, day) < settings.options.roll_min_dte
+        headroom = settings.options.tail_hedge_annual_premium_cap - self.premium_committed(day)
+        if rolling and headroom <= _MIN_PREMIUM_HEADROOM:
+            if held is not None and _days_to_expiry(held, day) > 0:
+                logger.info(
+                    "%s: tail-hedge premium cap %.4f reached — holding %s to expiry.",
+                    day,
+                    settings.options.tail_hedge_annual_premium_cap,
+                    held,
+                )
+                rolling = False
+            else:
+                logger.info(
+                    "%s: tail-hedge premium cap %.4f reached — no put bought.",
+                    day,
+                    settings.options.tail_hedge_annual_premium_cap,
+                )
+                self._held_contract_id = None
+                return _zero_underlying(decisions, underlying)
         selected = self._select_put(market_data, as_of_date, budget) if rolling else held
         if selected is None:
             if held is not None and _days_to_expiry(held, day) > 0:
@@ -110,25 +156,30 @@ class TailHedgeManager(ManagerAgent):
                 self._held_contract_id = None
                 return decisions
 
+        uncapped = self._premium_weight(selected, market_data, as_of_date, budget)
+        if selected == held:
+            weight = uncapped * self._held_scale
+        else:
+            weight = min(uncapped, headroom)
+            if weight < uncapped:
+                logger.info(
+                    "%s: tail-hedge premium cap %.4f cuts %s from %.4f to %.4f of NAV.",
+                    day,
+                    settings.options.tail_hedge_annual_premium_cap,
+                    selected,
+                    uncapped,
+                    weight,
+                )
+            self._held_scale = weight / uncapped if uncapped > 0.0 else 0.0
+            self._commitments.append((day, weight))
+
         option_rows: list[PortfolioDecision] = []
         if held is not None and held != selected:
             option_rows.append(_option_decision(held, day, 0.0, equity.contributing_signals))
-        option_rows.append(
-            _option_decision(
-                selected,
-                day,
-                self._premium_weight(selected, market_data, as_of_date, budget),
-                equity.contributing_signals,
-            )
-        )
+        option_rows.append(_option_decision(selected, day, weight, equity.contributing_signals))
         self._held_contract_id = selected
 
-        return [
-            decision.model_copy(update={"target_weight": 0.0})
-            if decision.asset == underlying
-            else decision
-            for decision in decisions
-        ] + option_rows
+        return _zero_underlying(decisions, underlying) + option_rows
 
     def _premium_weight(
         self, contract_id: str, market_data: pd.DataFrame, as_of_date: pd.Timestamp, budget: float
@@ -184,6 +235,18 @@ class TailHedgeManager(ManagerAgent):
             return None
         _log_protection(contract, mark, spot, day, budget)
         return contract.contract_id
+
+
+def _zero_underlying(
+    decisions: list[PortfolioDecision], underlying: str
+) -> list[PortfolioDecision]:
+    """`decisions` with the `underlying` equity row's target weight set to 0.0."""
+    return [
+        decision.model_copy(update={"target_weight": 0.0})
+        if decision.asset == underlying
+        else decision
+        for decision in decisions
+    ]
 
 
 def _hedge_confidence(signals: list[ManagerSignal]) -> float | None:

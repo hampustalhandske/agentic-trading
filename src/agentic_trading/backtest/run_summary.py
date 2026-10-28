@@ -14,9 +14,12 @@ actually reads afterwards: final metrics, the equity curve,
 `signal_health`, `source_performance` (the attribution-score reading of
 analyst/manager skill), and `pod_return_history` (each pod's own real,
 weighted daily return — small, one number per pod per day, not one row
-per asset per day like the fields this strips). Per-pod sizing
-diagnostics are reduced to each pod's binding-stage shares and mean
-final-to-target vol ratio; the per-day entries are not kept."""
+per asset per day like the fields this strips). `pod_performance` and
+`pod_costs` (each pod's fill costs, option premium and turnover) pass
+through as they are. Per-pod sizing diagnostics are reduced to each pod's
+binding-stage shares and mean final-to-target vol ratio, and unfactored
+split-sized moves to a count per security; the per-day and per-move
+entries are not kept."""
 
 from collections import Counter
 from typing import Any
@@ -81,6 +84,14 @@ def _sizing_summary(block: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {"sizing_binding_shares": binding_shares, "sizing_vol_ratio": vol_ratio}
 
 
+def _unfactored_split_move_counts(block: dict[str, Any]) -> dict[str, int]:
+    """The number of `unfactored_split_moves` entries per security in a
+    period block, keyed by the security id as a string; `{}` when the block
+    has none."""
+    moves = block.get("unfactored_split_moves") or []
+    return dict(Counter(str(move["security_id"]) for move in moves))
+
+
 def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
     """The full `experiment_result.json` payload in, the compact summary
     out. `experiment_result` must have `experiment`, `market_data_source`,
@@ -98,6 +109,8 @@ def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
         summary[period]["source_performance"] = block["source_performance"]
         summary[period]["pod_return_history"] = block.get("pod_return_history", {})
         summary[period]["pod_performance"] = block.get("pod_performance", {})
+        summary[period]["pod_costs"] = block.get("pod_costs", {})
+        summary[period]["unfactored_split_moves_by_security"] = _unfactored_split_move_counts(block)
         summary[period].update(_unfilled_order_counts(block))
         summary[period].update(_capital_usage_means(block))
         summary[period].update(_sizing_summary(block))

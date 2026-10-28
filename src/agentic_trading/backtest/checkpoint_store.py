@@ -2,9 +2,9 @@
 
 """Append-only SQLite-backed backtest checkpoint.
 
-Each simulated day appends exactly that day's new rows to seven tables
+Each simulated day appends exactly that day's new rows to eight tables
 (`track_record`, `decisions`, `trades`, `unfilled_orders`, `capital_usage`,
-`sizing_diagnostics`, `pod_returns`) via `INSERT` — O(1) per day, O(n)
+`sizing_diagnostics`, `pod_returns`, `pod_cost_days`) via `INSERT` — O(1) per day, O(n)
 total for a run of length n — and keeps a single small `cursor` row (next
 day index, portfolio state, signal health, pending decisions, the
 Commander's serialized risk state, and the run's own config for
@@ -21,6 +21,7 @@ from typing import Any
 from agentic_trading.agents.schemas import (
     CapitalUsage,
     PerformanceRecord,
+    PodCostDay,
     PortfolioDecision,
     SizingDiagnostics,
     TradeRecord,
@@ -74,6 +75,12 @@ CREATE TABLE IF NOT EXISTS pod_returns (
     as_of_date TEXT NOT NULL,
     pod_id TEXT NOT NULL,
     value REAL NOT NULL
+)
+"""
+_CREATE_POD_COST_DAYS = """
+CREATE TABLE IF NOT EXISTS pod_cost_days (
+    as_of_date TEXT NOT NULL,
+    payload TEXT NOT NULL
 )
 """
 _CREATE_PORTFOLIO_VALUE = """
@@ -134,6 +141,7 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
     connection.execute(_CREATE_CAPITAL_USAGE)
     connection.execute(_CREATE_SIZING_DIAGNOSTICS)
     connection.execute(_CREATE_POD_RETURNS)
+    connection.execute(_CREATE_POD_COST_DAYS)
     connection.execute(_CREATE_PORTFOLIO_VALUE)
     connection.execute(_CREATE_CURSOR)
     _add_missing_columns(connection)
@@ -146,6 +154,7 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
             connection.execute("DELETE FROM capital_usage")
             connection.execute("DELETE FROM sizing_diagnostics")
             connection.execute("DELETE FROM pod_returns")
+            connection.execute("DELETE FROM pod_cost_days")
             connection.execute("DELETE FROM portfolio_value")
             connection.execute("DELETE FROM cursor")
     return connection
@@ -172,6 +181,7 @@ def append_day(
     capital_usage: CapitalUsage | None = None,
     sizing_diagnostics: list[SizingDiagnostics] | None = None,
     new_pod_returns: list[tuple[str, date, float]] | None = None,
+    pod_cost_day: PodCostDay | None = None,
 ) -> None:
     """Appends exactly this simulated day's new rows — never touches a
     prior day's already-written rows — plus overwrites the single small
@@ -180,7 +190,8 @@ def append_day(
     form, or `None` for a commander that carries no risk state.
     `sizing_diagnostics` are the day's per-pod sizing diagnostics, in pod
     order. `new_pod_returns` are the (pod id, date, return) entries first seen
-    this day."""
+    this day. `pod_cost_day` is the day's pod contributions and the fill
+    costs charged to each pod."""
     with connection:
         connection.execute(
             "INSERT INTO portfolio_value (as_of_date, value) VALUES (?, ?)",
@@ -244,6 +255,11 @@ def append_day(
                 for pod_id, return_date, value in new_pod_returns or []
             ],
         )
+        if pod_cost_day is not None:
+            connection.execute(
+                "INSERT INTO pod_cost_days (as_of_date, payload) VALUES (?, ?)",
+                (as_of_date.isoformat(), json.dumps(pod_cost_day.model_dump(mode="json"))),
+            )
         connection.execute(
             """
             INSERT INTO cursor
@@ -354,6 +370,12 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
             "SELECT as_of_date, payload FROM sizing_diagnostics ORDER BY as_of_date, rowid"
         )
     ]
+    pod_cost_days = [
+        json.loads(payload)
+        for _as_of_date_str, payload in connection.execute(
+            "SELECT as_of_date, payload FROM pod_cost_days ORDER BY as_of_date, rowid"
+        )
+    ]
     pod_return_history: dict[str, list[tuple[str, float]]] = {}
     for pod_id, return_date, value in connection.execute(
         "SELECT pod_id, as_of_date, value FROM pod_returns ORDER BY as_of_date, rowid"
@@ -381,5 +403,6 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         "capital_usage": capital_usage,
         "sizing_diagnostics": sizing_diagnostics,
         "pod_return_history": pod_return_history,
+        "pod_cost_days": pod_cost_days,
         "portfolio_value_history": portfolio_value_history,
     }

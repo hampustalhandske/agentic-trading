@@ -188,6 +188,11 @@ class OptionsConfig(BaseModel):
     # holds a fixed number of contracts rather than buying more.
     tail_hedge_notional_fraction: float = Field(default=1.0, gt=0.0)
     tail_hedge_target_protection: float = Field(default=0.10, gt=0.0, le=1.0)
+    # The tail-hedge pod commits at most this fraction of NAV to new puts
+    # over any trailing 365 days; 2% sits inside the 1-3% a year
+    # institutional tail-hedge programmes budget. Fixed before any run that
+    # uses it; a change is a new trial (see docs/prior_exposure.json).
+    tail_hedge_annual_premium_cap: float = Field(default=0.02, ge=0.0, le=1.0)
     # Short straddles on a rich variance risk premium need at least this
     # confidence from the VRP analyst; below it the view is expressed as a
     # long single leg only.
