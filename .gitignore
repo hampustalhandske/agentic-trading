@@ -94,6 +94,10 @@ tempCodeRunnerFile.py
 .claude/
 CLAUDE.md
 
+# Local working notes, kept out of the public repo
+CHANGELOG.md
+KNOWN_LIMITATIONS.md
+
 # agentic_trading runtime log (see src/agentic_trading/logging_config.py)
 log/
 
