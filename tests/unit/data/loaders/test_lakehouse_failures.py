@@ -24,7 +24,7 @@ def test_lakehouse_error_propagates_instead_of_becoming_none(fake_lake: Any) -> 
 def test_connection_error_propagates(fake_lake: Any) -> None:
     fake_lake.error = ConnectionError("refused")
     with pytest.raises(ConnectionError):
-        lakehouse_loader._split_adjustment_factor("AAPL", date(2024, 1, 5))
+        lakehouse_loader.split_adjustment_factor("AAPL", date(2024, 1, 5))
 
 
 def test_zero_rows_is_none(fake_lake: Any) -> None:

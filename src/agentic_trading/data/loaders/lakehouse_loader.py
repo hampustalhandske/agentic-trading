@@ -115,7 +115,7 @@ def load_sp500_constituents_asof(as_of_date: date) -> list[str] | None:
     return tickers
 
 
-def _split_adjustment_factor(ticker: str, quote_date: date) -> float:
+def split_adjustment_factor(ticker: str, quote_date: date) -> float:
     """Factor that moves an option-chain row quoted on `quote_date` onto
     the basis of `ticker`'s `instrument_prices` close: the product of
     `1 / ratio` over the ticker's rows in the lake's
@@ -155,7 +155,7 @@ def _apply_split_adjustment(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
     and untouched. A no-op for any ticker/date with no later split."""
     frame = frame.copy()
     for quote_date in frame["date"].dt.date.unique():
-        factor = _split_adjustment_factor(ticker, quote_date)
+        factor = split_adjustment_factor(ticker, quote_date)
         if factor == 1.0:
             continue
         mask = frame["date"].dt.date == quote_date

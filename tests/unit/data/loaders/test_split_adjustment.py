@@ -1,5 +1,5 @@
 # test_split_adjustment.py
-"""Unit tests for agentic_trading.data.loaders.lakehouse_loader._split_adjustment_factor."""
+"""Unit tests for agentic_trading.data.loaders.lakehouse_loader.split_adjustment_factor."""
 
 from datetime import date
 from typing import Any
@@ -61,7 +61,7 @@ def test_factor_is_product_of_inverse_ratios_after_quote_date(
 ) -> None:
     """Only splits with ex_date strictly after the quote date contribute 1/ratio."""
     _load_splits(fake_lake, _ROWS)
-    result = lakehouse_loader._split_adjustment_factor(ticker, quote)
+    result = lakehouse_loader.split_adjustment_factor(ticker, quote)
     assert result == pytest.approx(expected, rel=1e-6)
 
 
@@ -79,13 +79,13 @@ def test_in_close_basis_false_never_counts_and_null_counts(
 ) -> None:
     """Rows with in_close_basis false are excluded; true and null rows are included."""
     _load_splits(fake_lake, _ROWS)
-    result = lakehouse_loader._split_adjustment_factor(ticker, quote)
+    result = lakehouse_loader.split_adjustment_factor(ticker, quote)
     assert result == pytest.approx(expected, rel=1e-6)
 
 
 def test_unknown_ticker_and_empty_table_return_one(fake_lake: Any) -> None:
     """A ticker with no rows, or an empty table, yields a factor of 1.0."""
     _load_splits(fake_lake, _ROWS)
-    assert lakehouse_loader._split_adjustment_factor("MSFT", date(2020, 1, 2)) == 1.0
+    assert lakehouse_loader.split_adjustment_factor("MSFT", date(2020, 1, 2)) == 1.0
     _load_splits(fake_lake, [])
-    assert lakehouse_loader._split_adjustment_factor("AAPL", date(2020, 8, 28)) == 1.0
+    assert lakehouse_loader.split_adjustment_factor("AAPL", date(2020, 8, 28)) == 1.0

@@ -759,6 +759,10 @@ def _option_engine(
 @pytest.fixture
 def option_marks_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("agentic_trading.backtest.engine.load_option_mark", _fake_load_option_mark)
+    monkeypatch.setattr(
+        "agentic_trading.backtest.engine.lakehouse_loader.split_adjustment_factor",
+        lambda *_args: 1.0,
+    )
 
 
 def test_run_fills_marks_and_settles_an_option_decision(option_marks_stub: None) -> None:

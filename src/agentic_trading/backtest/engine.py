@@ -32,6 +32,7 @@ from agentic_trading.agents.schemas import (
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.portfolio import OptionPosition, Portfolio
 from agentic_trading.config import settings
+from agentic_trading.data.loaders import lakehouse_loader
 from agentic_trading.data.loaders.option_marks import OptionMark, load_option_mark
 from agentic_trading.data.point_in_time import get_point_in_time_data
 from agentic_trading.logging_config import get_logger, log_progress
@@ -607,6 +608,9 @@ class BacktestEngine:
                                 decision.instrument.underlying,
                                 as_of_timestamp,
                                 "open" if self.execution_lag_days else "close",
+                            ),
+                            split_factor=lakehouse_loader.split_adjustment_factor(
+                                decision.instrument.underlying, as_of_timestamp.date()
                             ),
                         )
                         trade_log.append(option_trade)

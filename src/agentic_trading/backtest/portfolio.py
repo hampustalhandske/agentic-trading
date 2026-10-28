@@ -19,10 +19,15 @@ logger = get_logger(__name__)
 class OptionPosition(BaseModel):
     """An open listed-option position: signed `contracts` (long positive,
     short negative), the per-share premium it was opened at, and the last
-    mid it was marked at (what it is valued at on a day without a mark)."""
+    mid it was marked at (what it is valued at on a day without a mark).
+
+    Contracts, premiums and strike are on the split-adjusted basis the
+    option marks use: one as-traded contract held across later splits of
+    the underlying counts as `split_factor` contracts here (see
+    `Portfolio.apply_option_decision`), so the count need not be whole."""
 
     contract: OptionContract
-    contracts: int
+    contracts: float
     entry_price: float = Field(ge=0.0)
     last_mid: float = Field(ge=0.0, default=0.0)
 
@@ -118,31 +123,46 @@ class Portfolio(BaseModel):
         mark: OptionMark,
         portfolio_value: float,
         spot: float | None = None,
+        split_factor: float = 1.0,
     ) -> TradeRecord:
         """Fills toward `decision.target_weight` (signed premium notional
-        over NAV) in whole contracts of `decision.instrument`, buying at
-        `mark.ask` and selling at `mark.bid`, paying
-        `settings.options.commission_per_contract` per contract traded.
-        A mark whose `tradeable` flag is false is a hold, leaving cash and
-        positions unchanged, whatever bid/ask it carries. Any fill needs a
-        two-sided quote with at least
-        `settings.options.min_premium_per_share` of premium (a close to
-        zero needs only a bid), and a contract count is capped so its
-        underlying notional stays within `settings.options.max_notional_fraction`
-        of NAV when `spot` is known. A change smaller than
-        `settings.options.rebalance_band` of the held
-        contracts is a hold (closing to zero always fills). A fill that
-        would open or grow a short past
+        over NAV) in whole as-traded contracts of `decision.instrument`,
+        buying at `mark.ask` and selling at `mark.bid`, paying
+        `settings.options.commission_per_contract` per as-traded contract
+        traded. A mark whose `tradeable` flag is false is a hold, leaving
+        cash and positions unchanged, whatever bid/ask it carries. Any
+        fill needs a two-sided quote with at least
+        `settings.options.min_premium_per_share` of as-traded premium (a
+        close to zero needs only a bid), and a contract count is capped so
+        its underlying notional stays within
+        `settings.options.max_notional_fraction` of NAV when `spot` is
+        known. A change smaller than `settings.options.rebalance_band` of
+        the held contracts is a hold (closing to zero always fills). A
+        fill that would open or grow a short past
         `settings.options.max_short_premium_fraction` of NAV (short
         premium outstanding over every short position) is clipped to the
-        cap."""
+        largest whole number of as-traded contracts within the cap.
+
+        `mark`, `spot` and the held positions are on the split-adjusted
+        basis of the underlying's price history; `split_factor` (positive)
+        converts that basis to the contract as traded on the fill day: the
+        product of `1 / ratio` over the underlying's splits after that day
+        (1.0 with none). An as-traded premium is `mark.mid * split_factor`,
+        one as-traded contract is held as `split_factor` contracts, and an
+        as-traded contract count is the held count over `split_factor`.
+        Every per-share and per-contract rule (the minimum premium, whole
+        contract rounding, the notional and short-premium caps, the
+        commission) applies in as-traded units; positions, `TradeRecord`
+        contract counts and prices stay on the split-adjusted basis."""
         if decision.instrument is None:
             raise ValueError("apply_option_decision requires a decision with an instrument")
+        if split_factor <= 0.0:
+            raise ValueError(f"split_factor must be positive, got {split_factor}")
         contract = decision.instrument
         contract_id = contract.contract_id
         multiplier = float(settings.options.contract_multiplier)
         position = self.option_positions.get(contract_id)
-        current_contracts = position.contracts if position is not None else 0
+        current_contracts = position.contracts if position is not None else 0.0
         previous_weight = (
             0.0
             if portfolio_value == 0
@@ -166,12 +186,18 @@ class Portfolio(BaseModel):
         if not mark.tradeable or mark.is_expired or mark.mid <= 0.0:
             return _hold()
 
-        target_contracts = round(decision.target_weight * portfolio_value / (mark.mid * multiplier))
+        as_traded_mid = mark.mid * split_factor
+        target_as_traded = round(
+            decision.target_weight * portfolio_value / (as_traded_mid * multiplier)
+        )
         if spot is not None and spot > 0.0:
-            max_contracts = int(
-                settings.options.max_notional_fraction * portfolio_value / (spot * multiplier)
+            max_as_traded = int(
+                settings.options.max_notional_fraction
+                * portfolio_value
+                / (spot * split_factor * multiplier)
             )
-            target_contracts = max(-max_contracts, min(max_contracts, target_contracts))
+            target_as_traded = max(-max_as_traded, min(max_as_traded, target_as_traded))
+        target_contracts = target_as_traded * split_factor
         if (
             current_contracts != 0
             and target_contracts != 0
@@ -180,7 +206,9 @@ class Portfolio(BaseModel):
         ):
             return _hold()
         if target_contracts != 0 and (
-            mark.bid <= 0.0 or mark.ask <= 0.0 or mark.mid < settings.options.min_premium_per_share
+            mark.bid <= 0.0
+            or mark.ask <= 0.0
+            or as_traded_mid < settings.options.min_premium_per_share
         ):
             return _hold()
         if target_contracts == 0 and mark.bid <= 0.0:
@@ -192,11 +220,14 @@ class Portfolio(BaseModel):
                 if other.contracts < 0 and other_id != contract_id
             )
             cap = settings.options.max_short_premium_fraction * portfolio_value
-            allowed = max(math.floor((cap - other_short_premium) / (mark.mid * multiplier)), 0)
+            allowed = (
+                max(math.floor((cap - other_short_premium) / (as_traded_mid * multiplier)), 0)
+                * split_factor
+            )
             clipped = max(target_contracts, min(current_contracts, -allowed))
             if clipped != target_contracts:
                 logger.info(
-                    "Short premium cap: %s target %d contracts clipped to %d "
+                    "Short premium cap: %s target %g contracts clipped to %g "
                     "(cap %.2f, other short premium %.2f)",
                     contract_id,
                     target_contracts,
@@ -212,7 +243,9 @@ class Portfolio(BaseModel):
 
         fill_price = mark.ask if delta_contracts > 0 else mark.bid
         premium = -delta_contracts * fill_price * multiplier
-        transaction_cost = abs(delta_contracts) * settings.options.commission_per_contract
+        transaction_cost = (
+            abs(delta_contracts) / split_factor * settings.options.commission_per_contract
+        )
         self.cash += premium - transaction_cost
 
         if target_contracts == 0:
