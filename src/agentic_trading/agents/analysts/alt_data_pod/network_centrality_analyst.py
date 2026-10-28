@@ -7,7 +7,12 @@ import numpy as np
 import pandas as pd
 from pydantic import Field, PrivateAttr
 
-from agentic_trading.agents._market_math import RefitCache, clamp, load_fixed_universe_returns
+from agentic_trading.agents._market_math import (
+    RefitCache,
+    balanced_panel,
+    clamp,
+    load_fixed_universe_returns,
+)
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import (
@@ -48,6 +53,11 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
     by how strongly it historically leads `asset`). Distinct methodology
     from the factor_pod regressions: this is a graph/network-science read
     of the cross-sectional return structure, not a linear factor model.
+    The graph is built on one balanced, date-aligned panel: the reference
+    dates are `asset`'s own last `WINDOW + LAG` return dates, and only
+    universe names with a return on every one of them are kept — a name
+    missing a date is dropped, never the date. `sample_count` is the
+    number of reference dates; the rationale reports the names kept.
 
     The universe is resolved fresh each call (refit at
     `_universe_refit_cache.refit_interval_days`) as the real, point-in-time
@@ -67,13 +77,13 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
 
     def _load_broad_lakehouse_universe(
         self, as_of_date: pd.Timestamp
-    ) -> dict[str, np.ndarray] | None:
+    ) -> dict[str, pd.Series] | None:
         """Real, point-in-time S&P 500 membership plus a single batch
-        lakehouse query for all of their trailing returns — the expensive
-        fetch `_universe_refit_cache` gates, cached under one universe-
-        wide key so every asset this pod scores on the same day (and
-        within the same refit interval) shares one fetch, the same shape
-        `fama_macbeth_analyst.py`'s identical helper uses. Returns `None`
+        lakehouse query for all of their trailing, date-indexed returns —
+        the expensive fetch `_universe_refit_cache` gates, cached under
+        one universe-wide key so every asset this pod scores on the same
+        day (and within the same refit interval) shares one fetch, the
+        same shape `fama_macbeth_analyst.py`'s identical helper uses. Returns `None`
         (not raises) on any failure or a too-thin resulting cross-section,
         so a cache miss during a lakehouse outage degrades to the fixed-
         universe fallback for `refit_interval_days` rather than retrying
@@ -89,7 +99,7 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
         if frame is None:
             return None
         candidate_returns = {
-            str(ticker): frame[(ticker, "log_return")].dropna().to_numpy()
+            str(ticker): frame[(ticker, "log_return")].dropna()
             for ticker in frame.columns.get_level_values(0).unique()
         }
         usable = {
@@ -157,8 +167,9 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
                     status="unavailable",
                 )
 
-        min_length = min(series.size for series in returns.values())
-        if min_length < WINDOW + LAG or asset not in returns:
+        asset_returns = returns[asset].dropna() if asset in returns else pd.Series(dtype=float)
+        reference_dates = asset_returns.index[-(WINDOW + LAG) :]
+        if len(reference_dates) < WINDOW + LAG:
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
@@ -171,11 +182,13 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
                 status="unavailable",
             )
 
-        aligned = {ticker: series[-(WINDOW + LAG) :] for ticker, series in returns.items()}
+        panel = balanced_panel(universe, returns, reference_dates)
+        kept = tuple(panel.columns)
+        aligned = {ticker: panel[ticker].to_numpy(dtype=np.float64) for ticker in kept}
         asset_current = aligned[asset][LAG:]
 
         lead_lag_corr: dict[str, float] = {}
-        for ticker in universe:
+        for ticker in kept:
             if ticker == asset:
                 continue
             leader_lagged = aligned[ticker][:-LAG]
@@ -212,7 +225,7 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
             confidence=confidence,
             rationale=(
                 f"lead-lag centrality={centrality:.3f}, predicted return={predicted_return:.5f} "
-                f"across universe {universe}"
+                f"across {len(kept)} of {len(universe)} universe names {kept}"
             ),
-            sample_count=min_length,
+            sample_count=len(reference_dates),
         )

@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from quantcore.statistics.regression import factor_loadings
 
-from agentic_trading.agents._market_math import clamp, market_slice
+from agentic_trading.agents._market_math import clamp, log_return_series
 from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
@@ -40,7 +40,9 @@ def _expected_factor_premia(factor_returns: pd.DataFrame) -> np.ndarray:
 
 class FamaFrenchFactorAnalyst(AnalystAgent):
     """Expected return from factor exposures: regresses the asset's
-    trailing-year excess returns on the Fama-French factors, keeps only
+    trailing-year excess returns on the Fama-French factors, joined by
+    date (only days with both a return and a factor row enter; that
+    joined row count is the signal's `sample_count`), keeps only
     loadings with a Newey-West |t| at or above
     `settings.analysts.t_stat_threshold`, and multiplies them by each
     factor's expected premium — half its 12-1-month momentum (Ehsani &
@@ -68,7 +70,7 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        returns = market_slice(market_data, as_of_date, asset).log_returns[
+        returns = log_return_series(market_data, as_of_date, asset).iloc[
             -settings.analysts.risk_window_long :
         ]
         factors = load_fama_french_factors_from_lakehouse(as_of_date.date(), model=self.model)
@@ -84,8 +86,10 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
             )
 
         factor_columns = [column for column in factors.columns if column != "RF"]
-        length = min(returns.size, len(factors))
-        if length < MIN_REGRESSION_OBSERVATIONS:
+        joined = pd.concat(
+            {"asset": returns.to_frame("return"), "factors": factors}, axis=1, join="inner"
+        ).dropna()
+        if len(joined) < MIN_REGRESSION_OBSERVATIONS:
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
@@ -94,10 +98,13 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
                 confidence=0.0,
                 rationale="insufficient overlapping history for a factor regression",
                 status="unavailable",
+                sample_count=len(joined),
             )
 
-        aligned_factors = factors.iloc[-length:]
-        excess_returns = returns[-length:] - aligned_factors["RF"].to_numpy(dtype=np.float64)
+        aligned_factors = joined["factors"]
+        excess_returns = (joined[("asset", "return")] - aligned_factors["RF"]).to_numpy(
+            dtype=np.float64
+        )
         factor_matrix = aligned_factors[factor_columns].to_numpy(dtype=np.float64)
 
         # quantcore returns the intercept (alpha) first, then one loading
@@ -115,6 +122,7 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
                 direction="flat",
                 confidence=0.0,
                 rationale="no factor loading is statistically significant",
+                sample_count=len(joined),
             )
 
         premia = _expected_factor_premia(factors[factor_columns])
@@ -142,4 +150,5 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
                 f"factor expected return {monthly_alpha:.4f}/month vs vol {monthly_vol:.4f} "
                 f"(z={z_score:.3f}; significant loadings: {loadings_text})"
             ),
+            sample_count=len(joined),
         )

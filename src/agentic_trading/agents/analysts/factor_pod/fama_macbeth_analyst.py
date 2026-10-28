@@ -8,7 +8,12 @@ import pandas as pd
 from pydantic import Field, PrivateAttr
 from quantcore.statistics.regression import factor_loadings, fama_macbeth_regression
 
-from agentic_trading.agents._market_math import RefitCache, clamp, load_fixed_universe_returns
+from agentic_trading.agents._market_math import (
+    RefitCache,
+    balanced_panel,
+    clamp,
+    load_fixed_universe_returns,
+)
 from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import (
@@ -34,6 +39,9 @@ _RISK_WINDOW = 120
 # is the minimum surviving cross-section size to still run the
 # regression on, not "all of them."
 _MIN_UNIVERSE_SIZE = 30
+# Fewest reference dates (the asset's return and the factors both
+# present) the time-series and cross-sectional stages run on.
+_MIN_JOINED_OBSERVATIONS = 30
 
 
 class FamaMacbethAnalyst(AnalystAgent):
@@ -42,6 +50,13 @@ class FamaMacbethAnalyst(AnalystAgent):
     cross-sectional `universe`, runs a Fama-MacBeth cross-sectional
     regression for the estimated risk premia, and predicts `asset`'s
     expected return from its own loadings times those premia.
+
+    Both stages run on one balanced, date-aligned panel: the reference
+    dates are the last `_RISK_WINDOW` days on which `asset`'s return and
+    the factors both exist (joined by date), and only universe tickers
+    with a return on every reference date are kept — a ticker missing a
+    date is dropped, never the date. `sample_count` is the number of
+    reference dates; the rationale reports how many tickers were kept.
 
     `universe` is resolved fresh each call as the real, point-in-time
     S&P 500 membership as of `as_of_date` (`data/loaders/lakehouse_loader.py`),
@@ -110,26 +125,36 @@ class FamaMacbethAnalyst(AnalystAgent):
             )
         factor_columns = [column for column in factors.columns if column != "RF"]
 
-        min_length = min([len(factors), *(series.size for series in universe_returns.values())])
-        if min_length < 30 or asset not in universe_returns:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient cross-sectional history for a Fama-MacBeth regression",
-                status="unavailable",
+        if asset not in universe_returns:
+            return self._insufficient_history(asset, as_of_date)
+        reference = (
+            pd.concat(
+                {"asset": universe_returns[asset].to_frame("return"), "factors": factors},
+                axis=1,
+                join="inner",
             )
+            .dropna()
+            .iloc[-_RISK_WINDOW:]
+        )
+        if len(reference) < _MIN_JOINED_OBSERVATIONS:
+            return self._insufficient_history(asset, as_of_date)
+        panel_frame = balanced_panel(universe, universe_returns, reference.index)
+        kept = tuple(panel_frame.columns)
+        if len(kept) <= len(factor_columns):
+            return self._insufficient_history(asset, as_of_date)
+        joined = pd.concat(
+            {"returns": panel_frame, "factors": reference["factors"]}, axis=1, join="inner"
+        )
 
-        aligned_factors = factors.iloc[-min_length:]
-        factor_matrix = aligned_factors[factor_columns].to_numpy(dtype=np.float64)
-        risk_free = aligned_factors["RF"].to_numpy(dtype=np.float64)
+        joined_returns = joined["returns"]
+        joined_factors = joined["factors"]
+        factor_matrix = joined_factors[factor_columns].to_numpy(dtype=np.float64)
+        risk_free = joined_factors["RF"].to_numpy(dtype=np.float64)
 
         betas_by_ticker: dict[str, np.ndarray] = {}
         panel_returns = []
-        for ticker in universe:
-            excess = universe_returns[ticker][-min_length:] - risk_free
+        for ticker in kept:
+            excess = joined_returns[ticker].to_numpy(dtype=np.float64) - risk_free
             # quantcore returns the intercept (alpha) first; only the per-
             # factor loadings belong in the cross-sectional stage.
             loadings, _t_stats = factor_loadings(excess, factor_matrix)
@@ -137,11 +162,11 @@ class FamaMacbethAnalyst(AnalystAgent):
             panel_returns.append(excess)
 
         panel = np.column_stack(panel_returns)
-        beta_matrix = np.vstack([betas_by_ticker[ticker] for ticker in universe])
+        beta_matrix = np.vstack([betas_by_ticker[ticker] for ticker in kept])
         premia, _t_stats = fama_macbeth_regression(panel, beta_matrix)
 
         predicted_return = float(np.dot(betas_by_ticker[asset], premia))
-        realized_vol = float(np.std(universe_returns[asset][-min_length:], ddof=1))
+        realized_vol = float(np.std(joined_returns[asset].to_numpy(dtype=np.float64), ddof=1))
 
         direction: Literal["long", "short", "flat"] = "long" if predicted_return >= 0.0 else "short"
         confidence = clamp(abs(predicted_return) / max(realized_vol, 1e-8))
@@ -154,19 +179,32 @@ class FamaMacbethAnalyst(AnalystAgent):
             confidence=confidence,
             rationale=(
                 f"Fama-MacBeth predicted return={predicted_return:.5f} across a "
-                f"{len(universe)}-name cross-section"
+                f"{len(kept)}-name cross-section ({len(universe) - len(kept)} of "
+                f"{len(universe)} names dropped for a missing date)"
             ),
+            sample_count=len(joined),
+        )
+
+    def _insufficient_history(self, asset: str, as_of_date: pd.Timestamp) -> AgentSignal:
+        return AgentSignal(
+            agent_id=self.agent_id,
+            asset=asset,
+            as_of_date=as_of_date.date(),
+            direction="flat",
+            confidence=0.0,
+            rationale="insufficient cross-sectional history for a Fama-MacBeth regression",
+            status="unavailable",
         )
 
     def _load_broad_lakehouse_universe(
         self, as_of_date: pd.Timestamp
-    ) -> tuple[tuple[str, ...], dict[str, np.ndarray]] | None:
+    ) -> tuple[tuple[str, ...], dict[str, pd.Series]] | None:
         """The expensive fetch `_universe_refit_cache` gates: real,
         point-in-time S&P 500 membership plus a single batch lakehouse
-        query for all of their trailing returns. Returns `None` (not
-        raises) on any failure, so a cache miss during a lakehouse outage
-        degrades to the fixed-universe fallback for `refit_interval_days`
-        rather than retrying every day."""
+        query for all of their trailing, date-indexed returns. Returns
+        `None` (not raises) on any failure, so a cache miss during a
+        lakehouse outage degrades to the fixed-universe fallback for
+        `refit_interval_days` rather than retrying every day."""
         lakehouse_universe = load_sp500_constituents_asof(as_of_date.date())
         if lakehouse_universe is None:
             return None
@@ -177,15 +215,14 @@ class FamaMacbethAnalyst(AnalystAgent):
         if frame is None:
             return None
         # A ticker present in the frame isn't necessarily usable — a
-        # corrupted or thin price series (confirmed live: some lakehouse
-        # rows carry a real `close` but a broken all-zero `adj_close`,
-        # masked to NaN by the loader) can leave a ticker with almost no
-        # real return observations. Filtering on this BEFORE computing
-        # `min_length` in the caller matters: an all-NaN ticker included
-        # here would otherwise drag the cross-sectional `min_length` down
-        # to 0 for every asset's regression that day, not just its own.
+        # corrupted or thin price series (some lakehouse rows carry a real
+        # `close` but a broken all-zero `adj_close`, masked to NaN by the
+        # loader) can leave a ticker with almost no real return
+        # observations. Filtering on this before the caller's date join
+        # matters: an all-NaN ticker included here would empty the
+        # inner-joined panel for every asset that day, not just its own.
         candidate_returns = {
-            str(ticker): frame[(ticker, "log_return")].dropna().to_numpy()[-_RISK_WINDOW:]
+            str(ticker): frame[(ticker, "log_return")].dropna()
             for ticker in frame.columns.get_level_values(0).unique()
         }
         universe_returns = {
@@ -199,10 +236,10 @@ class FamaMacbethAnalyst(AnalystAgent):
 
     def _resolve_with_broad_universe(
         self,
-        broad_universe_result: tuple[tuple[str, ...], dict[str, np.ndarray]],
+        broad_universe_result: tuple[tuple[str, ...], dict[str, pd.Series]],
         asset: str,
         as_of_date: pd.Timestamp,
-    ) -> AgentSignal | tuple[tuple[str, ...], dict[str, np.ndarray]]:
+    ) -> AgentSignal | tuple[tuple[str, ...], dict[str, pd.Series]]:
         """Per-call, cheap: reuses the cached broad-universe returns as
         they stand, only doing a fresh (single-ticker, fast) lakehouse
         lookup if `asset` itself isn't already in the cached set — most
@@ -225,24 +262,19 @@ class FamaMacbethAnalyst(AnalystAgent):
                 status="unavailable",
             )
         merged_returns = dict(universe_returns)
-        merged_returns[asset] = (
-            asset_frame[(asset, "log_return")].dropna().to_numpy()[-_RISK_WINDOW:]
-        )
+        merged_returns[asset] = asset_frame[(asset, "log_return")].dropna()
         return (*resolved_tickers, asset), merged_returns
 
     def _fixed_universe_returns(
         self, universe: tuple[str, ...], asset: str, as_of_date: pd.Timestamp
-    ) -> AgentSignal | tuple[tuple[str, ...], dict[str, np.ndarray]]:
+    ) -> AgentSignal | tuple[tuple[str, ...], dict[str, pd.Series]]:
         """Fallback used only when the broad lakehouse S&P 500 universe
         itself is unreachable that day: `load_fixed_universe_returns`
         over a small fixed list, only usable at that scale — every
         ticker must succeed, since this path is never handed hundreds of
         names where partial failure is expected."""
         try:
-            universe_returns = {
-                ticker: series[-_RISK_WINDOW:]
-                for ticker, series in load_fixed_universe_returns(universe, as_of_date).items()
-            }
+            universe_returns = load_fixed_universe_returns(universe, as_of_date)
         except Exception as exc:
             logger.debug(
                 "%s: universe price history download failed (%s) — returning flat.",

@@ -14,6 +14,7 @@ from agentic_trading.agents._market_math import (
     clamp,
     conditional_daily_volatility,
     market_slice,
+    raw_spot,
 )
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
     real_atm_options_by_expiration,
@@ -35,8 +36,10 @@ class BlackScholesValuationAnalyst(AnalystAgent):
     and compares it against the same option priced off the **real
     market-quoted ATM implied volatility** (nearest available expiration,
     `_options_data.real_atm_options_by_expiration`) — a model-vs-market
-    read. Flat with zero confidence when no real snapshot exists for the
-    date. The GARCH leg refits at most once every
+    read. Spot and strike are the unadjusted close
+    (`_market_math.raw_spot`), the basis option strikes are quoted on.
+    Flat with zero confidence when no real snapshot or no close exists
+    for the date. The GARCH leg refits at most once every
     `_refit_cache.refit_interval_days` simulated days per asset — see
     `RefitCache`'s docstring."""
 
@@ -59,9 +62,11 @@ class BlackScholesValuationAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        slice_ = market_slice(market_data, as_of_date, asset)
-        returns = slice_.log_returns[-settings.analysts.risk_window_short :]
-        if slice_.close is None or returns.size < 2:
+        returns = market_slice(market_data, as_of_date, asset).log_returns[
+            -settings.analysts.risk_window_short :
+        ]
+        spot = raw_spot(market_data, as_of_date, asset)
+        if spot is None or returns.size < 2:
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
@@ -72,7 +77,7 @@ class BlackScholesValuationAnalyst(AnalystAgent):
                 status="unavailable",
             )
 
-        real_options = real_atm_options_by_expiration(asset, as_of_date, slice_.close)
+        real_options = real_atm_options_by_expiration(asset, as_of_date, spot)
         if real_options is None or real_options.empty:
             return AgentSignal(
                 agent_id=self.agent_id,
@@ -94,29 +99,29 @@ class BlackScholesValuationAnalyst(AnalystAgent):
         )
 
         fitted_call = black_scholes_call(
-            slice_.close,
-            slice_.close,
+            spot,
+            spot,
             mean_return,
             fitted_volatility,
             self._time_to_maturity,
         )
         benchmark_call = black_scholes_call(
-            slice_.close,
-            slice_.close,
+            spot,
+            spot,
             mean_return,
             benchmark_volatility,
             self._time_to_maturity,
         )
         fitted_put = black_scholes_put(
-            slice_.close,
-            slice_.close,
+            spot,
+            spot,
             mean_return,
             fitted_volatility,
             self._time_to_maturity,
         )
         benchmark_put = black_scholes_put(
-            slice_.close,
-            slice_.close,
+            spot,
+            spot,
             mean_return,
             benchmark_volatility,
             self._time_to_maturity,
@@ -133,7 +138,7 @@ class BlackScholesValuationAnalyst(AnalystAgent):
         # leg instead would lose nothing and gain nothing.
         edge = fitted_call - benchmark_call
         direction: Literal["long", "short", "flat"] = "long" if edge >= 0.0 else "short"
-        confidence = clamp(abs(edge) / max(slice_.close, 1e-12))
+        confidence = clamp(abs(edge) / max(spot, 1e-12))
         return AgentSignal(
             agent_id=self.agent_id,
             asset=asset,

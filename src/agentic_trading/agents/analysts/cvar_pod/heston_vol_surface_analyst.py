@@ -5,7 +5,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-from agentic_trading.agents._market_math import clamp, market_slice
+from agentic_trading.agents._market_math import clamp, market_slice, raw_spot
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
     annualized_garch_volatility,
     real_atm_options_by_expiration,
@@ -105,14 +105,16 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        slice_ = market_slice(market_data, as_of_date, asset)
-        returns = slice_.log_returns[-settings.analysts.risk_window_long :]
-        if slice_.close is None or returns.size < MIN_RETURN_OBSERVATIONS:
+        returns = market_slice(market_data, as_of_date, asset).log_returns[
+            -settings.analysts.risk_window_long :
+        ]
+        spot = raw_spot(market_data, as_of_date, asset)
+        if spot is None or returns.size < MIN_RETURN_OBSERVATIONS:
             return self._flat(
                 asset, as_of_date, "insufficient history for a volatility read", "unavailable"
             )
 
-        real_options = real_atm_options_by_expiration(asset, as_of_date, slice_.close)
+        real_options = real_atm_options_by_expiration(asset, as_of_date, spot)
         if real_options is None or real_options.empty:
             return self._flat(
                 asset,

@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from pydantic import PrivateAttr
 
-from agentic_trading.agents._market_math import clamp, market_slice
+from agentic_trading.agents._market_math import clamp, market_slice, raw_spot
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
     real_atm_options_by_expiration,
 )
@@ -40,9 +40,11 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
     snapshot (`_options_data.real_atm_options_by_expiration`).
 
     The intensity g = S * gamma * sqrt(DTE / 252) is a DTE-normalised ATM
-    dollar gamma. Without open interest, ATM gamma is a deterministic
-    function of spot, implied vol and time to expiry, so g says nothing
-    about dealer positioning by itself; the only information is how it
+    dollar gamma, with S the unadjusted close (`_market_math.raw_spot`) —
+    the basis the chain's strikes and gamma are quoted on. Without open
+    interest, ATM gamma is a deterministic function of spot, implied vol
+    and time to expiry, so g says nothing about dealer positioning by
+    itself; the only information is how it
     compares to its own history. Each distinct snapshot's log g is kept
     in-process per asset and z-scored against the trailing
     `settings.analysts.gamma_history_window` points once at least
@@ -87,14 +89,14 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        slice_ = market_slice(market_data, as_of_date, asset)
-        returns = slice_.log_returns[-MOMENTUM_VOL_WINDOW:]
-        if slice_.close is None or returns.size < MIN_RETURN_OBSERVATIONS:
+        returns = market_slice(market_data, as_of_date, asset).log_returns[-MOMENTUM_VOL_WINDOW:]
+        spot = raw_spot(market_data, as_of_date, asset)
+        if spot is None or returns.size < MIN_RETURN_OBSERVATIONS:
             return self._flat(
                 asset, as_of_date, "insufficient history for gamma-regime read", "unavailable"
             )
 
-        real_options = real_atm_options_by_expiration(asset, as_of_date, slice_.close)
+        real_options = real_atm_options_by_expiration(asset, as_of_date, spot)
         if real_options is None or real_options.empty:
             return self._flat(
                 asset,
@@ -112,9 +114,7 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
             )
         near = front.iloc[0]
         dte = int(near["days_to_expiration"])
-        gamma_intensity = (
-            slice_.close * float(near["gamma"]) * float(np.sqrt(dte / TRADING_DAYS_PER_YEAR))
-        )
+        gamma_intensity = spot * float(near["gamma"]) * float(np.sqrt(dte / TRADING_DAYS_PER_YEAR))
         if not np.isfinite(gamma_intensity) or gamma_intensity <= 0.0:
             return self._flat(
                 asset, as_of_date, "non-positive ATM gamma in the snapshot", "unavailable"

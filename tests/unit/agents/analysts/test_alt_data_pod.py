@@ -44,7 +44,10 @@ def test_calendar_seasonality_analyst_flat_with_insufficient_history() -> None:
     assert signal.confidence == 0.0
 
 
-def _lead_lag_universe_returns(n: int = 71) -> dict[str, np.ndarray]:
+def _lead_lag_universe_returns(n: int = 71) -> dict[str, pd.Series]:
+    """Dated returns, the shape `load_fixed_universe_returns` gives: AAPL
+    repeats MSFT's return one day later, every other name is flat."""
+    dates = pd.bdate_range(end="2024-06-19", periods=n)
     msft_returns = np.array([0.01 if i % 2 == 0 else -0.01 for i in range(n)])
     aapl_returns = np.zeros(n)
     aapl_returns[1:] = msft_returns[:-1]
@@ -57,7 +60,7 @@ def _lead_lag_universe_returns(n: int = 71) -> dict[str, np.ndarray]:
             returns[ticker] = aapl_returns
         else:
             returns[ticker] = np.zeros(n)
-    return returns
+    return {ticker: pd.Series(values, index=dates) for ticker, values in returns.items()}
 
 
 @patch(

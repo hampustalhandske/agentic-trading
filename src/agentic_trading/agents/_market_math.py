@@ -46,6 +46,35 @@ def _slice_history(
     return sliced.copy()
 
 
+def _log_return_series(history: pd.DataFrame) -> pd.Series:
+    """Date-indexed log returns of a single-asset `history`: its own
+    `log_return` column when present, otherwise log differences of
+    `close`/`Close`; empty when it has neither."""
+    if "log_return" in history.columns:
+        return history["log_return"].dropna()
+    for field in ("close", "Close"):
+        if field in history.columns:
+            close_series = history[field].dropna()
+            if close_series.empty:
+                break
+            return pd.Series(
+                np.log(close_series / close_series.shift(1)), index=close_series.index
+            ).dropna()
+    return pd.Series(dtype=float)
+
+
+def log_return_series(
+    market_data: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    asset: str | None = None,
+) -> pd.Series:
+    """Date-indexed log returns of `asset` on bars at or before
+    `as_of_date` — the same values as `market_slice(...).log_returns`,
+    keeping the dates so a caller can join them to another dated source
+    instead of aligning by position."""
+    return _log_return_series(_slice_history(market_data, as_of_date, asset))
+
+
 def market_slice(
     market_data: pd.DataFrame,
     as_of_date: pd.Timestamp,
@@ -54,30 +83,14 @@ def market_slice(
     history = _slice_history(market_data, as_of_date, asset)
 
     close: float | None = None
-    if "close" in history.columns:
-        close_series = history["close"].dropna()
-        if not close_series.empty:
-            close = float(close_series.iloc[-1])
-    elif "Close" in history.columns:
-        close_series = history["Close"].dropna()
-        if not close_series.empty:
-            close = float(close_series.iloc[-1])
+    for field in ("close", "Close"):
+        if field in history.columns:
+            close_series = history[field].dropna()
+            if not close_series.empty:
+                close = float(close_series.iloc[-1])
+            break
 
-    if "log_return" in history.columns:
-        return_series: pd.Series = history["log_return"].dropna()
-    elif close is not None and "close" in history.columns:
-        close_series = history["close"].dropna()
-        return_series = pd.Series(
-            np.log(close_series / close_series.shift(1)), index=close_series.index
-        ).dropna()
-    elif close is not None and "Close" in history.columns:
-        close_series = history["Close"].dropna()
-        return_series = pd.Series(
-            np.log(close_series / close_series.shift(1)), index=close_series.index
-        ).dropna()
-    else:
-        return_series = pd.Series(dtype=float)
-
+    return_series = _log_return_series(history)
     return MarketSlice(close=close, log_returns=return_series.to_numpy(dtype=np.float64))
 
 
@@ -87,10 +100,11 @@ def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
 
 def load_fixed_universe_returns(
     universe: tuple[str, ...], as_of_date: pd.Timestamp
-) -> dict[str, np.ndarray]:
-    """Point-in-time-safe log returns for a fixed cross-sectional `universe`
-    a few analysts need for their own methodology (e.g. a Fama-MacBeth
-    cross-sectional regression, a lead-lag correlation graph) — fetched
+) -> dict[str, pd.Series]:
+    """Point-in-time-safe, date-indexed log returns (NaNs dropped) for a
+    fixed cross-sectional `universe` a few analysts need for their own
+    methodology (e.g. a Fama-MacBeth cross-sectional regression, a
+    lead-lag correlation graph) — fetched
     independently of whatever assets the current backtest's own
     `market_data` happens to include, via the lakehouse, not
     `market_slice()`.
@@ -113,10 +127,28 @@ def load_fixed_universe_returns(
     filtered = get_point_in_time_data(raw, as_of_date)
     tickers_present = set(filtered.columns.get_level_values(0))
     return {
-        ticker: filtered[ticker]["log_return"].dropna().to_numpy(dtype=np.float64)
+        ticker: filtered[ticker]["log_return"].dropna().astype(np.float64)
         for ticker in universe
         if ticker in tickers_present
     }
+
+
+def balanced_panel(
+    universe: tuple[str, ...],
+    universe_returns: dict[str, pd.Series],
+    reference_dates: pd.Index,
+) -> pd.DataFrame:
+    """Returns of every `universe` ticker that has a value on each of
+    `reference_dates`, one column per kept ticker in `universe` order,
+    indexed by `reference_dates`. A ticker missing any of those dates is
+    dropped whole, so one gappy or recently listed name never removes a
+    date from the other names."""
+    columns = {}
+    for ticker in universe:
+        values = universe_returns[ticker].reindex(reference_dates)
+        if not values.isna().any():
+            columns[ticker] = values
+    return pd.DataFrame(columns, index=reference_dates)
 
 
 def single_asset_from_attrs(market_data: pd.DataFrame) -> str:
