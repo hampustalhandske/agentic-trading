@@ -36,6 +36,7 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-65 | risk-free series forward-filled only; raises before first value | dadea7a |
 | AT-4, AT-37 | run provenance block; loaders tested against lake contract v1 | 9ed37ed |
 | AT-7, AT-8, AT-9, AT-11 | NYSE session calendar; short interest, earnings, SEC filings gated on it; insider log | fd8e1ca |
+| AT-10, AT-12 | EPS as discrete quarters; dividends regular cash on one basis | 45daf84 |
 | AT-77 | asks 1 and 2 approved: edgelab executes; LLM scope event-desk then macro | 119b15a |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
@@ -50,9 +51,10 @@ are graded "not assessable" until edgelab fixes EL-35 (membership-interval
 coverage) and reruns them. Readings so far: reversal loses net of costs,
 JT momentum and the ML ranker show no edge, Ang low-volatility looks
 strong but random entry matches it a quarter of the time (p 0.25), so
-unknown. Moskowitz failed on the 2014-03-18 ZN/ZB gap because a roll fills
-two sessions after its decision; the folder now rolls at 10 days
-(v1.1.0) and awaits edgelab's rerun.
+unknown. Moskowitz v1.1.0 (roll at 10 days) lost money: Sharpe -0.79, HAC t
+-2.25, loss-making before costs too; not assessable (26 missing bars,
+LK-43). Futures were charged equity cost rates; edgelab EL-38 fixes the
+defaults. No post-result cost version was registered.
 
 ## In progress
 
@@ -60,8 +62,8 @@ Nothing in flight.
 
 ## Next steps, in order
 
-1. AT-10 (discrete quarters from company facts; with LK-13) and AT-12
-   (dividends from `equity_distributions`, regular cash on one basis).
+1. When LK-13 and LK-14 land, move company facts and insider transactions
+   back from the `_log` views to the current views.
 2. AT-6 waits for LK-15 (COT `published_at`); until then the `+3 days`
    gate stands.
 3. Remaining data and point-in-time musts: AT-15..19, 21, 38, 39,
@@ -80,6 +82,8 @@ Nothing in flight.
   from the lake's `docs/contract-v1.json` when a new contract is frozen.
   Security ids: equity_ticker_history (ticker and date, inclusive),
   futures contract_code with futures_roll_calendar, options by OSI.
+- Test-writers have only a full-file Write tool: when one edits an existing
+  test file, diff it against HEAD for dropped tests before committing.
 - `data/trading_calendar.py` is a hand-kept NYSE rule set (pandas holiday
   rules plus special closures); it matches SPY session dates 2000-2026
   exactly. A new unscheduled closure must be added there. Adding

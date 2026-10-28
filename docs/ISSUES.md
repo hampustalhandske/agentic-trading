@@ -131,14 +131,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: fd8e1ca. Acceptance from sec_filings, one row per accession (max accepted_at; a filing repeats once per issuer ticker). Live: 99.7% of NVDA insider rows and 54.9% of AAPL company-fact rows move to the next session; NVDA files Form 4s in the evening.
 
 ### AT-10 Company facts drop period columns and mix 3-month, YTD, annual and restated values
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M19)
 - Evidence: [M] `lakehouse_loader.py:706` returns only `concept, value, fiscal_period, filed`. AAPL diluted EPS as of 2024-06-30: 308 rows; the last 12 read 4.82, 4.67, 1.26, 5.61, ... (9-month, 3-month and annual mixed). Lake key collision (read `_log`).
 - Acceptance: the loader returns the period columns and form and keeps the latest `filed_date <= as_of` per (concept, unit, period_start, period_end). The analyst uses discrete quarters. AAPL's trailing 8 quarterly diluted EPS as of 2024-06-30 equal the reported 3-month figures.
 - Blocked-by / Blocks: with LK-13
-- Commits: none
+- Commits: 45daf84. Reads sec_company_facts_log de-duplicated until LK-13 lands; latest available filing per (concept, unit, period); the analyst uses discrete 80-100-day quarters with Q4 derived as annual minus Q1-Q3 (approximate for EPS). Verified live: AAPL's trailing 8 quarters as of 2024-06-30 are 1.20, 1.29, 1.88, 1.52, 1.26, 1.47, 2.18, 1.53.
 
 ### AT-11 Insider loader collapses distinct lines of one filing
 - Status: done
@@ -151,14 +151,14 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: fd8e1ca. Reads sec_insider_transactions_log de-duplicated over every column except scraped_at, dt, table until LK-14 lands. Verified live: NVDA 3,796 rows, 276.7M shares.
 
 ### AT-12 Dividend signal on mixed bases: splits and specials read as cuts
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M21)
 - Evidence: [M] `lakehouse_loader.py:312-352` reads `dolthub_stock_dividends`. AAPL 0.82 to 0.205 (-75%) from the 4:1 split. COST special 15.00 makes the next 1.16 read as a -92% cut. XOM 2024-05 is missing.
 - Acceptance: the source is `equity_distributions`, regular cash only, on one split-consistent basis. AAPL's change on 2020-08-07 is 0% and COST's special is excluded.
 - Blocked-by / Blocks: none
-- Commits: none
+- Commits: 45daf84. Verified live: AAPL 2020-08-07 to 2020-11-06 unchanged at 0.205; COST's 2023-12-27 special excluded; XOM 2024-05-14 present.
 
 ### AT-13 Survivorship: members without prices vanish; no delisting returns
 - Status: open
