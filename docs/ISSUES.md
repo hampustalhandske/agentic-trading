@@ -743,7 +743,7 @@ Paths are relative to `src/agentic_trading/`.
 - Acceptance: rows failing the check are masked, and the count is logged.
 - Blocked-by / Blocks: none
 - Resolution: 1,828 lake rows since 2000 have an open outside [low, high], mostly Yahoo FX rows with open equal to close. Those opens load as NaN with one warning per load (live: EURUSD=X 15 in 2022-2024); the engine skips a fill at a NaN or non-positive price.
-- Commits: 072c364
+- Commits: 072c364, ebb98a0 (every skipped order is recorded in `BacktestResult.unfilled_orders` and counted by reason in the run summary)
 
 ### AT-67 Option expiry can settle at a later day's spot
 - Status: done
@@ -881,12 +881,12 @@ Paths are relative to `src/agentic_trading/`.
 - Evidence: `dolthub_option_chain` starts 2019-02; `option_chain_history` holds SPY, QQQ and IWM full chains with open interest from 2008 to 2025-12. The 2010-2017 test window has no options today.
 - Acceptance: option analysts read `option_chain_history` for SPY, QQQ and IWM before 2019. Each row is a 16:00 ET end-of-day snapshot on `snapshot_date`, usable at that close; fills use bid/ask, never `mark` (wrong for deep in-the-money contracts in early years). Coverage per analyst in 2010-2017 is reported. The table is static and ends 2025-12-12; `option_chain_snapshots` resumes 2026-09-27, so the gap between them is stated, not filled.
 - Blocked-by / Blocks: narrows LK-37 to single names before 2019
-- Resolution: SPY, QQQ and IWM read `option_chain_history` before their first DoltHub date (SPY 2019-02-09; QQQ and IWM always, to 2025-12). Coverage 2010-2017: SPY has a usable snapshot on every sampled session (96 of 96, one per month), 17 expiries on 2012-06-15. That serves the CVaR options analysts and the tail-hedge put on SPY. Their other underlyings (AAPL, MSFT and the rest) still start 2019 (LK-37). QQQ and IWM are in no pod's scope. Agents still read the chain one session late (`options.publication_lag_days`), which is conservative for an end-of-day snapshot. The gap from 2025-12-15 to 2026-09-27 is unfilled for QQQ and IWM.
+- Resolution: SPY, QQQ and IWM read `option_chain_history` before their first DoltHub date (SPY 2019-02-09; QQQ and IWM always, to 2025-12). Coverage 2010-2017: all 2,013 NYSE sessions have a same-day SPY snapshot, and every session has a usable one after the one-day publication lag (17 expiries on 2012-06-15). Quotes are genuine bid and ask, not a mid or last price. In June of 2010, 2013 and 2017, 90% of rows are two-sided (ask above bid) with a median relative spread of 1.7-2.5%. Locked quotes are 0-0.7%; `mark` equals the mid on only 41-50% of rows, and the last trade equals the bid or ask on 4-11%. The other ~10% have a zero bid and are untradeable under AT-21. That serves the CVaR options analysts and the tail-hedge put on SPY. Their other underlyings (AAPL, MSFT and the rest) still start 2019 (LK-37). QQQ and IWM are in no pod's scope. Agents still read the chain one session late (`options.publication_lag_days`), which is conservative for an end-of-day snapshot. The gap from 2025-12-15 to 2026-09-27 is unfilled for QQQ and IWM.
 - Commits: 3a8f250
 
 
 ### AT-80 S&P universe priced from `instrument_prices`, which lacks a quarter of members
-- Status: open
+- Status: done (residual gap on LK-50 and pre-entry history)
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5, 2026-10-28, while checking LK-50 with edgelab-62
@@ -894,4 +894,18 @@ Paths are relative to `src/agentic_trading/`.
 - Acceptance: the S&P universe analysts price members by `security_id` from a source with full member coverage (`equity_daily_from_bars` covers 92.5% of member-sessions since 1996; see LK-50), adjusted for splits and distributions by security. Coverage per year over 2010-2017 is reported, and a member without prices is reported, never silently dropped.
 - Design (database-57, 2026-10-28): raw prices from `equity_daily_from_bars` by `security_id` (as traded, regular session). Returns use `official_close` where present, since the last-bucket `close` differs by more than 0.1% on 8-16% of large-cap sessions. Adjust with `equity_adjustment_factors`: per (security_id, date), take `cum_factor` from the row with the smallest `effective_date` strictly after the date, else 1.0. Join on security_id, never ticker. Volume times 1/`split_factor` is in current shares. `sp500_membership` names a span by the current ticker, and a reused ticker can merge two companies (AGN 1996-2020), so membership must resolve to security_id. `sp500_price_coverage` is safe for the coverage report, but within-span share must be computed until LK-50 adds it. The LK-50 Yahoo fill lands in the same view with a `source` column.
 - Blocked-by / Blocks: LK-50 fills source gaps (not blocking; the design holds before and after)
-- Commits: none
+- Resolution: members come from `sp500_price_coverage` (one security each; FB and META are security 21100), and returns from `equity_daily_from_bars` by security. Live on 2012-06-29: 497 members, 456 with at least 125 daily returns. AAPL across the 2014-06-09 7:1 split returns +1.6%. Both analysts exclude a member below their return threshold (Fama-MacBeth 60 in 250 days, network centrality 61), so a short-history member drops out of the cross-section rather than ranking on short history; the exclusions are logged. Member-months over 2010-2017, from 12 month-ends a year:
+
+  | Year | No bars in window | First bar after window start | Excluded (< 60 returns) |
+  |---|---|---|---|
+  | 2010 | 8.1% | 10.4% | 8.8% |
+  | 2011 | 7.9% | 10.1% | 8.8% |
+  | 2012 | 6.6% | 9.6% | 7.6% |
+  | 2013 | 6.0% | 8.2% | 6.8% |
+  | 2014 | 5.2% | 8.0% | 6.0% |
+  | 2015 | 4.4% | 8.1% | 5.8% |
+  | 2016 | 3.8% | 8.2% | 5.1% |
+  | 2017 | 2.9% | 6.9% | 4.4% |
+
+  "No bars" is mostly LK-50's source gaps (pre-rename tickers, CMCSA). The rest are mostly entrants with no bars before they joined the index. Both shrink when the lake fills from Yahoo and before entry (LK-50); until then the exclusion rate must be stated with any result from these two analysts.
+- Commits: 7b37814

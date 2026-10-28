@@ -48,6 +48,8 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-63 | catalog trades SPY/IWM, not ^GSPC/^RUT; `USDJPY=X` | 7384697 |
 | AT-64, AT-66 | preflight per source and lookback; inconsistent opens masked, unfillable orders skipped | 072c364 |
 | AT-79 | SPY/QQQ/IWM option chains from `option_chain_history` before DoltHub | 3a8f250 |
+| AT-66 follow-up | unfilled orders recorded and counted per run | ebb98a0 |
+| AT-80 | S&P cross-section priced by security from `equity_daily_from_bars` | 7b37814 |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
 2017-12-29) are verified. edgelab-62 runs the counted runs with `warmup`
@@ -68,7 +70,7 @@ defaults. No post-result cost version was registered.
 
 ## In progress
 
-- AT-80: tests in `tests/unit/data/loaders/test_sp500_member_prices.py` and `tests/unit/agents/analysts/test_broad_universe_securities.py` (uncommitted); implementer running; design from database-57 is in ISSUES (bars by `security_id`, `official_close`, `equity_adjustment_factors`, membership from `sp500_price_coverage`).
+Nothing in flight.
 
 ## Next steps, in order
 
@@ -76,9 +78,9 @@ defaults. No post-result cost version was registered.
    back from the `_log` views to the current views.
 2. AT-6 waits for LK-15 (COT `published_at`); until then the `+3 days`
    gate stands.
-3. Remaining data issues: AT-79 and AT-80 (in progress), then AT-78
-   (re-pin quantcore to a041d0d; run after the implementers finish, since
-   it re-syncs the venv). AT-68 is blocked by LK-49 (no
+3. AT-78: re-pin quantcore to a041d0d and record every numeric change.
+   AT-80's residual exclusions (table in ISSUES) shrink when LK-50 lands;
+   re-measure then. AT-68 is blocked by LK-49 (no
    usable declaration date; LK-48).
 4. AT-40 ledger: shared format with pitch-edge (PE-21); the two
    conformance vectors are the acceptance tests and are written first.
