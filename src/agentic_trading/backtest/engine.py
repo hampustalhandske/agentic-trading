@@ -29,6 +29,7 @@ from agentic_trading.agents.schemas import (
     PerformanceRecord,
     PodPerformance,
     PortfolioDecision,
+    SizingDiagnostics,
     TradeRecord,
     UnfilledOrder,
 )
@@ -468,6 +469,14 @@ class BacktestEngine:
             if checkpoint
             else []
         )
+        sizing_diagnostics = (
+            [
+                SizingDiagnostics.model_validate(entry)
+                for entry in checkpoint.get("sizing_diagnostics", [])
+            ]
+            if checkpoint
+            else []
+        )
         pod_return_history: dict[str, list[tuple[date, float]]] = {}
         seen_pod_returns: set[tuple[str, date]] = set()
         if checkpoint:
@@ -816,6 +825,11 @@ class BacktestEngine:
                     ),
                 )
             )
+            sizing_diagnostics_fn = getattr(self.commander, "sizing_diagnostics", None)
+            day_sizing_diagnostics: list[SizingDiagnostics] = (
+                sizing_diagnostics_fn() if callable(sizing_diagnostics_fn) else []
+            )
+            sizing_diagnostics.extend(day_sizing_diagnostics)
             connection = self._checkpoint()
             if connection is not None:
                 risk_state = self._commander_risk_state()
@@ -828,6 +842,7 @@ class BacktestEngine:
                     new_trades=trade_log[trades_before:],
                     new_unfilled_orders=unfilled_orders[unfilled_before:],
                     capital_usage=capital_usage[-1],
+                    sizing_diagnostics=day_sizing_diagnostics,
                     new_pod_returns=new_pod_returns,
                     next_day_index=day_index + 1,
                     start_date=self.start_date,
@@ -948,6 +963,7 @@ class BacktestEngine:
             trade_log=trade_log,
             unfilled_orders=unfilled_orders,
             capital_usage=capital_usage,
+            sizing_diagnostics=sizing_diagnostics,
             signal_health=signal_health,
             market_data_source=self.market_data_source,
             source_performance=self._source_performance(),

@@ -2,16 +2,15 @@
 
 """Append-only SQLite-backed backtest checkpoint.
 
-Each simulated day appends exactly that day's new rows to six tables
+Each simulated day appends exactly that day's new rows to seven tables
 (`track_record`, `decisions`, `trades`, `unfilled_orders`, `capital_usage`,
-`pod_returns`) via `INSERT` — O(1) per day, O(n) total for a run of length n — and keeps a
-single small `cursor` row (next
+`sizing_diagnostics`, `pod_returns`) via `INSERT` — O(1) per day, O(n)
+total for a run of length n — and keeps a single small `cursor` row (next
 day index, portfolio state, signal health, pending decisions, the
 Commander's serialized risk state, and the run's own config for
-`_restore_checkpoint`'s match-check) as the only
-thing overwritten each day, since that piece stays small regardless of
-run length. Mirrors the append-only idiom `data/db.py` uses for the fetch
-log."""
+`_restore_checkpoint`'s match-check) as the only thing overwritten each
+day, since that piece stays small regardless of run length. Mirrors the
+append-only idiom `data/db.py` uses for the fetch log."""
 
 import json
 import sqlite3
@@ -23,6 +22,7 @@ from agentic_trading.agents.schemas import (
     CapitalUsage,
     PerformanceRecord,
     PortfolioDecision,
+    SizingDiagnostics,
     TradeRecord,
     UnfilledOrder,
 )
@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS unfilled_orders (
 """
 _CREATE_CAPITAL_USAGE = """
 CREATE TABLE IF NOT EXISTS capital_usage (
+    as_of_date TEXT NOT NULL,
+    payload TEXT NOT NULL
+)
+"""
+_CREATE_SIZING_DIAGNOSTICS = """
+CREATE TABLE IF NOT EXISTS sizing_diagnostics (
     as_of_date TEXT NOT NULL,
     payload TEXT NOT NULL
 )
@@ -126,6 +132,7 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
     connection.execute(_CREATE_TRADES)
     connection.execute(_CREATE_UNFILLED_ORDERS)
     connection.execute(_CREATE_CAPITAL_USAGE)
+    connection.execute(_CREATE_SIZING_DIAGNOSTICS)
     connection.execute(_CREATE_POD_RETURNS)
     connection.execute(_CREATE_PORTFOLIO_VALUE)
     connection.execute(_CREATE_CURSOR)
@@ -137,6 +144,7 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
             connection.execute("DELETE FROM trades")
             connection.execute("DELETE FROM unfilled_orders")
             connection.execute("DELETE FROM capital_usage")
+            connection.execute("DELETE FROM sizing_diagnostics")
             connection.execute("DELETE FROM pod_returns")
             connection.execute("DELETE FROM portfolio_value")
             connection.execute("DELETE FROM cursor")
@@ -162,6 +170,7 @@ def append_day(
     total_option_premium_paid: float = 0.0,
     new_unfilled_orders: list[UnfilledOrder] | None = None,
     capital_usage: CapitalUsage | None = None,
+    sizing_diagnostics: list[SizingDiagnostics] | None = None,
     new_pod_returns: list[tuple[str, date, float]] | None = None,
 ) -> None:
     """Appends exactly this simulated day's new rows — never touches a
@@ -169,7 +178,8 @@ def append_day(
     `cursor` row with this day's resumability state. `commander_risk_state`
     is the Commander's `risk_state()` already dumped to JSON-compatible
     form, or `None` for a commander that carries no risk state.
-    `new_pod_returns` are the (pod id, date, return) entries first seen
+    `sizing_diagnostics` are the day's per-pod sizing diagnostics, in pod
+    order. `new_pod_returns` are the (pod id, date, return) entries first seen
     this day."""
     with connection:
         connection.execute(
@@ -220,6 +230,13 @@ def append_day(
                 "INSERT INTO capital_usage (as_of_date, payload) VALUES (?, ?)",
                 (as_of_date.isoformat(), json.dumps(capital_usage.model_dump(mode="json"))),
             )
+        connection.executemany(
+            "INSERT INTO sizing_diagnostics (as_of_date, payload) VALUES (?, ?)",
+            [
+                (as_of_date.isoformat(), json.dumps(entry.model_dump(mode="json")))
+                for entry in sizing_diagnostics or []
+            ],
+        )
         connection.executemany(
             "INSERT INTO pod_returns (as_of_date, pod_id, value) VALUES (?, ?, ?)",
             [
@@ -331,6 +348,12 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
             "SELECT as_of_date, payload FROM capital_usage ORDER BY as_of_date"
         )
     ]
+    sizing_diagnostics = [
+        json.loads(payload)
+        for _as_of_date_str, payload in connection.execute(
+            "SELECT as_of_date, payload FROM sizing_diagnostics ORDER BY as_of_date, rowid"
+        )
+    ]
     pod_return_history: dict[str, list[tuple[str, float]]] = {}
     for pod_id, return_date, value in connection.execute(
         "SELECT pod_id, as_of_date, value FROM pod_returns ORDER BY as_of_date, rowid"
@@ -356,6 +379,7 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         "trade_log": trade_log,
         "unfilled_orders": unfilled_orders,
         "capital_usage": capital_usage,
+        "sizing_diagnostics": sizing_diagnostics,
         "pod_return_history": pod_return_history,
         "portfolio_value_history": portfolio_value_history,
     }

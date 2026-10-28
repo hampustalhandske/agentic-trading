@@ -14,7 +14,9 @@ actually reads afterwards: final metrics, the equity curve,
 `signal_health`, `source_performance` (the attribution-score reading of
 analyst/manager skill), and `pod_return_history` (each pod's own real,
 weighted daily return — small, one number per pod per day, not one row
-per asset per day like the fields this strips)."""
+per asset per day like the fields this strips). Per-pod sizing
+diagnostics are reduced to each pod's binding-stage shares and mean
+final-to-target vol ratio; the per-day entries are not kept."""
 
 from collections import Counter
 from typing import Any
@@ -56,6 +58,29 @@ def _capital_usage_means(block: dict[str, Any]) -> dict[str, float | None]:
     }
 
 
+def _sizing_summary(block: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Per-pod sizing statistics for a period block, from its
+    `sizing_diagnostics` entries with `path == "full"`, keyed by
+    `manager_id`. `sizing_binding_shares` maps each pod to the share of
+    its full-path days on which each stage was `binding_stage` (`"none"`
+    when no stage bound). `sizing_vol_ratio` maps each pod to the mean of
+    `final_vol / target_vol` over those days. A pod with no full-path days
+    is left out; a block with no diagnostics gives `{}` for both."""
+    days_by_pod: dict[str, list[dict[str, Any]]] = {}
+    for entry in block.get("sizing_diagnostics") or []:
+        if entry["path"] == "full":
+            days_by_pod.setdefault(entry["manager_id"], []).append(entry)
+    binding_shares: dict[str, dict[str, float]] = {}
+    vol_ratio: dict[str, float] = {}
+    for pod_id, days in days_by_pod.items():
+        counts = Counter(entry["binding_stage"] or "none" for entry in days)
+        binding_shares[pod_id] = {stage: count / len(days) for stage, count in counts.items()}
+        vol_ratio[pod_id] = sum(entry["final_vol"] / entry["target_vol"] for entry in days) / len(
+            days
+        )
+    return {"sizing_binding_shares": binding_shares, "sizing_vol_ratio": vol_ratio}
+
+
 def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
     """The full `experiment_result.json` payload in, the compact summary
     out. `experiment_result` must have `experiment`, `market_data_source`,
@@ -75,6 +100,7 @@ def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
         summary[period]["pod_performance"] = block.get("pod_performance", {})
         summary[period].update(_unfilled_order_counts(block))
         summary[period].update(_capital_usage_means(block))
+        summary[period].update(_sizing_summary(block))
 
     summary["baselines"] = {
         name: {

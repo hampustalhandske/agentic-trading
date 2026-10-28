@@ -22,6 +22,7 @@ from agentic_trading.agents.schemas import (
     ManagerSignal,
     OptionContract,
     PortfolioDecision,
+    SizingDiagnostics,
 )
 from agentic_trading.config import settings
 from agentic_trading.data.loaders import option_marks
@@ -62,10 +63,12 @@ def _construct_pod_portfolio(
     market_data: pd.DataFrame,
     as_of_date: pd.Timestamp,
     scoreboard: PerformanceScoreboard,
-) -> tuple[str, list[PortfolioDecision]]:
-    return manager.agent_id, manager.construct_portfolio(
-        assets, market_data, as_of_date, scoreboard
-    )
+) -> tuple[str, list[PortfolioDecision], SizingDiagnostics | None]:
+    """Runs one pod's `construct_portfolio` and returns its id, decisions
+    and sizing diagnostics together, so a worker process's results reach
+    the caller even though its copy of `manager` does not."""
+    decisions = manager.construct_portfolio(assets, market_data, as_of_date, scoreboard)
+    return manager.agent_id, decisions, manager.last_sizing_diagnostics()
 
 
 def _today_log_returns(market_data: pd.DataFrame, as_of_date: pd.Timestamp) -> dict[str, float]:
@@ -660,6 +663,7 @@ class Commander:
         self.parallel_backend = parallel_backend
         self._executor: Executor | None = None
         self._idle_pod_share: float | None = None
+        self._sizing_diagnostics: list[SizingDiagnostics] = []
         self._pod_return_tracker = _PodReturnTracker(pod_returns_lookback_days)
         self.drawdown_breaker = (
             drawdown_breaker if drawdown_breaker is not None else _DrawdownBreaker()
@@ -688,6 +692,12 @@ class Commander:
         the sum of the idle pods' final allocations, after the tail-hedge
         carve-out and the drawdown-breaker multipliers."""
         return self._idle_pod_share
+
+    def sizing_diagnostics(self) -> list[SizingDiagnostics]:
+        """The sizing diagnostics from the most recent `decide()` call, one
+        per pod that recorded one, in manager order, each tagged with its
+        pod's `manager_id`. Empty before any call."""
+        return list(self._sizing_diagnostics)
 
     def risk_state(self) -> CommanderRiskState:
         return CommanderRiskState(
@@ -722,6 +732,7 @@ class Commander:
         firm risk scale with the number of idle pods. `idle_pod_share()`
         reports that share.
         """
+        self._sizing_diagnostics = []
         if market_data.empty or not self.managers:
             return []
 
@@ -737,11 +748,8 @@ class Commander:
 
         executor = self._get_executor()
         if executor is None:
-            pod_decisions = [
-                (
-                    manager.agent_id,
-                    manager.construct_portfolio(assets, market_data, as_of_date, scoreboard),
-                )
+            pod_results = [
+                _construct_pod_portfolio(manager, assets, market_data, as_of_date, scoreboard)
                 for manager in self.managers
             ]
         else:
@@ -751,7 +759,11 @@ class Commander:
                 )
                 for manager in self.managers
             ]
-            pod_decisions = [future.result() for future in futures]
+            pod_results = [future.result() for future in futures]
+        pod_decisions = [(manager_id, decisions) for manager_id, decisions, _ in pod_results]
+        self._sizing_diagnostics = [
+            diagnostics for _, _, diagnostics in pod_results if diagnostics is not None
+        ]
 
         pod_return_history = self._pod_return_tracker.record_and_get_history(
             pod_decisions, market_data, as_of_date, instrument_returns

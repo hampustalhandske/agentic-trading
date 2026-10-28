@@ -285,6 +285,54 @@ class UnfilledOrder(BaseModel):
     price: float | None = None
 
 
+# The sizing stages `PortfolioConstructor.construct` applies after the risk
+# budget, in pipeline order.
+SizingStage = Literal[
+    "vol_target_cap",
+    "kelly",
+    "gross_cap",
+    "net_trim",
+    "no_trade_band",
+    "component_var_cap",
+    "rebalance_calendar",
+    "final_clip",
+]
+
+
+class SizingDiagnostics(BaseModel):
+    """Ex-ante annualised volatility of one pod's book after each sizing
+    stage of one `PortfolioConstructor.construct` call.
+
+    Every vol is `sqrt(w' Sigma w * trading_days_per_year)`, with `Sigma`
+    the shrunk daily covariance the constructor estimated for the assets
+    that vary; assets left out of it carry weight 0. `path` is `"full"`
+    when the book was risk-budgeted off that covariance and
+    `"view_direction"` when it was sized off view direction alone (too
+    little history, or no asset varies); a `"view_direction"` call has an
+    empty `vol_after` and `None` for `unlevered_vol`, `final_vol` and
+    `binding_stage`.
+
+    `target_vol` is the constructor's annualised vol target.
+    `unlevered_vol` is the vol of the risk-budgeted weights before any
+    leverage. `vol_after` maps each stage to the vol of the weights it
+    produced, in pipeline order (see `SizingStage`); a stage that did not
+    change the weights carries the previous stage's vol. `final_vol` is the
+    vol of the returned weights, the last entry of `vol_after`.
+    `binding_stage` is the stage with the largest drop in vol from the
+    stage before it, `target_vol` standing in before the first stage;
+    `None` when no drop exceeds `1e-9 * target_vol`. `manager_id` is the
+    owning manager's `agent_id`, `None` for a constructor no manager runs."""
+
+    as_of_date: date
+    manager_id: str | None = None
+    path: Literal["full", "view_direction"]
+    target_vol: float
+    unlevered_vol: float | None
+    vol_after: dict[SizingStage, float]
+    final_vol: float | None
+    binding_stage: SizingStage | None
+
+
 class BacktestResult(BaseModel):
     """Summary of a completed backtest run.
 
@@ -313,6 +361,8 @@ class BacktestResult(BaseModel):
     unfilled_orders: list[UnfilledOrder] = Field(default_factory=list)
     # One entry per valuation day, in date order.
     capital_usage: list[CapitalUsage] = Field(default_factory=list)
+    # Each pod's sizing diagnostics per valuation day, in date then pod order.
+    sizing_diagnostics: list[SizingDiagnostics] = Field(default_factory=list)
     signal_health: dict[str, dict[str, int]] = Field(default_factory=dict)
     market_data_source: str | None = None
     source_performance: dict[str, dict[str, float]] = Field(default_factory=dict)

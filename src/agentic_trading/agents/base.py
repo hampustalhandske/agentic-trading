@@ -14,7 +14,12 @@ from pydantic import BaseModel, Field, PrivateAttr
 
 from agentic_trading.agents._market_math import wide_log_returns
 from agentic_trading.agents.portfolio_construction import PodView, PortfolioConstructor
-from agentic_trading.agents.schemas import AgentSignal, ManagerSignal, PortfolioDecision
+from agentic_trading.agents.schemas import (
+    AgentSignal,
+    ManagerSignal,
+    PortfolioDecision,
+    SizingDiagnostics,
+)
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
@@ -362,6 +367,7 @@ class ManagerAgent(Agent):
             )
 
         returns_history = wide_log_returns(scoped_assets, market_data)
+        self.portfolio_constructor.manager_id = self.agent_id
         sized_weights = self.portfolio_constructor.construct(
             views, returns_history, as_of_date, self._previous_weights
         )
@@ -376,3 +382,14 @@ class ManagerAgent(Agent):
             )
             for asset in assets
         ]
+
+    def last_sizing_diagnostics(self) -> SizingDiagnostics | None:
+        """The per-stage volatility diagnostics of this pod's most recent
+        `portfolio_constructor.construct()` call, with `manager_id` set to
+        this manager's `agent_id`; `None` before any call or when the
+        constructor recorded none. Describes the equity book the constructor
+        sized, before any option rows a subclass adds."""
+        diagnostics = self.portfolio_constructor.last_diagnostics()
+        if diagnostics is None:
+            return None
+        return diagnostics.model_copy(update={"manager_id": self.agent_id})
