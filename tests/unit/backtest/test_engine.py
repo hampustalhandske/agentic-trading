@@ -133,6 +133,7 @@ class _FakeCommander:
 class _FakePortfolio:
     def __init__(self, total_values: list[float]) -> None:
         self._total_values = total_values
+        self.cash = 0.0
         self.total_value_calls: list[dict[str, float]] = []
         self.apply_decision_calls: list[tuple[PortfolioDecision, float, float]] = []
         self.option_positions: dict[str, OptionPosition] = {}

@@ -659,6 +659,7 @@ class Commander:
         self.parallel_workers = parallel_workers
         self.parallel_backend = parallel_backend
         self._executor: Executor | None = None
+        self._idle_pod_share: float | None = None
         self._pod_return_tracker = _PodReturnTracker(pod_returns_lookback_days)
         self.drawdown_breaker = (
             drawdown_breaker if drawdown_breaker is not None else _DrawdownBreaker()
@@ -678,6 +679,15 @@ class Commander:
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
+
+    def idle_pod_share(self) -> float | None:
+        """The share of firm capital allocated to idle pods on the most
+        recent `decide()` call, or `None` before any call. A pod is idle
+        when every decision it produced that day, option rows included,
+        has a zero target weight, or when it produced none. The share is
+        the sum of the idle pods' final allocations, after the tail-hedge
+        carve-out and the drawdown-breaker multipliers."""
+        return self._idle_pod_share
 
     def risk_state(self) -> CommanderRiskState:
         return CommanderRiskState(
@@ -705,6 +715,12 @@ class Commander:
         individual position's sizing math itself. Every `ManagerSignal`
         that fed into any pod's decision for an asset is carried forward
         onto the combined decision, so the result stays fully auditable.
+
+        An idle pod (one holding nothing today) keeps its allocation; its
+        share of capital stays as cash earning the risk-free rate, and it
+        is not re-allocated to the active pods. Re-allocating would make
+        firm risk scale with the number of idle pods. `idle_pod_share()`
+        reports that share.
         """
         if market_data.empty or not self.managers:
             return []
@@ -783,6 +799,12 @@ class Commander:
             pod_return_history, breaker_ids
         ).items():
             pod_allocations[manager_id] = pod_allocations.get(manager_id, 0.0) * multiplier
+
+        self._idle_pod_share = sum(
+            pod_allocations.get(manager_id, 0.0)
+            for manager_id, decisions in pod_decisions
+            if all(decision.target_weight == 0.0 for decision in decisions)
+        )
 
         # The tail-hedge pod's book is kept aside while the firm limits
         # run on everything else, then added back: its fixed insurance

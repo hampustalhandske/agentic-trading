@@ -927,7 +927,7 @@ Paths are relative to `src/agentic_trading/`.
 
 
 ### AT-80 S&P universe priced from `instrument_prices`, which lacks a quarter of members
-- Status: done (residual gap on LK-50 and pre-entry history)
+- Status: done (residual gap on LK-51 and LK-52)
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5, 2026-10-28, while checking LK-50 with edgelab-62
@@ -948,11 +948,26 @@ Paths are relative to `src/agentic_trading/`.
   | 2016 | 3.8% | 8.2% | 5.1% |
   | 2017 | 2.9% | 6.9% | 4.4% |
 
-  "No bars" is mostly LK-50's source gaps (pre-rename tickers, CMCSA). The rest are mostly entrants with no bars before they joined the index. Both shrink when the lake fills from Yahoo and before entry (LK-50); until then the exclusion rate must be stated with any result from these two analysts.
+  "No bars" is mostly LK-50's source gaps (pre-rename tickers, CMCSA). The rest are mostly entrants with no bars before they joined the index. Both shrink when the lake fills from Yahoo and before entry (LK-50).
+
+  Re-measured after LK-50 (lake dcd547b, 2026-10-28) [V], same method:
+
+  | Year | No bars in window | First bar after window start | Excluded (< 60 returns) |
+  |---|---|---|---|
+  | 2010 | 4.5% | 5.6% | 4.8% |
+  | 2011 | 4.5% | 5.6% | 4.9% |
+  | 2012 | 3.2% | 4.6% | 3.6% |
+  | 2013 | 2.4% | 3.5% | 2.7% |
+  | 2014 | 2.0% | 3.0% | 2.4% |
+  | 2015 | 1.7% | 3.2% | 2.2% |
+  | 2016 | 1.7% | 2.8% | 2.0% |
+  | 2017 | 1.1% | 2.2% | 1.5% |
+
+  Exclusions roughly halve, to 1.5-4.9%. What remains is LK-52 (YHOO/AABA and 20 renamed members such as TRV, WM and MSI before 2008). LDOS returns before 2013-09-30 are off by x2.47 until LK-51. The exclusion rate must still be stated with any result from these two analysts.
 - Commits: 7b37814
 
 ### AT-81 Pods that hold nothing take a share of firm capital
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data (edgelab-3f, 2026-10-28: the numbers are wrong today)
 - Raised by: agentic-trading-c5, 2026-10-28, during the AT-78 A/B
@@ -960,7 +975,12 @@ Paths are relative to `src/agentic_trading/`.
 - Decision (edgelab-3f, 2026-10-28): keep the allocation and hold the idle-pod share as cash at the risk-free rate (AT-82). Re-allocating to active pods would scale firm risk with the number of idle pods.
 - Acceptance: the allocation is unchanged. Each period's result reports the idle-pod share (capital allocated to pods with an empty book on the day) and the cash share of NAV. The rule is documented in the Commander.
 - Blocked-by / Blocks: none
-- Commits: none
+- Resolution: the allocation is unchanged. An idle pod's share stays as cash, which earns the risk-free rate under AT-82; the rule is documented on `Commander.decide`.
+  - Each valuation day records a `CapitalUsage` in `BacktestResult.capital_usage`, persisted through checkpoints. It holds `idle_pod_share` (from `Commander.idle_pod_share()`, the sum of final allocations of pods whose decisions that day all have zero target weight) and `cash_share` (cash over NAV after fills and financing). `run_summary` reports `mean_idle_pod_share` and `mean_cash_share` per period and baseline.
+  - Live, AAPL/XOM/SPY 2016-01-04 to 02-29 (39 days) [V]: idle-pod share mean 0.58 (0.29-0.85) and cash share mean 0.998 (0.95-1.11).
+  - The idle share is above the 0.30 estimated from the three pods that never trade, because a pod whose analysts are all flat that day is idle too.
+  - The cash share is near 1 because the long and short sides largely offset.
+- Commits: pending
 
 ### AT-82 Positive cash earns nothing while Sharpe subtracts the risk-free rate
 - Status: done

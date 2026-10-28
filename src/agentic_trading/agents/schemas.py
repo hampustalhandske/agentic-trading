@@ -235,6 +235,19 @@ class AgentWeight(BaseModel):
     weight: float = Field(ge=0.0, le=1.0)
 
 
+class CapitalUsage(BaseModel):
+    """How much of the firm's capital sat idle on one valuation day.
+
+    `idle_pod_share` is the fraction of firm capital allocated to pods
+    that held no position that day (`None` when the commander does not
+    report it). `cash_share` is cash divided by net asset value after the
+    day's fills and financing."""
+
+    as_of_date: date
+    idle_pod_share: float | None
+    cash_share: float
+
+
 class UnfilledOrder(BaseModel):
     """A decision the backtest engine could not execute on `as_of_date`, the
     day the order failed to fill.
@@ -279,6 +292,8 @@ class BacktestResult(BaseModel):
     trade_log: list[TradeRecord] = Field(default_factory=list)
     # Decisions the engine skipped rather than executed, in fill order.
     unfilled_orders: list[UnfilledOrder] = Field(default_factory=list)
+    # One entry per valuation day, in date order.
+    capital_usage: list[CapitalUsage] = Field(default_factory=list)
     signal_health: dict[str, dict[str, int]] = Field(default_factory=dict)
     market_data_source: str | None = None
     source_performance: dict[str, dict[str, float]] = Field(default_factory=dict)

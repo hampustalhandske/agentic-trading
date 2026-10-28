@@ -24,6 +24,7 @@ from quantcore.performance.metrics import (
 from agentic_trading.agents.commander import CommanderRiskState
 from agentic_trading.agents.schemas import (
     BacktestResult,
+    CapitalUsage,
     OptionContract,
     PerformanceRecord,
     PortfolioDecision,
@@ -444,6 +445,11 @@ class BacktestEngine:
             if checkpoint
             else []
         )
+        capital_usage = (
+            [CapitalUsage.model_validate(entry) for entry in checkpoint.get("capital_usage", [])]
+            if checkpoint
+            else []
+        )
         signal_health = checkpoint.get("signal_health", {}) if checkpoint else {}
         pending_decisions = (
             [
@@ -767,6 +773,18 @@ class BacktestEngine:
                     )
 
             pending_decisions = decisions
+            idle_pod_share_fn = getattr(self.commander, "idle_pod_share", None)
+            capital_usage.append(
+                CapitalUsage(
+                    as_of_date=as_of_timestamp.date(),
+                    idle_pod_share=idle_pod_share_fn() if callable(idle_pod_share_fn) else None,
+                    cash_share=(
+                        self.portfolio.cash / portfolio_value
+                        if math.isfinite(portfolio_value) and portfolio_value > 0.0
+                        else 0.0
+                    ),
+                )
+            )
             connection = self._checkpoint()
             if connection is not None:
                 risk_state = self._commander_risk_state()
@@ -778,6 +796,7 @@ class BacktestEngine:
                     decisions=decisions,
                     new_trades=trade_log[trades_before:],
                     new_unfilled_orders=unfilled_orders[unfilled_before:],
+                    capital_usage=capital_usage[-1],
                     next_day_index=day_index + 1,
                     start_date=self.start_date,
                     end_date=self.end_date,
@@ -893,6 +912,7 @@ class BacktestEngine:
             decisions_by_day=decisions_by_day,
             trade_log=trade_log,
             unfilled_orders=unfilled_orders,
+            capital_usage=capital_usage,
             signal_health=signal_health,
             market_data_source=self.market_data_source,
             source_performance=self._source_performance(),
