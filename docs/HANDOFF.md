@@ -70,7 +70,7 @@ defaults. No post-result cost version was registered.
 
 ## In progress
 
-Nothing in flight.
+- AT-78: `pyproject.toml`/`uv.lock` re-pinned to quantcore a041d0d (0.3.0), uncommitted. 0.3.0 changes APIs: `FactorLoadingsResult` instead of a tuple, `ConvergenceError` instead of `converged`, and covariance inputs need positive variances. An implementer is porting (13 tests failed before the port). The baseline before the re-pin: `agentic-trading-cli AAPL XOM SPY --start-date 2016-01-04 --end-date 2016-02-29 --yes --no-log` on 55de545, lake version 3221b45705b9, gave Sharpe -2.9034, final NAV 9,791,065.51 and 193 trades (scratchpad `at78_before.clean.json`). Rerun the same command after the port at the same lake version and report every number that moves (coordinator's condition). The quantcore changelog is in the uv git cache, `checkouts/c25289b1a1625e82/a041d0d/CHANGELOG.md`.
 
 ## Next steps, in order
 
