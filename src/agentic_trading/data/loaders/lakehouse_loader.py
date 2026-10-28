@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from agentic_trading.config import _env_value
 from agentic_trading.data.lakehouse_client import Lake
 from agentic_trading.data.point_in_time import assert_point_in_time
+from agentic_trading.data.trading_calendar import add_sessions, next_session
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -244,9 +245,7 @@ def load_cot_positioning_from_lakehouse(
     Point-in-time: COT reports have a real publication lag — the
     Tuesday-dated `report_date` isn't released until the following
     Friday. Gates on `report_date + 3 days` as the estimated
-    availability date, the same estimated-lag convention this project's
-    FINRA short-interest loader already uses for an identical
-    reporting-lag shape.
+    availability date.
 
     Returns `None` if `ticker` has no COT coverage at all — callers
     should treat that as "no positioning read available," not an
@@ -313,22 +312,23 @@ def load_dividends_from_lakehouse(ticker: str, as_of_date: date) -> pd.Series | 
 def load_earnings_surprise_from_lakehouse(
     ticker: str, as_of_date: date
 ) -> tuple[float, float, pd.Timestamp] | None:
-    """The most recent real EPS surprise for `ticker` as of `as_of_date`:
-    `(reported, estimate, announcement_date)` for whichever quarter's
-    real announcement date (`dolthub_earnings_calendar.date`) is the
-    latest one on or before `as_of_date` — the exact real availability
-    gate, not an estimated lag, since both the fiscal period
-    (`dolthub_eps_history.period_end_date`) and the real announcement
-    date are both directly in the lake. Joins the two tables on a
-    75-day window after `period_end_date` — a generous margin around the
-    typical ~29-30 day real reporting lag, not a tight estimate.
+    """The most recent real EPS surprise for `ticker` known at the close
+    of `as_of_date`: `(reported, estimate, announcement_date)` for the
+    quarter with the latest announcement (`dolthub_earnings_calendar.
+    date`) available by then. An announcement whose `when` is "Before
+    market open" is available on its date; "After market close" or a
+    NULL `when` makes it available the next NYSE session. The returned
+    `announcement_date` is the calendar date itself. Joins the two
+    tables on a 75-day window after `dolthub_eps_history.period_end_date`
+    — a generous margin around the typical ~29-30 day real reporting
+    lag, not a tight estimate.
 
     Returns `None` if `ticker` has no earnings history at all, or no
-    quarter's real announcement date has occurred yet as of
-    `as_of_date`. Self-asserts point-in-time on `announcement_date`
-    before returning."""
+    quarter's announcement is available yet as of `as_of_date`.
+    Self-asserts point-in-time on the availability date before
+    returning."""
     query = """
-        SELECT h.reported, h.estimate, c.date AS announcement_date
+        SELECT h.reported, h.estimate, c.date AS announcement_date, c."when" AS announced_when
         FROM (
             SELECT *
             FROM dolthub_eps_history
@@ -344,14 +344,36 @@ def load_earnings_surprise_from_lakehouse(
                AND date_add(CAST(h.period_end_date AS DATE), INTERVAL 75 DAY)
         WHERE CAST(c.date AS DATE) <= ?
         ORDER BY c.date DESC
-        LIMIT 1
     """
     frame = _query(query, [ticker, ticker, as_of_date.isoformat()])
     if frame.empty:
         return None
-    assert_point_in_time(frame, as_of_date, date_column="announcement_date")
+    frame["announcement_date"] = pd.to_datetime(frame["announcement_date"])
+    frame["available_date"] = [
+        _earnings_available_date(announced.date(), when)
+        for announced, when in zip(frame["announcement_date"], frame["announced_when"], strict=True)
+    ]
+    frame = frame[frame["available_date"] <= pd.Timestamp(as_of_date)]
+    if frame.empty:
+        return None
+    assert_point_in_time(frame, as_of_date, date_column="available_date")
     row = frame.iloc[0]
     return float(row["reported"]), float(row["estimate"]), pd.Timestamp(row["announcement_date"])
+
+
+# `dolthub_earnings_calendar.when` value for an announcement made before
+# the open, so it is public for that day's session; any other value
+# (after the close, or unknown) waits for the next session.
+_BEFORE_MARKET_OPEN = "Before market open"
+
+
+def _earnings_available_date(announced: date, when: str | None) -> pd.Timestamp:
+    """The first day an announcement on `announced` is known at the
+    close: that day for a `_BEFORE_MARKET_OPEN` announcement, otherwise
+    the next NYSE session."""
+    if when == _BEFORE_MARKET_OPEN:
+        return pd.Timestamp(announced)
+    return pd.Timestamp(next_session(announced))
 
 
 def load_sic_code_from_lakehouse(ticker: str) -> str | None:
@@ -565,15 +587,21 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     for the same concept (current quarter, year-to-date, prior-year
     comparatives) as separate rows sharing one `filed_date` — the same
     multi-row-per-filing shape the original SEC EDGAR XBRL API already
-    produced, not new here. Gated on the real `filed_date` (never the
-    fiscal period it describes — a lookahead bug otherwise)
-    `<= as_of_date`. Returns `None` if the table has no rows for
-    `ticker`. Self-asserts point-in-time on the returned `filed` column
-    (the renamed `filed_date`) before returning."""
-    query = """
-        SELECT concept, value, fiscal_period, filed_date AS filed
-        FROM sec_company_facts
-        WHERE ticker = ? AND filed_date <= ?
+    produced. Gated on when the filing became public (never the fiscal
+    period it describes): `available_date` (datetime64) is set from the
+    filing's latest acceptance time in `sec_filings`
+    (`_SEC_ACCEPTANCE_QUERY`) by `_sec_available_dates`, and only rows
+    with `available_date <= as_of_date` are returned.
+    Returns `None` if no rows remain. Self-asserts point-in-time on
+    `filed` (the SQL gate) and on `available_date` before returning."""
+    query = f"""
+        SELECT x.concept, x.value, x.fiscal_period, x.filed_date AS filed, f.accepted_at
+        FROM (
+            SELECT *
+            FROM sec_company_facts
+            WHERE ticker = ? AND filed_date <= ?
+        ) x
+        LEFT JOIN ({_SEC_ACCEPTANCE_QUERY}) f ON f.accession_number = x.accession_number
         ORDER BY filed
     """
     frame = _query(query, [ticker, as_of_date.isoformat()])
@@ -581,53 +609,151 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
         return None
     frame["filed"] = pd.to_datetime(frame["filed"])
     assert_point_in_time(frame, as_of_date, date_column="filed")
+    frame["available_date"] = _sec_available_dates(frame["filed"], frame["accepted_at"])
+    frame = frame[frame["available_date"] <= pd.Timestamp(as_of_date)].drop(columns="accepted_at")
+    if frame.empty:
+        return None
+    frame = frame.reset_index(drop=True)
+    assert_point_in_time(frame, as_of_date, date_column="available_date")
     return frame
+
+
+# One acceptance time per filing: `sec_filings` lists a filing once per
+# issuer ticker, sometimes with different `accepted_at` values, and the
+# latest one is the conservative availability.
+_SEC_ACCEPTANCE_QUERY = """
+    SELECT accession_number, max(accepted_at) AS accepted_at
+    FROM sec_filings
+    GROUP BY accession_number
+"""
+
+# Decisions are taken at the NYSE close (16:00 America/New_York); an SEC
+# filing accepted before that time is public for that day's decision.
+_DECISION_TIMEZONE = "America/New_York"
+_DECISION_TIME = pd.Timedelta(hours=16)
+
+
+def _sec_available_dates(filed: pd.Series, accepted_at: pd.Series) -> pd.Series:
+    """The day each SEC filing is known at the decision time, from its
+    `filed` date and EDGAR `accepted_at` timestamp (time-zone aware, any
+    zone, or missing): the filed date when acceptance falls strictly
+    before 16:00 America/New_York on that date, otherwise — including a
+    missing `accepted_at` — the next NYSE session after the filed date.
+    Returns a datetime64 series aligned with `filed`."""
+    filed_days = pd.to_datetime(filed).dt.normalize()
+    cutoff = (filed_days + _DECISION_TIME).dt.tz_localize(_DECISION_TIMEZONE)
+    accepted = pd.to_datetime(accepted_at, utc=True).dt.tz_convert(_DECISION_TIMEZONE)
+    before_close = accepted < cutoff
+    following = filed_days.map(lambda day: pd.Timestamp(next_session(day.date())))
+    return filed_days.where(before_close, following)
+
+
+# FINRA publishes short interest about seven business days after the
+# settlement date, after the close; eight NYSE sessions after settlement
+# and then the next session is the conservative day it is known at the
+# close.
+_FINRA_DISSEMINATION_LAG_SESSIONS = 8
+# `finra_short_interest.revision_flag` value marking a row FINRA revised
+# after first publication.
+_FINRA_REVISED = "R"
+
+
+def _finra_available_date(settlement: date) -> date:
+    """The day a settlement's short interest is known at the close:
+    `next_session(add_sessions(settlement, _FINRA_DISSEMINATION_LAG_SESSIONS))`."""
+    return next_session(add_sessions(settlement, _FINRA_DISSEMINATION_LAG_SESSIONS))
 
 
 def load_short_interest_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataFrame | None:
     """FINRA short-interest history for `ticker`, from the
     `finra_short_interest` table (`symbol`, `settlement_date`,
-    `dissemination_date`, `current_short_position`, `days_to_cover`,
-    `average_daily_volume`, ...) — renamed to a
-    `short_interest_shares`/`days_to_cover`/`avg_daily_volume`/
-    `settlement_date`/`dissemination_date` shape. Gated on
-    `dissemination_date <= as_of_date`. Returns `None` if the table has
-    no rows for `ticker`. Self-asserts point-in-time on
-    `dissemination_date` before returning."""
+    `revision_flag`, `current_short_position`, `days_to_cover`,
+    `average_daily_volume`, ...), as `settlement_date`/
+    `dissemination_date`/`short_interest_shares`/`days_to_cover`/
+    `avg_daily_volume` rows sorted by settlement date.
+
+    `dissemination_date` holds this loader's own availability estimate,
+    `_finra_available_date(settlement_date)`, not the lake's
+    `dissemination_date`, which counts weekdays rather than NYSE sessions
+    (lake issue LK-47). A revised row (`revision_flag` 'R') carries a
+    value published with the symbol's next settlement, so it takes that
+    settlement's availability; a revised row with no later settlement is
+    dropped, because the lake keeps no pre-revision value. Only rows
+    available on or before `as_of_date` are returned; `None` if none are.
+    Self-asserts point-in-time on `dissemination_date` before returning."""
     query = """
-        SELECT settlement_date, dissemination_date,
+        SELECT settlement_date, revision_flag,
                current_short_position AS short_interest_shares,
                days_to_cover, average_daily_volume AS avg_daily_volume
         FROM finra_short_interest
-        WHERE symbol = ? AND dissemination_date <= ?
+        WHERE symbol = ?
         ORDER BY settlement_date
     """
-    frame = _query(query, [ticker, as_of_date.isoformat()])
+    frame = _query(query, [ticker])
     if frame.empty:
         return None
     frame["settlement_date"] = pd.to_datetime(frame["settlement_date"])
-    frame["dissemination_date"] = pd.to_datetime(frame["dissemination_date"])
+    settlements = sorted({stamp.date() for stamp in frame["settlement_date"]})
+    next_settlement: dict[date, date | None] = dict(
+        zip(settlements, [*settlements[1:], None], strict=True)
+    )
+    revised = frame["revision_flag"].eq(_FINRA_REVISED).fillna(False).astype(bool)
+    available: list[pd.Timestamp | None] = []
+    for stamp, is_revised in zip(frame["settlement_date"], revised, strict=True):
+        published_with = next_settlement[stamp.date()] if is_revised else stamp.date()
+        available.append(
+            None if published_with is None else pd.Timestamp(_finra_available_date(published_with))
+        )
+    frame["dissemination_date"] = pd.to_datetime(pd.Series(available, index=frame.index))
+    frame = frame[frame["dissemination_date"] <= pd.Timestamp(as_of_date)]
+    if frame.empty:
+        return None
+    frame = frame[
+        [
+            "settlement_date",
+            "dissemination_date",
+            "short_interest_shares",
+            "days_to_cover",
+            "avg_daily_volume",
+        ]
+    ].reset_index(drop=True)
     assert_point_in_time(frame, as_of_date, date_column="dissemination_date")
     return frame
 
 
 def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataFrame | None:
-    """SEC Form 4 insider transactions for `ticker` from the
-    `sec_insider_transactions` table (`owner_cik`, `owner_name`,
-    `is_officer`, `is_director`, `is_ten_percent_owner`, `transaction_date`,
-    `transaction_code`, `shares`, `price_per_share`, `acquired_disposed`,
-    `filed_date`), gated on `filed_date <= as_of_date` — the STOCK Act
-    gives insiders two business days to file, so the filing date, not the
-    trade date, is when the information became public.
-    Returns `None` if the table has no rows for `ticker`.
-    Self-asserts point-in-time on `filed_date` before returning."""
-    query = """
-        SELECT owner_cik, owner_name, is_officer, is_director, is_ten_percent_owner,
-               transaction_date, transaction_code, shares, price_per_share,
-               acquired_disposed, filed_date
-        FROM sec_insider_transactions
-        WHERE issuer_ticker = ? AND filed_date <= ?
-        ORDER BY filed_date, transaction_date
+    """SEC Form 4 insider transactions for `ticker` (`owner_cik`,
+    `owner_name`, `is_officer`, `is_director`, `is_ten_percent_owner`,
+    `transaction_date`, `transaction_code`, `shares`, `price_per_share`,
+    `acquired_disposed`, `filed_date`, `available_date`), sorted by
+    filed and transaction date.
+
+    Reads the `sec_insider_transactions_log` view, which keeps every
+    scrape, because the deduplicated `sec_insider_transactions` view
+    collapses distinct lines of one filing into one row until lake issue
+    LK-14 lands. Rows identical apart from their scrape (`scraped_at`,
+    `dt`, `table`) count once, so two genuinely identical lines in one
+    filing also count once.
+
+    The trade date is not when a trade became public; the filing is.
+    `available_date` (datetime64) is set from the filing's latest EDGAR
+    acceptance time in `sec_filings` (`_SEC_ACCEPTANCE_QUERY`) by
+    `_sec_available_dates` (16:00 America/New_York, the close, is the
+    decision time), and only rows with `available_date <= as_of_date`
+    are returned. Returns `None` if no rows remain. Self-asserts
+    point-in-time on `filed_date` (the SQL gate) and on `available_date`
+    before returning."""
+    query = f"""
+        SELECT t.owner_cik, t.owner_name, t.is_officer, t.is_director, t.is_ten_percent_owner,
+               t.transaction_date, t.transaction_code, t.shares, t.price_per_share,
+               t.acquired_disposed, t.filed_date, f.accepted_at
+        FROM (
+            SELECT DISTINCT * EXCLUDE (scraped_at, dt, "table")
+            FROM sec_insider_transactions_log
+            WHERE issuer_ticker = ? AND filed_date <= ?
+        ) t
+        LEFT JOIN ({_SEC_ACCEPTANCE_QUERY}) f ON f.accession_number = t.accession_number
+        ORDER BY t.filed_date, t.transaction_date
     """
     frame = _query(query, [ticker, as_of_date.isoformat()])
     if frame.empty:
@@ -635,6 +761,12 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
     frame["filed_date"] = pd.to_datetime(frame["filed_date"])
     frame["transaction_date"] = pd.to_datetime(frame["transaction_date"])
     assert_point_in_time(frame, as_of_date, date_column="filed_date")
+    frame["available_date"] = _sec_available_dates(frame["filed_date"], frame["accepted_at"])
+    frame = frame[frame["available_date"] <= pd.Timestamp(as_of_date)].drop(columns="accepted_at")
+    if frame.empty:
+        return None
+    frame = frame.reset_index(drop=True)
+    assert_point_in_time(frame, as_of_date, date_column="available_date")
     return frame
 
 

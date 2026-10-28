@@ -4,6 +4,7 @@
  },
  "contract": "lakehouse-contract-v1",
  "frozen_on": "2026-10-27",
+ "log_views": "each <view>_log has the same columns as <view> (contract CHANGELOG)",
  "views": {
   "cftc_cot_disaggregated": {
    "cftc_contract_market_code": "VARCHAR",
@@ -166,7 +167,23 @@
    "unit": "VARCHAR",
    "value": "DOUBLE"
   },
-  "sec_insider_transactions": {
+  "sec_filings": {
+   "accepted_at": "TIMESTAMP WITH TIME ZONE",
+   "accession_number": "VARCHAR",
+   "cik": "BIGINT",
+   "dt": "DATE",
+   "filing_date": "DATE",
+   "form": "VARCHAR",
+   "items": "VARCHAR",
+   "primary_doc_description": "VARCHAR",
+   "primary_document": "VARCHAR",
+   "report_date": "DATE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "size": "BIGINT",
+   "table": "VARCHAR",
+   "ticker": "VARCHAR"
+  },
+  "sec_insider_transactions_log": {
    "accession_number": "VARCHAR",
    "acquired_disposed": "VARCHAR",
    "dt": "DATE",

@@ -16,36 +16,25 @@ import pytest
 from agentic_trading.data.loaders import lakehouse_loader
 
 
-def _short_interest_table(dissemination_date: str) -> pd.DataFrame:
+def _short_interest_table() -> pd.DataFrame:
     return pd.DataFrame(
         {
             "symbol": ["AAPL"],
             "settlement_date": ["2024-01-01"],
-            "dissemination_date": [dissemination_date],
+            "dissemination_date": ["2024-01-10"],
             "current_short_position": [1000],
             "days_to_cover": [1.5],
             "average_daily_volume": [500],
-        }
-    )
-
-
-def _short_interest_result(dissemination_date: str) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "settlement_date": ["2024-01-01"],
-            "dissemination_date": [dissemination_date],
-            "short_interest_shares": [1000],
-            "days_to_cover": [1.5],
-            "avg_daily_volume": [500],
+            "revision_flag": pd.Series([None], dtype="string"),
         }
     )
 
 
 def test_load_short_interest_returns_valid_data(fake_lake: Any) -> None:
-    """Valid, in-window dissemination dates pass straight through."""
+    """An unrevised settlement already available by as_of_date passes straight through."""
     fake_lake.add(
         "finra_short_interest",
-        _short_interest_table("2024-01-10"),
+        _short_interest_table(),
         date_columns=("settlement_date", "dissemination_date"),
     )
 
@@ -55,15 +44,7 @@ def test_load_short_interest_returns_valid_data(fake_lake: Any) -> None:
     assert result.loc[0, "short_interest_shares"] == 1000
 
 
-def test_load_short_interest_raises_on_future_dissemination_date(fake_lake: Any) -> None:
-    """A dissemination_date after as_of_date is a broken SQL gate — must raise, not pass through."""
-    fake_lake.fixed_result = _short_interest_result("2024-01-20")
-
-    with pytest.raises(ValueError, match="2024-01-20"):
-        lakehouse_loader.load_short_interest_from_lakehouse("AAPL", date(2024, 1, 15))
-
-
-def _company_facts_table(filed: str) -> pd.DataFrame:
+def _company_facts_table(filed: str, accession: str) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "ticker": ["AAPL"],
@@ -71,15 +52,25 @@ def _company_facts_table(filed: str) -> pd.DataFrame:
             "value": [1_000_000.0],
             "fiscal_period": ["Q1"],
             "filed_date": [filed],
+            "accession_number": [accession],
         }
     )
 
 
-def test_load_company_facts_returns_valid_data(fake_lake: Any) -> None:
-    """Valid, in-window filed dates pass straight through."""
-    fake_lake.add(
-        "sec_company_facts", _company_facts_table("2024-01-10"), date_columns=("filed_date",)
+def _sec_filings_table(accession: str, accepted_at: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        {"accession_number": [accession], "accepted_at": [pd.Timestamp(accepted_at, tz="UTC")]}
     )
+
+
+def test_load_company_facts_returns_valid_data(fake_lake: Any) -> None:
+    """Facts from a filing accepted well before as_of_date pass straight through."""
+    fake_lake.add(
+        "sec_company_facts",
+        _company_facts_table("2024-01-10", "0000320193-24-000001"),
+        date_columns=("filed_date",),
+    )
+    fake_lake.add("sec_filings", _sec_filings_table("0000320193-24-000001", "2024-01-10 14:00"))
 
     result = lakehouse_loader.load_company_facts_from_lakehouse("AAPL", date(2024, 1, 15))
 

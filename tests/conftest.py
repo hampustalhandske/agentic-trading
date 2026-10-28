@@ -17,8 +17,10 @@ resets the module's internal state per-test (see that file) to configure
 fresh instances despite this session-wide disabling.
 """
 
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -122,73 +124,23 @@ def fake_lake(monkeypatch: pytest.MonkeyPatch) -> FakeLake:
     return lake
 
 
+_CONTRACT_PATH = Path(__file__).parent / "fixtures" / "lakehouse_contract_v1.json"
+
+
 @pytest.fixture
 def preflight_lake(fake_lake: FakeLake) -> FakeLake:
-    """A `fake_lake` holding the (empty) tables the CLI and dashboard run
-    paths query: the data-availability preflight (FRED, Ken French, SEC
-    facts, FINRA, insider filings) and the price history. Every
-    requirement reports no coverage."""
-    fake_lake.add_empty(
-        "instrument_prices",
-        {
-            "ticker": "VARCHAR",
-            "date": "DATE",
-            "open": "DOUBLE",
-            "close": "DOUBLE",
-            "adj_close": "DOUBLE",
-            "volume": "DOUBLE",
-        },
-    )
-    fake_lake.add_empty(
-        "fred_vintages",
-        {"series_id": "VARCHAR", "date": "DATE", "realtime_start": "DATE", "value": "DOUBLE"},
-    )
-    fake_lake.add_empty(
-        "famafrench_returns",
-        {
-            "dataset": "VARCHAR",
-            "frequency": "VARCHAR",
-            "date": "DATE",
-            "portfolio": "VARCHAR",
-            "value": "DOUBLE",
-        },
-    )
-    fake_lake.add_empty(
-        "sec_company_facts",
-        {
-            "ticker": "VARCHAR",
-            "concept": "VARCHAR",
-            "value": "DOUBLE",
-            "fiscal_period": "VARCHAR",
-            "filed_date": "DATE",
-        },
-    )
-    fake_lake.add_empty(
-        "finra_short_interest",
-        {
-            "symbol": "VARCHAR",
-            "settlement_date": "DATE",
-            "dissemination_date": "DATE",
-            "current_short_position": "BIGINT",
-            "days_to_cover": "DOUBLE",
-            "average_daily_volume": "BIGINT",
-        },
-    )
-    fake_lake.add_empty(
-        "sec_insider_transactions",
-        {
-            "issuer_ticker": "VARCHAR",
-            "owner_cik": "VARCHAR",
-            "owner_name": "VARCHAR",
-            "is_officer": "BOOLEAN",
-            "is_director": "BOOLEAN",
-            "is_ten_percent_owner": "BOOLEAN",
-            "transaction_date": "DATE",
-            "transaction_code": "VARCHAR",
-            "shares": "DOUBLE",
-            "price_per_share": "DOUBLE",
-            "acquired_disposed": "VARCHAR",
-            "filed_date": "DATE",
-        },
-    )
+    """A `fake_lake` holding every view of the frozen lake contract
+    (`tests/fixtures/lakehouse_contract_v1.json`) as an empty table with
+    the contract's column types, so the CLI and dashboard run paths (the
+    data-availability preflight and the price history) bind their SQL
+    against the real schema. Every requirement reports no coverage."""
+    contract = json.loads(_CONTRACT_PATH.read_text())
+    for view, columns in contract["views"].items():
+        fake_lake.add_empty(
+            view,
+            {
+                f'"{name}"': ("VARCHAR" if kind == '"NULL"' else kind)
+                for name, kind in columns.items()
+            },
+        )
     return fake_lake
