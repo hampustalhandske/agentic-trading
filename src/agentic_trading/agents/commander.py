@@ -215,7 +215,9 @@ def _cross_pod_risk_parity_weights(
     remain."""
     if len(qualifying) < 2:
         return None
-    overlapping = pd.DataFrame({m: pod_return_history[m] for m in qualifying}).dropna()
+    # Sorted so the covariance matrix has one column order whatever the set's iteration order;
+    # the shrinkage and the optimizer are only bit-stable for a fixed order.
+    overlapping = pd.DataFrame({m: pod_return_history[m] for m in sorted(qualifying)}).dropna()
     if len(overlapping) <= len(qualifying):
         return None
     flat_pods = [
