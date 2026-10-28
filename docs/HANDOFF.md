@@ -43,6 +43,9 @@ Updated: 2026-10-28, branch `dev`. Nothing is pushed; never push.
 | AT-59, AT-67 | agents' option chains lagged a day; settlement at the expiry close | 2caf7bf |
 | AT-57 | option fills: premium floor, rounding, commission in as-traded units | cf7352c |
 | AT-77 | asks 1 and 2 approved: edgelab executes; LLM scope event-desk then macro | 119b15a |
+| AT-38, AT-39, AT-58, AT-62 | experiment options resolve after `--set`; derived MC seeds; membership by security, end exclusive; SIC limit documented | d29f8a3 |
+| AT-60 | stale option quotes re-marked from the current surface; missing rate raises | 1e2316b |
+| AT-63 | catalog trades SPY/IWM, not ^GSPC/^RUT; `USDJPY=X` | 7384697 |
 
 A1 baselines (five literature strategies on edgelab, 2010-01-01 to
 2017-12-29) are verified. edgelab-62 runs the counted runs with `warmup`
@@ -71,8 +74,11 @@ Nothing in flight.
    back from the `_log` views to the current views.
 2. AT-6 waits for LK-15 (COT `published_at`); until then the `+3 days`
    gate stands.
-3. Remaining data and point-in-time musts: AT-38, 39, 58, 60, 62..64, 66,
-   68, AT-79, AT-78 (re-pin quantcore to a041d0d).
+3. Remaining data issues: AT-64 (preflight covers every source from the
+   warm-up start), AT-66 (mask OHLC rows failing low <= open <= high),
+   AT-79 (SPY/QQQ/IWM options from `option_chain_history` before 2019),
+   AT-78 (re-pin quantcore to a041d0d). AT-68 is blocked by LK-49 (no
+   usable declaration date; LK-48).
 4. AT-40 ledger: shared format with pitch-edge (PE-21); the two
    conformance vectors are the acceptance tests and are written first.
 5. AT-77: measure OmniRoute route costs once its key is in `.env`.
@@ -94,3 +100,8 @@ Nothing in flight.
   exactly. A new unscheduled closure must be added there. Adding
   `exchange-calendars` was blocked by the permission classifier.
 - The first lake request after 15 idle minutes can take up to 60 s.
+- `option_chain_history` (SPY, QQQ, IWM) is daily from 2008 with ~16
+  expiries, IV, greeks and open interest on every row; `snapshot_date` is
+  the date column. A full-table aggregate through `/v1/sql` runs out of
+  memory: query it by underlying and a date window.
+- Never let an agent run `git stash` while another agent edits the tree.

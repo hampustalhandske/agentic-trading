@@ -431,7 +431,7 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: 9ed37ed. Seeds are constants in analyst code (42), so the git sha pins them; no separate seeds field.
 
 ### AT-38 `experiment` ignores `--set firm.commission_rate/slippage_bps/execution_lag_days` but records them
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: held (the experiment CLI is deleted with the engine if AT-77 is approved)
 - Raised by: agentic-trading-c5 audit 2026-10-27 (R-M2)
@@ -439,17 +439,19 @@ Paths are relative to `src/agentic_trading/`.
 - Acceptance: option defaults are `None`, resolved from `settings` after overrides. `experiment --set firm.commission_rate=0.003` runs the portfolio at 0.003. `--set firm.max_leverage` fails loudly or is documented unsupported.
 - Blocked-by / Blocks: none
 - Note: Pending owner approval of AT-77: deleted with the engine if approved.
-- Commits: none
+- Resolution: options default to `None` and resolve from `settings` after `--set`; an explicit flag wins. `--set firm.max_leverage` exits with a usage error in `run` and `experiment`.
+- Commits: d29f8a3
 
 ### AT-39 Monte Carlo seeds hard-coded 42 in four analysts
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (R-M3)
 - Evidence: [C] `seed=42` in `monte_carlo_valuation_analyst.py:80`, `gbm_momentum_analyst.py:63`, `cir_rate_regime_analyst.py:112`, `ou_mean_reversion_analyst.py:122`. Same seed for every asset and day, not in `config.py`, not recorded.
 - Acceptance: `settings.analysts.mc_seed`, derived per (asset, date, analyst) from a base seed. The base seed is in the provenance block. `KNOWN_LIMITATIONS.md` lists all four analysts.
 - Blocked-by / Blocks: none
-- Commits: none
+- Resolution: `settings.analysts.mc_seed` (42) is in the provenance settings block; `_market_math.derived_seed` gives each (analyst, asset, date) its own seed.
+- Commits: d29f8a3
 
 ### AT-40 No trial ledger; `experiment` disables logging
 - Status: open
@@ -648,14 +650,15 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: cf7352c (option fill path in as-traded units via the fill day's split factor). The full as-traded option book with OCC adjustments is edgelab's, via the adapter.
 
 ### AT-58 Membership counts the removal day; renames read as new names
-- Status: open
+- Status: done
 - Priority: must (M6)
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-M25)
 - Evidence: [M] `lakehouse_loader.py:105-106` uses `end_date >= as_of`. On 2022-06-09 both FB and META are returned. No `security_id` join, so a rename is an exit plus an entry.
 - Acceptance: membership is `start_date <= as_of < end_date`, keyed by `security_id`, with the lake's rename rule. 2022-06-09 returns one Meta entry.
 - Blocked-by / Blocks: none
-- Commits: none
+- Resolution: verified live: 2022-06-08 has FB, 2022-06-09 has META only (504 names both days).
+- Commits: d29f8a3
 
 ### AT-59 Same-day DoltHub chain despite a 1-4 day publication lag
 - Status: done
@@ -668,14 +671,15 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: 2caf7bf. Applied to agent reads only (ATM helper, cvar and tail-hedge contract selection); engine marks and fills use quotes on or before the mark date.
 
 ### AT-60 Stale-IV marks up to 45 days; silent 0.0 rate
-- Status: open
+- Status: done
 - Priority: should
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S2)
 - Evidence: [I] `option_marks.py:256-262`, `config.py:149,154`: positions are tradeable up to 10 days old and marked up to 45. `option_marks.py:85-90` returns a 0.0 rate when DGS3MO is missing, without a warning.
 - Acceptance: IV is interpolated from a surface or the mark is flagged unusable after a few sessions. A missing rate raises or marks the signal `unavailable`.
 - Blocked-by / Blocks: none
-- Commits: none
+- Resolution: stale quotes take IV from the current snapshot's surface. Live check: XOM 2023-03-17 109 call on 2023-03-09 marks at 0.28465 (the surface), not its 2023-03-06 IV of 0.2831. A missing DGS3MO raises.
+- Commits: 1e2316b
 
 ### AT-61 Loader errors silently become "no coverage"
 - Status: done
@@ -688,24 +692,26 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: 3ff8eff
 
 ### AT-62 SIC is a current mapping used historically
-- Status: open
+- Status: done
 - Priority: should
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S4)
 - Evidence: [I] `lakehouse_loader.py:419-478` and `_pairs_screening.py:30`. The lake has no point-in-time rule for SIC, so reclassified names are paired with later knowledge.
 - Acceptance: use a point-in-time classification, or document the limit.
 - Blocked-by / Blocks: none
-- Commits: none
+- Resolution: the limit is documented. The lake has only the current SIC per ticker (`sec_sic_classification`, no history), so no point-in-time gate is possible. `load_sic_code_from_lakehouse` and `same_sic_candidate_pairs` state the look-ahead limit.
+- Commits: d29f8a3
 
 ### AT-63 Catalog offers untradeable indices and `JPY=X`
-- Status: open
+- Status: done
 - Priority: should
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S5, D-S6)
 - Evidence: [M] `data/ticker_catalog.py:166-167,278-279` list ^GSPC and ^RUT; ^GSPC "volume" 3.95e9 becomes ADV. `:180,:286` use `JPY=X`, which the lake lacks (only `USDJPY=X`), so the "Diversified Multi-Asset 20" preset raises at load.
 - Acceptance: tradeable proxies (SPY, IWM, ES=F) replace the indices. Every preset loads.
 - Blocked-by / Blocks: none
-- Commits: none
+- Resolution: every preset symbol has lake prices (checked live).
+- Commits: 7384697
 
 ### AT-64 Preflight checks five sources and ignores the warm-up
 - Status: open
@@ -748,13 +754,13 @@ Paths are relative to `src/agentic_trading/`.
 - Commits: 2caf7bf. Settlement close from instrument_prices.close (the strikes' basis), last session on or before expiry within 10 days, else the passed spot. Verified live: XOM expiry 2020-01-20 (holiday) settles on the 2020-01-17 close 68.56.
 
 ### AT-68 Dividend signal fires on ex-date, weeks after declaration
-- Status: open
+- Status: blocked (data)
 - Priority: should
 - Gate: data
 - Raised by: agentic-trading-c5 audit 2026-10-27 (D-S11)
 - Evidence: [I] the gate is `ex_date`: safe, but late. Dividends are announced at declaration.
 - Acceptance: the signal gates on the declaration date.
-- Blocked-by / Blocks: none
+- Blocked-by / Blocks: LK-49 (point-in-time declaration dates, lake scout). `nasdaq_dividend_calendar.announcement_date` is not usable: LK-48 (14,302 rows carry the 2026 backfill date) and about 20% coverage of `equity_distributions` since 2013. The `ex_date` gate stays until LK-49 lands.
 - Commits: none
 
 ### AT-69 Dead scripts, symbols and test references
