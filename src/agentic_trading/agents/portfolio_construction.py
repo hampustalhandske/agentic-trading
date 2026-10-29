@@ -21,7 +21,6 @@ from quantcore.performance.metrics import component_var
 from quantcore.portfolio.black_litterman import black_litterman
 from quantcore.portfolio.covariance import ledoit_wolf_shrinkage
 from quantcore.portfolio.optimization import (
-    min_variance_weights,
     risk_parity_weights,
     unconstrained_mean_variance_weights,
 )
@@ -63,13 +62,15 @@ class PodView(BaseModel):
 # lives in `config.settings.portfolio`, with the reasoning for each value
 # there. Constructor arguments left as `None` resolve to it at build time.
 
+_METHODS = ("mean_variance", "risk_parity")
+
 
 class PortfolioConstructor:
     """Eight-stage pipeline turning one pod's raw analyst views into a sized
     book: covariance estimate (Ledoit-Wolf shrinkage) -> equilibrium prior
     (`implied_equilibrium_returns`) -> Black-Litterman posterior using the
-    pod's own views -> a risk budget (`method` selects min_variance/
-    mean_variance/risk_parity, default mean_variance) -> volatility-targeting
+    pod's own views -> a risk budget (`method` selects mean_variance or
+    risk_parity, default mean_variance) -> volatility-targeting
     leverage (lever the whole book so its own realized annualized vol
     tracks `target_annualized_vol`, hard-clipped to `leverage_cap` as a
     sanity backstop, not the primary sizing lever — this is the
@@ -87,13 +88,11 @@ class PortfolioConstructor:
     component-VaR risk report (logged only, computed on the truly final
     weights).
 
-    `method` matters more than a tuning knob: `min_variance` sizes purely
-    off `cov_matrix`, discarding the Black-Litterman posterior this class
-    just spent four stages building from the pod's own views —
-    `mean_variance` is the only one that reads `expected_returns`.
-    `min_variance`/`mean_variance` are both called with `allow_short=True`
-    (a quantcore-level parameter): a bearish enough view can size to a
-    genuine negative weight, not just floor at zero, matching
+    `method` matters more than a tuning knob: `mean_variance` is the only
+    one that reads `expected_returns`, the Black-Litterman posterior built
+    from the pod's own views. It is unconstrained long/short: a bearish
+    enough view can size to a genuine negative weight, not just floor at
+    zero, matching
     `PortfolioDecision.target_weight`'s own `[-MAX_LEVERAGE, MAX_LEVERAGE]`
     bounds and `AgentSignal.direction`'s first-class "short".
     `risk_parity` never reads `expected_returns` either, but it does read
@@ -141,6 +140,8 @@ class PortfolioConstructor:
             raise ValueError(f"net_leverage_cap must be within [0, {leverage_cap}]")
         if not 0.0 <= kelly_fraction_weight <= 1.0:
             raise ValueError("kelly_fraction_weight must be within [0, 1]")
+        if method not in _METHODS:
+            raise ValueError(f"method must be one of {_METHODS}, got {method!r}")
         self.method = method
         self.risk_aversion = risk_aversion
         self.tau = tau
@@ -250,15 +251,12 @@ class PortfolioConstructor:
         # pod that is net short in its views is net short in its book, and
         # an asset with no view gets no weight. Gross exposure is set
         # afterwards by vol targeting and the leverage caps, not here.
-        # `min_variance` keeps quantcore's
-        # fully-invested, view-free solution. `risk_parity` starts from
-        # quantcore's equal-risk-contribution budget and tilts each asset's
+        # `risk_parity` starts from quantcore's equal-risk-contribution
+        # budget and tilts each asset's
         # share by `risk_parity_view_tilt` x its conviction (|z| clipped to
         # 1), taking the view's sign, so a short view becomes a short risk
         # budget and a no-view asset keeps its plain long budget; gross is
         # renormalised to 1 so vol targeting sees the same scale.
-        if self.method == "min_variance":
-            return np.asarray(min_variance_weights(cov_matrix, allow_short=True))
         if self.method == "mean_variance":
             if not np.any(expected_returns):
                 return np.zeros(len(expected_returns))

@@ -15,7 +15,7 @@ import pytest
 from agentic_trading.agents.portfolio_construction import PodView, PortfolioConstructor
 
 AS_OF = pd.Timestamp("2024-06-03")
-METHODS = ["mean_variance", "risk_parity", "min_variance"]
+METHODS = ["mean_variance", "risk_parity"]
 
 
 class _LiveRecords:

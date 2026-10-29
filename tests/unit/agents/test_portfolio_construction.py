@@ -86,12 +86,12 @@ def test_constructor_skips_when_observations_equal_asset_count() -> None:
     assert result == dict.fromkeys(assets, 0.2)
 
 
-def test_constructor_supports_min_variance_and_mean_variance() -> None:
+def test_constructor_supports_mean_variance_and_risk_parity() -> None:
     assets = ["AAPL", "MSFT"]
     views = _views({"AAPL": 0.4, "MSFT": 0.2})
     returns_history = _returns_history(assets)
 
-    for method in ("min_variance", "mean_variance", "risk_parity"):
+    for method in ("mean_variance", "risk_parity"):
         constructor = PortfolioConstructor(method=method)
         result = constructor.construct(
             views=views,
@@ -100,6 +100,13 @@ def test_constructor_supports_min_variance_and_mean_variance() -> None:
         )
         assert set(result) == set(assets)
         assert all(math.isfinite(weight) for weight in result.values())
+
+
+@pytest.mark.parametrize("method", ["min_variance", "max_sharpe", ""])
+def test_constructor_rejects_an_unknown_method(method: str) -> None:
+    """Only `mean_variance` and `risk_parity` size a book; any other name fails at build time."""
+    with pytest.raises(ValueError, match="method"):
+        PortfolioConstructor(method=method)
 
 
 def test_leverage_tracks_target_annualized_vol_below_the_cap() -> None:
