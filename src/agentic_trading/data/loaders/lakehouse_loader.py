@@ -89,9 +89,16 @@ class LakeProvenance(BaseModel):
 
 class LakeTimeError(RuntimeError):
     """A read cannot be made at the session's lake time: a conflicting
-    lake time, a lake time before a rebuilt-whole table's build, the lake
-    refusing a pinned read (HTTP 409), a lake version change during the
-    session, or a checkpoint written at another lake time."""
+    lake time or `data_end` when joining an open session, a lake time
+    before a rebuilt-whole table's build, the lake refusing a pinned read
+    (HTTP 409), a lake version change during the session, or a checkpoint
+    written at another lake time."""
+
+
+class HoldoutReadError(RuntimeError):
+    """A loader was asked for data known after the open session's
+    `data_end`: its knowledge-time argument is later than the cut (see
+    `_guard_data_end`). Raised before any query is sent."""
 
 
 def _required_env(name: str) -> str:
@@ -165,14 +172,17 @@ class LakeTableMetadata(BaseModel):
 
 class LakeSession(BaseModel):
     """One lake time for every read made while the session is open.
-    `lake_time` is T (UTC), `lake_version` the `X-Lakehouse-Version` the
-    session first saw (`None` until a response carries one), and
-    `rebuilt_whole_builds` maps each rebuilt-whole table in `READ_TABLES`
-    that holds rows to its build time. The table metadata the reads are
-    shaped from, and the set of tables a query has read, are held
-    privately for the life of the session."""
+    `lake_time` is T (UTC), `data_end` the last knowledge-time date a
+    loader may be asked for (`None`: no cut; see `_guard_data_end`),
+    `lake_version` the `X-Lakehouse-Version` the session first saw
+    (`None` until a response carries one), and `rebuilt_whole_builds` maps
+    each rebuilt-whole table in `READ_TABLES` that holds rows to its build
+    time. The table metadata the reads are shaped from, and the set of
+    tables a query has read, are held privately for the life of the
+    session."""
 
     lake_time: datetime
+    data_end: date | None = None
     lake_version: str | None = None
     rebuilt_whole_builds: dict[str, datetime] = {}
     _tables: dict[str, LakeTableMetadata] = PrivateAttr(default_factory=dict)
@@ -206,6 +216,30 @@ def current_lake_time() -> datetime | None:
     return None if session is None else session.lake_time
 
 
+def _guard_data_end(knowledge_time: date, loader: str) -> None:
+    """Raises `HoldoutReadError` when a `lake_session` with a `data_end`
+    is open and `knowledge_time` is later than it; otherwise does nothing.
+
+    The cut is on knowledge time: `knowledge_time` is the loader's
+    `as_of`/`as_of_date`, or `end` for a bar-dated range, the last date
+    whose data the read may rest on. Each loader gates its rows on that
+    argument by source, so a read at or before `data_end` returns nothing
+    known after it. Every public loader with a knowledge-time argument
+    calls this first, before any early return or query, so a read past the
+    cut never reaches the lake. A `datetime` (including `pd.Timestamp`) is
+    compared by its calendar date. `loader` names the caller in the
+    error."""
+    session = _current_session()
+    if session is None or session.data_end is None:
+        return
+    day = knowledge_time.date() if isinstance(knowledge_time, datetime) else knowledge_time
+    if day > session.data_end:
+        raise HoldoutReadError(
+            f"{loader} was asked for data known at {day.isoformat()}, after the session's "
+            f"data_end {session.data_end.isoformat()}"
+        )
+
+
 def _utc(value: Any) -> datetime | None:
     """`value` (a timestamp from a query result; naive means UTC) as an
     aware UTC `datetime`, or `None` when it is null."""
@@ -223,10 +257,11 @@ def _rebuilt_whole_build(lake: Lake, table: str) -> datetime | None:
     return None if frame.empty else _utc(frame.iloc[0]["build"])
 
 
-def _open_session(lake_time: datetime | None) -> LakeSession:
+def _open_session(lake_time: datetime | None, data_end: date | None) -> LakeSession:
     """Reads the metadata of every table in `READ_TABLES` and the build of
     each rebuilt-whole one, then fixes T: `lake_time` when given, else 1 s
-    after the newest of the tables' `last_write` and the builds. Raises
+    after the newest of the tables' `last_write` and the builds. The
+    session carries `data_end` as given. Raises
     `LakeTimeError` when an explicit `lake_time` precedes a build, or when
     no default can be formed because the lake reports no write for any of
     the tables."""
@@ -262,25 +297,46 @@ def _open_session(lake_time: datetime | None) -> LakeSession:
                     "this lake time cannot be reproduced"
                 )
     session = LakeSession(
-        lake_time=lake_time, lake_version=lake.last_version, rebuilt_whole_builds=builds
+        lake_time=lake_time,
+        data_end=data_end,
+        lake_version=lake.last_version,
+        rebuilt_whole_builds=builds,
     )
     session._tables = tables
     return session
 
 
 @contextmanager
-def lake_session(lake_time: datetime | None = None) -> Iterator[LakeSession]:
+def lake_session(
+    lake_time: datetime | None = None, *, data_end: date | None = None
+) -> Iterator[LakeSession]:
     """Opens a process-wide session in which every loader read sees the
     lake as it stood at one lake time T, and yields it.
 
     `lake_time` must be timezone-aware (a naive value raises `ValueError`)
     and is held in UTC; when `None`, T is 1 s after the newest `last_write`
     of `READ_TABLES` and the newest rebuilt-whole build, so the same lake
-    state gives the same T. A call while a session is open joins it and
-    yields the open session; a joining call whose `lake_time` differs from
-    the open T raises `LakeTimeError`. Only the call that opened the
-    session closes it, and when its block ends without an error it first
-    runs `verify_rebuilt_whole_builds`."""
+    state gives the same T.
+
+    `data_end` is a hard cut on knowledge time, a separate axis from T:
+    T bounds which writes of the lake are visible, `data_end` bounds which
+    dates a loader may be asked about. Inside the session every public
+    loader with a knowledge-time argument (`as_of`/`as_of_date`, or `end`
+    for a bar-dated range) raises `HoldoutReadError` before querying when
+    that argument is later than `data_end`; an argument equal to
+    `data_end` reads as it would without the cut. Each loader already gates
+    its rows on that argument by source (bar date, SEC `filed`, FRED
+    vintage release, FINRA estimated dissemination, COT release, option
+    snapshot date), so no row known after `data_end` is returned. `None`
+    means no cut.
+
+    A call while a session is open joins it and yields the open session.
+    A joining call whose `lake_time` differs from the open T raises
+    `LakeTimeError`; a joining call without a `data_end` inherits the open
+    session's, and one whose `data_end` differs from the open session's
+    (including a session opened without one) raises `LakeTimeError`. Only
+    the call that opened the session closes it, and when its block ends
+    without an error it first runs `verify_rebuilt_whole_builds`."""
     global _SESSION
     if lake_time is not None and lake_time.utcoffset() is None:
         raise ValueError(
@@ -292,12 +348,18 @@ def lake_session(lake_time: datetime | None = None) -> Iterator[LakeSession]:
         session = _SESSION
         opened = session is None
         if session is None:
-            session = _open_session(requested)
+            session = _open_session(requested, data_end)
             _SESSION = session
         elif requested is not None and requested != session.lake_time:
             raise LakeTimeError(
                 f"a lake session at {session.lake_time.isoformat()} is open; cannot read at "
                 f"{requested.isoformat()} inside it"
+            )
+        elif data_end is not None and data_end != session.data_end:
+            open_end = "no data_end" if session.data_end is None else session.data_end.isoformat()
+            raise LakeTimeError(
+                f"a lake session with {open_end} is open; cannot join it with data_end "
+                f"{data_end.isoformat()}"
             )
     try:
         yield session
@@ -317,7 +379,9 @@ def verify_rebuilt_whole_builds() -> None:
     rebuilt-whole table is compared by its build (re-read from the table),
     a row-time pinned table (`_ROW_TIME_PIN_COLUMNS`) by the `last_write`
     the lake reports for it. A table no query read is not checked. Does
-    nothing outside a session."""
+    nothing outside a session. Not subject to the session's `data_end`
+    (`_guard_data_end`): it takes no knowledge-time argument and returns
+    no market data, only checks build and write times."""
     session = _current_session()
     if session is None:
         return
@@ -456,7 +520,9 @@ def lake_provenance() -> LakeProvenance:
     of each adjustment table from `adjustment_table_row_count`. Inside a
     `lake_session` it also carries the session's lake time, rebuilt-whole
     builds and row-time-pinned tables. Raises `EmptyAdjustmentTableError`
-    when either adjustment table is empty."""
+    when either adjustment table is empty. Not subject to the session's
+    `data_end` (`_guard_data_end`): it takes no knowledge-time argument and
+    returns provenance, not market data."""
     lake = _lake()
     status = lake.status()
     read_at = datetime.now(UTC)
@@ -515,7 +581,9 @@ def adjustment_table_row_count(table: AdjustmentTable) -> int:
     `_LakeTimeMemo`) and kept while reads stay at that lake time. Raises
     `EmptyAdjustmentTableError` when the table has no rows (that result is
     not kept, so a later call queries again) and `ValueError` when `table`
-    is not an adjustment table."""
+    is not an adjustment table. Not subject to the session's `data_end`
+    (`_guard_data_end`): it takes no knowledge-time argument and returns a
+    row count recorded as provenance, never row values."""
     if table not in get_args(AdjustmentTable):
         raise ValueError(f"{table!r} is not an adjustment table")
     cached = _ADJUSTMENT_TABLE_ROWS.values()
@@ -552,6 +620,7 @@ def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | N
     the row with the latest `start_date` names the ticker. A counted span without a
     `security_id` is left out and named in one WARNING. Returns `None`
     when no row counts."""
+    _guard_data_end(as_of_date, "load_sp500_member_securities_asof")
     query = f"""
         SELECT security_id, ticker
         FROM (
@@ -604,6 +673,7 @@ def load_sp500_member_count(start: date, end: date) -> pd.DataFrame | None:
     against the nominal 500 and gates nothing. Returns `None` when no row
     is dated in the range. Self-asserts point-in-time on the index against
     `end` before returning."""
+    _guard_data_end(end, "load_sp500_member_count")
     query = f"""
         SELECT date, {", ".join(_MEMBER_COUNT_COLUMNS)}
         FROM {_table_sql("sp500_member_count")}
@@ -816,6 +886,7 @@ def load_security_log_returns(
     security, using the factor `effective_date`s the price read joined,
     and adds each to `unfactored_split_move_registry`; the returned series
     are not changed."""
+    _guard_data_end(end, "load_security_log_returns")
     if not security_ids:
         return {}
     frame = _adjusted_security_bars(security_ids, start, end, with_open_and_volume=False)
@@ -874,6 +945,7 @@ def load_security_daily_bars(
     without a factor row are logged and registered as in
     `load_security_log_returns`. Self-asserts point-in-time on the index
     against `end` before returning."""
+    _guard_data_end(end, "load_security_daily_bars")
     if not security_ids:
         return None
     frame = _adjusted_security_bars(security_ids, start, end, with_open_and_volume=True)
@@ -937,7 +1009,14 @@ def split_adjustment_factor(ticker: str, quote_date: date) -> float:
     fractional splits count too, because the close is adjusted for them.
 
     Raises `EmptyAdjustmentTableError` when `yahoo_split_close_basis` has
-    no rows at all; a ticker with no rows of its own gets 1.0."""
+    no rows at all; a ticker with no rows of its own gets 1.0.
+
+    Not subject to the session's `data_end` (`_guard_data_end`):
+    `quote_date` is not a knowledge time but the date of a chain row an
+    option loader already read under its guarded `as_of_date`. The split
+    ratios it reads have ex-dates after `quote_date`, up to the lake time
+    T, and serve only to put that row on the split-adjusted close basis;
+    they carry no signal value of their own."""
     adjustment_table_row_count("yahoo_split_close_basis")
     query = f"""
         SELECT ratio
@@ -1048,6 +1127,7 @@ def load_options_snapshot_from_lakehouse(
     archival and never itself adjusted for a later split. Rows are sorted
     on every returned column. Self-asserts point-in-time on `date` before
     returning."""
+    _guard_data_end(as_of_date, "load_options_snapshot_from_lakehouse")
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
     window_end = as_of_date.isoformat()
     table, date_column = _option_chain_source(ticker, as_of_date)
@@ -1129,6 +1209,7 @@ def load_cot_positioning_from_lakehouse(
     should treat that as "no positioning read available," not an
     empty-but-valid series. Self-asserts point-in-time on the
     `report_date` index before returning."""
+    _guard_data_end(as_of_date, "load_cot_positioning_from_lakehouse")
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
     availability_cutoff = as_of_date.isoformat()
     queries = [
@@ -1191,6 +1272,7 @@ def load_dividends_from_lakehouse(ticker: str, as_of_date: date) -> pd.Series | 
     is safe because a dividend is declared before its ex-date, so it is
     public by then. Returns `None` when no rows qualify. Self-asserts
     point-in-time on the ex-date index before returning."""
+    _guard_data_end(as_of_date, "load_dividends_from_lakehouse")
     query = f"""
         SELECT ex_date, amount_split_adjusted
         FROM {_table_sql("equity_distributions")}
@@ -1224,6 +1306,7 @@ def load_earnings_surprise_from_lakehouse(
     quarter's announcement is available yet as of `as_of_date`.
     Self-asserts point-in-time on the availability date before
     returning."""
+    _guard_data_end(as_of_date, "load_earnings_surprise_from_lakehouse")
     query = f"""
         SELECT h.reported, h.estimate, c.date AS announcement_date, c."when" AS announced_when
         FROM (
@@ -1285,7 +1368,12 @@ def load_sic_code_from_lakehouse(ticker: str) -> str | None:
     time inside a `lake_session`). A company reclassified after
     that date is grouped by its later industry. This is a known look-ahead
     limit of SIC-based pair screening, with no `as_of_date` gate possible
-    until the lake carries classification history."""
+    until the lake carries classification history.
+
+    Not subject to the session's `data_end` (`_guard_data_end`): it takes
+    no knowledge-time argument. The read is current-state, bounded only by
+    the lake time T, so inside a session with a `data_end` it can return a
+    classification made after `data_end`."""
     frame = _query(
         f"SELECT sic FROM {_table_sql('sec_sic_classification')} WHERE ticker = ?", [ticker]
     )
@@ -1301,7 +1389,11 @@ def same_sic_candidate_pairs(tickers: list[str]) -> list[tuple[str, str]]:
     Tickers with no SIC record (non-equities, or an equity outside SEC
     EDGAR's coverage) can't form a pair here, so this only ever
     under-generates candidates. The codes are current, not point-in-time
-    (see `load_sic_code_from_lakehouse`)."""
+    (see `load_sic_code_from_lakehouse`). Not subject to the session's
+    `data_end` (`_guard_data_end`): it reads only through
+    `load_sic_code_from_lakehouse`, which takes no knowledge-time
+    argument, so the pairs can reflect classifications made after
+    `data_end`."""
     sic_by_ticker: dict[str, str] = {}
     for ticker in tickers:
         sic = load_sic_code_from_lakehouse(ticker)
@@ -1459,6 +1551,7 @@ def load_price_history_from_lakehouse(
     Self-asserts point-in-time on the combined frame's date index against
     `end` before returning.
     """
+    _guard_data_end(end, "load_price_history_from_lakehouse")
     crypto = [ticker for ticker in tickers if ticker in _CRYPTO_KLINE_SYMBOLS]
     others = [ticker for ticker in tickers if ticker not in _CRYPTO_KLINE_SYMBOLS]
     parts = []
@@ -1516,6 +1609,7 @@ def load_raw_close_from_lakehouse(
     `lookback_days` calendar days. `None` when the lake has no positive
     close for `ticker` in that window. Self-asserts point-in-time on
     `date` before returning."""
+    _guard_data_end(as_of_date, "load_raw_close_from_lakehouse")
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
     query = f"""
         SELECT date, close
@@ -1543,6 +1637,7 @@ def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Seri
     as_of_date`; an observation with no version published by then is left
     out. The index is sorted and unique. Returns `None` if no rows remain.
     Self-asserts point-in-time on the date index before returning."""
+    _guard_data_end(as_of_date, "load_fred_series_from_lakehouse")
     query = f"""
         SELECT date, value
         FROM (
@@ -1600,6 +1695,7 @@ def load_fama_french_factors_from_lakehouse(
     if the table has no rows or `model` isn't one of the two supported
     names. Self-asserts point-in-time on the date index before
     returning."""
+    _guard_data_end(as_of_date, "load_fama_french_factors_from_lakehouse")
     dataset = _KEN_FRENCH_DATASET_BY_MODEL.get(model)
     if dataset is None:
         return None
@@ -1660,6 +1756,7 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     the order the lake stores them in.
     Returns `None` if no rows remain. Self-asserts point-in-time on
     `filed` (the SQL gate) and on `available_date` before returning."""
+    _guard_data_end(as_of_date, "load_company_facts_from_lakehouse")
     query = f"""
         SELECT x.concept, x.unit, x.period_start, x.period_end, x.value, x.fiscal_year,
                x.fiscal_period, x.form, x.filed_date AS filed, f.accepted_at
@@ -1761,6 +1858,7 @@ def load_short_interest_from_lakehouse(ticker: str, as_of_date: date) -> pd.Data
     dropped, because the lake keeps no pre-revision value. Only rows
     available on or before `as_of_date` are returned; `None` if none are.
     Self-asserts point-in-time on `dissemination_date` before returning."""
+    _guard_data_end(as_of_date, "load_short_interest_from_lakehouse")
     query = f"""
         SELECT settlement_date, revision_flag,
                current_short_position AS short_interest_shares,
@@ -1824,6 +1922,7 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
     are returned, sorted on every returned column. Returns `None` if no
     rows remain. Self-asserts point-in-time on `filed_date` (the SQL gate)
     and on `available_date` before returning."""
+    _guard_data_end(as_of_date, "load_insider_transactions_from_lakehouse")
     query = f"""
         SELECT t.owner_cik, t.owner_name, t.is_officer, t.is_director, t.is_ten_percent_owner,
                t.transaction_date, t.transaction_code, t.shares, t.price_per_share,
@@ -1882,6 +1981,7 @@ def load_option_quote_from_lakehouse(
     matching rows the one with the latest `date` is returned. `None`
     when never quoted in the window. Self-asserts point-in-time on
     `date` before returning."""
+    _guard_data_end(as_of_date, "load_option_quote_from_lakehouse")
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
     table, date_column = _option_chain_source(underlying, as_of_date)
     query = f"""
@@ -1950,7 +2050,10 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
       `end_date` in `sp500_membership`, an open membership span counting
       as today; `identifier` is not used.
 
-    Returns `None` when the lake holds no matching rows."""
+    Returns `None` when the lake holds no matching rows. Not subject to
+    the session's `data_end` (`_guard_data_end`): it takes no
+    knowledge-time argument and returns coverage dates for the preflight,
+    not data, so the last date can fall after `data_end`."""
     if source == "options_chain":
         query = f"""
             SELECT MIN(date) AS first, MAX(date) AS last

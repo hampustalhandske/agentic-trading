@@ -9,7 +9,10 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from agentic_trading.data.loaders.lakehouse_loader import load_price_history_from_lakehouse
+from agentic_trading.data.loaders.lakehouse_loader import (
+    _guard_data_end,
+    load_price_history_from_lakehouse,
+)
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -39,10 +42,15 @@ def load_price_history_with_fallback(
     run starts, rather than this function's raise being the first
     anyone hears of it mid-load.
 
+    Inside a `lake_session` with a `data_end`, raises `HoldoutReadError`
+    before any other check or query when `end` is later than it (see
+    `lakehouse_loader._guard_data_end`).
+
     Returns `(frame, source_label)` — `source_label` is always
     `"lakehouse data"`, kept in the return shape so existing callers
     (e.g. the CLI's log line) don't need to change.
     """
+    _guard_data_end(end, "load_price_history_with_fallback")
     if warmup_days < 0:
         raise ValueError("warmup_days must be non-negative")
     data_start = start - timedelta(days=warmup_days)
