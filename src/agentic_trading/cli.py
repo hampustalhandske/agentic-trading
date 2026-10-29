@@ -2,10 +2,13 @@
 
 import json
 from datetime import date, datetime
+from importlib import metadata
 from pathlib import Path
+from typing import cast, get_args
 
 import typer
 
+from agentic_trading import provenance
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.roster import build_default_analysts, build_default_managers
@@ -39,9 +42,12 @@ from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.provenance import build_run_provenance
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
+from agentic_trading.stage_a.runner import run_batch
+from agentic_trading.stage_a.store import InstrumentKind
 
 app = typer.Typer()
 experiment_app = typer.Typer()
+stage_a_app = typer.Typer()
 
 # Every asset class CATALOG actually classifies into (see ticker_catalog.py's
 # AssetClass) — options are deliberately excluded there, so they're
@@ -820,9 +826,159 @@ def experiment(
         )
 
 
+# The repository root; a stage (a) store must lie outside it.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Exit code of `agentic-trading-stage-a` when the batch stopped for resources.
+_EXIT_STOPPED_FOR_RESOURCES = 3
+
+
+def _stage_a_analysts(agent_ids: list[str]) -> list[AnalystAgent]:
+    """The default-roster analysts with `agent_ids`, in that order. An id
+    the roster does not hold, or an id given twice, is a usage error."""
+    roster = {analyst.agent_id: analyst for analyst in build_default_analysts()}
+    unknown = [agent_id for agent_id in agent_ids if agent_id not in roster]
+    if unknown:
+        raise typer.BadParameter(
+            f"no analyst in the default roster has id(s) {unknown}", param_hint="--analyst"
+        )
+    repeated = sorted({agent_id for agent_id in agent_ids if agent_ids.count(agent_id) > 1})
+    if repeated:
+        raise typer.BadParameter(f"analyst id(s) given twice: {repeated}", param_hint="--analyst")
+    return [roster[agent_id] for agent_id in agent_ids]
+
+
+def _stage_a_instrument_kind(value: str) -> InstrumentKind:
+    """`value` as a `decision_file.v1` instrument kind; any other value is a
+    usage error."""
+    kinds: tuple[str, ...] = get_args(InstrumentKind)
+    if value not in kinds:
+        raise typer.BadParameter(
+            f"must be one of {', '.join(kinds)}, got {value!r}", param_hint="--instrument-kind"
+        )
+    return cast(InstrumentKind, value)
+
+
+@stage_a_app.command()
+def stage_a(
+    analyst: list[str] = typer.Option(  # noqa: B008
+        ...,
+        "--analyst",
+        help="Default-roster analyst id to run; repeat for several, run in the order given.",
+    ),
+    universe: list[str] = typer.Option(  # noqa: B008
+        ..., "--universe", help="Instrument id (ticker) to run over; repeat for several."
+    ),
+    store_dir: Path = typer.Option(  # noqa: B008
+        ...,
+        "--store-dir",
+        help="Directory outside the repository holding one subdirectory per trial spec hash.",
+    ),
+    instrument_kind: str = typer.Option(
+        "equity",
+        "--instrument-kind",
+        help="decision_file.v1 instrument kind every row is written as: "
+        "equity, etf, future, fx, crypto or option.",
+    ),
+    window_start: str | None = typer.Option(
+        None,
+        "--window-start",
+        help=f"First decision date, {_DATE_FORMAT_HINT} (default: stage_a.window_start).",
+    ),
+    window_end: str | None = typer.Option(
+        None,
+        "--window-end",
+        help=f"Last decision date, {_DATE_FORMAT_HINT}, at most stage_a.data_end "
+        "(default: stage_a.data_end).",
+    ),
+    lake_time: str | None = typer.Option(None, "--lake-time", help=_LAKE_TIME_HELP),
+) -> None:
+    """Compute and store stage (a) signals and decisions for the given
+    analysts over the universe, resuming each trial from its store.
+
+    Loads the universe's prices from the window start minus the standard
+    warm-up to the window end, then runs `stage_a.runner.run_batch`, all
+    inside one lake session cut at `stage_a.data_end`, so the prices and
+    every analyst read see the same lake time. The spec records that
+    lake time, the lake version and the installed quantcore version and
+    commit. Prints the batch result as JSON. Exits 0 when every analyst
+    finished, 3 when the batch stopped for low memory or disk (rerun to
+    resume), and 2 on a usage error: an unknown analyst id, a missing
+    --store-dir or one inside the repository, a naive --lake-time, or a
+    window that is reversed or ends after stage_a.data_end.
+    """
+    requested_lake_time = _parse_lake_time_flag(lake_time)
+    kind = _stage_a_instrument_kind(instrument_kind)
+    data_end = settings.stage_a.data_end
+    start = (
+        settings.stage_a.window_start
+        if window_start is None
+        else _parse_date_flag(window_start, "--window-start")
+    )
+    end = data_end if window_end is None else _parse_date_flag(window_end, "--window-end")
+    if start > end:
+        raise typer.BadParameter(
+            f"--window-start ({start.isoformat()}) is after --window-end ({end.isoformat()})."
+        )
+    if end > data_end:
+        raise typer.BadParameter(
+            f"--window-end ({end.isoformat()}) is after stage_a.data_end "
+            f"({data_end.isoformat()}); the holdout stays locked."
+        )
+    if store_dir.resolve().is_relative_to(_REPO_ROOT):
+        raise typer.BadParameter(
+            f"{store_dir} is inside the repository; give a directory outside it.",
+            param_hint="--store-dir",
+        )
+    analysts = _stage_a_analysts([agent_id.strip() for agent_id in analyst])
+    tickers = [ticker.strip() for ticker in universe]
+
+    configure_logging()
+    logger = get_logger(__name__)
+    logger.info(
+        "Stage (a) batch: analysts=%s, universe=%s, %s to %s, store %s",
+        [agent.agent_id for agent in analysts],
+        tickers,
+        start,
+        end,
+        store_dir,
+    )
+    with lake_session(requested_lake_time, data_end=data_end) as session:
+        typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
+        market_data, source_label = load_price_history_with_fallback(
+            tickers, start, end, warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS
+        )
+        typer.echo(f"Market data ready: {source_label}; {len(market_data)} rows.", err=True)
+        lake_version = (
+            session.lake_version
+            if session.lake_version is not None
+            else provenance.lake_provenance().lake_version
+        )
+        result = run_batch(
+            analysts,
+            tickers,
+            kind,
+            start,
+            end,
+            store_dir,
+            market_data,
+            lake_time=session.lake_time,
+            lake_version=lake_version,
+            quantcore_version=metadata.version("quantcore"),
+            quantcore_sha=provenance.quantcore_sha(),
+        )
+    typer.echo(result.model_dump_json(indent=2))
+    if result.stopped_for_resources:
+        raise typer.Exit(code=_EXIT_STOPPED_FOR_RESOURCES)
+
+
 def main(args: list[str] | None = None) -> None:
     app(args=args)
 
 
 def experiment_main(args: list[str] | None = None) -> None:
     experiment_app(args=args)
+
+
+def stage_a_main(args: list[str] | None = None) -> None:
+    stage_a_app(args=args)

@@ -9,7 +9,11 @@ from typing import Any
 from pydantic import BaseModel
 
 from agentic_trading.config import settings
-from agentic_trading.data.loaders.lakehouse_loader import LakeProvenance, lake_provenance
+from agentic_trading.data.loaders.lakehouse_loader import LakeProvenance
+from agentic_trading.data.loaders.lakehouse_loader import lake_provenance as lake_provenance
+
+# `lake_provenance` is re-exported (`as lake_provenance`): the stage (a) CLI
+# reads the lake version through this module.
 
 # The lake's frozen data contract the loaders are written against
 # (tests/fixtures/lakehouse_contract_v1.json checks it).
@@ -65,7 +69,7 @@ def _git_state() -> tuple[str | None, bool | None]:
     return sha.strip(), bool(status.strip())
 
 
-def _quantcore_sha() -> str | None:
+def quantcore_sha() -> str | None:
     """The VCS commit quantcore was installed from, read from its
     `direct_url.json`; `None` when quantcore was not installed from a VCS URL."""
     try:
@@ -88,7 +92,7 @@ def build_run_provenance(
     return RunProvenance(
         git_sha=git_sha,
         git_dirty=git_dirty,
-        quantcore_sha=_quantcore_sha(),
+        quantcore_sha=quantcore_sha(),
         settings=settings.model_dump(mode="json"),
         cli_args=cli_args,
         analyst_ids=analyst_ids,

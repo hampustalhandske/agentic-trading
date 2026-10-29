@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -440,6 +441,30 @@ class AnalystConfig(BaseModel):
     mc_seed: int = Field(default=42, ge=0)
 
 
+class StageAConfig(BaseModel):
+    """Stage (a) precompute: the holdout cut and window every trial is
+    computed under, and the resource guard of `stage_a.runner.run_batch`."""
+
+    model_config = _GROUP_CONFIG
+
+    # Last date the signal compute may know (the `lake_session` data_end):
+    # 2025-01-02 onward is the holdout, locked until the owner opens it.
+    data_end: date = date(2024, 12, 31)
+    # First decision date of the stage (a) window: every round-1 instrument
+    # has bars before it (AT-110).
+    window_start: date = date(2010, 1, 4)
+    # The last three fields tune how a batch runs, not what it computes, so
+    # they are left out of the spec hash (`stage_a.spec.RUNTIME_SETTINGS_FIELDS`).
+    # A batch stops after its current day below this share of free system
+    # memory or this much free disk (GB) on the store's volume: AT-110's
+    # memory guard for heavy runs.
+    min_free_memory_pct: float = Field(default=20.0, ge=0.0, le=100.0)
+    min_free_disk_gb: float = Field(default=10.0, ge=0.0)
+    # Decision days between resource checks: the slowest round-1 analyst
+    # takes about 12 s a day, so a check comes every few minutes at most.
+    check_every_days: int = Field(default=20, ge=1)
+
+
 class StrategyConfig(BaseModel):
     model_config = _GROUP_CONFIG
 
@@ -449,6 +474,7 @@ class StrategyConfig(BaseModel):
     commander: CommanderConfig = Field(default_factory=CommanderConfig)
     portfolio: PortfolioConstructionConfig = Field(default_factory=PortfolioConstructionConfig)
     analysts: AnalystConfig = Field(default_factory=AnalystConfig)
+    stage_a: StageAConfig = Field(default_factory=StageAConfig)
     # Per-pod sizing, keyed by manager `agent_id`; the research-grounded
     # reasoning for each row lives next to the manager in `roster.py`.
     pod_sizing: dict[str, PodSizingConfig] = Field(

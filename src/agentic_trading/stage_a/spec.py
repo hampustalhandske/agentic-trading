@@ -31,9 +31,13 @@ from agentic_trading.config import settings
 
 # Dotted `settings` paths (`<group>.<field>`, or `pod_sizing.<pod>.<field>`)
 # that tune how a run executes rather than what it computes, and so are
-# left out of the hashed snapshot. Empty: every `settings` field is a
-# strategy constant.
-RUNTIME_SETTINGS_FIELDS: tuple[str, ...] = ()
+# left out of the hashed snapshot: the batch runner's resource guard.
+# Every other `settings` field is a strategy constant.
+RUNTIME_SETTINGS_FIELDS: tuple[str, ...] = (
+    "stage_a.min_free_memory_pct",
+    "stage_a.min_free_disk_gb",
+    "stage_a.check_every_days",
+)
 
 # The rule that turns one day's analyst signals into instrument weights.
 DECISION_RULE = (

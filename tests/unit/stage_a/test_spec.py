@@ -83,7 +83,11 @@ def test_build_spec_records_the_trial() -> None:
     spec = _build()
     cls = CIRRateRegimeAnalyst
 
-    assert spec_module.RUNTIME_SETTINGS_FIELDS == ()
+    assert spec_module.RUNTIME_SETTINGS_FIELDS == (
+        "stage_a.min_free_memory_pct",
+        "stage_a.min_free_disk_gb",
+        "stage_a.check_every_days",
+    )
     assert spec.agent_id == "cir_rate_regime_analyst"
     assert spec.analyst_class in {cls.__qualname__, f"{cls.__module__}.{cls.__qualname__}"}
     assert spec.analyst_params["rate_sensitivity"] == -1.0
