@@ -35,6 +35,10 @@ _EMPTY_CASES: dict[str, Callable[[], Any]] = {
     "load_security_log_returns": lambda: (
         lakehouse_loader.load_security_log_returns([1], _START, _END) or None
     ),
+    "load_security_daily_bars": lambda: lakehouse_loader.load_security_daily_bars(
+        [1], _START, _END
+    ),
+    "load_sp500_member_count": lambda: lakehouse_loader.load_sp500_member_count(_START, _END),
     "load_options_snapshot_from_lakehouse": lambda: (
         lakehouse_loader.load_options_snapshot_from_lakehouse("AAPL", _AS_OF)
     ),

@@ -2,7 +2,8 @@
  "additions": {
   "cftc_cot_publication": "added on top of contract v1 by lake commit fa44af5 (LK-15)",
   "yahoo_split_close_basis": "added on top of contract v1 by lake commit 11e1960 (LK-41)",
-  "sp500_price_coverage.piece_start, piece_end": "added on top of contract v1 by lake commit 796b115 (LK-67 part 1)"
+  "sp500_price_coverage.piece_start, piece_end": "added on top of contract v1 by lake commit 796b115 (LK-67 part 1)",
+  "sp500_member_count": "added on top of contract v1; observed on lake f89aef2f428a, 2026-10-29"
  },
  "contract": "lakehouse-contract-v1",
  "frozen_on": "2026-10-27",
@@ -324,6 +325,15 @@
    "sic_description": "VARCHAR",
    "table": "VARCHAR",
    "ticker": "VARCHAR"
+  },
+  "sp500_member_count": {
+   "date": "DATE",
+   "dt": "DATE",
+   "member_lines": "INTEGER",
+   "nominal_members": "INTEGER",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "shortfall": "INTEGER",
+   "table": "VARCHAR"
   },
   "sp500_membership": {
    "dt": "DATE",

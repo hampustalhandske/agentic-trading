@@ -134,6 +134,7 @@ READ_TABLES: tuple[str, ...] = (
     "sec_filings",
     "sec_insider_transactions_log",
     "sec_sic_classification",
+    "sp500_member_count",
     "sp500_membership",
     "sp500_price_coverage",
     "yahoo_split_close_basis",
@@ -588,6 +589,36 @@ def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | N
     return members or None
 
 
+# The count columns `load_sp500_member_count` returns.
+_MEMBER_COUNT_COLUMNS = ("member_lines", "nominal_members", "shortfall")
+
+
+def load_sp500_member_count(start: date, end: date) -> pd.DataFrame | None:
+    """The lake's daily S&P 500 member count from `sp500_member_count`,
+    one row per date from `start` to `end` inclusive, on an ascending
+    `DatetimeIndex` named `date`, with the lake's `member_lines`,
+    `nominal_members` and `shortfall` columns as nullable integers
+    (`Int64`).
+
+    For reporting only: it states each day's shortfall of priced members
+    against the nominal 500 and gates nothing. Returns `None` when no row
+    is dated in the range. Self-asserts point-in-time on the index against
+    `end` before returning."""
+    query = f"""
+        SELECT date, {", ".join(_MEMBER_COUNT_COLUMNS)}
+        FROM {_table_sql("sp500_member_count")}
+        WHERE date BETWEEN ? AND ?
+        ORDER BY date
+    """
+    frame = _query(query, [start.isoformat(), end.isoformat()])
+    if frame.empty:
+        return None
+    result = frame.set_index(pd.DatetimeIndex(pd.to_datetime(frame["date"]), name="date"))
+    result = result[list(_MEMBER_COUNT_COLUMNS)].astype("Int64").sort_index()
+    assert_point_in_time(result, end)
+    return result
+
+
 # Shares received per share held in the split sizes the lake records; a
 # reverse split is the reciprocal. Splits smaller than 3-for-2 move the
 # price by less than many ordinary trading days, so they are not listed.
@@ -606,9 +637,10 @@ _UNFACTORED_SPLIT_MOVES_LOCK = threading.Lock()
 
 def unfactored_split_move_registry() -> list[UnfactoredSplitMove]:
     """Every distinct (security_id, date) split-sized move flagged by a
-    `load_security_log_returns` read since the registry was last cleared,
-    sorted by security then date. A move flagged again by a later read
-    keeps the ratio it was first flagged with."""
+    `load_security_log_returns` or `load_security_daily_bars` read since
+    the registry was last cleared, sorted by security then date. A move
+    flagged again by a later read keeps the ratio it was first flagged
+    with."""
     with _UNFACTORED_SPLIT_MOVES_LOCK:
         entries = sorted(_UNFACTORED_SPLIT_MOVES.items())
     return [
@@ -650,6 +682,108 @@ def unfactored_split_moves(
     return flagged
 
 
+def _adjusted_security_bars(
+    security_ids: list[int], start: date, end: date, with_open_and_volume: bool
+) -> pd.DataFrame:
+    """The `equity_daily_from_bars` bars of `security_ids` dated `start`
+    to `end` inclusive, adjusted with `equity_adjustment_factors`, as one
+    row per (`security_id`, `date`) sorted by security then date. One
+    query serves every id; it reads the bars' `open` and `volume` only
+    when `with_open_and_volume` is true.
+
+    A bar's raw price is `official_close`, or `close` when that is null;
+    a bar whose raw price is null or not positive is left out. Each bar
+    takes the `cum_factor` of the security's factor row with the smallest
+    `effective_date` strictly after the bar's date (1.0 when there is
+    none); bars and factors are joined on `security_id`, never on ticker.
+    Columns:
+
+    - `security_id`, `date` (a `Timestamp`);
+    - `close`: the raw price times the factor;
+    - `raw_close`: the raw price;
+    - `open` (only with `with_open_and_volume`): the bar's `open` times
+      the factor, NaN when that is null or not positive;
+    - `volume` (only with `with_open_and_volume`): the bar's `volume`
+      unadjusted, NaN when null or not positive;
+    - `factor_date`: the `effective_date` of the factor row joined (null
+      when none);
+    - `log_return`: the log of the bar's `close` over the previous kept
+      bar's, only when that bar is on the NYSE session immediately before
+      (a gap never yields a multi-day return, and the first bar in the
+      range has none), NaN otherwise.
+
+    The frame is empty when no bar is kept. Raises
+    `EmptyAdjustmentTableError` when `equity_adjustment_factors` has no
+    rows at all. Logs and registers split-sized moves through
+    `_warn_unfactored_split_moves`; the frame is not changed by them."""
+    adjustment_table_row_count("equity_adjustment_factors")
+    placeholders = ", ".join("?" for _ in security_ids)
+    bar_columns = ", open, volume" if with_open_and_volume else ""
+    open_and_volume = (
+        """
+               CASE WHEN bars.open > 0
+                    THEN bars.open * COALESCE(factors.cum_factor, 1.0) END AS open,
+               CASE WHEN bars.volume > 0 THEN bars.volume END AS volume,"""
+        if with_open_and_volume
+        else ""
+    )
+    query = f"""
+        SELECT bars.security_id, bars.date,
+               bars.raw_close * COALESCE(factors.cum_factor, 1.0) AS close,
+               bars.raw_close,{open_and_volume}
+               factors.effective_date AS factor_date
+        FROM (
+            SELECT security_id, date, COALESCE(official_close, close) AS raw_close{bar_columns}
+            FROM {_table_sql("equity_daily_from_bars")}
+            WHERE security_id IN ({placeholders})
+              AND date BETWEEN ? AND ?
+              AND COALESCE(official_close, close) > 0
+        ) AS bars
+        ASOF LEFT JOIN (
+            SELECT security_id, effective_date, cum_factor
+            FROM {_table_sql("equity_adjustment_factors")}
+            WHERE security_id IN ({placeholders})
+              AND effective_date > ?
+        ) AS factors
+          ON factors.security_id = bars.security_id
+         AND bars.date < factors.effective_date
+        ORDER BY bars.security_id, bars.date
+    """
+    ids = [int(security_id) for security_id in security_ids]
+    params = [*ids, start.isoformat(), end.isoformat(), *ids, start.isoformat()]
+    frame = _query(query, params)
+    if frame.empty:
+        return frame
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame.drop_duplicates(["security_id", "date"]).reset_index(drop=True)
+    previous_date = frame.groupby("security_id")["date"].shift(1)
+    session_after = {
+        stamp: pd.Timestamp(next_session(stamp.date()))
+        for stamp in pd.DatetimeIndex(previous_date.dropna().unique())
+    }
+    consecutive = previous_date.map(session_after) == frame["date"]
+    log_price = pd.Series(np.log(frame["close"].to_numpy(dtype=np.float64)), index=frame.index)
+    log_return = log_price - log_price.groupby(frame["security_id"]).shift(1)
+    frame["log_return"] = log_return.where(consecutive)
+    _warn_unfactored_split_moves(_log_return_series(frame), frame)
+    return frame
+
+
+def _log_return_series(frame: pd.DataFrame) -> dict[int, pd.Series]:
+    """The non-NaN `log_return` values of an `_adjusted_security_bars`
+    frame, one series per `security_id` on an ascending `DatetimeIndex`.
+    A security with no returns has no key."""
+    returns = frame.loc[frame["log_return"].notna()]
+    result: dict[int, pd.Series] = {}
+    for security_id, group in returns.groupby("security_id"):
+        result[int(cast(int, security_id))] = pd.Series(
+            group["log_return"].to_numpy(dtype=np.float64),
+            index=pd.DatetimeIndex(group["date"]),
+            name="log_return",
+        ).sort_index()
+    return result
+
+
 def load_security_log_returns(
     security_ids: list[int], start: date, end: date
 ) -> dict[int, pd.Series]:
@@ -684,56 +818,76 @@ def load_security_log_returns(
     are not changed."""
     if not security_ids:
         return {}
-    adjustment_table_row_count("equity_adjustment_factors")
-    placeholders = ", ".join("?" for _ in security_ids)
-    query = f"""
-        SELECT bars.security_id, bars.date,
-               bars.price * COALESCE(factors.cum_factor, 1.0) AS price,
-               factors.effective_date AS factor_date
-        FROM (
-            SELECT security_id, date, COALESCE(official_close, close) AS price
-            FROM {_table_sql("equity_daily_from_bars")}
-            WHERE security_id IN ({placeholders})
-              AND date BETWEEN ? AND ?
-              AND COALESCE(official_close, close) > 0
-        ) AS bars
-        ASOF LEFT JOIN (
-            SELECT security_id, effective_date, cum_factor
-            FROM {_table_sql("equity_adjustment_factors")}
-            WHERE security_id IN ({placeholders})
-              AND effective_date > ?
-        ) AS factors
-          ON factors.security_id = bars.security_id
-         AND bars.date < factors.effective_date
-        ORDER BY bars.security_id, bars.date
-    """
-    ids = [int(security_id) for security_id in security_ids]
-    params = [*ids, start.isoformat(), end.isoformat(), *ids, start.isoformat()]
-    frame = _query(query, params)
+    frame = _adjusted_security_bars(security_ids, start, end, with_open_and_volume=False)
     if frame.empty:
         return {}
-    frame["date"] = pd.to_datetime(frame["date"])
-    frame = frame.drop_duplicates(["security_id", "date"])
-    previous_date = frame.groupby("security_id")["date"].shift(1)
-    session_after = {
-        stamp: pd.Timestamp(next_session(stamp.date()))
-        for stamp in pd.DatetimeIndex(previous_date.dropna().unique())
-    }
-    consecutive = previous_date.map(session_after) == frame["date"]
-    log_price = pd.Series(np.log(frame["price"].to_numpy(dtype=np.float64)), index=frame.index)
-    frame["log_return"] = log_price - log_price.groupby(frame["security_id"]).shift(1)
-    returns = frame.loc[consecutive]
-
-    result: dict[int, pd.Series] = {}
-    for security_id, group in returns.groupby("security_id"):
-        series = pd.Series(
-            group["log_return"].to_numpy(dtype=np.float64),
-            index=pd.DatetimeIndex(group["date"]),
-            name="log_return",
-        ).sort_index()
+    result = _log_return_series(frame)
+    for series in result.values():
         assert_point_in_time(series, end)
-        result[int(cast(int, security_id))] = series
-    _warn_unfactored_split_moves(result, frame)
+    return result
+
+
+# The fields `load_security_daily_bars` returns per security, in column order.
+_DAILY_BAR_FIELDS = ("close", "raw_close", "open", "volume", "log_return")
+
+
+def load_security_daily_bars(
+    security_ids: list[int], start: date, end: date
+) -> pd.DataFrame | None:
+    """Daily bars per security from `equity_daily_from_bars`, dated
+    `start` to `end` inclusive, on the price basis and consecutive-session
+    rule of `load_security_log_returns`. One query serves every id in
+    `security_ids`.
+
+    The frame has an ascending `DatetimeIndex` named `date` (every date
+    on which at least one of the securities has a kept bar) and
+    `MultiIndex` columns named `security_id` and `field`, with one group
+    per security that has a kept bar in the range and these fields:
+
+    - `close`: the bar's `official_close` (or `close` when that is null)
+      times the `cum_factor` of the security's first
+      `equity_adjustment_factors` row with an `effective_date` strictly
+      after the bar's date (1.0 when there is none), joined on
+      `security_id`;
+    - `raw_close`: the same price before the factor;
+    - `open`: the bar's `open` times the same factor, NaN when the open
+      is null or not positive;
+    - `volume`: the bar's volume, unadjusted, NaN when null or not
+      positive;
+    - `log_return`: the value `load_security_log_returns` gives for that
+      security and day, NaN on every day it gives none.
+
+    A bar whose price is null or not positive is missing: every field of
+    that security is NaN on that day, as on a day it has no bar.
+
+    Back-adjustment with the factors known at the lake time puts every
+    later split and distribution, including those after `end`, into the
+    earlier `close` and `open` levels, so those levels are not the prices
+    that traded. Returns and ratios therefore use `close` and
+    `log_return`; any level-based rule (a price filter, a round-number
+    level) uses `raw_close`. `volume` is raw.
+
+    Returns `None` when `security_ids` is empty or no security has a kept
+    bar in the range. Raises `EmptyAdjustmentTableError` when
+    `equity_adjustment_factors` has no rows at all; a security with no
+    factor rows of its own is read unadjusted. Split-sized moves on dates
+    without a factor row are logged and registered as in
+    `load_security_log_returns`. Self-asserts point-in-time on the index
+    against `end` before returning."""
+    if not security_ids:
+        return None
+    frame = _adjusted_security_bars(security_ids, start, end, with_open_and_volume=True)
+    if frame.empty:
+        return None
+    per_security = {
+        int(cast(int, security_id)): group.set_index("date")[list(_DAILY_BAR_FIELDS)].astype(
+            np.float64
+        )
+        for security_id, group in frame.groupby("security_id")
+    }
+    result = pd.concat(per_security, axis=1, names=["security_id", "field"], sort=True)
+    result.index = pd.DatetimeIndex(result.index, name="date")
+    assert_point_in_time(result, end)
     return result
 
 

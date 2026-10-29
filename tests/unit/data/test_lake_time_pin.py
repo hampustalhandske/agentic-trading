@@ -125,10 +125,11 @@ def _seed_klines(lake: Any) -> None:
 
 
 def test_interface_names_and_read_tables() -> None:
-    """READ_TABLES lists the 22 tables the loader reads and LakeTimeError is a RuntimeError."""
+    """READ_TABLES lists the 23 tables the loader reads and LakeTimeError is a RuntimeError."""
     names = set(ll.READ_TABLES)
     base = {
         "sp500_membership",
+        "sp500_member_count",
         "sp500_price_coverage",
         "equity_daily_from_bars",
         "equity_adjustment_factors",
@@ -153,7 +154,7 @@ def test_interface_names_and_read_tables() -> None:
     }
 
     assert issubclass(ll.LakeTimeError, RuntimeError)
-    assert len(ll.READ_TABLES) == len(names) == 22
+    assert len(ll.READ_TABLES) == len(names) == 23
     assert base <= names
 
 
