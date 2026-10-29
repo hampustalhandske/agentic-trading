@@ -33,12 +33,14 @@ def _returns(stds: dict[str, float], periods: int = 250, seed: int = 0) -> pd.Da
 
 
 def _quiet_constructor(**kwargs: object) -> PortfolioConstructor:
-    """A constructor with the Kelly, cost and no-trade stages switched off."""
+    """A constructor with the Kelly stage and the no-trade buffer switched off.
+
+    The band's cost-derived minimum move follows `settings.firm` and acts
+    only against previous weights, which these tests never pass."""
     params: dict[str, object] = {
         "method": "risk_parity",
         "leverage_cap": 6.0,
         "target_annualized_vol": 0.10,
-        "transaction_cost_bps": 0.0,
         "no_trade_buffer": 0.0,
         "kelly_fraction_weight": 0.0,
     }

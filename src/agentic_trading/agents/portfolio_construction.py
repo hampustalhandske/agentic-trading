@@ -33,6 +33,7 @@ from agentic_trading.agents.schemas import (
     SizingStage,
 )
 from agentic_trading.config import settings
+from agentic_trading.execution_costs import expected_fill_cost_fraction
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -117,13 +118,9 @@ class PortfolioConstructor:
         net_leverage_cap: float | None = None,
         kelly_fraction_weight: float = 0.0,
         kelly_lookback_days: int | None = None,
-        transaction_cost_bps: float | None = None,
         no_trade_buffer: float | None = None,
     ) -> None:
         defaults = settings.portfolio
-        transaction_cost_bps = (
-            defaults.transaction_cost_bps if transaction_cost_bps is None else transaction_cost_bps
-        )
         no_trade_buffer = defaults.no_trade_buffer if no_trade_buffer is None else no_trade_buffer
         risk_aversion = defaults.risk_aversion if risk_aversion is None else risk_aversion
         tau = defaults.tau if tau is None else tau
@@ -153,7 +150,6 @@ class PortfolioConstructor:
         self.net_leverage_cap = leverage_cap if net_leverage_cap is None else net_leverage_cap
         self.kelly_fraction_weight = kelly_fraction_weight
         self.kelly_lookback_days = kelly_lookback_days
-        self.transaction_cost_bps = transaction_cost_bps
         self.no_trade_buffer = no_trade_buffer
         # This pod's own realized daily returns, from yesterday's sized
         # weights against today's real asset returns — same
@@ -706,11 +702,11 @@ class PortfolioConstructor:
         final_weights = self._apply_net_leverage_trim(final_weights)
         vol_after["net_trim"] = self._annualized_vol(final_weights, cov_matrix)
 
-        if previous_weights and (self.transaction_cost_bps > 0.0 or self.no_trade_buffer > 0.0):
-            cost_derived_min_move = (
-                settings.portfolio.cost_clearance_multiplier * self.transaction_cost_bps / 10_000.0
-            )
-            min_move = max(self.no_trade_buffer, cost_derived_min_move)
+        min_move = max(
+            self.no_trade_buffer,
+            settings.portfolio.cost_clearance_multiplier * expected_fill_cost_fraction(),
+        )
+        if previous_weights and min_move > 0.0:
             final_weights = np.array(
                 [
                     previous_weights.get(asset, 0.0)

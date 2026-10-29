@@ -11,12 +11,12 @@ from datetime import date
 import numpy as np
 import pandas as pd
 import pytest
-from agentic_trading.execution_costs import expected_fill_cost_fraction
 
 from agentic_trading.agents.portfolio_construction import PodView, PortfolioConstructor
 from agentic_trading.agents.schemas import PortfolioDecision, TradeRecord
 from agentic_trading.backtest.portfolio import Portfolio
 from agentic_trading.config import settings, temporary_overrides
+from agentic_trading.execution_costs import expected_fill_cost_fraction
 
 _ASSETS = ["AAPL", "MSFT"]
 _AS_OF = pd.Timestamp("2024-06-03")

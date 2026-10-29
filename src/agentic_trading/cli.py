@@ -595,6 +595,15 @@ def experiment(
     resolved_execution_lag_days = (
         settings.firm.execution_lag_days if execution_lag_days is None else execution_lag_days
     )
+    # The resolved values go back onto `settings.firm`, so the no-trade band
+    # and the provenance read the same costs the fills pay.
+    apply_overrides(
+        {
+            "firm.commission_rate": resolved_commission_rate,
+            "firm.slippage_bps": resolved_slippage_bps,
+            "firm.execution_lag_days": resolved_execution_lag_days,
+        }
+    )
     excluded = frozenset(analyst_id.strip() for analyst_id in exclude_analyst)
     analysts = build_default_analysts(excluded_analyst_ids=excluded)
     typer.echo(

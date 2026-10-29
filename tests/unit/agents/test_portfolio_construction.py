@@ -8,6 +8,10 @@ from quantcore.portfolio.optimization import risk_parity_weights
 
 from agentic_trading.agents.portfolio_construction import PodView, PortfolioConstructor
 from agentic_trading.config import settings, temporary_overrides
+from agentic_trading.execution_costs import expected_fill_cost_fraction
+
+# Firm costs that turn the no-trade band's cost-derived minimum move off.
+_ZERO_FILL_COST = {"firm.commission_rate": 0.0, "firm.slippage_bps": 0.0}
 
 
 def _views(signals: dict[str, float]) -> dict[str, PodView]:
@@ -309,17 +313,18 @@ def test_no_trade_buffer_allows_a_large_rebalance_through() -> None:
     assert result != {"AAPL": 0.0, "MSFT": 0.0}
 
 
-def test_transaction_cost_bps_blocks_a_marginal_rebalance() -> None:
+def test_a_large_fill_cost_blocks_a_marginal_rebalance() -> None:
     assets = ["AAPL", "MSFT"]
-    constructor = PortfolioConstructor(method="risk_parity", transaction_cost_bps=100_000.0)
+    constructor = PortfolioConstructor(method="risk_parity")
     returns_history = _returns_history(assets)
 
-    result = constructor.construct(
-        views=_views({"AAPL": 0.4, "MSFT": -0.2}),
-        returns_history=returns_history,
-        as_of_date=pd.Timestamp("2024-06-01"),
-        previous_weights={"AAPL": 0.0, "MSFT": 0.0},
-    )
+    with temporary_overrides({"firm.commission_rate": 10.0, "firm.slippage_bps": 100_000.0}):
+        result = constructor.construct(
+            views=_views({"AAPL": 0.4, "MSFT": -0.2}),
+            returns_history=returns_history,
+            as_of_date=pd.Timestamp("2024-06-01"),
+            previous_weights={"AAPL": 0.0, "MSFT": 0.0},
+        )
 
     assert result == {"AAPL": 0.0, "MSFT": 0.0}
 
@@ -439,10 +444,10 @@ def test_risk_parity_with_no_views_is_quantcores_plain_budget() -> None:
 def test_cost_aware_sizing_is_on_by_default() -> None:
     constructor = PortfolioConstructor()
 
-    assert constructor.transaction_cost_bps == settings.portfolio.transaction_cost_bps
     assert constructor.no_trade_buffer == settings.portfolio.no_trade_buffer
-    assert constructor.transaction_cost_bps > 0.0
     assert constructor.no_trade_buffer > 0.0
+    assert settings.portfolio.cost_clearance_multiplier > 0.0
+    assert expected_fill_cost_fraction() > 0.0
 
 
 def test_default_no_trade_band_still_trades_from_a_flat_book() -> None:
@@ -464,10 +469,8 @@ def test_rebalance_calendar_scheduled_day_lets_a_full_resize_through() -> None:
     a full resize should go through even though `previous_weights` is
     set — never snapped back to the drift-band override path."""
     assets = ["AAPL", "MSFT"]
-    constructor = PortfolioConstructor(
-        method="risk_parity", no_trade_buffer=1e-9, transaction_cost_bps=0.0
-    )
-    with temporary_overrides({"portfolio.rebalance_calendar_days": 1}):
+    constructor = PortfolioConstructor(method="risk_parity", no_trade_buffer=1e-9)
+    with temporary_overrides({**_ZERO_FILL_COST, "portfolio.rebalance_calendar_days": 1}):
         returns_history = _returns_history(assets)
         first = constructor.construct(
             views=_views({"AAPL": 0.4, "MSFT": -0.2}),
@@ -490,10 +493,8 @@ def test_rebalance_calendar_non_scheduled_day_snaps_everything_back() -> None:
     drifted past the band: every asset must snap back to its held
     (`previous_weights`) value, not the newly-sized `final_weights`."""
     assets = ["AAPL", "MSFT"]
-    constructor = PortfolioConstructor(
-        method="risk_parity", no_trade_buffer=1e-9, transaction_cost_bps=0.0
-    )
-    with temporary_overrides({"portfolio.rebalance_calendar_days": 100}):
+    constructor = PortfolioConstructor(method="risk_parity", no_trade_buffer=1e-9)
+    with temporary_overrides({**_ZERO_FILL_COST, "portfolio.rebalance_calendar_days": 100}):
         returns_history = _returns_history(assets)
         first = constructor.construct(
             views=_views({"AAPL": 0.4, "MSFT": -0.2}),
@@ -517,11 +518,13 @@ def test_rebalance_calendar_drift_override_lets_only_the_drifted_asset_through()
     band and the other doesn't: only the drifted asset takes its new
     weight, the other snaps back to `previous_weights`."""
     assets = ["AAPL", "MSFT"]
-    constructor = PortfolioConstructor(
-        method="risk_parity", no_trade_buffer=1e-9, transaction_cost_bps=0.0
-    )
+    constructor = PortfolioConstructor(method="risk_parity", no_trade_buffer=1e-9)
     with temporary_overrides(
-        {"portfolio.rebalance_calendar_days": 100, "portfolio.rebalance_drift_band": 0.10}
+        {
+            **_ZERO_FILL_COST,
+            "portfolio.rebalance_calendar_days": 100,
+            "portfolio.rebalance_drift_band": 0.10,
+        }
     ):
         previous_weights = {"AAPL": 0.20, "MSFT": -0.10}
         # Seed a scheduled rebalance first so the second call is genuinely

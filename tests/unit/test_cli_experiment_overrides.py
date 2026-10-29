@@ -109,6 +109,17 @@ def test_experiment_prints_overridden_commission_in_provenance() -> None:
     assert payload["provenance"]["settings"]["firm"]["commission_rate"] == pytest.approx(0.003)
 
 
+def test_experiment_cost_flags_set_the_firm_costs_the_band_reads() -> None:
+    """`--commission-rate` and `--slippage-bps` land on `settings.firm`, so the no-trade band
+    and the provenance read the same costs the fills pay."""
+    result, _ = _run(["--commission-rate", "0.001", "--slippage-bps", "2"])
+
+    assert result.exit_code == 0, result.output
+    firm = json.loads(result.stdout[result.stdout.index("{") :])["provenance"]["settings"]["firm"]
+    assert firm["commission_rate"] == pytest.approx(0.001)
+    assert firm["slippage_bps"] == pytest.approx(2.0)
+
+
 def test_experiment_rejects_max_leverage_override() -> None:
     """`--set firm.max_leverage` fails with a message naming the unsupported key."""
     result, calls = _run(["--set", "firm.max_leverage=3"])

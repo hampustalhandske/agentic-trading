@@ -282,10 +282,9 @@ class PortfolioConstructionConfig(BaseModel):
     # analyst opinion reaches position size without abandoning the
     # covariance-based budget.
     risk_parity_view_tilt: float = Field(default=0.5, ge=0.0, le=1.0)
-    # Cost-aware sizing: a rebalance must move a weight by more than the
-    # no-trade band, and clear `cost_clearance_multiplier` x the round-trip
-    # cost, before it goes through. 5 bps matches the engine's slippage.
-    transaction_cost_bps: float = Field(default=5.0, ge=0.0)
+    # Cost-aware sizing: a rebalance must move a weight by more than this
+    # no-trade buffer, and by more than `cost_clearance_multiplier` x the
+    # expected fill cost fraction, before it goes through.
     no_trade_buffer: float = Field(default=0.005, ge=0.0)
     # Rebalance calendar: a pod only re-trades on a scheduled cadence, or
     # off-cycle when an asset's weight has drifted from its last executed
@@ -318,8 +317,11 @@ class PortfolioConstructionConfig(BaseModel):
     # The Kelly overlay ramps from 0 to the pod's target fraction over this
     # many trailing days; a Sharpe from a handful of points is noise.
     kelly_lookback_days: int = Field(default=60, ge=1)
-    # No-trade buffer's cost-derived minimum move = this x cost_bps / 10,000;
-    # a fixed economic-hurdle approximation, not a real impact model.
+    # The no-trade band's cost-derived minimum move is this multiple of
+    # `execution_costs.expected_fill_cost_fraction()` (commission plus
+    # slippage from `firm`, read at construct time): a weight change must
+    # earn several times its linear fill cost. Impact and option spreads
+    # are not in that fraction.
     cost_clearance_multiplier: float = Field(default=5.0, ge=0.0)
 
 
