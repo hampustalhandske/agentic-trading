@@ -43,7 +43,8 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
     once every `_refit_cache.refit_interval_days` simulated days per
     asset — see `RefitCache`'s docstring; the forecast/impulse-response
     step still scores against every day's fresh data. Every active
-    signal's `source_as_of` is the newest `realtime_start` among the
+    signal's `source_as_of` is the newest `known_at` (the later of a
+    vintage's publication date and its observation date) among the
     macro vintages on the dates of the VAR system."""
 
     agent_id: str = "macro_var_spillover_analyst"
@@ -74,16 +75,16 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
     def _macro_series(self, as_of_date: pd.Timestamp) -> tuple[list[pd.Series], pd.Series] | None:
         """The macro columns of the VAR system as of `as_of_date`, each
         indexed by observation date, and each observation date's newest
-        `realtime_start` across every vintage loaded for them. `None` when
-        any series has no vintage published before `as_of_date`."""
+        `known_at` across every vintage loaded for them. `None` when any
+        series has no vintage known before `as_of_date`."""
         series_list: list[pd.Series] = []
-        published: list[pd.Series] = []
+        known: list[pd.Series] = []
         for series_id in self.macro_series_ids:
             vintages = load_fred_vintages_from_lakehouse(series_id, as_of_date.date())
             if vintages is None:
                 return None
             series_list.append(vintages["value"])
-            published.append(vintages["realtime_start"])
+            known.append(vintages["known_at"])
         if self.use_yield_curve_slope:
             long_rate = load_fred_vintages_from_lakehouse(DGS10, as_of_date.date())
             short_rate = load_fred_vintages_from_lakehouse(DGS3MO, as_of_date.date())
@@ -91,9 +92,9 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                 return None
             yield_curve = pd.concat([long_rate["value"], short_rate["value"]], axis=1, join="inner")
             series_list.append(yield_curve.iloc[:, 0] - yield_curve.iloc[:, 1])
-            published.extend([long_rate["realtime_start"], short_rate["realtime_start"]])
-        newest_published = pd.concat(published, axis=1).max(axis=1)
-        return series_list, newest_published
+            known.extend([long_rate["known_at"], short_rate["known_at"]])
+        newest_known = pd.concat(known, axis=1).max(axis=1)
+        return series_list, newest_known
 
     def generate_signal(
         self,
@@ -115,7 +116,7 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                 rationale="insufficient asset/macro history for a VAR spillover read",
                 status="unavailable",
             )
-        macro_series, newest_published = macro
+        macro_series, newest_known = macro
 
         history = market_data.loc[market_data.index <= as_of_date]
         if isinstance(history.columns, pd.MultiIndex):
@@ -154,7 +155,7 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                 rationale="insufficient overlapping history for a VAR spillover read",
                 status="unavailable",
             )
-        source_as_of = newest_published.reindex(aligned.index).max().date()
+        source_as_of = newest_known.reindex(aligned.index).max().date()
 
         def _fit_var_system() -> tuple[int, float, np.ndarray | None, np.ndarray | None]:
             n_lags = (

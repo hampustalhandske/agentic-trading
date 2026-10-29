@@ -1654,8 +1654,11 @@ def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Seri
     `BAMLH0A0HYM2`/`BAMLC0A0CM` — the same series `macro_loader.
     SUPPORTED_SERIES` names) as it stood at the close of `as_of_date`:
     the `value` column of `load_fred_vintages_from_lakehouse`, indexed by
-    observation date. Returns `None` if no observation is published
-    before `as_of_date`."""
+    observation date. A version is known at `known_at`, the later of its
+    vintage date (`realtime_start`) and its observation date, because a
+    value cannot be known before its own day ends; only versions with
+    `known_at` strictly before `as_of_date` are used. Returns `None` if
+    no observation is known by then."""
     _guard_data_end(as_of_date, "load_fred_series_from_lakehouse")
     vintages = _fred_vintages(series_id, as_of_date)
     return None if vintages is None else vintages["value"]
@@ -1665,17 +1668,22 @@ def load_fred_vintages_from_lakehouse(series_id: str, as_of_date: date) -> pd.Da
     """The FRED series `series_id` as it stood at the close of
     `as_of_date`, from the `fred_vintages` table (`series_id`, `date`,
     `realtime_start`, `value`; one row per published version of an
-    observation). Each observation date carries its latest version with
-    `realtime_start` strictly before `as_of_date`: FRED can publish after
-    the 16:00 ET close (the H.15 daily rates around 16:15 ET, VIXCLS the
-    next morning), so a version first published on `as_of_date` counts
-    from the next day. An observation with no version published by then
-    is left out.
+    observation).
+
+    A version is known at `known_at`, the later of its vintage date
+    (`realtime_start`) and its observation date, because a value cannot
+    be known before its own day ends. Each observation date carries its
+    latest version (by `realtime_start`) among those with `known_at`
+    strictly before `as_of_date`: FRED can publish after the 16:00 ET
+    close (the H.15 daily rates around 16:15 ET, VIXCLS the next
+    morning), so a version known on `as_of_date` counts from the next
+    day. An observation with no version known by then is left out.
 
     Returns a frame indexed by observation date (sorted and unique) with
-    columns `value` and `realtime_start` (the date that version was
-    published, datetime64), or `None` if no rows remain. Self-asserts
-    point-in-time on the date index before returning."""
+    columns `value`, `realtime_start` (the date that version was
+    published) and `known_at` (the date it became known), both
+    datetime64, or `None` if no rows remain. Self-asserts point-in-time
+    on the date index before returning."""
     _guard_data_end(as_of_date, "load_fred_vintages_from_lakehouse")
     return _fred_vintages(series_id, as_of_date)
 
@@ -1684,25 +1692,30 @@ def _fred_vintages(series_id: str, as_of_date: date) -> pd.DataFrame | None:
     """The query behind `load_fred_vintages_from_lakehouse`, without the
     `data_end` guard its public callers apply first."""
     query = f"""
-        SELECT date, value, realtime_start
+        SELECT date, value, realtime_start, known_at
         FROM (
-            SELECT date, value, realtime_start, ROW_NUMBER() OVER (
+            SELECT date, value, realtime_start, known_at, ROW_NUMBER() OVER (
                 PARTITION BY date
                 ORDER BY realtime_start DESC
             ) AS rn
-            FROM {_table_sql("fred_vintages")}
-            WHERE series_id = ? AND realtime_start < ? AND date <= ?
+            FROM (
+                SELECT date, value, realtime_start,
+                    GREATEST(realtime_start, date) AS known_at
+                FROM {_table_sql("fred_vintages")}
+                WHERE series_id = ?
+            )
+            WHERE known_at < ?
         )
         WHERE rn = 1
         ORDER BY date
     """
-    cutoff = as_of_date.isoformat()
-    frame = _query(query, [series_id, cutoff, cutoff])
+    frame = _query(query, [series_id, as_of_date.isoformat()])
     if frame.empty:
         return None
     frame["date"] = pd.to_datetime(frame["date"])
     frame["realtime_start"] = pd.to_datetime(frame["realtime_start"])
-    vintages = frame.set_index("date")[["value", "realtime_start"]]
+    frame["known_at"] = pd.to_datetime(frame["known_at"])
+    vintages = frame.set_index("date")[["value", "realtime_start", "known_at"]]
     assert_point_in_time(vintages, as_of_date)
     return vintages
 

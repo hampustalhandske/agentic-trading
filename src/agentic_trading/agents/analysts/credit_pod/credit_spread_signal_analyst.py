@@ -34,8 +34,9 @@ class CreditSpreadSignalAnalyst(AnalystAgent):
     2023-09-18 (an ICE licensing change, not a fetch bug — confirmed
     directly against FRED); this analyst is flat before that date
     regardless of `as_of_date`, not silently wrong. Every active signal's
-    `source_as_of` is the newest `realtime_start` among the spread
-    vintages in the trailing window."""
+    `source_as_of` is the newest `known_at` (the later of a vintage's
+    publication date and its observation date) among the spread vintages
+    in the trailing window."""
 
     agent_id: str = "credit_spread_signal_analyst"
     data_requirements: tuple[DataRequirement, ...] = Field(
@@ -79,7 +80,7 @@ class CreditSpreadSignalAnalyst(AnalystAgent):
                 rationale="insufficient credit-spread history for a z-score read",
                 status="unavailable",
             )
-        source_as_of = used["realtime_start"].max().date()
+        source_as_of = used["known_at"].max().date()
 
         mean = float(np.mean(window))
         std = float(np.std(window, ddof=1))

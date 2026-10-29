@@ -59,7 +59,8 @@ ALL_ANALYST_CLASSES = (
 def _fred_vintages(values: pd.Series) -> pd.DataFrame:
     """`values` as `load_fred_vintages_from_lakehouse` returns them, each observation first
     published the day after its date."""
-    return pd.DataFrame({"value": values, "realtime_start": values.index + pd.Timedelta(days=1)})
+    published = values.index + pd.Timedelta(days=1)
+    return pd.DataFrame({"value": values, "realtime_start": published, "known_at": published})
 
 
 def test_analysts_imports() -> None:

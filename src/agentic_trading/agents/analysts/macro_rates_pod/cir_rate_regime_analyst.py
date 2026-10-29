@@ -36,7 +36,8 @@ class CIRRateRegimeAnalyst(AnalystAgent):
     `_refit_cache.refit_interval_days` simulated days per asset — see
     `RefitCache`'s docstring.
 
-    Every active signal's `source_as_of` is the newest `realtime_start`
+    Every active signal's `source_as_of` is the newest `known_at` (the
+    later of a vintage's publication date and its observation date)
     among the DGS3MO vintages in the fitted window."""
 
     agent_id: str = "cir_rate_regime_analyst"
@@ -84,7 +85,7 @@ class CIRRateRegimeAnalyst(AnalystAgent):
                 rationale="insufficient rate history for a CIR regime read",
                 status="unavailable",
             )
-        source_as_of = window["realtime_start"].max().date()
+        source_as_of = window["known_at"].max().date()
 
         try:
             fitted = self._refit_cache.get_or_refit(

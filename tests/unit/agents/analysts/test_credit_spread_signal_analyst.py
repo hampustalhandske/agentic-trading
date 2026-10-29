@@ -19,7 +19,13 @@ def _patch_spread(monkeypatch, spread_series: pd.Series | None) -> None:
     vintages = (
         None
         if spread_series is None
-        else pd.DataFrame({"value": spread_series, "realtime_start": AS_OF - pd.Timedelta(days=1)})
+        else pd.DataFrame(
+            {
+                "value": spread_series,
+                "realtime_start": AS_OF - pd.Timedelta(days=1),
+                "known_at": AS_OF - pd.Timedelta(days=1),
+            }
+        )
     )
     monkeypatch.setattr(
         "agentic_trading.agents.analysts.credit_pod.credit_spread_signal_analyst."

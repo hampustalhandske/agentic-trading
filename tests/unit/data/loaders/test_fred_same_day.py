@@ -59,3 +59,38 @@ def test_fred_series_uses_vintages_published_before_as_of(fake_lake: Any) -> Non
         assert result.index.is_monotonic_increasing and result.index.is_unique
         read = {stamp.date().isoformat(): value for stamp, value in result.items()}
         assert read == pytest.approx(values), as_of
+
+
+def test_fred_value_is_known_from_the_later_of_its_vintage_and_its_observation(
+    fake_lake: Any,
+) -> None:
+    """A FRED value is known at `known_at = max(realtime_start, date)` and is used only when
+    `known_at` is strictly before `as_of_date`: a vintage stamped before its own observation date
+    (as on some VIXCLS rows) cannot reveal that day's value early, and a same-day vintage counts
+    from the next day. `known_at` is returned beside `realtime_start`."""
+    fake_lake.add(
+        "fred_vintages",
+        _vintages(
+            [
+                ("VIXCLS", "2020-03-09", "2020-03-09", 54.5),
+                ("VIXCLS", "2020-03-12", "2020-03-09", 75.5),
+            ]
+        ),
+        date_columns=_VINTAGE_DATES,
+    )
+    for as_of in (date(2020, 3, 9), date(2020, 3, 10), date(2020, 3, 11), date(2020, 3, 12)):
+        vintages = lakehouse_loader.load_fred_vintages_from_lakehouse("VIXCLS", as_of)
+        observed = set() if vintages is None else {s.date() for s in vintages.index}
+        assert date(2020, 3, 12) not in observed, as_of
+        if as_of > date(2020, 3, 9):
+            assert vintages is not None
+            assert observed == {date(2020, 3, 9)}, as_of
+        else:
+            assert vintages is None, as_of
+
+    vintages = lakehouse_loader.load_fred_vintages_from_lakehouse("VIXCLS", date(2020, 3, 13))
+    assert vintages is not None
+    known = {s.date(): k.date() for s, k in vintages["known_at"].items()}
+    assert known == {date(2020, 3, 9): date(2020, 3, 9), date(2020, 3, 12): date(2020, 3, 12)}
+    series = lakehouse_loader.load_fred_series_from_lakehouse("VIXCLS", date(2020, 3, 12))
+    assert series is not None and list(series.index.date) == [date(2020, 3, 9)]

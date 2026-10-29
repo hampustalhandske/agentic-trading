@@ -171,7 +171,12 @@ def test_load_fred_series_returns_valid_data(fake_lake: Any) -> None:
 def test_load_fred_series_raises_on_future_index_date(fake_lake: Any) -> None:
     """A date after as_of_date in the index is a broken SQL gate — must raise."""
     fake_lake.fixed_result = pd.DataFrame(
-        {"date": ["2024-01-20"], "value": [5.25], "realtime_start": ["2024-01-21"]}
+        {
+            "date": ["2024-01-20"],
+            "value": [5.25],
+            "realtime_start": ["2024-01-21"],
+            "known_at": ["2024-01-21"],
+        }
     )
 
     with pytest.raises(ValueError, match="2024-01-20"):

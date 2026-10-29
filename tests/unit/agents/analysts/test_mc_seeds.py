@@ -71,6 +71,7 @@ def _patch_cir(mod: Any, monkeypatch: pytest.MonkeyPatch, sim: Callable[..., Any
         {
             "value": 4.0 + np.random.default_rng(1).normal(0.0, 0.1, 400),
             "realtime_start": pd.Timestamp(_AS_OF) - pd.Timedelta(days=1),
+            "known_at": pd.Timestamp(_AS_OF) - pd.Timedelta(days=1),
         }
     )
     monkeypatch.setattr(mod, "load_fred_vintages_from_lakehouse", lambda *_a: rates)
