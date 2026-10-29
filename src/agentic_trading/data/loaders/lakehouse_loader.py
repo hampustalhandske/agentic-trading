@@ -168,12 +168,14 @@ class LakeSession(BaseModel):
     session first saw (`None` until a response carries one), and
     `rebuilt_whole_builds` maps each rebuilt-whole table in `READ_TABLES`
     that holds rows to its build time. The table metadata the reads are
-    shaped from is held privately for the life of the session."""
+    shaped from, and the set of tables a query has read, are held
+    privately for the life of the session."""
 
     lake_time: datetime
     lake_version: str | None = None
     rebuilt_whole_builds: dict[str, datetime] = {}
     _tables: dict[str, LakeTableMetadata] = PrivateAttr(default_factory=dict)
+    _read_tables: set[str] = PrivateAttr(default_factory=set)
 
     def row_time_pinned_tables(self) -> list[str]:
         """The tables in `READ_TABLES` this session pins on a row-time
@@ -307,19 +309,24 @@ def lake_session(lake_time: datetime | None = None) -> Iterator[LakeSession]:
 
 
 def verify_rebuilt_whole_builds() -> None:
-    """Checks that no table the open session reads at its current state
-    changed during the session, and raises `LakeTimeError` naming each one
-    that did. Those tables carry no `scraped_at` pin, so a change would
-    otherwise alter the data a run reads without an error: a rebuilt-whole
-    table is compared by its build (re-read from the table), a row-time
-    pinned table (`_ROW_TIME_PIN_COLUMNS`) by the `last_write` the lake
-    reports for it. Does nothing outside a session."""
+    """Checks that no table a query of the open session read at its
+    current state changed during the session, and raises `LakeTimeError`
+    naming each one that did. Those tables carry no `scraped_at` pin, so a
+    change would otherwise alter the data a run reads without an error: a
+    rebuilt-whole table is compared by its build (re-read from the table),
+    a row-time pinned table (`_ROW_TIME_PIN_COLUMNS`) by the `last_write`
+    the lake reports for it. A table no query read is not checked. Does
+    nothing outside a session."""
     session = _current_session()
     if session is None:
         return
+    with _SESSION_LOCK:
+        read = set(session._read_tables)
     lake = _lake()
     changed = []
     for table, metadata in sorted(session._tables.items()):
+        if table not in read:
+            continue
         if metadata.rebuilt_whole:
             recorded = session.rebuilt_whole_builds.get(table)
             current = _rebuilt_whole_build(lake, table)
@@ -391,9 +398,15 @@ def _table_sql(table: str) -> str:
     `JOIN`: the bare table name outside a session, and inside one the
     table as of the session's lake time (see the module docstring for the
     read shape per table). A pinned relation is a parenthesized subquery,
-    so a caller that qualifies columns gives it an alias."""
+    so a caller that qualifies columns gives it an alias. Inside a session
+    the table is recorded as read, for `verify_rebuilt_whole_builds`."""
     session = _current_session()
-    return table if session is None else _pinned_table_sql(session, table)
+    if session is None:
+        return table
+    relation = _pinned_table_sql(session, table)
+    with _SESSION_LOCK:
+        session._read_tables.add(table)
+    return relation
 
 
 def _record_version(session: LakeSession, version: str | None) -> None:

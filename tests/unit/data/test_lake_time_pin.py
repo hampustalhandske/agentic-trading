@@ -680,6 +680,7 @@ def test_a_rebuilt_whole_table_rebuilt_during_the_session_raises_at_the_check(
     _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
 
     with ll.lake_session(_T):
+        ll.split_adjustment_factor("AAPL", date(2024, 6, 3))
         ll.verify_rebuilt_whole_builds()
         _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.5, True)], "2024-05-25T00:00:00Z")
         with pytest.raises(ll.LakeTimeError, match="yahoo_split_close_basis") as error:
@@ -697,10 +698,12 @@ def test_closing_a_session_checks_the_builds_and_outside_one_the_check_is_a_no_o
 
     with pytest.raises(ll.LakeTimeError, match="yahoo_split_close_basis"):
         with ll.lake_session(_T):
+            ll.split_adjustment_factor("AAPL", date(2024, 6, 3))
             _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.5, True)], "2024-05-25T00:00:00Z")
     assert ll.current_lake_time() is None
 
     with pytest.raises(ZeroDivisionError), ll.lake_session(_T):
+        ll.split_adjustment_factor("AAPL", date(2024, 6, 3))
         _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.75, True)], "2024-05-30T00:00:00Z")
         raise ZeroDivisionError
     assert ll.current_lake_time() is None
@@ -711,9 +714,29 @@ def test_a_row_time_table_written_during_the_session_raises_at_the_check(fake_la
     _seed_klines(fake_lake)
 
     with ll.lake_session(_T):
+        ll.load_price_history_from_lakehouse(["BTC-USD"], date(2023, 1, 17), date(2023, 1, 17))
         ll.verify_rebuilt_whole_builds()
         fake_lake.last_write_overrides["crypto_klines_1m"] = "2024-06-02T00:00:00Z"
         with pytest.raises(ll.LakeTimeError, match="crypto_klines_1m") as error:
             ll.verify_rebuilt_whole_builds()
         fake_lake.last_write_overrides.clear()
     assert "last write" in str(error.value)
+
+
+def test_the_check_covers_only_tables_the_session_read(fake_lake: Any) -> None:
+    """A table the session never read may change without failing the check; once a query has
+    read a table, a change to it fails the check, naming only that table."""
+    _seed_klines(fake_lake)
+    _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
+
+    with ll.lake_session(_T):
+        ll.split_adjustment_factor("AAPL", date(2024, 6, 3))
+        fake_lake.last_write_overrides["crypto_klines_1m"] = "2024-06-02T00:00:00Z"
+        ll.verify_rebuilt_whole_builds()
+
+        _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.5, True)], "2024-05-25T00:00:00Z")
+        with pytest.raises(ll.LakeTimeError, match="yahoo_split_close_basis") as error:
+            ll.verify_rebuilt_whole_builds()
+        _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
+        fake_lake.last_write_overrides.clear()
+    assert "crypto_klines_1m" not in str(error.value)
