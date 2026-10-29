@@ -126,7 +126,7 @@ def test_loader_past_data_end_raises_before_querying(name: str, fake_lake: Any) 
     loader = getattr(ll, name)
     fake_lake.error = AssertionError(f"{name} queried the lake past data_end")
 
-    with ll.lake_session(_T, data_end=_DATA_END), pytest.raises(ll.HoldoutReadError):
+    with pytest.raises(ll.HoldoutReadError), ll.lake_session(_T, data_end=_DATA_END):
         loader(**_arguments(loader))
 
     assert fake_lake.calls == []
@@ -170,7 +170,32 @@ def test_price_history_with_fallback_past_data_end_raises(fake_lake: Any) -> Non
     """The CLI's price entry point raises HoldoutReadError for an end after data_end, unqueried."""
     fake_lake.error = AssertionError("queried the lake past data_end")
 
-    with ll.lake_session(_T, data_end=_DATA_END), pytest.raises(ll.HoldoutReadError):
+    with pytest.raises(ll.HoldoutReadError), ll.lake_session(_T, data_end=_DATA_END):
         load_price_history_with_fallback(["AAPL"], date(2024, 12, 2), _PAST_END)
 
     assert fake_lake.calls == []
+
+
+def test_a_swallowed_holdout_read_still_fails_the_session(fake_lake: Any) -> None:
+    """A HoldoutReadError caught inside the block (as a manager's broad `except` would) is
+    recorded on the session, and the opening `lake_session` raises it when the block ends."""
+    fake_lake.error = AssertionError("queried the lake past data_end")
+
+    with (
+        pytest.raises(ll.HoldoutReadError, match="load_fred_series_from_lakehouse"),
+        ll.lake_session(_T, data_end=_DATA_END) as session,
+    ):
+        try:
+            ll.load_fred_series_from_lakehouse("DGS10", _PAST_END)
+        except Exception:
+            pass
+        assert len(session.holdout_violations) == 1
+
+    assert fake_lake.calls == []
+
+
+def test_a_session_with_no_holdout_read_closes_cleanly(preflight_lake: Any) -> None:
+    """Reads at or before data_end leave no violation, and the session closes without error."""
+    with ll.lake_session(_T, data_end=_DATA_END) as session:
+        ll.load_fred_series_from_lakehouse("DGS10", _DATA_END)
+        assert session.holdout_violations == []

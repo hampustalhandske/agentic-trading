@@ -175,16 +175,18 @@ class LakeSession(BaseModel):
     `lake_time` is T (UTC), `data_end` the last knowledge-time date a
     loader may be asked for (`None`: no cut; see `_guard_data_end`),
     `lake_version` the `X-Lakehouse-Version` the session first saw
-    (`None` until a response carries one), and `rebuilt_whole_builds` maps
+    (`None` until a response carries one), `rebuilt_whole_builds` maps
     each rebuilt-whole table in `READ_TABLES` that holds rows to its build
-    time. The table metadata the reads are shaped from, and the set of
-    tables a query has read, are held privately for the life of the
-    session."""
+    time, and `holdout_violations` lists the message of every read refused
+    past `data_end`, kept even when the caller catches the error. The
+    table metadata the reads are shaped from, and the set of tables a
+    query has read, are held privately for the life of the session."""
 
     lake_time: datetime
     data_end: date | None = None
     lake_version: str | None = None
     rebuilt_whole_builds: dict[str, datetime] = {}
+    holdout_violations: list[str] = []
     _tables: dict[str, LakeTableMetadata] = PrivateAttr(default_factory=dict)
     _read_tables: set[str] = PrivateAttr(default_factory=set)
 
@@ -234,10 +236,13 @@ def _guard_data_end(knowledge_time: date, loader: str) -> None:
         return
     day = knowledge_time.date() if isinstance(knowledge_time, datetime) else knowledge_time
     if day > session.data_end:
-        raise HoldoutReadError(
+        message = (
             f"{loader} was asked for data known at {day.isoformat()}, after the session's "
             f"data_end {session.data_end.isoformat()}"
         )
+        with _SESSION_LOCK:
+            session.holdout_violations.append(message)
+        raise HoldoutReadError(message)
 
 
 def _utc(value: Any) -> datetime | None:
@@ -336,7 +341,9 @@ def lake_session(
     session's, and one whose `data_end` differs from the open session's
     (including a session opened without one) raises `LakeTimeError`. Only
     the call that opened the session closes it, and when its block ends
-    without an error it first runs `verify_rebuilt_whole_builds`."""
+    without an error it first raises `HoldoutReadError` if any read was
+    refused past `data_end` (a caller's `except` cannot hide one), then
+    runs `verify_rebuilt_whole_builds`."""
     global _SESSION
     if lake_time is not None and lake_time.utcoffset() is None:
         raise ValueError(
@@ -364,6 +371,11 @@ def lake_session(
     try:
         yield session
         if opened:
+            if session.holdout_violations:
+                raise HoldoutReadError(
+                    f"{len(session.holdout_violations)} read(s) past data_end in this session: "
+                    + "; ".join(session.holdout_violations)
+                )
             verify_rebuilt_whole_builds()
     finally:
         if opened:
