@@ -69,7 +69,11 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
     `load_fixed_universe_returns()`, independent of whatever assets the
     current backtest's own `market_data` happens to include) only when
     the lakehouse can't resolve real membership or too few names have
-    usable history."""
+    usable history.
+
+    An active signal's `source_as_of` is the latest reference date: S&P
+    500 membership changes are announced before they take effect, so the
+    newest data the graph rests on is its latest price bar."""
 
     agent_id: str = "lead_lag_network_centrality_analyst"
     data_requirements: tuple[DataRequirement, ...] = (
@@ -251,4 +255,5 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
                 f"across {len(kept)} of {len(universe)} universe names {kept}"
             ),
             sample_count=len(reference_dates),
+            source_as_of=reference_dates[-1].date(),
         )

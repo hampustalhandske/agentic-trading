@@ -11,7 +11,7 @@ from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import (
     DEFAULT_COT_LOOKBACK_DAYS,
     DEFAULT_COT_TICKER_BY_ASSET,
-    load_cot_positioning_from_lakehouse,
+    load_cot_reports_from_lakehouse,
 )
 from agentic_trading.logging_config import get_logger
 
@@ -26,7 +26,7 @@ class COTPositioningAnalyst(AnalystAgent):
     macro/commodity desks build from CFTC Commitment of Traders reports:
     z-scores net speculative positioning (managed-money net for
     commodities, leveraged-funds net for FX/rate futures, as a fraction
-    of open interest — see `load_cot_positioning_from_lakehouse`) against
+    of open interest — see `load_cot_reports_from_lakehouse`) against
     its own trailing window. Extreme net-long positioning is treated as
     contrarian-bearish (a crowded long is exposed to unwind risk), extreme
     net-short as contrarian-bullish — not a trend-following read.
@@ -37,7 +37,11 @@ class COTPositioningAnalyst(AnalystAgent):
     `lakehouse_loader.DEFAULT_COT_TICKER_BY_ASSET`, the mapping the
     preflight coverage check also resolves through); defaults to `asset`
     itself, which already matches COT's own ticker convention for
-    commodities and FX."""
+    commodities and FX.
+
+    Every active signal's `source_as_of` is the CFTC release date of the
+    newest report in the trailing window, the date the report was
+    published rather than the possibly later date it became usable."""
 
     agent_id: str = "cot_positioning_analyst"
     data_requirements: tuple[DataRequirement, ...] = (
@@ -77,8 +81,8 @@ class COTPositioningAnalyst(AnalystAgent):
                 rationale=f"{asset} is outside this instance's COT asset class",
                 status="unavailable",
             )
-        series = load_cot_positioning_from_lakehouse(cot_ticker, as_of_date.date())
-        if series is None:
+        reports = load_cot_reports_from_lakehouse(cot_ticker, as_of_date.date())
+        if reports is None:
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
@@ -89,7 +93,8 @@ class COTPositioningAnalyst(AnalystAgent):
                 status="unavailable",
             )
 
-        window = series.to_numpy(dtype=np.float64)[-_RISK_WINDOW:]
+        used = reports.iloc[-_RISK_WINDOW:]
+        window = used["net_positioning_ratio"].to_numpy(dtype=np.float64)
         if window.size < _MIN_OBSERVATIONS:
             return AgentSignal(
                 agent_id=self.agent_id,
@@ -134,4 +139,5 @@ class COTPositioningAnalyst(AnalystAgent):
                 f"COT net positioning z-score={z_score:.2f} for {cot_ticker} "
                 f"vs its own {_RISK_WINDOW}-report trailing window"
             ),
+            source_as_of=used["published_date"].max().date(),
         )

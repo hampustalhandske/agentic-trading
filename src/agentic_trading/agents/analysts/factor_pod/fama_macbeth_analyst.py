@@ -17,6 +17,7 @@ from agentic_trading.agents._market_math import (
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, calendar_days_for_sessions
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import (
+    ken_french_public_date,
     load_fama_french_factors_from_lakehouse,
     load_price_history_from_lakehouse,
     load_security_log_returns,
@@ -67,7 +68,12 @@ class FamaMacbethAnalyst(AnalystAgent):
     original methodology and institutional usage both run it), which a
     handful of megacaps cannot provide regardless of which five are
     picked. Falls back to `self.universe` (a small static list) only if
-    the lakehouse is unreachable that day."""
+    the lakehouse is unreachable that day.
+
+    An active signal's `source_as_of` is the public date
+    (`ken_french_public_date`) of the newest factor row the regression
+    used. The price bars are known at the close of their own date, on or
+    before `as_of_date`, so they do not move it."""
 
     agent_id: str = "fama_macbeth_analyst"
 
@@ -196,6 +202,7 @@ class FamaMacbethAnalyst(AnalystAgent):
                 f"{len(universe)} names dropped for a missing date)"
             ),
             sample_count=len(joined),
+            source_as_of=ken_french_public_date(joined.index.max().date()),
         )
 
     def _insufficient_history(self, asset: str, as_of_date: pd.Timestamp) -> AgentSignal:

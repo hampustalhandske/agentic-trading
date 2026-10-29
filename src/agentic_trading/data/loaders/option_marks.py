@@ -129,7 +129,7 @@ def _query_chain(underlying: str, as_of_date: date) -> pd.DataFrame | None:
 
 def _query_rate(as_of_date: date) -> float:
     """Annual risk-free rate as a fraction, from the latest DGS3MO
-    observation published on or before `as_of_date`.
+    observation published before `as_of_date`.
 
     Raises `ValueError` naming the series and `as_of_date` when no such
     observation exists."""
@@ -138,8 +138,8 @@ def _query_rate(as_of_date: date) -> float:
         series = series.dropna()
     if series is None or series.empty:
         raise ValueError(
-            f"lakehouse has no FRED {_RATE_SERIES_ID} observation published on or "
-            f"before {as_of_date.isoformat()}; option marks need a risk-free rate"
+            f"lakehouse has no FRED {_RATE_SERIES_ID} observation published before "
+            f"{as_of_date.isoformat()}; option marks need a risk-free rate"
         )
     return float(series.iloc[-1]) / 100.0
 

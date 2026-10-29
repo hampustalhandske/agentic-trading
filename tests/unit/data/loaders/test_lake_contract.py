@@ -48,6 +48,12 @@ _EMPTY_CASES: dict[str, Callable[[], Any]] = {
     "load_cot_positioning_from_lakehouse[tff]": lambda: (
         lakehouse_loader.load_cot_positioning_from_lakehouse("EURUSD=X", _AS_OF)
     ),
+    "load_cot_reports_from_lakehouse[disaggregated]": lambda: (
+        lakehouse_loader.load_cot_reports_from_lakehouse("GC=F", _AS_OF)
+    ),
+    "load_cot_reports_from_lakehouse[tff]": lambda: (
+        lakehouse_loader.load_cot_reports_from_lakehouse("EURUSD=X", _AS_OF)
+    ),
     "load_dividends_from_lakehouse": lambda: lakehouse_loader.load_dividends_from_lakehouse(
         "AAPL", _AS_OF
     ),
@@ -62,6 +68,9 @@ _EMPTY_CASES: dict[str, Callable[[], Any]] = {
         "AAPL", _AS_OF, 10
     ),
     "load_fred_series_from_lakehouse": lambda: lakehouse_loader.load_fred_series_from_lakehouse(
+        "DGS3MO", _AS_OF
+    ),
+    "load_fred_vintages_from_lakehouse": lambda: lakehouse_loader.load_fred_vintages_from_lakehouse(
         "DGS3MO", _AS_OF
     ),
     "load_fama_french_factors_from_lakehouse[3factor]": lambda: (

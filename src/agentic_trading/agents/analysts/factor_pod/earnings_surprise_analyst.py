@@ -35,7 +35,8 @@ class EarningsSurpriseAnalyst(AnalystAgent):
 
     Point-in-time: the announcement date used to gate this is the real
     date from `dolthub_earnings_calendar`, not an estimated lag — see
-    the loader's own docstring. Confidence decays linearly to zero as
+    the loader's own docstring — and is every active signal's
+    `source_as_of`. Confidence decays linearly to zero as
     `as_of_date` moves from the announcement date to
     `_DRIFT_WINDOW_DAYS` afterward, so the signal fades out rather than
     persisting at full strength indefinitely."""
@@ -70,6 +71,7 @@ class EarningsSurpriseAnalyst(AnalystAgent):
             )
 
         reported, estimate, announcement_date = result
+        source_as_of = announcement_date.date()
         days_since_announcement = (as_of_date - announcement_date).days
         if days_since_announcement > _DRIFT_WINDOW_DAYS:
             return AgentSignal(
@@ -82,6 +84,7 @@ class EarningsSurpriseAnalyst(AnalystAgent):
                     f"most recent earnings surprise is {days_since_announcement}d old — "
                     f"beyond the {_DRIFT_WINDOW_DAYS}d PEAD window"
                 ),
+                source_as_of=source_as_of,
             )
 
         if abs(estimate) < _MIN_ESTIMATE_MAGNITUDE:
@@ -117,4 +120,5 @@ class EarningsSurpriseAnalyst(AnalystAgent):
                 f"EPS surprise={surprise_ratio:+.1%} (reported={reported:.2f} vs "
                 f"estimate={estimate:.2f}), {days_since_announcement}d post-announcement"
             ),
+            source_as_of=source_as_of,
         )

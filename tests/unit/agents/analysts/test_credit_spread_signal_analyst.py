@@ -14,10 +14,17 @@ MARKET_DATA = pd.DataFrame({"close": [100.0], "log_return": [0.0]}, index=[AS_OF
 
 
 def _patch_spread(monkeypatch, spread_series: pd.Series | None) -> None:
+    """Serves `spread_series` as the spread's FRED vintages, each published the day before
+    AS_OF; `None` as no coverage."""
+    vintages = (
+        None
+        if spread_series is None
+        else pd.DataFrame({"value": spread_series, "realtime_start": AS_OF - pd.Timedelta(days=1)})
+    )
     monkeypatch.setattr(
         "agentic_trading.agents.analysts.credit_pod.credit_spread_signal_analyst."
-        "load_fred_series_from_lakehouse",
-        lambda _series_id, _as_of_date: spread_series,
+        "load_fred_vintages_from_lakehouse",
+        lambda _series_id, _as_of_date: vintages,
     )
 
 

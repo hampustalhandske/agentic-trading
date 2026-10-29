@@ -9,7 +9,7 @@ from pydantic import Field
 from agentic_trading.agents._market_math import clamp
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, calendar_days_for_sessions
 from agentic_trading.agents.schemas import AgentSignal
-from agentic_trading.data.loaders.lakehouse_loader import load_fred_series_from_lakehouse
+from agentic_trading.data.loaders.lakehouse_loader import load_fred_vintages_from_lakehouse
 from agentic_trading.data.loaders.macro_loader import BAMLH0A0HYM2
 from agentic_trading.logging_config import get_logger
 
@@ -33,7 +33,9 @@ class CreditSpreadSignalAnalyst(AnalystAgent):
     section). `BAMLH0A0HYM2` itself only has free history back to
     2023-09-18 (an ICE licensing change, not a fetch bug — confirmed
     directly against FRED); this analyst is flat before that date
-    regardless of `as_of_date`, not silently wrong."""
+    regardless of `as_of_date`, not silently wrong. Every active signal's
+    `source_as_of` is the newest `realtime_start` among the spread
+    vintages in the trailing window."""
 
     agent_id: str = "credit_spread_signal_analyst"
     data_requirements: tuple[DataRequirement, ...] = Field(
@@ -54,8 +56,8 @@ class CreditSpreadSignalAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        spread_history = load_fred_series_from_lakehouse(BAMLH0A0HYM2, as_of_date.date())
-        if spread_history is None:
+        vintages = load_fred_vintages_from_lakehouse(BAMLH0A0HYM2, as_of_date.date())
+        if vintages is None:
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
@@ -65,9 +67,8 @@ class CreditSpreadSignalAnalyst(AnalystAgent):
                 rationale="no FRED BAMLH0A0HYM2 coverage in the lakehouse",
                 status="unavailable",
             )
-        spread_series = spread_history.dropna().to_numpy(dtype=np.float64)
-
-        window = spread_series[-_RISK_WINDOW:]
+        used = vintages.dropna(subset=["value"]).iloc[-_RISK_WINDOW:]
+        window = used["value"].to_numpy(dtype=np.float64)
         if window.size < _MIN_OBSERVATIONS:
             return AgentSignal(
                 agent_id=self.agent_id,
@@ -78,6 +79,7 @@ class CreditSpreadSignalAnalyst(AnalystAgent):
                 rationale="insufficient credit-spread history for a z-score read",
                 status="unavailable",
             )
+        source_as_of = used["realtime_start"].max().date()
 
         mean = float(np.mean(window))
         std = float(np.std(window, ddof=1))
@@ -89,6 +91,7 @@ class CreditSpreadSignalAnalyst(AnalystAgent):
                 direction="flat",
                 confidence=0.0,
                 rationale="zero trailing variance in the credit-spread window",
+                source_as_of=source_as_of,
             )
 
         z_score = (float(window[-1]) - mean) / std
@@ -110,4 +113,5 @@ class CreditSpreadSignalAnalyst(AnalystAgent):
             rationale=(
                 f"HY OAS spread z-score={z_score:.2f} vs its own {_RISK_WINDOW}d trailing window"
             ),
+            source_as_of=source_as_of,
         )

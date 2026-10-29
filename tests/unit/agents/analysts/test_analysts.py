@@ -56,6 +56,12 @@ ALL_ANALYST_CLASSES = (
 )
 
 
+def _fred_vintages(values: pd.Series) -> pd.DataFrame:
+    """`values` as `load_fred_vintages_from_lakehouse` returns them, each observation first
+    published the day after its date."""
+    return pd.DataFrame({"value": values, "realtime_start": values.index + pd.Timedelta(days=1)})
+
+
 def test_analysts_imports() -> None:
     for analyst_cls in ALL_ANALYST_CLASSES:
         assert analyst_cls.__name__
@@ -83,8 +89,8 @@ def test_macro_var_spillover_drops_non_finite_rows(monkeypatch) -> None:
 
     monkeypatch.setattr(
         "agentic_trading.agents.analysts.macro_rates_pod.macro_var_spillover_analyst."
-        "load_fred_series_from_lakehouse",
-        lambda _series_id, _as_of_date: macro,
+        "load_fred_vintages_from_lakehouse",
+        lambda _series_id, _as_of_date: _fred_vintages(macro),
     )
     signal = MacroVarSpilloverAnalyst(use_yield_curve_slope=False).generate_signal(
         "AAPL", market_data, dates[-1]
@@ -675,8 +681,8 @@ def test_cir_rate_regime_falls_back_to_flat_on_trending_rates(monkeypatch) -> No
 
     monkeypatch.setattr(
         "agentic_trading.agents.analysts.macro_rates_pod.cir_rate_regime_analyst."
-        "load_fred_series_from_lakehouse",
-        lambda _series_id, _as_of_date: trending_rates,
+        "load_fred_vintages_from_lakehouse",
+        lambda _series_id, _as_of_date: _fred_vintages(trending_rates),
     )
     signal = CIRRateRegimeAnalyst().generate_signal("AAPL", market_data, dates[-1])
 
@@ -701,7 +707,9 @@ def test_cir_rate_regime_uses_real_mle_fitted_parameters(monkeypatch) -> None:
         3.0 + 0.3 * np.sin(np.linspace(0, 6 * np.pi, 60)) + rng.normal(0.0, 0.02, 60),
         index=dates,
     )
-    monkeypatch.setattr(mod, "load_fred_series_from_lakehouse", lambda *_: mean_reverting_rates)
+    monkeypatch.setattr(
+        mod, "load_fred_vintages_from_lakehouse", lambda *_: _fred_vintages(mean_reverting_rates)
+    )
 
     captured: dict[str, float] = {}
     real_fn = mod.simulate_cir_paths
@@ -847,8 +855,8 @@ def test_macro_var_spillover_handles_solver_failure(monkeypatch) -> None:
 
     monkeypatch.setattr(
         "agentic_trading.agents.analysts.macro_rates_pod.macro_var_spillover_analyst."
-        "load_fred_series_from_lakehouse",
-        lambda _series_id, _as_of_date: macro,
+        "load_fred_vintages_from_lakehouse",
+        lambda _series_id, _as_of_date: _fred_vintages(macro),
     )
     monkeypatch.setattr(
         "agentic_trading.agents.analysts.macro_rates_pod.macro_var_spillover_analyst.granger_causality_test",
@@ -878,7 +886,7 @@ def test_macro_var_spillover_selects_lag_order_via_aic_by_default(monkeypatch) -
         index=dates,
     )
     macro = pd.Series(rng.normal(20.0, 2.0, size=90), index=dates)
-    monkeypatch.setattr(mod, "load_fred_series_from_lakehouse", lambda *_: macro)
+    monkeypatch.setattr(mod, "load_fred_vintages_from_lakehouse", lambda *_: _fred_vintages(macro))
 
     captured: dict[str, int] = {}
     real_select = mod.select_var_lag_order

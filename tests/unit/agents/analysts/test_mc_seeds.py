@@ -67,8 +67,13 @@ def _patch_gbm(mod: Any, monkeypatch: pytest.MonkeyPatch, sim: Callable[..., Any
 
 
 def _patch_cir(mod: Any, monkeypatch: pytest.MonkeyPatch, sim: Callable[..., Any]) -> None:
-    rates = pd.Series(4.0 + np.random.default_rng(1).normal(0.0, 0.1, 400))
-    monkeypatch.setattr(mod, "load_fred_series_from_lakehouse", lambda *_a: rates)
+    rates = pd.DataFrame(
+        {
+            "value": 4.0 + np.random.default_rng(1).normal(0.0, 0.1, 400),
+            "realtime_start": pd.Timestamp(_AS_OF) - pd.Timedelta(days=1),
+        }
+    )
+    monkeypatch.setattr(mod, "load_fred_vintages_from_lakehouse", lambda *_a: rates)
     monkeypatch.setattr(
         mod, "cir_fit", lambda *_a: SimpleNamespace(kappa=1.0, theta=0.04, sigma=0.05)
     )

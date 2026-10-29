@@ -83,9 +83,11 @@ def _signal(
 
 
 def _rates_day(day: date, shy_as_of: date | None = None) -> list[AgentSignal]:
-    """SHY long 0.6 on FRED of `shy_as_of` (default the day), IEF short 0.2, TLT unavailable."""
+    """SHY long 0.6 on FRED of `shy_as_of` (default two days before), IEF short 0.2, TLT
+    unavailable."""
+    shy_known = shy_as_of or day - timedelta(days=2)
     return [
-        _signal("SHY", day, "long", 0.6, source_as_of=shy_as_of or day, sample_count=250),
+        _signal("SHY", day, "long", 0.6, source_as_of=shy_known, sample_count=250),
         _signal("IEF", day, "short", 0.2, source_as_of=day - timedelta(days=1), sample_count=249),
         _signal("TLT", day, "flat", 0.0, status="unavailable"),
     ]
@@ -126,7 +128,7 @@ def _is_text(kind: pa.DataType) -> bool:
 def test_open_writes_spec_and_sources(tmp_path: Path) -> None:
     """open() writes spec.json and the row sources' after-close flags, and reopens unchanged."""
     analysts: list[tuple[AnalystAgent, dict[str, str], list[dict[str, Any]]]] = [
-        (CIRRateRegimeAnalyst(), _RATE_IDS, [{"name": "fred", "after_close": False}]),
+        (CIRRateRegimeAnalyst(), _RATE_IDS, [{"name": "fred", "after_close": True}]),
         (EarningsSurpriseAnalyst(), _EQUITY_IDS, [{"name": "earnings", "after_close": True}]),
         (GBMMomentumAnalyst(), _RATE_IDS, []),
     ]
@@ -166,7 +168,7 @@ def test_open_refuses_a_changed_record(tmp_path: Path) -> None:
 def test_write_day_rows(tmp_path: Path) -> None:
     """write_day appends one signal and one decision row per instrument and records progress."""
     store, trial = _open(tmp_path)
-    day, previous = _DAYS[0], _DAYS[0] - timedelta(days=1)
+    day, previous, two_before = _DAYS[0], _DAYS[0] - timedelta(days=1), _DAYS[0] - timedelta(days=2)
     assert store.last_completed() is None
     store.write_day(day, _rates_day(day), _RATE_IDS, "equity")
     signals, decisions = _rows(trial / "signals.parquet"), _rows(trial / "decisions.parquet")
@@ -176,12 +178,12 @@ def test_write_day_rows(tmp_path: Path) -> None:
     assert all(set(row) == set(_DECISION_COLUMNS) for row in decisions)
     assert [tuple(row[column] for column in _SIGNAL_COLUMNS) for row in signals] == [
         (day, "IEF", "active", "short", 0.2, previous, 249),
-        (day, "SHY", "active", "long", 0.6, day, 250),
+        (day, "SHY", "active", "long", 0.6, two_before, 250),
         (day, "TLT", "unavailable", "flat", 0.0, None, None),
     ]
     assert [tuple(row[column] for column in decision_fields) for row in decisions] == [
         (day, "equity", "IEF", "active", "fred", previous),
-        (day, "equity", "SHY", "active", "fred", day),
+        (day, "equity", "SHY", "active", "fred", two_before),
         (day, "equity", "TLT", "unavailable", None, None),
     ]
     assert [row["target_weight"] for row in decisions] == pytest.approx([-0.25, 0.75, 0.0])
@@ -244,16 +246,23 @@ def test_write_day_refuses_out_of_order(tmp_path: Path) -> None:
 def test_counts(tmp_path: Path) -> None:
     """Per-instrument status day counts and annual turnover, the first day measured from 0."""
     store, trial = _open(tmp_path)
+    fred = [day - timedelta(days=1) for day in _DAYS]
     days = [
-        [_signal("SHY", _DAYS[0], "long", 0.5), _signal("IEF", _DAYS[0], "short", 0.5)],
         [
-            _signal("SHY", _DAYS[1], "long", 1.0),
+            _signal("SHY", _DAYS[0], "long", 0.5, source_as_of=fred[0]),
+            _signal("IEF", _DAYS[0], "short", 0.5, source_as_of=fred[0]),
+        ],
+        [
+            _signal("SHY", _DAYS[1], "long", 1.0, source_as_of=fred[1]),
             _signal("IEF", _DAYS[1], "flat", 0.0, status="unavailable"),
         ],
-        [_signal("SHY", _DAYS[2], "long", 0.3), _signal("IEF", _DAYS[2], "long", 0.1)],
+        [
+            _signal("SHY", _DAYS[2], "long", 0.3, source_as_of=fred[2]),
+            _signal("IEF", _DAYS[2], "long", 0.1, source_as_of=fred[2]),
+        ],
         [
             _signal("SHY", _DAYS[3], "flat", 0.0, status="error"),
-            _signal("IEF", _DAYS[3], "short", 0.2),
+            _signal("IEF", _DAYS[3], "short", 0.2, source_as_of=fred[3]),
         ],
     ]
     for day, signals in zip(_DAYS, days, strict=True):

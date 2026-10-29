@@ -37,17 +37,17 @@ def _cpi_vintages() -> pd.DataFrame:
 @pytest.mark.parametrize(
     ("as_of", "expected"),
     [
-        (date(2022, 7, 12), None),
-        (date(2022, 7, 13), 296.311),
-        (date(2023, 2, 13), 296.311),
-        (date(2023, 2, 14), 295.328),
+        (date(2022, 7, 13), None),
+        (date(2022, 7, 14), 296.311),
+        (date(2023, 2, 14), 296.311),
+        (date(2023, 2, 15), 295.328),
         (date(2023, 3, 1), 295.328),
     ],
 )
 def test_fred_series_uses_latest_version_published_by_as_of(
     fake_lake: Any, as_of: date, expected: float | None
 ) -> None:
-    """Each observation carries the value of its latest version with realtime_start <= as_of."""
+    """Each observation carries the value of its latest version with realtime_start < as_of."""
     fake_lake.add("fred_vintages", _cpi_vintages(), date_columns=_VINTAGE_DATES)
 
     result = lakehouse_loader.load_fred_series_from_lakehouse("CPIAUCSL", as_of)
@@ -64,12 +64,12 @@ def test_fred_series_uses_latest_version_published_by_as_of(
 
 
 @pytest.mark.parametrize(
-    ("as_of", "present"), [(date(2010, 3, 1), False), (date(2010, 3, 2), True)]
+    ("as_of", "present"), [(date(2010, 3, 2), False), (date(2010, 3, 3), True)]
 )
 def test_fred_series_excludes_observation_until_published(
     fake_lake: Any, as_of: date, present: bool
 ) -> None:
-    """An observation appears only once its first version's realtime_start has been reached."""
+    """An observation appears only from the day after its first version's realtime_start."""
     fake_lake.add(
         "fred_vintages",
         _vintages(

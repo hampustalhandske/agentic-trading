@@ -1201,7 +1201,21 @@ def load_cot_positioning_from_lakehouse(
     ticker: str, as_of_date: date, lookback_days: int = DEFAULT_COT_LOOKBACK_DAYS
 ) -> pd.Series | None:
     """Net speculative positioning as a fraction of open interest, from
-    CFTC Commitment of Traders reports — `managed_money_long -
+    CFTC Commitment of Traders reports: the `net_positioning_ratio`
+    column of `load_cot_reports_from_lakehouse`, indexed by
+    `report_date`. Returns `None` if `ticker` has no COT report available
+    by `as_of_date`."""
+    _guard_data_end(as_of_date, "load_cot_positioning_from_lakehouse")
+    reports = _cot_reports(ticker, as_of_date, lookback_days)
+    return None if reports is None else reports["net_positioning_ratio"]
+
+
+def load_cot_reports_from_lakehouse(
+    ticker: str, as_of_date: date, lookback_days: int = DEFAULT_COT_LOOKBACK_DAYS
+) -> pd.DataFrame | None:
+    """The CFTC Commitment of Traders reports for `ticker` available at
+    the close of `as_of_date`, dated within `lookback_days` calendar days
+    before it. Net speculative positioning is `managed_money_long -
     managed_money_short` (the disaggregated report's commodity category)
     for commodities, `leveraged_funds_long - leveraged_funds_short` (the
     TFF report's closest equivalent) for FX/rates, divided by
@@ -1217,11 +1231,19 @@ def load_cot_positioning_from_lakehouse(
     with no publication row, or a null `published_date` (every report
     before 2000), is never available.
 
-    Returns `None` if `ticker` has no COT coverage at all — callers
-    should treat that as "no positioning read available," not an
-    empty-but-valid series. Self-asserts point-in-time on the
-    `report_date` index before returning."""
-    _guard_data_end(as_of_date, "load_cot_positioning_from_lakehouse")
+    Returns a frame indexed by `report_date` (datetime64, ascending) with
+    columns `net_positioning_ratio` and `published_date` (the CFTC
+    release date, datetime64), or `None` if `ticker` has no COT coverage
+    at all — callers should treat that as "no positioning read
+    available," not an empty-but-valid frame. Self-asserts point-in-time
+    on the `report_date` index before returning."""
+    _guard_data_end(as_of_date, "load_cot_reports_from_lakehouse")
+    return _cot_reports(ticker, as_of_date, lookback_days)
+
+
+def _cot_reports(ticker: str, as_of_date: date, lookback_days: int) -> pd.DataFrame | None:
+    """The query behind `load_cot_reports_from_lakehouse`, without the
+    `data_end` guard its public callers apply first."""
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
     availability_cutoff = as_of_date.isoformat()
     queries = [
@@ -1242,7 +1264,8 @@ def load_cot_positioning_from_lakehouse(
             continue
         query = f"""
             SELECT cot.report_date,
-                   {net_position_expr} / cot.open_interest_all AS net_positioning_ratio
+                   {net_position_expr} / cot.open_interest_all AS net_positioning_ratio,
+                   pub.published_date
             FROM {_table_sql(table)} AS cot
             JOIN {_table_sql("cftc_cot_publication")} AS pub ON pub.report_date = cot.report_date
             WHERE cot.cftc_contract_market_code = ?
@@ -1260,9 +1283,10 @@ def load_cot_positioning_from_lakehouse(
         )
         if not frame.empty:
             frame["report_date"] = pd.to_datetime(frame["report_date"])
-            series = frame.set_index("report_date")["net_positioning_ratio"]
-            assert_point_in_time(series, as_of_date)
-            return series
+            frame["published_date"] = pd.to_datetime(frame["published_date"])
+            reports = frame.set_index("report_date")[["net_positioning_ratio", "published_date"]]
+            assert_point_in_time(reports, as_of_date)
+            return reports
     return None
 
 
@@ -1306,13 +1330,15 @@ def load_earnings_surprise_from_lakehouse(
     """The most recent real EPS surprise for `ticker` known at the close
     of `as_of_date`: `(reported, estimate, announcement_date)` for the
     quarter with the latest announcement (`dolthub_earnings_calendar.
-    date`) available by then. An announcement whose `when` is "Before
-    market open" is available on its date; "After market close" or a
-    NULL `when` makes it available the next NYSE session. The returned
-    `announcement_date` is the calendar date itself. Joins the two
-    tables on a 75-day window after `dolthub_eps_history.period_end_date`
-    — a generous margin around the typical ~29-30 day real reporting
-    lag, not a tight estimate.
+    date`) available by then. Every announcement is available from the
+    next NYSE session after its date, whatever its `when` ("Before
+    market open" included): `earnings` can publish after the close
+    (`stage_a.decisions.SOURCES`), and the announcement date is the
+    signal's date-only publication date, which must fall before the
+    decision date. The returned `announcement_date` is the calendar date
+    itself. Joins the two tables on a 75-day window after
+    `dolthub_eps_history.period_end_date` — a generous margin around the
+    typical ~29-30 day real reporting lag, not a tight estimate.
 
     Returns `None` if `ticker` has no earnings history at all, or no
     quarter's announcement is available yet as of `as_of_date`.
@@ -1320,7 +1346,7 @@ def load_earnings_surprise_from_lakehouse(
     returning."""
     _guard_data_end(as_of_date, "load_earnings_surprise_from_lakehouse")
     query = f"""
-        SELECT h.reported, h.estimate, c.date AS announcement_date, c."when" AS announced_when
+        SELECT h.reported, h.estimate, c.date AS announcement_date
         FROM (
             SELECT *
             FROM {_table_sql("dolthub_eps_history")}
@@ -1334,7 +1360,7 @@ def load_earnings_surprise_from_lakehouse(
         ON c.act_symbol = h.act_symbol
            AND CAST(c.date AS DATE) BETWEEN CAST(h.period_end_date AS DATE)
                AND date_add(CAST(h.period_end_date AS DATE), INTERVAL 75 DAY)
-        WHERE CAST(c.date AS DATE) <= ?
+        WHERE CAST(c.date AS DATE) < ?
         ORDER BY c.date DESC
     """
     frame = _query(query, [ticker, ticker, as_of_date.isoformat()])
@@ -1342,8 +1368,7 @@ def load_earnings_surprise_from_lakehouse(
         return None
     frame["announcement_date"] = pd.to_datetime(frame["announcement_date"])
     frame["available_date"] = [
-        _earnings_available_date(announced.date(), when)
-        for announced, when in zip(frame["announcement_date"], frame["announced_when"], strict=True)
+        pd.Timestamp(next_session(announced.date())) for announced in frame["announcement_date"]
     ]
     frame = frame[frame["available_date"] <= pd.Timestamp(as_of_date)]
     if frame.empty:
@@ -1351,21 +1376,6 @@ def load_earnings_surprise_from_lakehouse(
     assert_point_in_time(frame, as_of_date, date_column="available_date")
     row = frame.iloc[0]
     return float(row["reported"]), float(row["estimate"]), pd.Timestamp(row["announcement_date"])
-
-
-# `dolthub_earnings_calendar.when` value for an announcement made before
-# the open, so it is public for that day's session; any other value
-# (after the close, or unknown) waits for the next session.
-_BEFORE_MARKET_OPEN = "Before market open"
-
-
-def _earnings_available_date(announced: date, when: str | None) -> pd.Timestamp:
-    """The first day an announcement on `announced` is known at the
-    close: that day for a `_BEFORE_MARKET_OPEN` announcement, otherwise
-    the next NYSE session."""
-    if when == _BEFORE_MARKET_OPEN:
-        return pd.Timestamp(announced)
-    return pd.Timestamp(next_session(announced))
 
 
 def load_sic_code_from_lakehouse(ticker: str) -> str | None:
@@ -1642,23 +1652,46 @@ def load_raw_close_from_lakehouse(
 def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Series | None:
     """A FRED macro series (`DGS3MO`/`DGS2`/`DGS10`/`VIXCLS`/`CPIAUCSL`/
     `BAMLH0A0HYM2`/`BAMLC0A0CM` — the same series `macro_loader.
-    SUPPORTED_SERIES` names) as it stood on `as_of_date`, from the
-    `fred_vintages` table (`series_id`, `date`, `realtime_start`, `value`;
-    one row per published version of an observation). Each observation
-    date carries the value of its latest version with `realtime_start <=
-    as_of_date`; an observation with no version published by then is left
-    out. The index is sorted and unique. Returns `None` if no rows remain.
-    Self-asserts point-in-time on the date index before returning."""
+    SUPPORTED_SERIES` names) as it stood at the close of `as_of_date`:
+    the `value` column of `load_fred_vintages_from_lakehouse`, indexed by
+    observation date. Returns `None` if no observation is published
+    before `as_of_date`."""
     _guard_data_end(as_of_date, "load_fred_series_from_lakehouse")
+    vintages = _fred_vintages(series_id, as_of_date)
+    return None if vintages is None else vintages["value"]
+
+
+def load_fred_vintages_from_lakehouse(series_id: str, as_of_date: date) -> pd.DataFrame | None:
+    """The FRED series `series_id` as it stood at the close of
+    `as_of_date`, from the `fred_vintages` table (`series_id`, `date`,
+    `realtime_start`, `value`; one row per published version of an
+    observation). Each observation date carries its latest version with
+    `realtime_start` strictly before `as_of_date`: FRED can publish after
+    the 16:00 ET close (the H.15 daily rates around 16:15 ET, VIXCLS the
+    next morning), so a version first published on `as_of_date` counts
+    from the next day. An observation with no version published by then
+    is left out.
+
+    Returns a frame indexed by observation date (sorted and unique) with
+    columns `value` and `realtime_start` (the date that version was
+    published, datetime64), or `None` if no rows remain. Self-asserts
+    point-in-time on the date index before returning."""
+    _guard_data_end(as_of_date, "load_fred_vintages_from_lakehouse")
+    return _fred_vintages(series_id, as_of_date)
+
+
+def _fred_vintages(series_id: str, as_of_date: date) -> pd.DataFrame | None:
+    """The query behind `load_fred_vintages_from_lakehouse`, without the
+    `data_end` guard its public callers apply first."""
     query = f"""
-        SELECT date, value
+        SELECT date, value, realtime_start
         FROM (
-            SELECT date, value, ROW_NUMBER() OVER (
+            SELECT date, value, realtime_start, ROW_NUMBER() OVER (
                 PARTITION BY date
                 ORDER BY realtime_start DESC
             ) AS rn
             FROM {_table_sql("fred_vintages")}
-            WHERE series_id = ? AND realtime_start <= ? AND date <= ?
+            WHERE series_id = ? AND realtime_start < ? AND date <= ?
         )
         WHERE rn = 1
         ORDER BY date
@@ -1668,9 +1701,10 @@ def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Seri
     if frame.empty:
         return None
     frame["date"] = pd.to_datetime(frame["date"])
-    series = frame.set_index("date")["value"]
-    assert_point_in_time(series, as_of_date)
-    return series
+    frame["realtime_start"] = pd.to_datetime(frame["realtime_start"])
+    vintages = frame.set_index("date")[["value", "realtime_start"]]
+    assert_point_in_time(vintages, as_of_date)
+    return vintages
 
 
 # `famafrench_returns` holds every Ken French dataset as long rows
@@ -1689,6 +1723,15 @@ _KEN_FRENCH_FREQUENCY = "daily"
 # Ken French posts each month's daily factors after that month closes, so
 # the end of the following month is the conservative public date.
 _KEN_FRENCH_PUBLICATION_LAG_MONTHS = 1
+
+
+def ken_french_public_date(day: date) -> date:
+    """The date the Ken French daily factor row for `day` counts as
+    public: the last day of the month `_KEN_FRENCH_PUBLICATION_LAG_MONTHS`
+    after `day`'s month, the date `load_fama_french_factors_from_lakehouse`
+    gates each row on."""
+    month = pd.Period(day, freq="M") + _KEN_FRENCH_PUBLICATION_LAG_MONTHS
+    return month.end_time.date()
 
 
 def load_fama_french_factors_from_lakehouse(

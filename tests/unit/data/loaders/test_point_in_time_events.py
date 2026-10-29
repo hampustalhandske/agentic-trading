@@ -150,13 +150,12 @@ def test_earnings_surprise_after_close_available_next_session(
     assert result == expected
 
 
-def test_earnings_surprise_before_open_available_same_day_and_null_is_after_close(
-    fake_lake: Any,
-) -> None:
-    """Before-open announcements are available on their date; a NULL `when` waits a session."""
+def test_earnings_surprise_before_open_and_null_wait_a_session(fake_lake: Any) -> None:
+    """Before-open announcements, like a NULL `when`, are available from the next session."""
     _seed_earnings(fake_lake, ["Before market open", None])
 
-    assert lakehouse_loader.load_earnings_surprise_from_lakehouse("AAPL", date(2024, 5, 2)) == (
+    assert lakehouse_loader.load_earnings_surprise_from_lakehouse("AAPL", date(2024, 5, 2)) is None
+    assert lakehouse_loader.load_earnings_surprise_from_lakehouse("AAPL", date(2024, 5, 3)) == (
         1.53,
         1.50,
         pd.Timestamp("2024-05-02"),

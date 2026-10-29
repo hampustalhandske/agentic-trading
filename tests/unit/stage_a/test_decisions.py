@@ -22,9 +22,14 @@ from agentic_trading.stage_a.decisions import (
 )
 
 _DAY = date(2015, 6, 3)
-_AFTER_CLOSE = {"earnings", "sec_edgar_facts", "sec_insider_transactions", "finra_short_interest"}
-_BEFORE_CLOSE = {
+_AFTER_CLOSE = {
+    "earnings",
     "fred",
+    "sec_edgar_facts",
+    "sec_insider_transactions",
+    "finra_short_interest",
+}
+_BEFORE_CLOSE = {
     "cftc_cot",
     "ken_french_factors",
     "sp500_membership",
@@ -88,7 +93,7 @@ def test_decision_weights() -> None:
 
 
 def test_sources_classify_every_roster_source() -> None:
-    """SOURCES marks exactly the four after-close sources and covers every roster source."""
+    """SOURCES marks exactly the five after-close sources and covers every roster source."""
     roster_sources = {
         requirement.source
         for analyst in build_default_analysts()
@@ -112,7 +117,7 @@ def test_row_source() -> None:
         "finra_short_interest"
     )
     assert row_source(_requires("sp500_membership", "ken_french_factors")) == "ken_french_factors"
-    assert row_source(_requires("fred", "cftc_cot", "fred")) == "cftc_cot"
+    assert row_source(_requires("fred", "cftc_cot", "fred")) == "fred"
 
 
 def test_check_source_as_of() -> None:
@@ -125,13 +130,13 @@ def test_check_source_as_of() -> None:
         (day_after, "fred"),
         (day_after, "earnings"),
         (_DAY, "earnings"),
+        (_DAY, "fred"),
         (_DAY, "sec_edgar_facts"),
         (_DAY, "sec_insider_transactions"),
         (_DAY, "finra_short_interest"),
     ]
     passed = [
         (None, None),
-        (_DAY, "fred"),
         (_DAY, "cftc_cot"),
         (day_before, "fred"),
         (day_before, "earnings"),

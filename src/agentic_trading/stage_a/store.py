@@ -41,6 +41,7 @@ import pandas as pd
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.stage_a.decisions import (
     SOURCES,
+    LookAheadError,
     check_source_as_of,
     decision_weights,
     source_of,
@@ -187,13 +188,20 @@ class SignalStore:
         `ValueError` when `day` is outside the spec's window, a signal is
         dated another day, two signals share an asset, or an asset is
         outside the spec's universe or `instrument_ids`; and
-        `LookAheadError` when a row's `source` and `source_as_of` fail
-        `decisions.check_source_as_of`."""
+        `LookAheadError` when the trial has a source and an active signal
+        carries no `source_as_of`, or a row's `source` and `source_as_of`
+        fail `decisions.check_source_as_of`."""
         self._require_open()
         self._check_day(day, signals, instrument_ids)
         weights = decision_weights(signals)
         sources: list[str | None] = []
         for signal in signals:
+            active = signal.status == "active"
+            if self._source is not None and active and signal.source_as_of is None:
+                raise LookAheadError(
+                    f"active signal for {signal.asset!r} on {day.isoformat()} has no "
+                    f"source_as_of, but the analyst declares source {self._source!r}"
+                )
             source = self._source if signal.source_as_of is not None else None
             check_source_as_of(signal.source_as_of, day, source)
             sources.append(source)

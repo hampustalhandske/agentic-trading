@@ -37,8 +37,9 @@ SOURCES: dict[str, bool] = {
     "earnings": True,
     # FINRA short interest: disseminated after the close.
     "finra_short_interest": True,
-    # FRED: a vintage is dated by the day FRED publishes it, during US business hours.
-    "fred": False,
+    # FRED: a vintage is dated by the day FRED publishes it; the H.15 daily rates post
+    # around 16:15 ET and VIXCLS the next morning.
+    "fred": True,
     # Ken French daily factors: posted after their month ends and dated by the end of
     # the following month, a conservative public date.
     "ken_french_factors": False,

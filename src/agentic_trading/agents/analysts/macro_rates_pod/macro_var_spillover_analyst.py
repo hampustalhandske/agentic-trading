@@ -17,7 +17,7 @@ from agentic_trading.agents._market_math import RefitCache, clamp, market_slice
 from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
-from agentic_trading.data.loaders.lakehouse_loader import load_fred_series_from_lakehouse
+from agentic_trading.data.loaders.lakehouse_loader import load_fred_vintages_from_lakehouse
 from agentic_trading.data.loaders.macro_loader import DGS3MO, DGS10, VIXCLS
 from agentic_trading.logging_config import get_logger
 
@@ -42,7 +42,9 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
     selection, the Granger test, and the VAR fit are only re-run at most
     once every `_refit_cache.refit_interval_days` simulated days per
     asset — see `RefitCache`'s docstring; the forecast/impulse-response
-    step still scores against every day's fresh data."""
+    step still scores against every day's fresh data. Every active
+    signal's `source_as_of` is the newest `realtime_start` among the
+    macro vintages on the dates of the VAR system."""
 
     agent_id: str = "macro_var_spillover_analyst"
 
@@ -69,21 +71,29 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
         ),
     )
 
-    def _macro_series(self, as_of_date: pd.Timestamp) -> list[pd.Series] | None:
+    def _macro_series(self, as_of_date: pd.Timestamp) -> tuple[list[pd.Series], pd.Series] | None:
+        """The macro columns of the VAR system as of `as_of_date`, each
+        indexed by observation date, and each observation date's newest
+        `realtime_start` across every vintage loaded for them. `None` when
+        any series has no vintage published before `as_of_date`."""
         series_list: list[pd.Series] = []
+        published: list[pd.Series] = []
         for series_id in self.macro_series_ids:
-            series = load_fred_series_from_lakehouse(series_id, as_of_date.date())
-            if series is None:
+            vintages = load_fred_vintages_from_lakehouse(series_id, as_of_date.date())
+            if vintages is None:
                 return None
-            series_list.append(series)
+            series_list.append(vintages["value"])
+            published.append(vintages["realtime_start"])
         if self.use_yield_curve_slope:
-            long_rate = load_fred_series_from_lakehouse(DGS10, as_of_date.date())
-            short_rate = load_fred_series_from_lakehouse(DGS3MO, as_of_date.date())
+            long_rate = load_fred_vintages_from_lakehouse(DGS10, as_of_date.date())
+            short_rate = load_fred_vintages_from_lakehouse(DGS3MO, as_of_date.date())
             if long_rate is None or short_rate is None:
                 return None
-            yield_curve = pd.concat([long_rate, short_rate], axis=1, join="inner")
+            yield_curve = pd.concat([long_rate["value"], short_rate["value"]], axis=1, join="inner")
             series_list.append(yield_curve.iloc[:, 0] - yield_curve.iloc[:, 1])
-        return series_list
+            published.extend([long_rate["realtime_start"], short_rate["realtime_start"]])
+        newest_published = pd.concat(published, axis=1).max(axis=1)
+        return series_list, newest_published
 
     def generate_signal(
         self,
@@ -94,8 +104,8 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
         asset_returns = market_slice(market_data, as_of_date, asset).log_returns[
             -settings.analysts.risk_window_medium :
         ]
-        macro_series = self._macro_series(as_of_date)
-        if asset_returns.size < 30 or macro_series is None:
+        macro = self._macro_series(as_of_date)
+        if asset_returns.size < 30 or macro is None:
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
@@ -105,6 +115,7 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                 rationale="insufficient asset/macro history for a VAR spillover read",
                 status="unavailable",
             )
+        macro_series, newest_published = macro
 
         history = market_data.loc[market_data.index <= as_of_date]
         if isinstance(history.columns, pd.MultiIndex):
@@ -143,6 +154,7 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                 rationale="insufficient overlapping history for a VAR spillover read",
                 status="unavailable",
             )
+        source_as_of = newest_published.reindex(aligned.index).max().date()
 
         def _fit_var_system() -> tuple[int, float, np.ndarray | None, np.ndarray | None]:
             n_lags = (
@@ -168,6 +180,7 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                     direction="flat",
                     confidence=0.0,
                     rationale=f"macro does not Granger-cause {asset} (p={p_value:.3f})",
+                    source_as_of=source_as_of,
                 )
 
             forecast = var_forecast(system, coef_matrix, n_lags, h=1)
@@ -207,4 +220,5 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
             rationale=(
                 f"macro Granger-causes {asset} (p={p_value:.3f}), forecast move={forecast_move:.4f}"
             ),
+            source_as_of=source_as_of,
         )

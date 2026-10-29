@@ -12,7 +12,10 @@ from agentic_trading.agents._market_math import clamp, log_return_series
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, calendar_days_for_sessions
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
-from agentic_trading.data.loaders.lakehouse_loader import load_fama_french_factors_from_lakehouse
+from agentic_trading.data.loaders.lakehouse_loader import (
+    ken_french_public_date,
+    load_fama_french_factors_from_lakehouse,
+)
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -51,7 +54,9 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
     over the asset's own monthly vol is the signal: its sign is the
     direction once above `factor_zscore_flat`, and confidence scales to
     `factor_zscore_full` (an information-ratio-style ratio, so it does
-    not saturate the way a t-stat does)."""
+    not saturate the way a t-stat does). Every active signal's
+    `source_as_of` is the public date (`ken_french_public_date`) of the
+    newest factor row, which the expected premia rest on."""
 
     agent_id: str = "fama_french_factor_analyst"
 
@@ -95,6 +100,7 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
             )
 
         factor_columns = [column for column in factors.columns if column != "RF"]
+        source_as_of = ken_french_public_date(factors.index.max().date())
         joined = pd.concat(
             {"asset": returns.to_frame("return"), "factors": factors}, axis=1, join="inner"
         ).dropna()
@@ -135,6 +141,7 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
                 confidence=0.0,
                 rationale="no factor loading is statistically significant",
                 sample_count=len(joined),
+                source_as_of=source_as_of,
             )
 
         premia = _expected_factor_premia(factors[factor_columns])
@@ -163,4 +170,5 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
                 f"(z={z_score:.3f}; significant loadings: {loadings_text})"
             ),
             sample_count=len(joined),
+            source_as_of=source_as_of,
         )

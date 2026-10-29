@@ -45,7 +45,7 @@ def load_risk_free_rate_series(start_date: date, end_date: date) -> pd.Series:
     before it. This is a backtest's own after-the-fact performance report,
     not a trading signal `generate_signal` reads live — the rate in force
     on a given day is that day's real rate, so the series is read as
-    published by `end_date`.
+    published before `end_date` (`load_fred_series_from_lakehouse`).
 
     Raises `ValueError` if the lakehouse has no `DGS3MO` observations, or
     if `start_date` precedes the first observation (the message names

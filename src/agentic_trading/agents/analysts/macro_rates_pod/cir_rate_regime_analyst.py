@@ -11,7 +11,7 @@ from agentic_trading.agents._market_math import RefitCache, clamp, derived_seed
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, calendar_days_for_sessions
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
-from agentic_trading.data.loaders.lakehouse_loader import load_fred_series_from_lakehouse
+from agentic_trading.data.loaders.lakehouse_loader import load_fred_vintages_from_lakehouse
 from agentic_trading.data.loaders.macro_loader import DGS3MO
 from agentic_trading.logging_config import get_logger
 
@@ -34,7 +34,10 @@ class CIRRateRegimeAnalyst(AnalystAgent):
     assets unless configured otherwise, a deliberate simplification).
     The fit is only re-run at most once every
     `_refit_cache.refit_interval_days` simulated days per asset — see
-    `RefitCache`'s docstring."""
+    `RefitCache`'s docstring.
+
+    Every active signal's `source_as_of` is the newest `realtime_start`
+    among the DGS3MO vintages in the fitted window."""
 
     agent_id: str = "cir_rate_regime_analyst"
 
@@ -58,8 +61,8 @@ class CIRRateRegimeAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        rate_history = load_fred_series_from_lakehouse(DGS3MO, as_of_date.date())
-        if rate_history is None:
+        vintages = load_fred_vintages_from_lakehouse(DGS3MO, as_of_date.date())
+        if vintages is None:
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
@@ -69,9 +72,8 @@ class CIRRateRegimeAnalyst(AnalystAgent):
                 rationale="no FRED DGS3MO coverage in the lakehouse",
                 status="unavailable",
             )
-        rate_series = rate_history.dropna().to_numpy(dtype=np.float64)
-
-        rates = rate_series[-settings.analysts.risk_window_long :] / 100.0
+        window = vintages.dropna(subset=["value"]).iloc[-settings.analysts.risk_window_long :]
+        rates = window["value"].to_numpy(dtype=np.float64) / 100.0
         if rates.size < 30:
             return AgentSignal(
                 agent_id=self.agent_id,
@@ -82,6 +84,7 @@ class CIRRateRegimeAnalyst(AnalystAgent):
                 rationale="insufficient rate history for a CIR regime read",
                 status="unavailable",
             )
+        source_as_of = window["realtime_start"].max().date()
 
         try:
             fitted = self._refit_cache.get_or_refit(
@@ -103,6 +106,7 @@ class CIRRateRegimeAnalyst(AnalystAgent):
                 direction="flat",
                 confidence=0.0,
                 rationale="rate series is trending, not mean-reverting — no CIR regime read",
+                source_as_of=source_as_of,
             )
         kappa, theta, sigma = fitted.kappa, fitted.theta, fitted.sigma
         r0 = float(rates[-1])
@@ -142,4 +146,5 @@ class CIRRateRegimeAnalyst(AnalystAgent):
                 f"CIR-simulated {SIMULATION_HORIZON_DAYS}d rate trend={rate_trend:.4f} "
                 f"(kappa={kappa:.3f}, theta={theta:.4f}, sensitivity={self.rate_sensitivity})"
             ),
+            source_as_of=source_as_of,
         )
