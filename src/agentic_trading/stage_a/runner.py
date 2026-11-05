@@ -1,13 +1,16 @@
 """The stage (a) batch runner: a list of analysts over a window, stored
 day by day, resumable, under a memory and disk guard.
 
-`run_batch` runs each analyst in turn over the NYSE sessions of the
-window inside one `lake_session` at the given lake time T, cut at
+`run_batch` runs each analyst in turn over the sessions of
+`settings.stage_a.session_calendar` in the window inside one
+`lake_session` at the given lake time T, cut at
 `settings.stage_a.data_end`. On each session it asks the analyst once per
-asset, at that day's midnight `pd.Timestamp`, with the point-in-time
-slice of the prices, and writes the day through the analyst's
-`SignalStore`. A trial resumes after its store's last completed day, so a
-rerun of a finished trial computes and writes nothing. Every
+asset with a close that day, at that day's midnight `pd.Timestamp`, with
+the point-in-time slice of the prices restricted to the rows on which
+that asset has a close; an asset without a close that day is stored as
+unavailable without asking the analyst. It writes the day through the
+analyst's `SignalStore`. A trial resumes after its store's last completed
+day, so a rerun of a finished trial computes and writes nothing. Every
 `settings.stage_a.check_every_days` days written, it calls the resource
 check (`system_resources_ok` by default) and, when that fails, stops
 after the day it has just written; the next run resumes from there."""
@@ -16,7 +19,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -36,7 +39,7 @@ from agentic_trading.data.loaders.lakehouse_loader import (
     lake_session,
 )
 from agentic_trading.data.point_in_time import get_point_in_time_data
-from agentic_trading.data.trading_calendar import is_session
+from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.logging_config import get_logger
 from agentic_trading.stage_a.spec import SpecRecord, build_spec, spec_hash
 from agentic_trading.stage_a.store import InstrumentKind, SignalStore
@@ -128,12 +131,6 @@ def system_resources_ok(store_dir: Path) -> bool:
     return True
 
 
-def _sessions(start: date, end: date) -> list[date]:
-    """The NYSE sessions from `start` to `end`, inclusive, in order."""
-    days = (start + timedelta(days=offset) for offset in range((end - start).days + 1))
-    return [day for day in days if is_session(day)]
-
-
 def _signal(
     analyst: AnalystAgent, asset: str, market_data: pd.DataFrame, as_of: pd.Timestamp
 ) -> AgentSignal:
@@ -171,14 +168,30 @@ def _day_signals(
     day: date,
     session: LakeSession,
 ) -> list[AgentSignal]:
-    """`analyst`'s signal for each asset of `universe` on `day`, from the
-    point-in-time slice of `market_data`. Raises `HoldoutReadError` when a
-    read past the session's `data_end` was refused while computing them,
-    even if the analyst caught the refusal, so no such day is stored."""
+    """`analyst`'s signal for each asset of `universe` on `day`, in
+    `universe` order. An asset with a close on `day` in `market_data` gets
+    the analyst's signal from the point-in-time slice of `market_data`
+    restricted to the rows on which that asset has a close, every column
+    kept. An asset with no close on `day` (no row that day, or a NaN close)
+    gets the analyst's `unavailable_signal` without the analyst being
+    asked. Raises `HoldoutReadError` when a read past the session's
+    `data_end` was refused while computing them, even if the analyst
+    caught the refusal, so no such day is stored."""
     as_of = pd.Timestamp(day)
     visible = get_point_in_time_data(market_data, as_of)
+    calendar = settings.stage_a.session_calendar
     refused_before = len(session.holdout_violations)
-    signals = [_signal(analyst, asset, visible, as_of) for asset in universe]
+    signals = []
+    for asset in universe:
+        closes = visible[(asset, "close")] if (asset, "close") in visible.columns else None
+        if closes is None or as_of not in closes.index or pd.isna(closes.loc[as_of]):
+            signals.append(
+                analyst.unavailable_signal(
+                    asset, as_of, f"no {calendar} bar for {asset} on {day.isoformat()}"
+                )
+            )
+        else:
+            signals.append(_signal(analyst, asset, visible.loc[closes.notna()], as_of))
     refused = session.holdout_violations[refused_before:]
     if refused:
         raise HoldoutReadError(
@@ -203,9 +216,10 @@ def run_batch(
     quantcore_sha: str | None,
     resources_ok: Callable[[Path], bool] = system_resources_ok,
 ) -> BatchResult:
-    """Run each of `analysts`, in order, over `universe` on the NYSE
-    sessions from `window_start` to `window_end`, storing each trial under
-    `store_dir` (see the module docstring).
+    """Run each of `analysts`, in order, over `universe` on the sessions of
+    `settings.stage_a.session_calendar` (read at call time) from
+    `window_start` to `window_end`, storing each trial under `store_dir`
+    (see the module docstring).
 
     Takes `market_data` in `load_price_history_from_lakehouse`'s (asset,
     field) column shape, covering the window and its warm-up; each
@@ -259,7 +273,7 @@ def run_batch(
             )
         )
     store_dir = Path(store_dir)
-    sessions = _sessions(window_start, window_end)
+    sessions = sessions_between(window_start, window_end, settings.stage_a.session_calendar)
     instrument_ids = {asset: asset for asset in universe}
     check_every_days = settings.stage_a.check_every_days
 

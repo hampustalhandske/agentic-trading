@@ -220,6 +220,7 @@ def test_stage_a_settings() -> None:
     assert build_spec(analyst, list(_UNIVERSE), _START, _END).settings["stage_a"] == {
         "data_end": "2024-12-31",
         "window_start": "2010-01-04",
+        "session_calendar": "XNYS",
     }
     assert unchanged == [base] * len(runtime)
     assert changed != base

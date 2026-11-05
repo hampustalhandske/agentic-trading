@@ -455,6 +455,7 @@ def run(
             parsed_start_date,
             parsed_end_date,
             warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+            align="intersection",
         )
         logger.info("Market data source: %s", source_label)
         engine = BacktestEngine(
@@ -663,6 +664,7 @@ def experiment(
             parsed_train_start,
             parsed_test_end,
             warmup_days=warmup_days,
+            align="intersection",
         )
         typer.echo(
             f"Market data ready: {source_label}; {len(market_data)} aligned rows. "
@@ -683,6 +685,7 @@ def experiment(
             parsed_train_start,
             parsed_test_end,
             warmup_days=0,
+            align="intersection",
         )
         benchmark_returns = (
             sp500_frame[SP500_BENCHMARK_TICKER]["close"].dropna().pct_change().dropna()
@@ -892,6 +895,13 @@ def stage_a(
         "(default: stage_a.data_end).",
     ),
     lake_time: str | None = typer.Option(None, "--lake-time", help=_LAKE_TIME_HELP),
+    set_override: list[str] = typer.Option(  # noqa: B008
+        [],
+        "--set",
+        help="Override one strategy constant for this batch, as group.field=value "
+        "(e.g. stage_a.session_calendar=XSTO); repeat for several. Hashed settings "
+        "enter each trial's spec. See agentic_trading/config.py for every key.",
+    ),
 ) -> None:
     """Compute and store stage (a) signals and decisions for the given
     analysts over the universe, resuming each trial from its store.
@@ -904,9 +914,15 @@ def stage_a(
     commit. Prints the batch result as JSON. Exits 0 when every analyst
     finished, 3 when the batch stopped for low memory or disk (rerun to
     resume), and 2 on a usage error: an unknown analyst id, a missing
-    --store-dir or one inside the repository, a naive --lake-time, or a
-    window that is reversed or ends after stage_a.data_end.
+    --store-dir or one inside the repository, a naive --lake-time, a bad
+    --set, or a window that is reversed or ends after stage_a.data_end.
+
+    `--set` overrides apply before any setting is read. Prices are aligned
+    on the sessions of `stage_a.session_calendar`, the calendar the batch
+    decides on, so an instrument without a bar on a session is stored as
+    unavailable that day rather than removing the day for every instrument.
     """
+    _apply_cli_overrides(set_override)
     requested_lake_time = _parse_lake_time_flag(lake_time)
     kind = _stage_a_instrument_kind(instrument_kind)
     data_end = settings.stage_a.data_end
@@ -946,7 +962,12 @@ def stage_a(
     with lake_session(requested_lake_time, data_end=data_end) as session:
         typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
         market_data, source_label = load_price_history_with_fallback(
-            tickers, start, end, warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS
+            tickers,
+            start,
+            end,
+            warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+            align="sessions",
+            calendar=settings.stage_a.session_calendar,
         )
         typer.echo(f"Market data ready: {source_label}; {len(market_data)} rows.", err=True)
         lake_version = (

@@ -277,12 +277,14 @@ def _load_basket_data(
     warmup_days: int = 0,
 ) -> tuple[pd.DataFrame, str]:
     """Thin wrapper around the shared `data.loader.load_price_history_with_fallback`
-    — the exact same, lakehouse-only function the CLI uses."""
+    — the exact same, lakehouse-only function the CLI uses, on the rows where
+    every ticker has a close, as the backtest engine needs."""
     return load_price_history_with_fallback(
         list(tickers),
         start,
         end,
         warmup_days=warmup_days,
+        align="intersection",
     )
 
 

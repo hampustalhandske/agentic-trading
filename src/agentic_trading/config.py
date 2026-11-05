@@ -453,6 +453,10 @@ class StageAConfig(BaseModel):
     # First decision date of the stage (a) window: every round-1 instrument
     # has bars before it (AT-110).
     window_start: date = date(2010, 1, 4)
+    # exchange-calendars calendar whose sessions are the decision days and
+    # the rows prices are aligned on: the round-1 universe is priced at the
+    # US close, crypto included (one bar per NYSE session, AT-15).
+    session_calendar: str = "XNYS"
     # The last three fields tune how a batch runs, not what it computes, so
     # they are left out of the spec hash (`stage_a.spec.RUNTIME_SETTINGS_FIELDS`).
     # A batch stops after its current day below this share of free system

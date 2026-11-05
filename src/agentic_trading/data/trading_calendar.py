@@ -1,14 +1,17 @@
 # trading_calendar.py
 
-"""NYSE trading sessions as `datetime.date`s: `is_session`, `next_session`
-and `add_sessions`.
+"""Exchange trading sessions as `datetime.date`s: `is_session`,
+`next_session` and `add_sessions` on the NYSE, and `sessions_between` on
+any exchange-calendars calendar (NYSE by default).
 
-Sessions come from exchange-calendars' `XNYS` calendar: weekdays that are
-neither NYSE holidays nor unscheduled full-day closures (state funerals,
-September 11, Hurricane Sandy). Early closes (half days) are sessions.
+NYSE sessions come from exchange-calendars' `XNYS` calendar: weekdays
+that are neither NYSE holidays nor unscheduled full-day closures (state
+funerals, September 11, Hurricane Sandy). Early closes (half days) are
+sessions.
 
-Sessions are precomputed once for `CALENDAR_START`..`CALENDAR_END`; every
-function raises `ValueError` for a day, or a result, outside that range."""
+Each calendar's sessions are computed once, on first use, for
+`CALENDAR_START`..`CALENDAR_END`; every function raises `ValueError` for a
+day, or a result, outside that range."""
 
 from datetime import date
 from functools import cache
@@ -24,11 +27,13 @@ CALENDAR_END = date(2035, 12, 31)
 
 
 @cache
-def _sessions() -> pd.DatetimeIndex:
-    """Every NYSE session from `CALENDAR_START` to `CALENDAR_END`, sorted,
-    as timezone-naive midnight timestamps."""
+def _sessions(calendar_name: str = "XNYS") -> pd.DatetimeIndex:
+    """Every session of exchange-calendars' `calendar_name` calendar (NYSE
+    by default) from `CALENDAR_START` to `CALENDAR_END`, sorted, as
+    timezone-naive midnight timestamps. exchange-calendars raises for an
+    unknown name or a calendar it cannot evaluate over that whole range."""
     calendar = xcals.get_calendar(
-        "XNYS", start=CALENDAR_START.isoformat(), end=CALENDAR_END.isoformat()
+        calendar_name, start=CALENDAR_START.isoformat(), end=CALENDAR_END.isoformat()
     )
     sessions = pd.DatetimeIndex(calendar.sessions)
     return sessions.tz_localize(None) if sessions.tz is not None else sessions
@@ -71,3 +76,13 @@ def add_sessions(day: date, n: int) -> date:
 def next_session(day: date) -> date:
     """The first session strictly after `day`."""
     return add_sessions(day, 1)
+
+
+def sessions_between(start: date, end: date, calendar: str = "XNYS") -> list[date]:
+    """The sessions of exchange-calendars' `calendar` calendar (NYSE by
+    default) from `start` to `end`, both included, in order; empty when
+    `start` is after `end`."""
+    sessions = _sessions(calendar)
+    first = int(sessions.searchsorted(_in_range(start), side="left"))
+    after_last = int(sessions.searchsorted(_in_range(end), side="right"))
+    return [stamp.date() for stamp in sessions[first:after_last]]
