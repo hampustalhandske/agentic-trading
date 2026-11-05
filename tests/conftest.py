@@ -282,6 +282,23 @@ def _block_real_lake(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     _REAL_LAKE_ACCESSOR.cache_clear()
 
 
+# The test module that specifies the empty-read retry: it checks the real
+# `EMPTY_READ_RETRY_SECONDS` and replaces `time.sleep` itself in every test
+# that can wait.
+_EMPTY_READ_RETRY_SPEC = "test_empty_read_retry.py"
+
+
+@pytest.fixture(autouse=True)
+def _no_empty_read_wait(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sets the loader's empty-read retry wait (`EMPTY_READ_RETRY_SECONDS`)
+    to 0 s, so a test whose lake holds an empty always-populated table
+    never really sleeps. Tests in `_EMPTY_READ_RETRY_SPEC` keep the real
+    value."""
+    if request.path.name == _EMPTY_READ_RETRY_SPEC:
+        return
+    monkeypatch.setattr(lakehouse_loader, "EMPTY_READ_RETRY_SECONDS", 0.0)
+
+
 @pytest.fixture(autouse=True)
 def _stub_run_provenance_lake(monkeypatch: pytest.MonkeyPatch) -> None:
     """Gives `build_run_provenance` a fixed lake build so CLI tests that
@@ -315,16 +332,29 @@ def fake_lake(monkeypatch: pytest.MonkeyPatch) -> FakeLake:
 
 _CONTRACT_PATH = Path(__file__).parent / "fixtures" / "lakehouse_contract_v1.json"
 
+# The one row `preflight_lake` puts in each always-populated table
+# (`lakehouse_loader.ALWAYS_POPULATED_TABLES`), by column: it matches no
+# ticker, security or report window and carries no coverage date.
+_PLACEHOLDER_ROWS: dict[str, dict[str, Any]] = {
+    "cftc_cot_publication": {"report_date": "2000-01-04"},
+    "equity_adjustment_factors": {"ticker": "ZZUNREL", "security_id": 999},
+    "sp500_membership": {"ticker": "ZZUNREL"},
+    "yahoo_split_close_basis": {"ticker": "ZZUNREL"},
+}
+
 
 @pytest.fixture
 def preflight_lake(fake_lake: FakeLake) -> FakeLake:
     """A `fake_lake` holding every view of the frozen lake contract
-    (`tests/fixtures/lakehouse_contract_v1.json`) as an empty table with
-    the contract's column types, so the CLI and dashboard run paths (the
+    (`tests/fixtures/lakehouse_contract_v1.json`) with the contract's
+    column types, so the CLI and dashboard run paths (the
     data-availability preflight and the price history) bind their SQL
-    against the real schema. Every requirement reports no coverage. Each
-    view reports a `last_write` of `_CATALOGUE_LAST_WRITE`, so a
-    `lake_session` opened on it has a default lake time."""
+    against the real schema. Every view is empty except the
+    always-populated tables, which hold the one `_PLACEHOLDER_ROWS` row
+    each (in the table and its log, scraped at `_CATALOGUE_LAST_WRITE`)
+    so their table-level reads find rows. Every requirement reports no
+    coverage. Each view reports a `last_write` of `_CATALOGUE_LAST_WRITE`,
+    so a `lake_session` opened on it has a default lake time."""
     contract = json.loads(_CONTRACT_PATH.read_text())
     for view, columns in contract["views"].items():
         fake_lake.add_empty(
@@ -335,4 +365,13 @@ def preflight_lake(fake_lake: FakeLake) -> FakeLake:
             },
         )
         fake_lake.last_write_overrides[view] = _CATALOGUE_LAST_WRITE
+    assert set(_PLACEHOLDER_ROWS) == lakehouse_loader.ALWAYS_POPULATED_TABLES
+    for table, row in _PLACEHOLDER_ROWS.items():
+        names = ", ".join([*row, "scraped_at"])
+        marks = ", ".join("?" for _ in range(len(row) + 1))
+        for relation in (table, f"{table}_log"):
+            fake_lake._connection.execute(
+                f"INSERT INTO {relation} ({names}) VALUES ({marks})",
+                [*row.values(), _CATALOGUE_LAST_WRITE],
+            )
     return fake_lake

@@ -5,9 +5,9 @@
 `tests/fixtures/lakehouse_contract_v1.json` lists every view the loaders read
 and each view's column names and DuckDB types. Registering those views as
 typed tables and running every loader proves each SQL statement binds
-against the contract's names and types. Every table is empty except the two
-adjustment tables, which hold one unrelated row each because the loaders
-refuse to read an empty adjustment table.
+against the contract's names and types. Every table is empty except the
+always-populated tables (`ALWAYS_POPULATED_TABLES`), which hold one unrelated
+row each because the loaders refuse to read one of them empty.
 """
 
 import inspect
@@ -96,8 +96,9 @@ _EMPTY_CASES: dict[str, Callable[[], Any]] = {
 
 def _register_contract(fake_lake: Any) -> None:
     """Creates every contract view as an empty table with its exact column types, except
-    that each adjustment table holds one row for an unrelated security, so the loaders'
-    empty-adjustment-table guard passes."""
+    that each adjustment table holds one row for an unrelated security and
+    `cftc_cot_publication` and `sp500_membership` one row matching no read, so the loaders'
+    empty-table guards pass."""
     for view, columns in _CONTRACT["views"].items():
         quoted = {
             f'"{name}"': ("VARCHAR" if kind == '"NULL"' else kind) for name, kind in columns.items()
@@ -110,6 +111,14 @@ def _register_contract(fake_lake: Any) -> None:
     fake_lake._connection.execute(
         "INSERT INTO yahoo_split_close_basis (ticker, ex_date, ratio) "
         "VALUES ('ZZUNREL', DATE '2000-01-03', 0.5)"
+    )
+    fake_lake._connection.execute(
+        "INSERT INTO cftc_cot_publication (report_date, published_date) "
+        "VALUES (DATE '2000-01-04', DATE '2000-01-07')"
+    )
+    fake_lake._connection.execute(
+        "INSERT INTO sp500_membership (ticker, start_date, end_date) "
+        "VALUES ('ZZUNREL', DATE '2000-01-03', DATE '2000-06-30')"
     )
 
 

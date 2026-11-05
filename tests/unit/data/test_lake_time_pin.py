@@ -476,6 +476,20 @@ def _sweep_lake(lake: Any) -> None:
     )
     _seed_rebuilt(lake, "equity_adjustment_factors", factors, _B1, date_columns=("effective_date",))
     _seed_splits(lake, [("ZZ", "2000-01-03", 0.5, True)], _B1)
+    publication = pd.DataFrame(
+        {
+            "report_date": ["2000-01-04"],
+            "published_date": ["2000-01-07"],
+            "published_at": pd.to_datetime(["2000-01-07 20:30"], utc=True),
+        }
+    )
+    _seed_rebuilt(
+        lake,
+        "cftc_cot_publication",
+        publication,
+        _B1,
+        date_columns=("report_date", "published_date"),
+    )
 
 
 def test_every_public_loader_sql_is_pinned_inside_a_session(fake_lake: Any) -> None:

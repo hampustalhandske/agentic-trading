@@ -35,9 +35,18 @@ the lake doesn't cover rather than falling back to a live API.
 A loader returns `None` only when its query succeeds and finds no rows. A
 failed request (`LakehouseError`, connection or timeout errors) propagates
 to the caller; inside a session the lake's refusal of a pinned read
-(HTTP 409) and a change of lake version raise `LakeTimeError`."""
+(HTTP 409) and a change of lake version raise `LakeTimeError`.
+
+A table in `ALWAYS_POPULATED_TABLES` is rebuilt whole by the lake and
+always holds rows, yet a read landing on a rebuild can find it empty
+without an error. Every read of such a table as a whole goes through
+`_query_table`, which sends an empty read once more after
+`EMPTY_READ_RETRY_SECONDS` and raises `EmptyTableReadError` when the
+table is empty again. A read filtered to one security, ticker or market
+that finds no rows is an answer, not a rebuild, and is never retried."""
 
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
@@ -179,8 +188,9 @@ class LakeSession(BaseModel):
     each rebuilt-whole table in `READ_TABLES` that holds rows to its build
     time, and `holdout_violations` lists the message of every read refused
     past `data_end`, kept even when the caller catches the error. The
-    table metadata the reads are shaped from, and the set of tables a
-    query has read, are held privately for the life of the session."""
+    table metadata the reads are shaped from, the set of tables a query
+    has read, and the always-populated tables `_require_rows` has found
+    holding rows are held privately for the life of the session."""
 
     lake_time: datetime
     data_end: date | None = None
@@ -189,6 +199,7 @@ class LakeSession(BaseModel):
     holdout_violations: list[str] = []
     _tables: dict[str, LakeTableMetadata] = PrivateAttr(default_factory=dict)
     _read_tables: set[str] = PrivateAttr(default_factory=set)
+    _populated_tables: set[str] = PrivateAttr(default_factory=set)
 
     def row_time_pinned_tables(self) -> list[str]:
         """The tables in `READ_TABLES` this session pins on a row-time
@@ -526,6 +537,72 @@ def _query(query: str, params: list[Any]) -> pd.DataFrame:
     return frame
 
 
+# Tables the lake rebuilds whole that always hold rows: an empty read of
+# one as a whole is a read that landed on a rebuild, not an answer.
+ALWAYS_POPULATED_TABLES: frozenset[str] = frozenset(
+    {
+        "cftc_cot_publication",
+        "equity_adjustment_factors",
+        "sp500_membership",
+        "yahoo_split_close_basis",
+    }
+)
+
+# Seconds `_query_table` waits before sending an empty read of a table in
+# `ALWAYS_POPULATED_TABLES` again; a rebuild's swap takes far less.
+EMPTY_READ_RETRY_SECONDS = 1.0
+
+
+class EmptyTableReadError(RuntimeError):
+    """A read of a table in `ALWAYS_POPULATED_TABLES` as a whole came back
+    with no rows twice, `EMPTY_READ_RETRY_SECONDS` apart, so the table is
+    empty or still being rebuilt and no answer read from it can be
+    trusted."""
+
+
+def _query_table(table: str, query: str, params: list[Any]) -> pd.DataFrame:
+    """Runs `query` with `params` through `_query`, as a read of `table`
+    as a whole, and returns its rows.
+
+    When `table` is in `ALWAYS_POPULATED_TABLES` and the result has no
+    rows, waits `EMPTY_READ_RETRY_SECONDS` (read at call time) and sends
+    the same query once more; a second empty result raises
+    `EmptyTableReadError` naming the table. For any other table an empty
+    result is returned from the one read. A query against an
+    always-populated table must therefore return no rows only when the
+    table is empty (an aggregate over it adds `HAVING count(*) > 0`). An
+    exception from `_query` propagates as is and is never retried."""
+    frame = _query(query, params)
+    if not frame.empty or table not in ALWAYS_POPULATED_TABLES:
+        return frame
+    time.sleep(EMPTY_READ_RETRY_SECONDS)
+    frame = _query(query, params)
+    if frame.empty:
+        raise EmptyTableReadError(
+            f"{table} read empty twice, {EMPTY_READ_RETRY_SECONDS} s apart; it always holds "
+            "rows, so it is empty or still being rebuilt"
+        )
+    return frame
+
+
+def _require_rows(table: str) -> None:
+    """Checks that `table`, one of `ALWAYS_POPULATED_TABLES`, holds rows,
+    with one `SELECT 1 ... LIMIT 1` read through `_query_table` (so an
+    empty table is read again once and then raises
+    `EmptyTableReadError`). Inside a `lake_session` a table found holding
+    rows is not read again for the rest of the session; outside one every
+    call reads. Returns nothing."""
+    session = _current_session()
+    if session is not None:
+        with _SESSION_LOCK:
+            if table in session._populated_tables:
+                return
+    _query_table(table, f"SELECT 1 AS present FROM {_table_sql(table)} LIMIT 1", [])
+    if session is not None:
+        with _SESSION_LOCK:
+            session._populated_tables.add(table)
+
+
 def lake_provenance() -> LakeProvenance:
     """The lake's version and the UTC time its status was read, from
     `Lake.status()` and the service's health payload, plus the row count
@@ -581,32 +658,36 @@ AdjustmentTable = Literal["equity_adjustment_factors", "yahoo_split_close_basis"
 _ADJUSTMENT_TABLE_ROWS: _LakeTimeMemo[int] = _LakeTimeMemo()
 
 
-class EmptyAdjustmentTableError(RuntimeError):
+class EmptyAdjustmentTableError(EmptyTableReadError):
     """An adjustment table (`equity_adjustment_factors` or
-    `yahoo_split_close_basis`) holds no rows, so every price read through
-    it would come back unadjusted."""
+    `yahoo_split_close_basis`) read empty twice (see `_query_table`), so
+    every price read through it would come back unadjusted."""
 
 
 def adjustment_table_row_count(table: AdjustmentTable) -> int:
-    """The total row count of adjustment table `table`, from one
-    `count(*)` query. Read once per table, lake client and lake time (see
-    `_LakeTimeMemo`) and kept while reads stay at that lake time. Raises
-    `EmptyAdjustmentTableError` when the table has no rows (that result is
-    not kept, so a later call queries again) and `ValueError` when `table`
-    is not an adjustment table. Not subject to the session's `data_end`
-    (`_guard_data_end`): it takes no knowledge-time argument and returns a
-    row count recorded as provenance, never row values."""
+    """The total row count of adjustment table `table`, from a `count(*)`
+    query sent through `_query_table`, which returns no row for an empty
+    table, so an empty read is sent once more after
+    `EMPTY_READ_RETRY_SECONDS`. Read once per table, lake client and lake
+    time (see `_LakeTimeMemo`) and kept while reads stay at that lake
+    time. Raises `EmptyAdjustmentTableError` when the table reads empty
+    twice (that result is not kept, so a later call queries again) and
+    `ValueError` when `table` is not an adjustment table. Not subject to
+    the session's `data_end` (`_guard_data_end`): it takes no
+    knowledge-time argument and returns a row count recorded as
+    provenance, never row values."""
     if table not in get_args(AdjustmentTable):
         raise ValueError(f"{table!r} is not an adjustment table")
     cached = _ADJUSTMENT_TABLE_ROWS.values()
     if table not in cached:
-        frame = _query(f"SELECT count(*) AS row_count FROM {_table_sql(table)}", [])
-        rows = 0 if frame.empty else int(frame.iloc[0]["row_count"])
-        if rows == 0:
+        query = f"SELECT count(*) AS row_count FROM {_table_sql(table)} HAVING count(*) > 0"
+        try:
+            frame = _query_table(table, query, [])
+        except EmptyTableReadError as error:
             raise EmptyAdjustmentTableError(
-                f"{table} has no rows; prices read through it would be unadjusted"
-            )
-        cached[table] = rows
+                f"{error}; prices read through it would be unadjusted"
+            ) from error
+        cached[table] = int(frame.iloc[0]["row_count"])
     return cached[table]
 
 
@@ -1243,7 +1324,11 @@ def load_cot_reports_from_lakehouse(
 
 def _cot_reports(ticker: str, as_of_date: date, lookback_days: int) -> pd.DataFrame | None:
     """The query behind `load_cot_reports_from_lakehouse`, without the
-    `data_end` guard its public callers apply first."""
+    `data_end` guard its public callers apply first. For a ticker with a
+    contract-market code, `_require_rows` first checks that
+    `cftc_cot_publication` holds rows, so a read landing on its rebuild
+    raises `EmptyTableReadError` instead of finding no available report;
+    inside a `lake_session` that check is made once per session."""
     window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
     availability_cutoff = as_of_date.isoformat()
     queries = [
@@ -1262,6 +1347,7 @@ def _cot_reports(ticker: str, as_of_date: date, lookback_days: int) -> pd.DataFr
         code = codes.get(ticker)
         if code is None:
             continue
+        _require_rows("cftc_cot_publication")
         query = f"""
             SELECT cot.report_date,
                    {net_position_expr} / cot.open_interest_all AS net_positioning_ratio,
@@ -2118,10 +2204,15 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
       `end_date` in `sp500_membership`, an open membership span counting
       as today; `identifier` is not used.
 
-    Returns `None` when the lake holds no matching rows. Not subject to
-    the session's `data_end` (`_guard_data_end`): it takes no
-    knowledge-time argument and returns coverage dates for the preflight,
-    not data, so the last date can fall after `data_end`."""
+    Returns `None` when the lake holds no matching rows. The
+    `sp500_membership` read, and for `cftc_cot` a check that
+    `cftc_cot_publication` holds rows (`_require_rows`) made before the
+    per-market read, go through `_query_table`, so a table those reads
+    find empty twice raises `EmptyTableReadError` rather than reporting
+    no coverage. Not subject to the session's `data_end`
+    (`_guard_data_end`): it takes no knowledge-time argument and returns
+    coverage dates for the preflight, not data, so the last date can fall
+    after `data_end`."""
     if source == "options_chain":
         query = f"""
             SELECT MIN(date) AS first, MAX(date) AS last
@@ -2151,6 +2242,7 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
             code = codes.get(cot_ticker)
             if code is None:
                 continue
+            _require_rows("cftc_cot_publication")
             query = f"""
                 SELECT MIN(pub.published_date) AS first, MAX(pub.published_date) AS last
                 FROM {_table_sql(table)} AS cot
@@ -2184,6 +2276,7 @@ def source_coverage(source: CoverageSource, identifier: str | None) -> tuple[dat
             SELECT MIN(start_date) AS first,
                    MAX(COALESCE(end_date, CAST(? AS DATE))) AS last
             FROM {_table_sql("sp500_membership")}
+            HAVING count(*) > 0
         """
-        return _first_and_last(_query(query, [date.today().isoformat()]))
+        return _first_and_last(_query_table("sp500_membership", query, [date.today().isoformat()]))
     raise ValueError(f"no coverage query for source {source!r}")
