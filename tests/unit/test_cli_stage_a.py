@@ -6,7 +6,7 @@ analysts, prints the `BatchResult` as JSON and exits 3 when the batch stopped fo
 
 import inspect
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, timedelta
 from importlib import import_module
 from pathlib import Path
@@ -18,14 +18,16 @@ import pytest
 from click.testing import Result
 from typer.testing import CliRunner
 
+from agentic_trading import cli
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.cli import stage_a_app
-from agentic_trading.config import temporary_overrides
+from agentic_trading.config import settings, temporary_overrides
 from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
     load_price_history_with_fallback,
 )
 from agentic_trading.stage_a.runner import BatchResult, run_batch
+from agentic_trading.trials.ledger import TrialLedger
 
 runner = CliRunner()
 
@@ -164,3 +166,46 @@ def test_stage_a_usage_errors(tmp_path: Path, preflight_lake: Any) -> None:
         assert result.exit_code == 2, (label, result.output)
         load.assert_not_called()
         batch.assert_not_called()
+
+
+@pytest.fixture
+def _restore_ledger_path() -> Iterator[None]:
+    """Restores `trials.ledger_path`, which `--set` mutates globally."""
+    with temporary_overrides({"trials.ledger_path": settings.trials.ledger_path}):
+        yield
+
+
+def test_stage_a_records_trials_in_the_ledger(
+    tmp_path: Path, preflight_lake: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_batch gets a TrialLedger at the repository root joined with trials.ledger_path, read
+    at use time, and the repository root as repo_root."""
+    repo_root = tmp_path / "repo"
+    monkeypatch.setattr(cli, "_REPO_ROOT", repo_root)
+    with temporary_overrides({"trials.ledger_path": "trials/ledger.duckdb"}):
+        result, _, batch = _invoke(_args(tmp_path / "store"))
+    called = _bound(run_batch, batch)
+
+    assert result.exit_code == 0, result.output
+    assert isinstance(called["ledger"], TrialLedger)
+    assert called["ledger"].path == repo_root / "trials" / "ledger.duckdb"
+    assert called["repo_root"] == repo_root
+    assert not repo_root.exists()
+
+
+@pytest.mark.usefixtures("_restore_ledger_path")
+def test_stage_a_ledger_path_from_set(
+    tmp_path: Path, preflight_lake: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An absolute trials.ledger_path given through --set is the ledger's path as is."""
+    repo_root = tmp_path / "repo"
+    ledger_path = tmp_path / "elsewhere" / "ledger.duckdb"
+    monkeypatch.setattr(cli, "_REPO_ROOT", repo_root)
+    result, _, batch = _invoke(
+        _args(tmp_path / "store", "--set", f"trials.ledger_path={ledger_path}")
+    )
+    called = _bound(run_batch, batch)
+
+    assert result.exit_code == 0, result.output
+    assert called["ledger"].path == ledger_path
+    assert called["repo_root"] == repo_root

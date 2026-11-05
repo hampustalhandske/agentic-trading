@@ -44,6 +44,7 @@ from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
 from agentic_trading.stage_a.runner import run_batch
 from agentic_trading.stage_a.store import InstrumentKind
+from agentic_trading.trials.ledger import TrialLedger
 
 app = typer.Typer()
 experiment_app = typer.Typer()
@@ -829,7 +830,8 @@ def experiment(
         )
 
 
-# The repository root; a stage (a) store must lie outside it.
+# The repository root; a stage (a) store must lie outside it, and the trial
+# ledger's relative paths are resolved against it.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Exit code of `agentic-trading-stage-a` when the batch stopped for resources.
@@ -900,20 +902,26 @@ def stage_a(
         "--set",
         help="Override one strategy constant for this batch, as group.field=value "
         "(e.g. stage_a.session_calendar=XSTO); repeat for several. Hashed settings "
-        "enter each trial's spec. See agentic_trading/config.py for every key.",
+        "enter each trial's spec; trials.ledger_path moves the trial ledger. See "
+        "agentic_trading/config.py for every key.",
     ),
 ) -> None:
     """Compute and store stage (a) signals and decisions for the given
-    analysts over the universe, resuming each trial from its store.
+    analysts over the universe, resuming each trial from its store, and
+    record each batch in the trial ledger.
 
     Loads the universe's prices from the window start minus the standard
     warm-up to the window end, then runs `stage_a.runner.run_batch`, all
     inside one lake session cut at `stage_a.data_end`, so the prices and
     every analyst read see the same lake time. The spec records that
     lake time, the lake version and the installed quantcore version and
-    commit. Prints the batch result as JSON. Exits 0 when every analyst
-    finished, 3 when the batch stopped for low memory or disk (rerun to
-    resume), and 2 on a usage error: an unknown analyst id, a missing
+    commit. Each analyst's hypothesis is registered in the trial ledger at
+    `trials.ledger_path` (relative to the repository root unless absolute)
+    before its first day is computed, and each analyst that wrote a day
+    records a trial row there, whose spec holds the batch's window. Prints
+    the batch result as JSON. Exits 0 when every analyst finished, 3 when
+    the batch stopped for low memory or disk (rerun to resume), and 2 on a
+    usage error: an unknown analyst id, a missing
     --store-dir or one inside the repository, a naive --lake-time, a bad
     --set, or a window that is reversed or ends after stage_a.data_end.
 
@@ -987,6 +995,8 @@ def stage_a(
             lake_version=lake_version,
             quantcore_version=metadata.version("quantcore"),
             quantcore_sha=provenance.quantcore_sha(),
+            ledger=TrialLedger(_REPO_ROOT / settings.trials.ledger_path, _REPO_ROOT),
+            repo_root=_REPO_ROOT,
         )
     typer.echo(result.model_dump_json(indent=2))
     if result.stopped_for_resources:
