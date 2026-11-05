@@ -87,6 +87,9 @@ def test_build_spec_records_the_trial() -> None:
         "stage_a.min_free_memory_pct",
         "stage_a.min_free_disk_gb",
         "stage_a.check_every_days",
+        "trials.ledger_path",
+        "trials.registry_dir",
+        "trials.firm_family",
     )
     assert spec.agent_id == "cir_rate_regime_analyst"
     assert spec.analyst_class in {cls.__qualname__, f"{cls.__module__}.{cls.__qualname__}"}
@@ -164,6 +167,18 @@ def test_runtime_settings_fields_are_excluded(monkeypatch: pytest.MonkeyPatch) -
 
     assert hashed_changed != hashed_base
     assert runtime_changed == runtime_base
+
+
+def test_trials_settings_stay_outside_the_hash() -> None:
+    """The trials group never enters the snapshot, so overriding it leaves the hash."""
+    analyst = CIRRateRegimeAnalyst()
+    base = _build(analyst)
+    overrides = {"trials.firm_family": "other-firm", "trials.ledger_path": "state/trials.duckdb"}
+    with temporary_overrides(overrides):
+        overridden = _build(analyst)
+
+    assert "trials" not in base.settings
+    assert spec_hash(overridden) == spec_hash(base)
 
 
 def test_module_hashes_cover_the_analyst_and_its_agents_imports() -> None:

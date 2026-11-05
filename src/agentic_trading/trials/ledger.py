@@ -346,6 +346,17 @@ class TrialLedger:
 
         self._write(operation)
 
+    def has_trial(self, trial_id: str) -> bool:
+        """Whether a trial with `trial_id` is recorded; False when the ledger file does not
+        exist."""
+        with self._reader() as con:
+            if con is None or not _has_table(con, "trials"):
+                return False
+            found = con.execute(
+                "SELECT count(*) FROM trials WHERE trial_id = ?", [trial_id]
+            ).fetchone()
+            return found is not None and bool(found[0])
+
     def record_review(
         self, hypothesis_id: str, kind: str, verdict: str, detail: dict[str, Any] | None = None
     ) -> None:

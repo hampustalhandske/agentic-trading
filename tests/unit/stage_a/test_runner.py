@@ -47,6 +47,9 @@ _RUNTIME_FIELDS = {
     "stage_a.min_free_memory_pct",
     "stage_a.min_free_disk_gb",
     "stage_a.check_every_days",
+    "trials.ledger_path",
+    "trials.registry_dir",
+    "trials.firm_family",
 }
 _ERRORS: dict[str, type[Exception]] = {
     "value": ValueError,

@@ -469,6 +469,26 @@ class StageAConfig(BaseModel):
     check_every_days: int = Field(default=20, ge=1)
 
 
+class TrialsConfig(BaseModel):
+    """Where trials are recorded: the trial ledger, the registry files of
+    its hypotheses and the family they are counted in. Paths are relative
+    to the repository root. These say where a trial is recorded, not what
+    it computes, so they are left out of the spec hash
+    (`stage_a.spec.RUNTIME_SETTINGS_FIELDS`)."""
+
+    model_config = _GROUP_CONFIG
+
+    # The hash-chained DuckDB trial ledger (`trials.ledger.TrialLedger`),
+    # kept with the research record it counts trials for.
+    ledger_path: str = "research/ledger.duckdb"
+    # Directory of the hypotheses' registry files (`<id>.yaml`), beside the
+    # ledger that records their hashes.
+    registry_dir: str = "research/registry"
+    # The one family every hypothesis of this firm is counted in, so edgelab
+    # deflates each result by the firm's whole trial count. Policy choice.
+    firm_family: str = "agentic-firm"
+
+
 class StrategyConfig(BaseModel):
     model_config = _GROUP_CONFIG
 
@@ -479,6 +499,7 @@ class StrategyConfig(BaseModel):
     portfolio: PortfolioConstructionConfig = Field(default_factory=PortfolioConstructionConfig)
     analysts: AnalystConfig = Field(default_factory=AnalystConfig)
     stage_a: StageAConfig = Field(default_factory=StageAConfig)
+    trials: TrialsConfig = Field(default_factory=TrialsConfig)
     # Per-pod sizing, keyed by manager `agent_id`; the research-grounded
     # reasoning for each row lives next to the manager in `roster.py`.
     pod_sizing: dict[str, PodSizingConfig] = Field(

@@ -30,13 +30,18 @@ from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.config import settings
 
 # Dotted `settings` paths (`<group>.<field>`, or `pod_sizing.<pod>.<field>`)
-# that tune how a run executes rather than what it computes, and so are
-# left out of the hashed snapshot: the batch runner's resource guard.
-# Every other `settings` field is a strategy constant.
+# that tune how a run executes or where it is recorded rather than what it
+# computes, and so are left out of the hashed snapshot: the batch runner's
+# resource guard, and the `trials` group (the trial ledger, the registry
+# directory and the firm family), which is therefore absent from the
+# snapshot. Every other `settings` field is a strategy constant.
 RUNTIME_SETTINGS_FIELDS: tuple[str, ...] = (
     "stage_a.min_free_memory_pct",
     "stage_a.min_free_disk_gb",
     "stage_a.check_every_days",
+    "trials.ledger_path",
+    "trials.registry_dir",
+    "trials.firm_family",
 )
 
 # The rule that turns one day's analyst signals into instrument weights.
@@ -57,7 +62,7 @@ class StageASpec(BaseModel):
       `<module>.<qualname>`;
     - `analyst_params`: the analyst's public fields as JSON values;
     - `settings`: `settings` as JSON values, minus
-      `RUNTIME_SETTINGS_FIELDS`;
+      `RUNTIME_SETTINGS_FIELDS` and any group they empty;
     - `module_hashes`: dotted module name to the sha256 hex digest of the
       module's source file, for the analyst's own module and each
       `agentic_trading.agents` module it imports directly;
@@ -90,14 +95,18 @@ class StageASpec(BaseModel):
         return self
 
 
-def spec_hash(spec: StageASpec) -> str:
-    """The sha256 hex digest of `spec`'s canonical JSON: its JSON-mode
-    dump with `universe` sorted, serialized with sorted keys and no
-    whitespace. Dict key order and instrument order never change it."""
+def canonical_spec_json(spec: StageASpec) -> str:
+    """`spec`'s canonical JSON: its JSON-mode dump with `universe` sorted,
+    serialized with sorted keys and no whitespace, non-JSON values written
+    through `str`. Dict key order and instrument order never change it."""
     payload = spec.model_dump(mode="json")
     payload["universe"] = sorted(payload["universe"])
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def spec_hash(spec: StageASpec) -> str:
+    """The sha256 hex digest of `canonical_spec_json(spec)`, UTF-8 encoded."""
+    return hashlib.sha256(canonical_spec_json(spec).encode("utf-8")).hexdigest()
 
 
 class SpecRecord(BaseModel):
@@ -149,18 +158,25 @@ def build_spec(
 
 def _hashed_settings(runtime_fields: tuple[str, ...]) -> dict[str, Any]:
     """`settings` as JSON values with every dotted path in `runtime_fields`
-    removed. Raises `KeyError` naming a path that is not a setting."""
+    removed, and every group (or pod) left empty by the removal dropped
+    too, so a group made only of runtime fields leaves no trace in the
+    snapshot. Raises `KeyError` naming a path that is not a setting."""
     snapshot: dict[str, Any] = settings.model_dump(mode="json")
     for path in runtime_fields:
         *parents, leaf = path.split(".")
-        node: Any = snapshot
+        nodes: list[dict[str, Any]] = [snapshot]
         for part in parents:
-            if not isinstance(node, dict) or part not in node:
+            node = nodes[-1].get(part)
+            if not isinstance(node, dict):
                 raise KeyError(f"runtime settings field {path!r} names no setting")
-            node = node[part]
-        if not isinstance(node, dict) or leaf not in node:
+            nodes.append(node)
+        if leaf not in nodes[-1]:
             raise KeyError(f"runtime settings field {path!r} names no setting")
-        del node[leaf]
+        del nodes[-1][leaf]
+        for depth in range(len(parents), 0, -1):
+            if nodes[depth]:
+                break
+            del nodes[depth - 1][parents[depth - 1]]
     return snapshot
 
 

@@ -13,13 +13,20 @@ analyst's `SignalStore`. A trial resumes after its store's last completed
 day, so a rerun of a finished trial computes and writes nothing. Every
 `settings.stage_a.check_every_days` days written, it calls the resource
 check (`system_resources_ok` by default) and, when that fails, stops
-after the day it has just written; the next run resumes from there."""
+after the day it has just written; the next run resumes from there.
+
+Given a `TrialLedger`, the batch also records its trials there: each
+analyst's stage (a) hypothesis is registered in
+`settings.trials.firm_family` before its first day is written, and each
+analyst that wrote a day gets one trial row (`trials.rows`), so a rerun
+that writes nothing adds no row and a resumed batch adds another row
+under the same spec hash."""
 
 import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -43,6 +50,13 @@ from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.logging_config import get_logger
 from agentic_trading.stage_a.spec import SpecRecord, build_spec, spec_hash
 from agentic_trading.stage_a.store import InstrumentKind, SignalStore
+from agentic_trading.trials.ledger import TrialLedger
+from agentic_trading.trials.rows import (
+    current_trial_provenance,
+    ensure_stage_a_registration,
+    stage_a_hypothesis_id,
+    stage_a_trial_row,
+)
 
 logger = get_logger(__name__)
 
@@ -215,6 +229,8 @@ def run_batch(
     quantcore_version: str,
     quantcore_sha: str | None,
     resources_ok: Callable[[Path], bool] = system_resources_ok,
+    ledger: TrialLedger | None = None,
+    repo_root: Path | None = None,
 ) -> BatchResult:
     """Run each of `analysts`, in order, over `universe` on the sessions of
     `settings.stage_a.session_calendar` (read at call time) from
@@ -236,14 +252,26 @@ def run_batch(
     analysts; on False the batch returns after that day with
     `stopped_for_resources` True and the analysts after it not started.
 
+    With a `ledger`, `repo_root` is the repository root its registry
+    files live under. Before an analyst's first pending day is computed,
+    its hypothesis (`stage_a_hypothesis_id`) is registered through
+    `ensure_stage_a_registration` in `settings.trials.firm_family` (read
+    at call time). After an analyst's counts.json is written, when this
+    call wrote at least one day for it, its `stage_a_trial_row` is
+    recorded with the provenance of the code running now and `n_days` the
+    sessions from `window_start` to the store's last completed day.
+    Without a ledger, nothing is written outside `store_dir`.
+
     Raises `ValueError`, before reading or writing anything, when
     `window_start` is after `window_end`, `window_end` is after
-    `settings.stage_a.data_end` (read at call time), or two analysts share
-    an agent_id. An analyst's exception is stored as that asset's error
-    signal for the day, except `HoldoutReadError` and `LakeTimeError`,
-    which propagate with the day unwritten; so does `HoldoutReadError`
-    for a day on which a read past data_end was refused and caught. A
-    store mismatch or a refused row propagates from `SignalStore`."""
+    `settings.stage_a.data_end` (read at call time), two analysts share
+    an agent_id, or a `ledger` is given without a `repo_root`. A
+    `LedgerError` from registering or recording propagates. An analyst's
+    exception is stored as that asset's error signal for the day, except
+    `HoldoutReadError` and `LakeTimeError`, which propagate with the day
+    unwritten; so does `HoldoutReadError` for a day on which a read past
+    data_end was refused and caught. A store mismatch or a refused row
+    propagates from `SignalStore`."""
     data_end = settings.stage_a.data_end
     if window_start > window_end:
         raise ValueError(
@@ -258,6 +286,9 @@ def run_batch(
     repeated = sorted({agent_id for agent_id in agent_ids if agent_ids.count(agent_id) > 1})
     if repeated:
         raise ValueError(f"analysts share an agent_id: {repeated}")
+    if ledger is not None and repo_root is None:
+        raise ValueError("a ledger needs the repo_root its registry files live under")
+    family = settings.trials.firm_family
 
     records = []
     for analyst in analysts:
@@ -273,7 +304,8 @@ def run_batch(
             )
         )
     store_dir = Path(store_dir)
-    sessions = sessions_between(window_start, window_end, settings.stage_a.session_calendar)
+    calendar = settings.stage_a.session_calendar
+    sessions = sessions_between(window_start, window_end, calendar)
     instrument_ids = {asset: asset for asset in universe}
     check_every_days = settings.stage_a.check_every_days
 
@@ -293,6 +325,16 @@ def run_batch(
                 len(pending),
                 len(sessions),
             )
+            hypothesis_id = stage_a_hypothesis_id(analyst.agent_id)
+            if ledger is not None and repo_root is not None and pending:
+                ensure_stage_a_registration(
+                    ledger=ledger,
+                    repo_root=repo_root,
+                    agent_id=analyst.agent_id,
+                    analyst_class=record.spec.analyst_class,
+                    family=family,
+                    now=datetime.now(UTC),
+                )
             written = 0
             for day in pending:
                 signals = _day_signals(analyst, universe, market_data, day, session)
@@ -306,16 +348,27 @@ def run_batch(
                         break
             if written or not (store.trial_dir / "counts.json").exists():
                 store.write_counts()
+            last_completed = store.last_completed()
+            if ledger is not None and written and last_completed is not None:
+                ledger.record_trial(
+                    stage_a_trial_row(
+                        record,
+                        hypothesis_id,
+                        family,
+                        n_days=len(sessions_between(window_start, last_completed, calendar)),
+                        provenance=current_trial_provenance(),
+                    )
+                )
             results[analyst.agent_id] = AnalystBatchResult(
                 spec_hash=record.spec_hash,
                 days_written=written,
-                last_completed=store.last_completed(),
+                last_completed=last_completed,
             )
             if stopped:
                 logger.warning(
                     "Stage (a) batch stopped for resources after %s on %s",
                     analyst.agent_id,
-                    store.last_completed(),
+                    last_completed,
                 )
                 break
     return BatchResult(analysts=results, stopped_for_resources=stopped)
