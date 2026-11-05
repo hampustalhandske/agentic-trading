@@ -263,8 +263,8 @@ class ConditionalValueAtRiskManager(ManagerAgent):
             # today's floating conviction score, even while holding the
             # same contract, is what turns a "hold until roll" position
             # into a stream of small, spread-crossing resizes every day
-            # the pod's underlying weight moves (see KNOWN_LIMITATIONS
-            # §6). Only opening a fresh contract (a first entry, a roll,
+            # the pod's underlying weight moves (see docs/LIMITATIONS.md
+            # §2). Only opening a fresh contract (a first entry, a roll,
             # or a confirmed side flip) re-sizes.
             return held_id, held.directional[held_id]
         fraction = min(abs(weight) * mark.mid / (abs(mark.delta) * spot), abs(weight))

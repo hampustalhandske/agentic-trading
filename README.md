@@ -110,7 +110,7 @@ Sharpe, cuts a pod 75% at a 10% drawdown until it recovers to 3%, gives
 the tail hedge a fixed 2%, and clips the combined book to a 25%
 single-name cap, 4× gross and a 2% one-day 95% VaR. The engine charges
 5 bps commission, 5 bps slippage, 50 bps annual stock borrow on shorts
-and risk-free plus 150 bps on borrowed cash. `KNOWN_LIMITATIONS.md`
+and risk-free plus 150 bps on borrowed cash. `docs/LIMITATIONS.md`
 lists what still departs from a production desk.
 
 ## Constants and per-run overrides
@@ -189,7 +189,7 @@ tests/unit/                    # mirrors src/
 - Every cross-component structure is a Pydantic `BaseModel`; no raw
   dicts across module boundaries.
 - `quantcore` owns the math. A missing primitive is a quantcore task;
-  `KNOWN_LIMITATIONS.md` §5 lists the ones currently bridged with a
+  `docs/LIMITATIONS.md` §5 lists the ones currently bridged with a
   minimal local fallback.
 - Point-in-time discipline is structural: loaders gate on availability
   dates, the engine slices with `get_point_in_time_data`.

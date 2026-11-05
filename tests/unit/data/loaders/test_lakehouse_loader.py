@@ -219,9 +219,7 @@ def test_options_snapshot_rescales_a_pre_split_strike_onto_todays_basis(
     """A contract quoted before a later 10-for-1 split is archival and
     never itself adjusted; the loader must divide its strike/bid/ask by
     the split factor so it lines up with the always-adjusted spot from
-    `instrument_prices` — this is the bug behind the NVDA 630 call that
-    marked near zero against an $88 spot in the live 2024_2026 run
-    (KNOWN_LIMITATIONS §0)."""
+    `instrument_prices`."""
     fake_lake.add(
         "dolthub_option_chain",
         _option_chain_table(

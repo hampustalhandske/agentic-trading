@@ -92,11 +92,11 @@ equilibrium exists for that basket:**
   systematic insurance sleeve — vix_tail_hedge_analyst reads `^VIX`'s
   own price history and produces a short-SPY signal scaled by how
   elevated VIX is. Funded by a fixed, protected Commander-level budget
-  carve-out (`commander.TAIL_HEDGE_BUDGET_FRACTION`) rather than the
+  carve-out (`commander.tail_hedge_budget_fraction`) rather than the
   normal trailing-Sharpe risk-budgeting every other pod gets, since a
   hedge that gets defunded by its own performance during a calm stretch
-  defeats its own purpose. A linear proxy, not real convex options
-  protection — see KNOWN_LIMITATIONS.md.
+  defeats its own purpose. The sleeve buys SPY puts and falls back to
+  a short SPY weight with no usable chain; see docs/LIMITATIONS.md §2.
 
 Every pod's own `leverage_cap`/`net_leverage_cap`/`target_annualized_vol`/
 `kelly_fraction_weight` is set per-strategy (research-grounded real-desk

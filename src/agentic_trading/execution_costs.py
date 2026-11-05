@@ -28,7 +28,7 @@ def expected_fill_cost_fraction(
     Square-root market impact and option bid/ask half-spreads are left
     out. Both depend on an order's size or a quote, and the no-trade band
     that consumes this number works on weight fractions with neither, so
-    the band clears only the linear cost (see KNOWN_LIMITATIONS §3.3).
+    the band clears only the linear cost (see docs/LIMITATIONS.md §2).
     """
     commission = settings.firm.commission_rate if commission_rate is None else commission_rate
     slippage = (settings.firm.slippage_bps if slippage_bps is None else slippage_bps) / 10_000.0
