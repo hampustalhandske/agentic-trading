@@ -17,6 +17,7 @@ from agentic_trading.agents._market_math import (
     raw_spot,
 )
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
+    chain_snapshot_date,
     options_chain_requirements,
     real_atm_options_by_expiration,
 )
@@ -42,7 +43,12 @@ class BlackScholesValuationAnalyst(AnalystAgent):
     Flat with zero confidence when no real snapshot or no close exists
     for the date. The GARCH leg refits at most once every
     `_refit_cache.refit_interval_days` simulated days per asset — see
-    `RefitCache`'s docstring."""
+    `RefitCache`'s docstring.
+
+    Every active signal's `source_as_of` is the date of the chain snapshot
+    it priced off (`_options_data.chain_snapshot_date`), the snapshot's own
+    date rather than the later decision date the publication lag first
+    makes it visible on."""
 
     agent_id: str = "black_scholes_valuation_analyst"
     data_requirements: tuple[DataRequirement, ...] = Field(
@@ -149,6 +155,7 @@ class BlackScholesValuationAnalyst(AnalystAgent):
             as_of_date=as_of_date.date(),
             direction=direction,
             confidence=confidence,
+            source_as_of=chain_snapshot_date(real_options),
             rationale=(
                 f"quantcore Black-Scholes edge: {settings.analysts.risk_window_short}d fitted vol="
                 f"{fitted_volatility:.3f} vs {benchmark_label}={benchmark_volatility:.3f}, "

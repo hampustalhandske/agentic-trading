@@ -551,6 +551,7 @@ def test_vrp_analyst_is_flat_inside_the_premium_threshold(monkeypatch) -> None:
 def _real_options_frame(ivs: list[float], gammas: list[float]) -> pd.DataFrame:
     return pd.DataFrame(
         {
+            "snapshot_date": pd.Timestamp("2024-02-14"),
             "expiration": pd.to_datetime(["2024-03-15", "2024-04-19", "2024-06-21"][: len(ivs)]),
             "days_to_expiration": [30, 65, 128][: len(ivs)],
             "strike": [100.0] * len(ivs),

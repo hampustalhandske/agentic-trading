@@ -17,6 +17,8 @@ they all see the same numbers on the same day:
   volatility view that gets compared against the real market quote.
 """
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 
@@ -114,6 +116,7 @@ def real_atm_options_by_expiration(
         days_to_expiration = max(int((expiration - snapshot_date).days), 1)
         rows.append(
             {
+                "snapshot_date": snapshot_date,
                 "expiration": expiration,
                 "days_to_expiration": days_to_expiration,
                 "strike": float(np.asarray(nearest_strike, dtype=np.float64)),
@@ -125,3 +128,11 @@ def real_atm_options_by_expiration(
     if not rows:
         return None
     return pd.DataFrame(rows).sort_values("days_to_expiration").reset_index(drop=True)
+
+
+def chain_snapshot_date(options: pd.DataFrame) -> date:
+    """The date of the chain snapshot a non-empty
+    `real_atm_options_by_expiration` frame was reduced from: an
+    end-of-day quote published at that date's close, so the publication
+    date of the data a signal read off `options` rests on."""
+    return pd.Timestamp(options["snapshot_date"].iloc[0]).date()

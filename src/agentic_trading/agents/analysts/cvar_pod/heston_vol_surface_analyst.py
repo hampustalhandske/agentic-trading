@@ -9,6 +9,7 @@ from pydantic import Field
 from agentic_trading.agents._market_math import clamp, market_slice, raw_spot
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
     annualized_garch_volatility,
+    chain_snapshot_date,
     options_chain_requirements,
     real_atm_options_by_expiration,
 )
@@ -78,9 +79,17 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
     positive returns); implied vol below the model forecast, or a
     backwardated curve, is short. Confidence grows from zero at the
     threshold to full `vrp_full_confidence_span` beyond it, with up to a
-    50% uplift for a steep term slope, capped at 0.75. Flat with zero
-    confidence when fewer than two usable expiries exist for the date.
-    The agent id is kept so scoreboard history stays continuous."""
+    50% uplift for a steep term slope, capped at 0.75. A premium inside
+    the threshold on a curve that is not backwardated abstains (active,
+    flat, confidence 0). Flat with zero confidence and unavailable when
+    fewer than two usable expiries exist for the date. The agent id is
+    kept so scoreboard history stays continuous.
+
+    Every active signal's `source_as_of`, an abstention included, is the
+    date of the chain snapshot the surface was read from
+    (`_options_data.chain_snapshot_date`), the snapshot's own date rather
+    than the later decision date the publication lag first makes it
+    visible on."""
 
     agent_id: str = "heston_vol_surface_analyst"
     data_requirements: tuple[DataRequirement, ...] = Field(
@@ -156,19 +165,24 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
         slope = float(ivs[-1] - ivs[0]) if days[-1] - days[0] >= MIN_SLOPE_SPAN_DAYS else 0.0
 
         threshold = settings.analysts.vrp_threshold
-        direction: Literal["long", "short", "flat"] = "flat"
+        source_as_of = chain_snapshot_date(real_options)
+        rationale = (
+            f"variance risk premium {vrp:+.4f} (IV_30={iv_30:.4f} vs model vol "
+            f"{model_vol:.4f}), term slope {slope:+.4f} over {days[0]:.0f}-{days[-1]:.0f} DTE"
+        )
+        direction: Literal["long", "short"]
         if vrp >= threshold and slope >= 0.0:
             direction = "long"
         elif vrp <= -threshold or slope <= BACKWARDATION_SLOPE:
             direction = "short"
+        else:
+            return self.abstain_signal(asset, as_of_date, rationale, source_as_of=source_as_of)
 
-        confidence = 0.0
-        if direction != "flat":
-            premium_strength = clamp(
-                (abs(vrp) - threshold) / settings.analysts.vrp_full_confidence_span
-            )
-            slope_uplift = 1.0 + SLOPE_UPLIFT_WEIGHT * clamp(abs(slope) / SLOPE_FULL_UPLIFT)
-            confidence = clamp(premium_strength * slope_uplift, 0.0, MAX_CONFIDENCE)
+        premium_strength = clamp(
+            (abs(vrp) - threshold) / settings.analysts.vrp_full_confidence_span
+        )
+        slope_uplift = 1.0 + SLOPE_UPLIFT_WEIGHT * clamp(abs(slope) / SLOPE_FULL_UPLIFT)
+        confidence = clamp(premium_strength * slope_uplift, 0.0, MAX_CONFIDENCE)
 
         return AgentSignal(
             agent_id=self.agent_id,
@@ -176,8 +190,6 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
             as_of_date=as_of_date.date(),
             direction=direction,
             confidence=confidence,
-            rationale=(
-                f"variance risk premium {vrp:+.4f} (IV_30={iv_30:.4f} vs model vol "
-                f"{model_vol:.4f}), term slope {slope:+.4f} over {days[0]:.0f}-{days[-1]:.0f} DTE"
-            ),
+            rationale=rationale,
+            source_as_of=source_as_of,
         )

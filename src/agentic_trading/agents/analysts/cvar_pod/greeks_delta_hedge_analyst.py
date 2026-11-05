@@ -9,6 +9,7 @@ from pydantic import Field, PrivateAttr
 
 from agentic_trading.agents._market_math import clamp, market_slice, raw_spot
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
+    chain_snapshot_date,
     options_chain_requirements,
     real_atm_options_by_expiration,
 )
@@ -55,7 +56,14 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
     low z (gamma-light regime) follows it; a 5-day move smaller than a
     fraction of its own 60-day sigma is neither. Confidence scales with
     |z| beyond `settings.analysts.gamma_zscore_threshold`, capped at
-    `MAX_CONFIDENCE`."""
+    `MAX_CONFIDENCE`. A move inside the noise floor or a z inside the
+    threshold abstains (active, flat, confidence 0).
+
+    Every active signal's `source_as_of`, an abstention included, is the
+    date of the day's chain snapshot (`_options_data.chain_snapshot_date`),
+    the newest of the snapshots whose gamma the z-score is computed over.
+    It is the snapshot's own date rather than the later decision date the
+    publication lag first makes it visible on."""
 
     agent_id: str = "greeks_delta_hedge_analyst"
     data_requirements: tuple[DataRequirement, ...] = Field(
@@ -124,6 +132,7 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
                 asset, as_of_date, "non-positive ATM gamma in the snapshot", "unavailable"
             )
         log_gamma = float(np.log(gamma_intensity))
+        source_as_of = chain_snapshot_date(real_options)
         self._record_log_gamma(asset, as_of_date, log_gamma)
 
         history = list(self._log_gamma_history[asset].values())
@@ -145,11 +154,12 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
             MOMENTUM_NOISE_FRACTION * float(np.std(returns, ddof=1)) * float(np.sqrt(MOMENTUM_DAYS))
         )
         if abs(momentum) < noise_floor:
-            return self._flat(
+            return self.abstain_signal(
                 asset,
                 as_of_date,
                 f"no move to fade/follow ({MOMENTUM_DAYS}-day momentum {momentum:+.4f} "
                 f"within noise {noise_floor:.4f}; g={gamma_intensity:.4f}, z={zscore:+.2f})",
+                source_as_of=source_as_of,
             )
         momentum_direction: Literal["long", "short"] = "long" if momentum > 0.0 else "short"
         against_momentum: Literal["long", "short"] = (
@@ -157,7 +167,11 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
         )
 
         threshold = settings.analysts.gamma_zscore_threshold
-        direction: Literal["long", "short", "flat"]
+        reading = (
+            f"{MOMENTUM_DAYS}-day momentum {momentum:+.4f}; "
+            f"ATM gamma intensity g={gamma_intensity:.4f} at {dte} DTE, z={zscore:+.2f}"
+        )
+        direction: Literal["long", "short"]
         if zscore > threshold:
             direction = against_momentum
             regime = "pinning regime: fading"
@@ -165,13 +179,10 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
             direction = momentum_direction
             regime = "gamma-light regime: following"
         else:
-            direction = "flat"
-            regime = "no gamma regime"
-        confidence = (
-            clamp((abs(zscore) - threshold) / CONFIDENCE_ZSCORE_SPAN, 0.0, MAX_CONFIDENCE)
-            if direction != "flat"
-            else 0.0
-        )
+            return self.abstain_signal(
+                asset, as_of_date, f"no gamma regime {reading}", source_as_of=source_as_of
+            )
+        confidence = clamp((abs(zscore) - threshold) / CONFIDENCE_ZSCORE_SPAN, 0.0, MAX_CONFIDENCE)
 
         return AgentSignal(
             agent_id=self.agent_id,
@@ -179,8 +190,6 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
             as_of_date=as_of_date.date(),
             direction=direction,
             confidence=confidence,
-            rationale=(
-                f"{regime} {MOMENTUM_DAYS}-day momentum {momentum:+.4f}; "
-                f"ATM gamma intensity g={gamma_intensity:.4f} at {dte} DTE, z={zscore:+.2f}"
-            ),
+            rationale=f"{regime} {reading}",
+            source_as_of=source_as_of,
         )
