@@ -60,6 +60,18 @@ from agentic_trading.trials.rows import (
 
 logger = get_logger(__name__)
 
+# Analysts that may not run in stage (a), by agent_id, with the reason.
+# `run_batch` refuses them and the stage (a) command reports them as a
+# usage error.
+_SEED_PAIRS_REASON = (
+    "trades seed pairs selected on 2017-04..2018-03 data, inside the grading window; "
+    "returns with point-in-time pair selection"
+)
+EXCLUDED_ANALYSTS: dict[str, str] = {
+    "pairs_cointegration_analyst": _SEED_PAIRS_REASON,
+    "kalman_hedge_ratio_analyst": _SEED_PAIRS_REASON,
+}
+
 # macOS's memory report; its last line gives the share of memory free.
 _MEMORY_PRESSURE_COMMAND = ("memory_pressure",)
 _MEMORY_PRESSURE_TIMEOUT_SECONDS = 10.0
@@ -264,8 +276,10 @@ def run_batch(
 
     Raises `ValueError`, before reading or writing anything, when
     `window_start` is after `window_end`, `window_end` is after
-    `settings.stage_a.data_end` (read at call time), two analysts share
-    an agent_id, or a `ledger` is given without a `repo_root`. A
+    `settings.stage_a.data_end` (read at call time), an analyst is in
+    `EXCLUDED_ANALYSTS` (the message names it and the reason), two
+    analysts share an agent_id, or a `ledger` is given without a
+    `repo_root`. A
     `LedgerError` from registering or recording propagates. An analyst's
     exception is stored as that asset's error signal for the day, except
     `HoldoutReadError` and `LakeTimeError`, which propagate with the day
@@ -283,6 +297,12 @@ def run_batch(
             f"{data_end.isoformat()}; the holdout stays locked"
         )
     agent_ids = [analyst.agent_id for analyst in analysts]
+    excluded = [agent_id for agent_id in agent_ids if agent_id in EXCLUDED_ANALYSTS]
+    if excluded:
+        raise ValueError(
+            "analyst(s) excluded from stage (a): "
+            + "; ".join(f"{agent_id} {EXCLUDED_ANALYSTS[agent_id]}" for agent_id in excluded)
+        )
     repeated = sorted({agent_id for agent_id in agent_ids if agent_ids.count(agent_id) > 1})
     if repeated:
         raise ValueError(f"analysts share an agent_id: {repeated}")

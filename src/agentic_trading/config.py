@@ -442,8 +442,8 @@ class AnalystConfig(BaseModel):
 
 
 class StageAConfig(BaseModel):
-    """Stage (a) precompute: the holdout cut and window every trial is
-    computed under, and the resource guard of `stage_a.runner.run_batch`."""
+    """Stage (a) precompute: the holdout cut, window and warm-up every trial
+    is computed under, and the resource guard of `stage_a.runner.run_batch`."""
 
     model_config = _GROUP_CONFIG
 
@@ -457,6 +457,12 @@ class StageAConfig(BaseModel):
     # the rows prices are aligned on: the round-1 universe is priced at the
     # US close, crypto included (one bar per NYSE session, AT-15).
     session_calendar: str = "XNYS"
+    # Calendar days of history loaded before the window: it covers
+    # `analysts.risk_window_garch` (750) returns on the first decision day,
+    # and it is the start of the expanding samples some analysts fit on
+    # (calendar_seasonality, macro_var_spillover), so it changes signals and
+    # is hashed.
+    warmup_days: int = Field(default=1100, ge=1)
     # The last three fields tune how a batch runs, not what it computes, so
     # they are left out of the spec hash (`stage_a.spec.RUNTIME_SETTINGS_FIELDS`).
     # A batch stops after its current day below this share of free system

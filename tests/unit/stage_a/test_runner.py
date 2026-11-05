@@ -224,6 +224,7 @@ def test_stage_a_settings() -> None:
         "data_end": "2024-12-31",
         "window_start": "2010-01-04",
         "session_calendar": "XNYS",
+        "warmup_days": 1100,
     }
     assert unchanged == [base] * len(runtime)
     assert changed != base

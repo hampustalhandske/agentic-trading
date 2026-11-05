@@ -5,10 +5,10 @@
 `StageASpec` holds everything that defines a trial: the analyst (its
 `agent_id`, class and constructor parameters), the `settings` snapshot
 minus `RUNTIME_SETTINGS_FIELDS`, the sha256 of the analyst's own module
-and of each `agentic_trading.agents` module it imports directly, the
-universe, the window and the decision rule. `spec_hash` is the sha256 of
-the spec's canonical JSON, so two specs hash alike exactly when they
-define the same trial.
+and of every `agentic_trading.agents` and `agentic_trading.data` module
+reachable through imports from it, the universe, the window and the
+decision rule. `spec_hash` is the sha256 of the spec's canonical JSON,
+so two specs hash alike exactly when they define the same trial.
 
 `SpecRecord` is what spec.json holds: the spec and its hash, plus the
 lake time T, the lake version and the quantcore version and sha, which
@@ -50,8 +50,10 @@ DECISION_RULE = (
     "non-active and zero-sum days weight 0"
 )
 
-# Package whose modules `module_hashes` covers.
-_AGENTS_PACKAGE = "agentic_trading.agents"
+# The top-level package, and the packages within it whose modules
+# `module_hashes` covers and follows imports through.
+_ROOT_PACKAGE = "agentic_trading"
+_HASHED_PACKAGES = ("agentic_trading.agents", "agentic_trading.data")
 
 
 class StageASpec(BaseModel):
@@ -64,8 +66,9 @@ class StageASpec(BaseModel):
     - `settings`: `settings` as JSON values, minus
       `RUNTIME_SETTINGS_FIELDS` and any group they empty;
     - `module_hashes`: dotted module name to the sha256 hex digest of the
-      module's source file, for the analyst's own module and each
-      `agentic_trading.agents` module it imports directly;
+      module's source file, for the analyst's own module and every
+      `agentic_trading.agents` and `agentic_trading.data` module reachable
+      through imports from it (see `_module_hashes`);
     - `universe`: the instrument ids the analyst runs over;
     - `window_start`, `window_end`: the trial's first and last date,
       inclusive;
@@ -189,23 +192,41 @@ def _module_file(module: str) -> Path:
     return Path(found.origin)
 
 
-def _is_module(name: str) -> bool:
-    """Whether `name` is an importable module (as opposed to a name
-    defined inside a package)."""
-    try:
-        return importlib.util.find_spec(name) is not None
-    except ModuleNotFoundError:
-        return False
+def _in_hashed_packages(name: str) -> bool:
+    """Whether dotted `name` lies under one of `_HASHED_PACKAGES`."""
+    return any(name.startswith(f"{package}.") for package in _HASHED_PACKAGES)
 
 
-def _direct_agents_imports(module: str, source: bytes) -> set[str]:
-    """The `agentic_trading.agents` submodules that `source`, the source
-    of `module`, imports directly, found by parsing it: every `import X`
-    and `from X import ...` anywhere in the file whose module `X`
-    (relative imports resolved against `module`'s package) is under the
-    package, and for `from <package> import name`, `<package>.name` when
-    that is itself a module."""
-    package = module.rpartition(".")[0]
+def _package_source(name: str) -> Path | None:
+    """The source file of `agentic_trading` submodule `name`, located on
+    disk under the package's directory without importing anything:
+    `<parts>.py`, or `<parts>/__init__.py` for a package. `None` when
+    neither exists, as for a name defined inside a module, or when `name`
+    is not under `agentic_trading`."""
+    top, _, rest = name.partition(".")
+    if top != _ROOT_PACKAGE or not rest:
+        return None
+    root = _module_file(_ROOT_PACKAGE).parent
+    parts = rest.split(".")
+    for candidate in (
+        root.joinpath(*parts[:-1], f"{parts[-1]}.py"),
+        root.joinpath(*parts, "__init__.py"),
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _package_imports(module: str, source: bytes, *, is_package: bool = False) -> set[str]:
+    """The `_HASHED_PACKAGES` modules that `source`, the source of
+    `module`, imports, found by parsing it without running it: every
+    `import X` and `from X import ...` anywhere in the file, lazy imports
+    included, whose module `X` is under the packages, and for
+    `from X import name`, `X.name` when that is itself a module. Relative
+    imports resolve against `module`'s package, which is `module` itself
+    when `is_package`. Names are kept only when they have a source file
+    under `agentic_trading`."""
+    package = module if is_package else module.rpartition(".")[0]
     found: set[str] = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
@@ -219,17 +240,31 @@ def _direct_agents_imports(module: str, source: bytes) -> set[str]:
         else:
             continue
         for name in candidates:
-            if name.startswith(f"{_AGENTS_PACKAGE}.") and _is_module(name):
+            if _in_hashed_packages(name) and _package_source(name) is not None:
                 found.add(name)
     return found
 
 
 def _module_hashes(module: str) -> dict[str, str]:
     """Dotted module name to the sha256 hex digest of its source file's
-    bytes, for `module` and each `agentic_trading.agents` module it
-    imports directly (`_direct_agents_imports`)."""
-    source = _module_file(module).read_bytes()
-    hashes = {module: hashlib.sha256(source).hexdigest()}
-    for name in sorted(_direct_agents_imports(module, source) - {module}):
-        hashes[name] = hashlib.sha256(_module_file(name).read_bytes()).hexdigest()
-    return hashes
+    bytes, for `module` and every `agentic_trading.agents` and
+    `agentic_trading.data` module reachable from it: the modules `module`
+    imports (`_package_imports`), the modules those import, and so on,
+    following imports only within those two packages. A module's parent
+    packages, which Python runs on import, are covered only when a
+    module imports them by name. Imports are found by parsing source, so
+    no code runs. Raises `ValueError` when `module` has no source file."""
+    files = {module: _module_file(module)}
+    sources = {module: files[module].read_bytes()}
+    pending = [module]
+    while pending:
+        name = pending.pop()
+        is_package = files[name].name == "__init__.py"
+        for imported in _package_imports(name, sources[name], is_package=is_package):
+            path = _package_source(imported)
+            if imported in files or path is None:
+                continue
+            files[imported] = path
+            sources[imported] = path.read_bytes()
+            pending.append(imported)
+    return {name: hashlib.sha256(sources[name]).hexdigest() for name in sorted(sources)}

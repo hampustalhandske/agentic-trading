@@ -22,7 +22,8 @@ class NeweyWestSignificanceAnalyst(AnalystAgent):
     asset's forward 1-day return on a configurable lagged predictor
     (default: the asset's own trailing momentum) via OLS + a Newey-West
     HAC covariance, only signaling when the predictor's HAC t-stat clears
-    `t_stat_threshold`. The HAC bandwidth (`n_lags`) is selected fresh
+    `t_stat_threshold` (`None`: `settings.analysts.t_stat_threshold`, read
+    each call). The HAC bandwidth (`n_lags`) is selected fresh
     each call from the fit's own residuals via
     `quantcore.statistics.regression.newey_west_optimal_lags` (the
     Newey-West/Andrews plug-in rule) unless explicitly pinned."""
@@ -30,7 +31,9 @@ class NeweyWestSignificanceAnalyst(AnalystAgent):
     agent_id: str = "newey_west_significance_analyst"
 
     momentum_window: int = DEFAULT_MOMENTUM_WINDOW
-    t_stat_threshold: float = settings.analysts.t_stat_threshold
+    # None -> settings.analysts.t_stat_threshold, read each call; an explicit
+    # value is used as given.
+    t_stat_threshold: float | None = None
     # None -> selected fresh each call via newey_west_optimal_lags; pin to
     # a fixed int to skip selection entirely.
     n_lags: int | None = None
@@ -71,7 +74,12 @@ class NeweyWestSignificanceAnalyst(AnalystAgent):
         slope_std_error = float(np.sqrt(max(cov_matrix[1, 1], 0.0)))
         t_stat = slope / slope_std_error if slope_std_error > 0 else 0.0
 
-        if abs(t_stat) < self.t_stat_threshold:
+        threshold = (
+            settings.analysts.t_stat_threshold
+            if self.t_stat_threshold is None
+            else self.t_stat_threshold
+        )
+        if abs(t_stat) < threshold:
             return self.abstain_signal(
                 asset, as_of_date, f"predictor not significant (HAC t={t_stat:.2f})"
             )
@@ -79,7 +87,7 @@ class NeweyWestSignificanceAnalyst(AnalystAgent):
         current_predictor_value = float(full_predictor[-1])
         predicted_move = slope * current_predictor_value
         direction: Literal["long", "short", "flat"] = "long" if predicted_move >= 0.0 else "short"
-        confidence = clamp(abs(t_stat) / (2 * self.t_stat_threshold))
+        confidence = clamp(abs(t_stat) / (2 * threshold))
 
         return AgentSignal(
             agent_id=self.agent_id,

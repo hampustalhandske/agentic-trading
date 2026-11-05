@@ -186,7 +186,9 @@ def test_module_hashes_cover_the_analyst_and_its_agents_imports() -> None:
     hashes = _build().module_hashes
 
     assert {CIRRateRegimeAnalyst.__module__, *_CIR_AGENT_IMPORTS} <= set(hashes)
-    assert all(name.startswith("agentic_trading.agents.") for name in hashes)
+    assert all(
+        name.startswith(("agentic_trading.agents.", "agentic_trading.data.")) for name in hashes
+    )
     for name, digest in hashes.items():
         source = Path(importlib.import_module(name).__file__ or "")
         assert digest == hashlib.sha256(source.read_bytes()).hexdigest(), name

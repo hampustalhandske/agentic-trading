@@ -42,7 +42,7 @@ from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.provenance import build_run_provenance
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
-from agentic_trading.stage_a.runner import run_batch
+from agentic_trading.stage_a.runner import EXCLUDED_ANALYSTS, run_batch
 from agentic_trading.stage_a.store import InstrumentKind
 from agentic_trading.trials.ledger import TrialLedger
 
@@ -852,12 +852,20 @@ _EXIT_STOPPED_FOR_RESOURCES = 3
 
 def _stage_a_analysts(agent_ids: list[str]) -> list[AnalystAgent]:
     """The default-roster analysts with `agent_ids`, in that order. An id
-    the roster does not hold, or an id given twice, is a usage error."""
+    the roster does not hold, an id in `stage_a.runner.EXCLUDED_ANALYSTS`
+    (reported with its reason), or an id given twice, is a usage error."""
     roster = {analyst.agent_id: analyst for analyst in build_default_analysts()}
     unknown = [agent_id for agent_id in agent_ids if agent_id not in roster]
     if unknown:
         raise typer.BadParameter(
             f"no analyst in the default roster has id(s) {unknown}", param_hint="--analyst"
+        )
+    excluded = [agent_id for agent_id in agent_ids if agent_id in EXCLUDED_ANALYSTS]
+    if excluded:
+        raise typer.BadParameter(
+            "excluded from stage (a): "
+            + "; ".join(f"{agent_id} {EXCLUDED_ANALYSTS[agent_id]}" for agent_id in excluded),
+            param_hint="--analyst",
         )
     repeated = sorted({agent_id for agent_id in agent_ids if agent_ids.count(agent_id) > 1})
     if repeated:
@@ -922,8 +930,8 @@ def stage_a(
     analysts over the universe, resuming each trial from its store, and
     record each batch in the trial ledger.
 
-    Loads the universe's prices from the window start minus the standard
-    warm-up to the window end, then runs `stage_a.runner.run_batch`, all
+    Loads the universe's prices from the window start minus
+    `stage_a.warmup_days` calendar days to the window end, then runs `stage_a.runner.run_batch`, all
     inside one lake session cut at `stage_a.data_end`, so the prices and
     every analyst read see the same lake time. The spec records that
     lake time, the lake version and the installed quantcore version and
@@ -933,7 +941,8 @@ def stage_a(
     records a trial row there, whose spec holds the batch's window. Prints
     the batch result as JSON. Exits 0 when every analyst finished, 3 when
     the batch stopped for low memory or disk (rerun to resume), and 2 on a
-    usage error: an unknown analyst id, a missing
+    usage error: an unknown analyst id or one excluded from stage (a)
+    (`stage_a.runner.EXCLUDED_ANALYSTS`), a missing
     --store-dir or one inside the repository, a naive --lake-time, a bad
     --set, or a window that is reversed or ends after stage_a.data_end.
 
@@ -985,7 +994,7 @@ def stage_a(
             tickers,
             start,
             end,
-            warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+            warmup_days=settings.stage_a.warmup_days,
             align="sessions",
             calendar=settings.stage_a.session_calendar,
         )

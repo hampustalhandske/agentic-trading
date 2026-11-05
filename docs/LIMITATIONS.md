@@ -96,7 +96,7 @@ Per source, as coded:
   It is the one undated input in `stage_a/decisions.py::UNDATED_SOURCES`:
   rows of `pairs_cointegration` and `kalman_hedge_ratio` are price-only,
   and each of their trials declares `sec_sic` with this limitation (AT-62,
-  AT-118).
+  AT-118). Both analysts are refused in stage (a) for now (section 3).
 - **Licence**: prices from Yahoo-sourced lake tables are used for
   personal, non-commercial research; no market data is in this repo
   (AT-113).
@@ -265,6 +265,15 @@ Data windows:
   analyst, and the analyst sees only the rows on which its asset has a
   close. A calendar exchange-calendars cannot build from 1990 raises on
   first use.
+- **Excluded from stage (a)** (AT-123): `pairs_cointegration_analyst` and
+  `kalman_hedge_ratio_analyst` trade four seed pairs (`_COINTEGRATED_PAIRS`
+  in `agents/roster.py`) selected on 2017-04 to 2018-03 data, inside the
+  grading window. `stage_a.runner.EXCLUDED_ANALYSTS` refuses them until
+  they select pairs point-in-time.
+- **Spec hash inputs** (AT-120): the hash covers `settings` (including
+  `stage_a.warmup_days`, the history loaded before the window) and every
+  `agentic_trading.agents` and `agentic_trading.data` module an analyst
+  reaches through its imports, so an edit to any of them is a new trial.
 - **Decision rule** (AT-110): `w_i = s_i / sum_j |s_j|` over active
   instruments, `s_i` the signed confidence; a non-active instrument weighs
   0 and is outside the denominator; every weight is 0 when the sum is 0.
