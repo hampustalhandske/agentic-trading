@@ -90,23 +90,31 @@ def check_gjr_params(fitted: GJRGARCHParams, sample_std: float) -> CheckFailure 
 
 def check_egarch_params(fitted: EGARCHParams, sample_std: float) -> CheckFailure | None:
     """Returns the first sanity check an EGARCH(1,1) fit fails, or None if
-    it passes all of them. Every failure is an "abstain": beta outside
-    `[MIN_EGARCH_BETA, max_garch_persistence]`, or the implied
-    unconditional vol `exp(omega / (2 (1 - beta)))` outside
-    `UNCONDITIONAL_VOL_RATIO_BOUNDS` of `sample_std` (an implied vol too
-    large to represent counts as outside)."""
+    it passes all of them. A non-finite omega or beta is an "error" (the
+    fit returned no usable model). Every other failure is an "abstain":
+    beta outside `[MIN_EGARCH_BETA, max_garch_persistence]`, or the
+    implied unconditional vol `exp(omega / (2 (1 - beta)))` outside
+    `UNCONDITIONAL_VOL_RATIO_BOUNDS` of `sample_std`. The vol check
+    compares logs, `omega / (2 (1 - beta))` against the log bounds, so a
+    fitted vol far above the band is judged on a finite number and never
+    overflows."""
+    if not (math.isfinite(fitted.omega) and math.isfinite(fitted.beta)):
+        return CheckFailure(kind="error", reason="non-finite EGARCH omega or beta")
     if fitted.beta < MIN_EGARCH_BETA:
         return CheckFailure(kind="abstain", reason=f"beta {fitted.beta:.4f} below minimum")
     if fitted.beta > settings.analysts.max_garch_persistence:
         return CheckFailure(kind="abstain", reason=f"beta {fitted.beta:.4f} above max persistence")
-    try:
-        unconditional_vol = math.exp(fitted.omega / (2.0 * (1.0 - fitted.beta)))
-    except OverflowError:
-        unconditional_vol = math.inf
-    if _ratio_outside(unconditional_vol, sample_std, UNCONDITIONAL_VOL_RATIO_BOUNDS):
+    log_vol = fitted.omega / (2.0 * (1.0 - fitted.beta))
+    low, high = UNCONDITIONAL_VOL_RATIO_BOUNDS
+    if sample_std <= 0.0 or not (
+        math.log(low * sample_std) <= log_vol <= math.log(high * sample_std)
+    ):
         return CheckFailure(
             kind="abstain",
-            reason=f"implied unconditional vol {unconditional_vol:.4f} far from sample std",
+            reason=(
+                f"implied unconditional log-vol {log_vol:.4f} far from log sample std "
+                f"{math.log(sample_std) if sample_std > 0.0 else float('-inf'):.4f}"
+            ),
         )
     return None
 

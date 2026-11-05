@@ -204,6 +204,8 @@ _EGARCH = EGARCHParams(
         ({"omega": 2.0 * (1.0 - 0.9) * math.log(10.0 * _S)}, "abstain"),
         ({"omega": 2.0 * (1.0 - 0.9) * math.log(_S / 10.0)}, "abstain"),
         ({"omega": 1e6}, "abstain"),
+        ({"omega": math.nan}, "error"),
+        ({"beta": math.nan}, "error"),
     ],
     ids=[
         "admissible",
@@ -212,11 +214,14 @@ _EGARCH = EGARCHParams(
         "beta_above_max_persistence",
         "unconditional_vol_too_high",
         "unconditional_vol_too_low",
-        "unconditional_vol_overflows",
+        "unconditional_vol_far_above_band",
+        "non_finite_omega",
+        "non_finite_beta",
     ],
 )
 def test_check_egarch_params(changes: dict[str, float], kind: str | None) -> None:
-    """Every EGARCH parameter-check failure abstains."""
+    """A non-finite EGARCH parameter is an error; every other parameter-check failure
+    abstains, a fitted vol far above the band included."""
     _assert_verdict(check_egarch_params(dataclasses.replace(_EGARCH, **changes), SAMPLE_STD), kind)
 
 
