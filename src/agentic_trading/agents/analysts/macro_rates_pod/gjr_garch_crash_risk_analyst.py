@@ -13,9 +13,10 @@ from agentic_trading.agents.analysts.macro_rates_pod._garch_checks import (
     check_gjr_params,
     check_sigma_path,
     fit_or_convergence_error,
+    rejection_signal,
 )
 from agentic_trading.agents.base import AnalystAgent
-from agentic_trading.agents.schemas import AgentSignal, SignalStatus
+from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -34,10 +35,13 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
     times its trailing average, and that jump is attributable to the
     fitted asymmetric (bad-news) term rather than the symmetric ARCH term.
 
-    Stays flat, with the failing check named in the rationale, whenever
-    the window is shorter than `min_garch_observations`, the fit fails or
-    does not converge (`ConvergenceError`), the parameters fail
-    `check_gjr_params`, or the computed path fails `check_sigma_path`."""
+    Stays flat at confidence 0, with the failing check named in the
+    rationale, whenever the window is shorter than `min_garch_observations`
+    (unavailable); the fit or variance recursion raises, or the fit does
+    not converge (`ConvergenceError`) (error); or the parameters fail
+    `check_gjr_params` or the computed path fails `check_sigma_path`
+    (the status the check's `CheckFailure.kind` gives: error for an
+    inadmissible fit or a broken path, an abstention otherwise)."""
 
     agent_id: str = "gjr_garch_crash_risk_analyst"
     _refit_cache: RefitCache = PrivateAttr(
@@ -45,23 +49,6 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
             refit_interval_days=settings.analysts.garch_refit_interval_days
         )
     )
-
-    def _flat(
-        self,
-        asset: str,
-        as_of_date: pd.Timestamp,
-        rationale: str,
-        status: SignalStatus = "active",
-    ) -> AgentSignal:
-        return AgentSignal(
-            agent_id=self.agent_id,
-            asset=asset,
-            as_of_date=as_of_date.date(),
-            direction="flat",
-            confidence=0.0,
-            rationale=rationale,
-            status=status,
-        )
 
     def generate_signal(
         self,
@@ -73,8 +60,8 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
             -settings.analysts.risk_window_garch :
         ]
         if returns.size < settings.analysts.min_garch_observations:
-            return self._flat(
-                asset, as_of_date, "insufficient history for GJR-GARCH fit", "unavailable"
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient history for GJR-GARCH fit"
             )
 
         try:
@@ -88,7 +75,7 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
                 asset,
                 exc,
             )
-            return self._flat(asset, as_of_date, "GJR-GARCH MLE fit failed", "error")
+            return self.error_signal(asset, as_of_date, "GJR-GARCH MLE fit failed")
 
         if isinstance(fitted, ConvergenceError):
             logger.debug(
@@ -97,18 +84,19 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
                 asset,
                 fitted.optimizer_message,
             )
-            return self._flat(
-                asset,
-                as_of_date,
-                "GJR-GARCH parameters rejected: MLE fit did not converge",
-                "unavailable",
+            return self.error_signal(
+                asset, as_of_date, "GJR-GARCH parameters rejected: MLE fit did not converge"
             )
 
         sample_std = float(np.std(returns, ddof=1))
         failed_check = check_gjr_params(fitted, sample_std)
         if failed_check is not None:
-            return self._flat(
-                asset, as_of_date, f"GJR-GARCH parameters rejected: {failed_check}", "unavailable"
+            return rejection_signal(
+                self,
+                asset,
+                as_of_date,
+                f"GJR-GARCH parameters rejected: {failed_check.reason}",
+                failed_check,
             )
 
         try:
@@ -122,13 +110,17 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
                 asset,
                 exc,
             )
-            return self._flat(asset, as_of_date, "GJR-GARCH variance computation failed", "error")
+            return self.error_signal(asset, as_of_date, "GJR-GARCH variance computation failed")
 
         conditional_std = np.sqrt(np.maximum(variance_path, 0.0))
         failed_check = check_sigma_path(conditional_std, sample_std)
         if failed_check is not None:
-            return self._flat(
-                asset, as_of_date, f"GJR-GARCH path rejected: {failed_check}", "unavailable"
+            return rejection_signal(
+                self,
+                asset,
+                as_of_date,
+                f"GJR-GARCH path rejected: {failed_check.reason}",
+                failed_check,
             )
 
         current_vol = float(conditional_std[-1])

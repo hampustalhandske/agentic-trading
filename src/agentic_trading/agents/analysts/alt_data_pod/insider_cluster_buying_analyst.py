@@ -43,23 +43,6 @@ class InsiderClusterBuyingAnalyst(AnalystAgent):
         )
     )
 
-    def _flat(
-        self,
-        asset: str,
-        as_of_date: pd.Timestamp,
-        rationale: str,
-        status: Literal["active", "unavailable", "error"],
-    ) -> AgentSignal:
-        return AgentSignal(
-            agent_id=self.agent_id,
-            asset=asset,
-            as_of_date=as_of_date.date(),
-            direction="flat",
-            confidence=0.0,
-            rationale=rationale,
-            status=status,
-        )
-
     def generate_signal(
         self,
         asset: str,
@@ -67,14 +50,12 @@ class InsiderClusterBuyingAnalyst(AnalystAgent):
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
         if not is_likely_equity(asset):
-            return self._flat(
-                asset, as_of_date, "not an equity — Form 4 filings don't apply", "unavailable"
+            return self.unavailable_signal(
+                asset, as_of_date, "not an equity — Form 4 filings don't apply"
             )
         filings = load_insider_transactions_from_lakehouse(asset, as_of_date.date())
         if filings is None or filings.empty:
-            return self._flat(
-                asset, as_of_date, "no Form 4 coverage in the lakehouse", "unavailable"
-            )
+            return self.unavailable_signal(asset, as_of_date, "no Form 4 coverage in the lakehouse")
 
         window_start = as_of_date - pd.Timedelta(days=settings.analysts.insider_window_days)
         recent = filings[filings["filed_date"] > window_start]

@@ -67,8 +67,11 @@ class FamaMacbethAnalyst(AnalystAgent):
     genuine cross-sectional breadth (hundreds of names, the way the
     original methodology and institutional usage both run it), which a
     handful of megacaps cannot provide regardless of which five are
-    picked. Falls back to `self.universe` (a small static list) only if
-    the lakehouse is unreachable that day.
+    picked. Falls back to `self.universe` (a small static list) only when
+    the lake has no membership for the date or too few members qualify.
+    A lake request that raises propagates to `ManagerAgent.collect_signals`,
+    which records an error signal; a fixed-universe load that raises is an
+    error signal; missing names, factors or history are unavailable.
 
     An active signal's `source_as_of` is the public date
     (`ken_french_public_date`) of the newest factor row the regression
@@ -134,14 +137,8 @@ class FamaMacbethAnalyst(AnalystAgent):
         universe, universe_returns = resolution
         factors = load_fama_french_factors_from_lakehouse(as_of_date.date(), model=self.model)
         if factors is None:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="no Ken French factor coverage in the lakehouse",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "no Ken French factor coverage in the lakehouse"
             )
         factor_columns = [column for column in factors.columns if column != "RF"]
 
@@ -206,14 +203,8 @@ class FamaMacbethAnalyst(AnalystAgent):
         )
 
     def _insufficient_history(self, asset: str, as_of_date: pd.Timestamp) -> AgentSignal:
-        return AgentSignal(
-            agent_id=self.agent_id,
-            asset=asset,
-            as_of_date=as_of_date.date(),
-            direction="flat",
-            confidence=0.0,
-            rationale="insufficient cross-sectional history for a Fama-MacBeth regression",
-            status="unavailable",
+        return self.unavailable_signal(
+            asset, as_of_date, "insufficient cross-sectional history for a Fama-MacBeth regression"
         )
 
     def _load_broad_lakehouse_universe(
@@ -282,14 +273,8 @@ class FamaMacbethAnalyst(AnalystAgent):
         window_start = (as_of_date - timedelta(days=250)).date()
         asset_frame = load_price_history_from_lakehouse([asset], window_start, as_of_date.date())
         if asset_frame is None or asset not in asset_frame.columns.get_level_values(0):
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=f"{asset} not resolvable in the lakehouse cross-section",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, f"{asset} not resolvable in the lakehouse cross-section"
             )
         merged_returns = dict(universe_returns)
         merged_returns[asset] = asset_frame[(asset, "log_return")].dropna()
@@ -311,23 +296,9 @@ class FamaMacbethAnalyst(AnalystAgent):
                 self.agent_id,
                 exc,
             )
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="universe price history lookup failed",
-                status="error",
-            )
+            return self.error_signal(asset, as_of_date, "universe price history lookup failed")
         if len(universe_returns) < len(universe):
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=f"insufficient price history for part of universe {universe}",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, f"insufficient price history for part of universe {universe}"
             )
         return universe, universe_returns

@@ -59,39 +59,24 @@ class CreditSpreadSignalAnalyst(AnalystAgent):
     ) -> AgentSignal:
         vintages = load_fred_vintages_from_lakehouse(BAMLH0A0HYM2, as_of_date.date())
         if vintages is None:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="no FRED BAMLH0A0HYM2 coverage in the lakehouse",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "no FRED BAMLH0A0HYM2 coverage in the lakehouse"
             )
         used = vintages.dropna(subset=["value"]).iloc[-_RISK_WINDOW:]
         window = used["value"].to_numpy(dtype=np.float64)
         if window.size < _MIN_OBSERVATIONS:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient credit-spread history for a z-score read",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient credit-spread history for a z-score read"
             )
         source_as_of = used["known_at"].max().date()
 
         mean = float(np.mean(window))
         std = float(np.std(window, ddof=1))
         if std <= 0.0:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="zero trailing variance in the credit-spread window",
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                "zero trailing variance in the credit-spread window",
                 source_as_of=source_as_of,
             )
 

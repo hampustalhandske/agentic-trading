@@ -21,6 +21,19 @@ SIMULATION_HORIZON_DAYS = 30
 # Daily FRED observations -> annualized CIR time unit, matching
 # simulate_cir_paths' own t=SIMULATION_HORIZON_DAYS/365.0 convention below.
 _DAILY_DT_YEARS = 1.0 / 365.0
+# quantcore's `cir_fit` raises one RuntimeError type for three fits outside
+# the CIR parameter space (kappa, theta or sigma^2 at or below zero); only
+# the kappa case, no mean reversion in the data, is an abstention, and its
+# message carries this marker. `test_cir_no_mean_reversion_matches_quantcore`
+# pins the wording against the installed quantcore.
+NO_MEAN_REVERSION_MARKER = "kappa <= 0"
+
+
+def is_no_mean_reversion(error: RuntimeError) -> bool:
+    """Whether a `RuntimeError` from `cir_fit` reports an estimated
+    kappa <= 0, a rate series with no mean reversion, rather than an
+    inadmissible theta or sigma^2 or any other failure."""
+    return NO_MEAN_REVERSION_MARKER in str(error)
 
 
 class CIRRateRegimeAnalyst(AnalystAgent):
@@ -36,9 +49,17 @@ class CIRRateRegimeAnalyst(AnalystAgent):
     `_refit_cache.refit_interval_days` simulated days per asset — see
     `RefitCache`'s docstring.
 
-    Every active signal's `source_as_of` is the newest `known_at` (the
-    later of a vintage's publication date and its observation date)
-    among the DGS3MO vintages in the fitted window."""
+    No DGS3MO coverage, or fewer than 30 rates in the trailing window,
+    is unavailable. A window holding a rate at or below zero abstains
+    (active, flat, confidence 0) without a fit: the data is valid but
+    outside CIR's domain. A fit with no mean reversion (`cir_fit`'s
+    kappa <= 0 `RuntimeError`) also abstains; any other `cir_fit` failure,
+    an inadmissible theta or sigma^2 or a `ValueError` included, is an
+    error.
+
+    Every signal past the history check carries as `source_as_of` the
+    newest `known_at` (the later of a vintage's publication date and its
+    observation date) among the DGS3MO vintages in the trailing window."""
 
     agent_id: str = "cir_rate_regime_analyst"
 
@@ -64,50 +85,55 @@ class CIRRateRegimeAnalyst(AnalystAgent):
     ) -> AgentSignal:
         vintages = load_fred_vintages_from_lakehouse(DGS3MO, as_of_date.date())
         if vintages is None:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="no FRED DGS3MO coverage in the lakehouse",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "no FRED DGS3MO coverage in the lakehouse"
             )
         window = vintages.dropna(subset=["value"]).iloc[-settings.analysts.risk_window_long :]
         rates = window["value"].to_numpy(dtype=np.float64) / 100.0
         if rates.size < 30:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient rate history for a CIR regime read",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient rate history for a CIR regime read"
             )
         source_as_of = window["known_at"].max().date()
+        if np.any(rates <= 0.0):
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                "trailing DGS3MO window holds a rate at or below zero, outside CIR's domain "
+                "— no CIR regime read",
+                source_as_of=source_as_of,
+            )
 
         try:
             fitted = self._refit_cache.get_or_refit(
                 asset, as_of_date, lambda: cir_fit(rates, _DAILY_DT_YEARS)
             )
-        except (ValueError, RuntimeError) as exc:
-            logger.debug(
-                "%s: cir_fit could not fit a mean-reverting CIR process to the trailing rate "
-                "window for %s (%s) — the series may be trending rather than reverting, which "
-                "is expected during sustained hiking/cutting cycles; returning flat.",
-                self.agent_id,
-                asset,
-                exc,
+        except RuntimeError as exc:
+            if is_no_mean_reversion(exc):
+                logger.debug(
+                    "%s: cir_fit found no mean reversion in the trailing rate window for %s "
+                    "(%s) — the series is trending rather than reverting, which is expected "
+                    "during sustained hiking/cutting cycles; abstaining.",
+                    self.agent_id,
+                    asset,
+                    exc,
+                )
+                return self.abstain_signal(
+                    asset,
+                    as_of_date,
+                    "rate series is trending, not mean-reverting — no CIR regime read",
+                    source_as_of=source_as_of,
+                )
+            logger.warning("%s: cir_fit failed for %s (%s).", self.agent_id, asset, exc)
+            return self.error_signal(
+                asset, as_of_date, f"CIR fit failed: {exc}", source_as_of=source_as_of
             )
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="rate series is trending, not mean-reverting — no CIR regime read",
-                source_as_of=source_as_of,
+        except ValueError as exc:
+            logger.warning(
+                "%s: cir_fit failed for %s (%s).", self.agent_id, asset, exc, exc_info=True
+            )
+            return self.error_signal(
+                asset, as_of_date, f"CIR fit failed: {exc}", source_as_of=source_as_of
             )
         kappa, theta, sigma = fitted.kappa, fitted.theta, fitted.sigma
         r0 = float(rates[-1])

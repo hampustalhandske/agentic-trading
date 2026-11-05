@@ -39,7 +39,12 @@ class EarningsSurpriseAnalyst(AnalystAgent):
     `source_as_of`. Confidence decays linearly to zero as
     `as_of_date` moves from the announcement date to
     `_DRIFT_WINDOW_DAYS` afterward, so the signal fades out rather than
-    persisting at full strength indefinitely."""
+    persisting at full strength indefinitely.
+
+    No surprise coverage is unavailable. An announcement older than
+    `_DRIFT_WINDOW_DAYS`, or a consensus with |estimate| below
+    `_MIN_ESTIMATE_MAGNITUDE` (the surprise ratio is undefined), abstains
+    (active, flat, confidence 0), dated by the announcement."""
 
     agent_id: str = "earnings_surprise_analyst"
     data_requirements: tuple[DataRequirement, ...] = (
@@ -60,42 +65,28 @@ class EarningsSurpriseAnalyst(AnalystAgent):
     ) -> AgentSignal:
         result = load_earnings_surprise_from_lakehouse(asset, as_of_date.date())
         if result is None:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="no real earnings-surprise coverage available",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "no real earnings-surprise coverage available"
             )
 
         reported, estimate, announcement_date = result
         source_as_of = announcement_date.date()
         days_since_announcement = (as_of_date - announcement_date).days
         if days_since_announcement > _DRIFT_WINDOW_DAYS:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=(
-                    f"most recent earnings surprise is {days_since_announcement}d old — "
-                    f"beyond the {_DRIFT_WINDOW_DAYS}d PEAD window"
-                ),
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                f"most recent earnings surprise is {days_since_announcement}d old — "
+                f"beyond the {_DRIFT_WINDOW_DAYS}d PEAD window",
                 source_as_of=source_as_of,
             )
 
         if abs(estimate) < _MIN_ESTIMATE_MAGNITUDE:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="consensus estimate too close to zero for a stable surprise ratio",
-                status="unavailable",
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                "consensus estimate too close to zero for a stable surprise ratio",
+                source_as_of=source_as_of,
             )
 
         surprise_ratio = (reported - estimate) / abs(estimate)

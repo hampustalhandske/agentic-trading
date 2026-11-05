@@ -7,6 +7,7 @@ Contains the abstract base classes for all agents in the system, both analysts a
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from datetime import date
 from typing import Literal
 
 import pandas as pd
@@ -19,6 +20,7 @@ from agentic_trading.agents.schemas import (
     ManagerSignal,
     ManagerState,
     PortfolioDecision,
+    SignalStatus,
     SizingDiagnostics,
 )
 from agentic_trading.config import settings
@@ -151,6 +153,79 @@ class AnalystAgent(Agent):
         tickers for which this is True. True for every asset unless an
         analyst limits an instance to a set of assets and overrides it."""
         return True
+
+    def _status_signal(
+        self,
+        status: SignalStatus,
+        asset: str,
+        as_of_date: pd.Timestamp,
+        rationale: str,
+        source_as_of: date | None,
+        sample_count: int | None,
+    ) -> AgentSignal:
+        return AgentSignal(
+            agent_id=self.agent_id,
+            asset=asset,
+            as_of_date=as_of_date.date(),
+            direction="flat",
+            confidence=0.0,
+            rationale=rationale,
+            status=status,
+            source_as_of=source_as_of,
+            sample_count=sample_count,
+        )
+
+    def unavailable_signal(
+        self,
+        asset: str,
+        as_of_date: pd.Timestamp,
+        rationale: str,
+        *,
+        source_as_of: date | None = None,
+        sample_count: int | None = None,
+    ) -> AgentSignal:
+        """A flat, 0-confidence signal with status "unavailable", for when the
+        data the analyst needs is not there: no coverage, too little history,
+        no bar. `source_as_of` and `sample_count` are the provenance of
+        whatever data was read, when known."""
+        return self._status_signal(
+            "unavailable", asset, as_of_date, rationale, source_as_of, sample_count
+        )
+
+    def abstain_signal(
+        self,
+        asset: str,
+        as_of_date: pd.Timestamp,
+        rationale: str,
+        *,
+        source_as_of: date | None = None,
+        sample_count: int | None = None,
+    ) -> AgentSignal:
+        """A flat, 0-confidence signal with status "active", for when the model
+        has the data and declines to bet on it: no serial dependence, a
+        degenerate or misspecified fit, a signal under its threshold.
+        `source_as_of` and `sample_count` are the provenance of the data the
+        model declined on."""
+        return self._status_signal(
+            "active", asset, as_of_date, rationale, source_as_of, sample_count
+        )
+
+    def error_signal(
+        self,
+        asset: str,
+        as_of_date: pd.Timestamp,
+        rationale: str,
+        *,
+        source_as_of: date | None = None,
+        sample_count: int | None = None,
+    ) -> AgentSignal:
+        """A flat, 0-confidence signal with status "error", for when the model
+        or a loader fails, a non-converged fit included. `source_as_of` and
+        `sample_count` are the provenance of the data read before the
+        failure, when known."""
+        return self._status_signal(
+            "error", asset, as_of_date, rationale, source_as_of, sample_count
+        )
 
     @abstractmethod
     def generate_signal(

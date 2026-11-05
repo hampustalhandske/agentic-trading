@@ -8,9 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agentic_trading.config import settings
 
-# Set explicitly by the analyst that built the signal: "active" is a real
-# market opinion (a flat included), "unavailable" means the inputs needed
-# for one were missing, and "error" means producing one failed.
+# Set by the analyst that built the signal: "active" is a market opinion,
+# including flat at confidence 0 when the model has the data and declines
+# to bet; "unavailable" means the data needed for one is not there; and
+# "error" means the model or a loader failed. `AnalystAgent` builds each
+# non-opinion signal through `unavailable_signal`, `abstain_signal` or
+# `error_signal`.
 SignalStatus = Literal["active", "unavailable", "error"]
 
 # A pod's state on one day. "unavailable": none of the pod's decisions
@@ -33,7 +36,11 @@ MAX_LEVERAGE = settings.firm.max_leverage
 
 
 class AgentSignal(BaseModel):
-    """A single analyst's directional view on a single asset, for one day."""
+    """A single analyst's directional view on a single asset, for one day.
+
+    A signal at `confidence` 0 carries no view, so validation sets its
+    `direction` to "flat" whatever the analyst passed; every other field,
+    `status` included, is kept as given."""
 
     agent_id: str
     asset: str
@@ -47,6 +54,12 @@ class AgentSignal(BaseModel):
     # read rests on (`sample_count`); managers dampen on both.
     source_as_of: date | None = None
     sample_count: int | None = None
+
+    @model_validator(mode="after")
+    def _zero_confidence_is_flat(self) -> "AgentSignal":
+        if self.confidence == 0.0:
+            self.direction = "flat"
+        return self
 
 
 class ManagerSignal(BaseModel):

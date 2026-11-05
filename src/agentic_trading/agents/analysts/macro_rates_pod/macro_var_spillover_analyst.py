@@ -107,14 +107,8 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
         ]
         macro = self._macro_series(as_of_date)
         if asset_returns.size < 30 or macro is None:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient asset/macro history for a VAR spillover read",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient asset/macro history for a VAR spillover read"
             )
         macro_series, newest_known = macro
 
@@ -128,14 +122,8 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
             asset_history = history
 
         if "log_return" not in asset_history:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="no asset return history for a VAR spillover read",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "no asset return history for a VAR spillover read"
             )
 
         aligned = (
@@ -146,14 +134,8 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
         system = aligned.to_numpy(dtype=np.float64)
         min_lags_assumed = self.n_lags if self.n_lags is not None else MAX_LAGS
         if system.shape[0] < 4 * min_lags_assumed + 10:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient overlapping history for a VAR spillover read",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient overlapping history for a VAR spillover read"
             )
         source_as_of = newest_known.reindex(aligned.index).max().date()
 
@@ -174,13 +156,10 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                 asset, as_of_date, _fit_var_system
             )
             if coef_matrix is None or sigma_u is None:
-                return AgentSignal(
-                    agent_id=self.agent_id,
-                    asset=asset,
-                    as_of_date=as_of_date.date(),
-                    direction="flat",
-                    confidence=0.0,
-                    rationale=f"macro does not Granger-cause {asset} (p={p_value:.3f})",
+                return self.abstain_signal(
+                    asset,
+                    as_of_date,
+                    f"macro does not Granger-cause {asset} (p={p_value:.3f})",
                     source_as_of=source_as_of,
                 )
 
@@ -199,14 +178,8 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                 as_of_date.date(),
                 exc,
             )
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="VAR spillover fit failed on the available finite observations",
-                status="error",
+            return self.error_signal(
+                asset, as_of_date, "VAR spillover fit failed on the available finite observations"
             )
 
         direction: Literal["long", "short", "flat"] = "long" if forecast_move >= 0.0 else "short"

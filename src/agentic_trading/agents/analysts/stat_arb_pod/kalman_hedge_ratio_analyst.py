@@ -62,14 +62,8 @@ class KalmanHedgeRatioAnalyst(AnalystAgent):
         partner_ticker = self.partner_ticker_by_asset.get(asset)
         if partner_ticker is None:
             self._open_direction_by_asset.pop(asset, None)
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=f"no partner ticker configured for {asset}",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, f"no partner ticker configured for {asset}"
             )
 
         y_returns = market_slice(market_data, as_of_date, asset).log_returns[
@@ -81,14 +75,8 @@ class KalmanHedgeRatioAnalyst(AnalystAgent):
         length = min(y_returns.size, x_returns.size)
         if length < 30:
             self._open_direction_by_asset.pop(asset, None)
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient overlapping history for a Kalman hedge ratio",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient overlapping history for a Kalman hedge ratio"
             )
 
         y_prices = np.cumsum(y_returns[-length:])

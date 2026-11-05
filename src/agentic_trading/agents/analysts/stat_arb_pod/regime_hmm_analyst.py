@@ -9,7 +9,7 @@ from quantcore.regime.hmm import hmm_fit, hmm_predict_proba
 
 from agentic_trading.agents._market_math import RefitCache, clamp, market_slice
 from agentic_trading.agents.base import AnalystAgent
-from agentic_trading.agents.schemas import AgentSignal, SignalStatus
+from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -42,7 +42,9 @@ class RegimeHMMAnalyst(AnalystAgent):
     genuinely distinct (variance ratio below `MIN_VARIANCE_RATIO`, a
     state occupying under `MIN_STATE_OCCUPANCY` of the sample, or a
     transition-matrix diagonal below `MIN_STATE_PERSISTENCE`) is treated
-    as no regime structure and reports flat."""
+    as no regime structure: the analyst abstains (active, flat, confidence
+    0). Fewer than `hmm_min_observations` returns is unavailable; a fit or
+    decode that raises is an error."""
 
     agent_id: str = "regime_hmm_analyst"
 
@@ -51,23 +53,6 @@ class RegimeHMMAnalyst(AnalystAgent):
             refit_interval_days=settings.analysts.hmm_refit_interval_days
         )
     )
-
-    def _flat(
-        self,
-        asset: str,
-        as_of_date: pd.Timestamp,
-        rationale: str,
-        status: SignalStatus = "active",
-    ) -> AgentSignal:
-        return AgentSignal(
-            agent_id=self.agent_id,
-            asset=asset,
-            as_of_date=as_of_date.date(),
-            direction="flat",
-            confidence=0.0,
-            rationale=rationale,
-            status=status,
-        )
 
     def generate_signal(
         self,
@@ -80,11 +65,8 @@ class RegimeHMMAnalyst(AnalystAgent):
         ]
         min_observations = settings.analysts.hmm_min_observations
         if returns.size < min_observations:
-            return self._flat(
-                asset,
-                as_of_date,
-                f"need >= {min_observations} observations for HMM regime fitting",
-                "unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, f"need >= {min_observations} observations for HMM regime fitting"
             )
 
         try:
@@ -101,7 +83,7 @@ class RegimeHMMAnalyst(AnalystAgent):
                 asset,
                 exc,
             )
-            return self._flat(asset, as_of_date, "HMM fit/decode failed", "error")
+            return self.error_signal(asset, as_of_date, "HMM fit/decode failed")
 
         variances = np.asarray(variances, dtype=float)
         means = np.asarray(means, dtype=float)
@@ -116,30 +98,27 @@ class RegimeHMMAnalyst(AnalystAgent):
             float(variances[bear_state]) / low_variance if low_variance > 0.0 else float("inf")
         )
         if variance_ratio < MIN_VARIANCE_RATIO:
-            return self._flat(
+            return self.abstain_signal(
                 asset,
                 as_of_date,
                 f"degenerate HMM: state variance ratio {variance_ratio:.2f} < "
                 f"{MIN_VARIANCE_RATIO} — no distinct volatility regimes",
-                "unavailable",
             )
         occupancy = np.asarray(posteriors, dtype=float).mean(axis=0)
         if float(occupancy.min()) < MIN_STATE_OCCUPANCY:
-            return self._flat(
+            return self.abstain_signal(
                 asset,
                 as_of_date,
                 f"degenerate HMM: minimum state occupancy {float(occupancy.min()):.3f} < "
                 f"{MIN_STATE_OCCUPANCY} — one state barely occurs in the sample",
-                "unavailable",
             )
         persistence = float(np.min(np.diag(np.asarray(transition_matrix, dtype=float))))
         if persistence < MIN_STATE_PERSISTENCE:
-            return self._flat(
+            return self.abstain_signal(
                 asset,
                 as_of_date,
                 f"degenerate HMM: minimum state persistence {persistence:.3f} < "
                 f"{MIN_STATE_PERSISTENCE} — states are not regimes",
-                "unavailable",
             )
 
         p_next = np.asarray(posteriors[-1], dtype=float) @ np.asarray(

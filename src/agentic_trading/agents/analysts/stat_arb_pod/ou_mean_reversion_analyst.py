@@ -34,7 +34,12 @@ class OUMeanReversionAnalyst(AnalystAgent):
     `RefitCache`'s docstring. Entry/exit follow the pod's shared
     `spread_direction` rule: enter against the spread beyond
     `z_entry_threshold`, hold while outside `z_exit_threshold`, flat once
-    it reverts inside."""
+    it reverts inside.
+
+    A spread under 10 points is unavailable. A spread that is not
+    mean-reverting, or whose simulated OU paths do not revert in the
+    trade's direction, abstains (active, flat, confidence 0). Every
+    non-signal branch clears the asset's open direction."""
 
     agent_id: str = "ou_mean_reversion_analyst"
 
@@ -72,14 +77,8 @@ class OUMeanReversionAnalyst(AnalystAgent):
         spread = self._build_spread(market_data, as_of_date, asset)
         if spread.size < 10:
             self._open_direction_by_asset.pop(asset, None)
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient history to build an OU spread",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient history to build an OU spread"
             )
 
         try:
@@ -94,13 +93,8 @@ class OUMeanReversionAnalyst(AnalystAgent):
                 exc,
             )
             self._open_direction_by_asset.pop(asset, None)
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="spread is not mean-reverting over the current window — holding",
+            return self.abstain_signal(
+                asset, as_of_date, "spread is not mean-reverting over the current window — holding"
             )
         half_life = max(raw_half_life, MIN_HALF_LIFE_DAYS)
         z_window = int(min(max(round(4 * half_life), 5), MAX_ZSCORE_WINDOW, spread.size))
@@ -133,7 +127,13 @@ class OUMeanReversionAnalyst(AnalystAgent):
                 direction == "long" and float(np.mean(reverted_toward_mean > 0)) > 0.5
             ) or (direction == "short" and float(np.mean(reverted_toward_mean < 0)) > 0.5)
             if not simulated_direction_agrees:
-                confidence = 0.0
+                self._open_direction_by_asset.pop(asset, None)
+                return self.abstain_signal(
+                    asset,
+                    as_of_date,
+                    f"simulated OU paths do not revert toward the {direction} trade "
+                    f"(z-score={current_z:.2f}, half-life={half_life:.1f}d) — holding",
+                )
 
         return AgentSignal(
             agent_id=self.agent_id,

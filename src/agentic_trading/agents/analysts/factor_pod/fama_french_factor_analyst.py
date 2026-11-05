@@ -89,14 +89,8 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
         ]
         factors = load_fama_french_factors_from_lakehouse(as_of_date.date(), model=self.model)
         if factors is None:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="no Ken French factor coverage in the lakehouse",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "no Ken French factor coverage in the lakehouse"
             )
 
         factor_columns = [column for column in factors.columns if column != "RF"]
@@ -105,14 +99,10 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
             {"asset": returns.to_frame("return"), "factors": factors}, axis=1, join="inner"
         ).dropna()
         if len(joined) < MIN_REGRESSION_OBSERVATIONS:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient overlapping history for a factor regression",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                "insufficient overlapping history for a factor regression",
                 sample_count=len(joined),
             )
 
@@ -133,15 +123,12 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
             0.0,
         )
         if not np.any(betas):
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="no factor loading is statistically significant",
-                sample_count=len(joined),
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                "no factor loading is statistically significant",
                 source_as_of=source_as_of,
+                sample_count=len(joined),
             )
 
         premia = _expected_factor_premia(factors[factor_columns])

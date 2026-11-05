@@ -156,7 +156,7 @@ def test_floors_the_sleeve_at_the_base_confidence(chain, monkeypatch) -> None:
             asset=asset,
             as_of_date=as_of_date.date(),
             direction="short",
-            confidence=0.0,
+            confidence=0.01,
             rationale="calm",
         ),
     )

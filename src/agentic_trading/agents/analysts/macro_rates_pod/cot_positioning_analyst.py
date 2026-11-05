@@ -39,9 +39,14 @@ class COTPositioningAnalyst(AnalystAgent):
     itself, which already matches COT's own ticker convention for
     commodities and FX.
 
-    Every active signal's `source_as_of` is the CFTC release date of the
-    newest report in the trailing window, the date the report was
-    published rather than the possibly later date it became usable."""
+    An asset outside `covered_assets`, no COT coverage, or too few reports
+    is unavailable. Zero trailing variance in net positioning leaves no
+    z-score, so the analyst abstains (active, flat, confidence 0).
+
+    Every active signal's `source_as_of`, an abstention included, is the
+    CFTC release date of the newest report in the trailing window, the
+    date the report was published rather than the possibly later date it
+    became usable."""
 
     agent_id: str = "cot_positioning_analyst"
     data_requirements: tuple[DataRequirement, ...] = (
@@ -72,51 +77,31 @@ class COTPositioningAnalyst(AnalystAgent):
     ) -> AgentSignal:
         cot_ticker = self.cot_ticker_by_asset.get(asset, asset)
         if not self.covers_asset(asset):
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=f"{asset} is outside this instance's COT asset class",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, f"{asset} is outside this instance's COT asset class"
             )
         reports = load_cot_reports_from_lakehouse(cot_ticker, as_of_date.date())
         if reports is None:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=f"no COT positioning coverage for {cot_ticker}",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, f"no COT positioning coverage for {cot_ticker}"
             )
 
         used = reports.iloc[-_RISK_WINDOW:]
         window = used["net_positioning_ratio"].to_numpy(dtype=np.float64)
         if window.size < _MIN_OBSERVATIONS:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient COT history for a positioning z-score",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient COT history for a positioning z-score"
             )
 
+        source_as_of = used["published_date"].max().date()
         mean = float(np.mean(window))
         std = float(np.std(window, ddof=1))
         if std <= 0.0:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="zero trailing variance in COT net positioning",
-                status="unavailable",
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                "zero trailing variance in COT net positioning",
+                source_as_of=source_as_of,
             )
 
         z_score = (float(window[-1]) - mean) / std
@@ -139,5 +124,5 @@ class COTPositioningAnalyst(AnalystAgent):
                 f"COT net positioning z-score={z_score:.2f} for {cot_ticker} "
                 f"vs its own {_RISK_WINDOW}-report trailing window"
             ),
-            source_as_of=used["published_date"].max().date(),
+            source_as_of=source_as_of,
         )

@@ -14,9 +14,10 @@ from agentic_trading.agents.analysts.macro_rates_pod._garch_checks import (
     check_egarch_params,
     check_sigma_path,
     fit_or_convergence_error,
+    rejection_signal,
 )
 from agentic_trading.agents.base import AnalystAgent
-from agentic_trading.agents.schemas import AgentSignal, SignalStatus
+from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -37,10 +38,13 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
     combined with a positive fitted gamma signals elevated near-term
     downside vol.
 
-    Stays flat, with the failing check named in the rationale, whenever
-    the window is shorter than `min_garch_observations`, the fit fails or
-    does not converge (`ConvergenceError`), the parameters fail
-    `check_egarch_params`, or the computed path fails `check_sigma_path`."""
+    Stays flat at confidence 0, with the failing check named in the
+    rationale, whenever the window is shorter than `min_garch_observations`
+    (unavailable); the fit or variance recursion raises, or the fit does
+    not converge (`ConvergenceError`) (error); or the parameters fail
+    `check_egarch_params` or the computed path fails `check_sigma_path`
+    (the status the check's `CheckFailure.kind` gives: error for an
+    inadmissible fit or a broken path, an abstention otherwise)."""
 
     agent_id: str = "egarch_asymmetric_vol_analyst"
     _refit_cache: RefitCache = PrivateAttr(
@@ -48,23 +52,6 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
             refit_interval_days=settings.analysts.garch_refit_interval_days
         )
     )
-
-    def _flat(
-        self,
-        asset: str,
-        as_of_date: pd.Timestamp,
-        rationale: str,
-        status: SignalStatus = "active",
-    ) -> AgentSignal:
-        return AgentSignal(
-            agent_id=self.agent_id,
-            asset=asset,
-            as_of_date=as_of_date.date(),
-            direction="flat",
-            confidence=0.0,
-            rationale=rationale,
-            status=status,
-        )
 
     def generate_signal(
         self,
@@ -76,9 +63,7 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
             -settings.analysts.risk_window_garch :
         ]
         if returns.size < settings.analysts.min_garch_observations:
-            return self._flat(
-                asset, as_of_date, "insufficient history for EGARCH fit", "unavailable"
-            )
+            return self.unavailable_signal(asset, as_of_date, "insufficient history for EGARCH fit")
 
         try:
             fitted: EGARCHParams | ConvergenceError = self._refit_cache.get_or_refit(
@@ -91,7 +76,7 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
                 asset,
                 exc,
             )
-            return self._flat(asset, as_of_date, "EGARCH MLE fit failed", "error")
+            return self.error_signal(asset, as_of_date, "EGARCH MLE fit failed")
 
         if isinstance(fitted, ConvergenceError):
             logger.debug(
@@ -100,18 +85,19 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
                 asset,
                 fitted.optimizer_message,
             )
-            return self._flat(
-                asset,
-                as_of_date,
-                "EGARCH parameters rejected: MLE fit did not converge",
-                "unavailable",
+            return self.error_signal(
+                asset, as_of_date, "EGARCH parameters rejected: MLE fit did not converge"
             )
 
         sample_std = float(np.std(returns, ddof=1))
         failed_check = check_egarch_params(fitted, sample_std)
         if failed_check is not None:
-            return self._flat(
-                asset, as_of_date, f"EGARCH parameters rejected: {failed_check}", "unavailable"
+            return rejection_signal(
+                self,
+                asset,
+                as_of_date,
+                f"EGARCH parameters rejected: {failed_check.reason}",
+                failed_check,
             )
 
         try:
@@ -125,7 +111,7 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
                 asset,
                 exc,
             )
-            return self._flat(asset, as_of_date, "EGARCH variance computation failed", "error")
+            return self.error_signal(asset, as_of_date, "EGARCH variance computation failed")
 
         # egarch_11_variance returns ln(sigma_t^2) — exponentiate before
         # taking sqrt.
@@ -133,8 +119,12 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
             conditional_std = np.sqrt(np.exp(log_variance_path))
         failed_check = check_sigma_path(conditional_std, sample_std)
         if failed_check is not None:
-            return self._flat(
-                asset, as_of_date, f"EGARCH path rejected: {failed_check}", "unavailable"
+            return rejection_signal(
+                self,
+                asset,
+                as_of_date,
+                f"EGARCH path rejected: {failed_check.reason}",
+                failed_check,
             )
 
         z_last = float(returns[-1] / conditional_std[-1])

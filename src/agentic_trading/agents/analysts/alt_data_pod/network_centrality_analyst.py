@@ -68,8 +68,11 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
     cross-section. Falls back to the fixed `universe` field (via
     `load_fixed_universe_returns()`, independent of whatever assets the
     current backtest's own `market_data` happens to include) only when
-    the lakehouse can't resolve real membership or too few names have
-    usable history.
+    the lakehouse has no membership for the date or too few names have
+    usable history. A broad fetch that raises is an error, with no
+    fallback, as is a fixed-universe load that raises; a fixed universe
+    missing a name, or too little history to build the graph, is
+    unavailable.
 
     An active signal's `source_as_of` is the latest reference date: S&P
     500 membership changes are announced before they take effect, so the
@@ -106,7 +109,8 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
         line. Returns `None` when the lake has no membership for the date
         or fewer than `_MIN_UNIVERSE_SIZE` members qualify, so the caller
         uses the fixed-universe fallback for `refit_interval_days`. A
-        failed lake request propagates to `generate_signal`. Never adds
+        failed lake request propagates to `generate_signal`, which
+        returns an error signal for it. Never adds
         `asset` to the membership: an asset outside it is scored on the
         fixed universe instead, leaving the shared cached fetch intact."""
         members = load_sp500_member_securities_asof(as_of_date.date())
@@ -151,14 +155,14 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
                 lambda: self._load_broad_lakehouse_universe(as_of_date),
             )
         except (RuntimeError, ValueError) as exc:
-            logger.debug(
-                "%s: broad lakehouse universe fetch failed (%s) — falling back to the fixed "
-                "%d-name universe.",
+            logger.warning(
+                "%s: broad lakehouse universe fetch failed for %s on %s (%s).",
                 self.agent_id,
+                asset,
+                as_of_date.date(),
                 exc,
-                len(self.universe),
             )
-            broad = None
+            return self.error_signal(asset, as_of_date, "broad S&P 500 universe lookup failed")
 
         if broad is not None and asset in broad:
             universe = tuple(broad)
@@ -173,40 +177,20 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
                     self.agent_id,
                     exc,
                 )
-                return AgentSignal(
-                    agent_id=self.agent_id,
-                    asset=asset,
-                    as_of_date=as_of_date.date(),
-                    direction="flat",
-                    confidence=0.0,
-                    rationale="universe price history lookup failed",
-                    status="error",
-                )
+                return self.error_signal(asset, as_of_date, "universe price history lookup failed")
 
             if len(returns) < len(universe):
-                return AgentSignal(
-                    agent_id=self.agent_id,
-                    asset=asset,
-                    as_of_date=as_of_date.date(),
-                    direction="flat",
-                    confidence=0.0,
-                    rationale=f"insufficient price history for part of universe {universe}",
-                    status="unavailable",
+                return self.unavailable_signal(
+                    asset, as_of_date, f"insufficient price history for part of universe {universe}"
                 )
 
         asset_returns = returns[asset].dropna() if asset in returns else pd.Series(dtype=float)
         reference_dates = asset_returns.index[-(WINDOW + LAG) :]
         if len(reference_dates) < WINDOW + LAG:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=(
-                    f"insufficient cross-sectional history across universe {universe} — holding."
-                ),
-                status="unavailable",
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"insufficient cross-sectional history across universe {universe} — holding.",
             )
 
         panel = balanced_panel(universe, returns, reference_dates)
@@ -224,14 +208,10 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
             lead_lag_corr[ticker] = 0.0 if np.isnan(corr) else corr
 
         if not lead_lag_corr:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="universe contains no other tickers to build a lead-lag graph — holding.",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                "universe contains no other tickers to build a lead-lag graph — holding.",
             )
 
         centrality = float(np.mean([abs(corr) for corr in lead_lag_corr.values()]))

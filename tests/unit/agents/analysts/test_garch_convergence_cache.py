@@ -62,7 +62,7 @@ def test_fit_or_convergence_error_returns_error_with_params_and_raises_without()
 def test_analyst_caches_non_converged_fit_but_retries_fit_without_params(
     monkeypatch: pytest.MonkeyPatch, module_name: str, class_name: str, fit_name: str
 ) -> None:
-    """Non-converged fits run once per interval and read unavailable; paramless ones retry daily."""
+    """Non-converged fits run once per interval and read error; paramless ones retry daily."""
     mod = importlib.import_module(f"{PACKAGE}.{module_name}")
     market_data, dates = _market_data()
     days = dates[-3:]
@@ -84,7 +84,7 @@ def test_analyst_caches_non_converged_fit_but_retries_fit_without_params(
     assert len(calls) == 1
     for signal in signals:
         assert signal.direction == "flat"
-        assert signal.status == "unavailable"
+        assert signal.status == "error"
         assert "did not converge" in signal.rationale
 
     _patch(None)

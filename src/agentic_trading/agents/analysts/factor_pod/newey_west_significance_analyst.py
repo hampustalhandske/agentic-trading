@@ -45,14 +45,8 @@ class NeweyWestSignificanceAnalyst(AnalystAgent):
             -settings.analysts.risk_window_medium :
         ]
         if returns.size < self.momentum_window + 30:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient history for a Newey-West significance test",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient history for a Newey-West significance test"
             )
 
         # The full convolution's last element is today's own trailing momentum
@@ -78,13 +72,8 @@ class NeweyWestSignificanceAnalyst(AnalystAgent):
         t_stat = slope / slope_std_error if slope_std_error > 0 else 0.0
 
         if abs(t_stat) < self.t_stat_threshold:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=f"predictor not significant (HAC t={t_stat:.2f})",
+            return self.abstain_signal(
+                asset, as_of_date, f"predictor not significant (HAC t={t_stat:.2f})"
             )
 
         current_predictor_value = float(full_predictor[-1])
