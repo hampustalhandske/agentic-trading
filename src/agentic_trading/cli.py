@@ -567,6 +567,12 @@ def experiment(
         help=_LAKE_TIME_HELP + " With --resume and no --lake-time, the lake time stored "
         "in the checkpoints.",
     ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Log detailed per-step timing (log-file only)."
+    ),
+    no_log: bool = typer.Option(
+        False, "--no-log", help="Disable logging entirely — nothing is written to the log file."
+    ),
 ) -> None:
     """Run a calibration phase followed by a separate out-of-sample test phase.
 
@@ -579,6 +585,10 @@ def experiment(
     lake session: at `--lake-time` when given; otherwise, with `--resume`,
     at the lake time stored in the checkpoints; otherwise at the default
     lake time.
+
+    The JSON result is the only thing on stdout; progress messages go to
+    stderr and the run log to `log/agentic_trading.log` (none with
+    `--no-log`).
     """
     parsed_train_start = _parse_date_flag(train_start, "--train-start")
     parsed_train_end = _parse_date_flag(train_end, "--train-end")
@@ -593,7 +603,7 @@ def experiment(
         requested_lake_time = _checkpoint_lake_time([calibration_checkpoint, test_checkpoint])
 
     resolved_assets = [symbol.strip().upper() for symbol in assets]
-    configure_logging(disable=True)
+    configure_logging(verbose=verbose, disable=no_log, console=False)
     overrides = _apply_cli_overrides(set_override)
     # An explicit flag wins; otherwise the firm setting as `--set` left it.
     resolved_commission_rate = (
@@ -650,6 +660,8 @@ def experiment(
                 "exclude_analyst": sorted(excluded),
                 "set": list(set_override),
                 "yes": yes,
+                "verbose": verbose,
+                "no_log": no_log,
                 "lake_time": lake_time,
             },
             [analyst.agent_id for analyst in analysts],

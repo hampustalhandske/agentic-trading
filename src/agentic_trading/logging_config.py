@@ -15,7 +15,10 @@ a logger as a function argument.
 An entry point (the CLI's `run` command, the GUI's `render_dashboard()`)
 calls `configure_logging()` — that's what wires up the actual handlers
 (file + console + the GUI's in-memory buffer), using the real
-`--verbose`/`--no-log` flags where applicable. `get_logger()` also
+`--verbose`/`--no-log` flags where applicable. An entry point whose stdout
+carries machine-readable output (the `experiment` command's JSON result)
+calls `configure_logging(console=False)`, which leaves out the console
+handler and keeps the file and the GUI buffer. `get_logger()` also
 self-configures with defaults if nothing has configured anything yet, so a
 module doing `logger = get_logger(__name__)` at import time always works —
 but that self-configuration is tracked separately and does NOT block a
@@ -93,7 +96,7 @@ class _GuiBufferHandler(logging.Handler):
         _gui_buffer.append(self.format(record))
 
 
-def _apply_configuration(*, verbose: bool, disable: bool) -> None:
+def _apply_configuration(*, verbose: bool, disable: bool, console: bool) -> None:
     """Does the actual handler setup — shared by the lazy (`get_logger()`)
     and explicit (`configure_logging()`) paths. Always tears down whatever
     handlers are currently attached first: the explicit path may be
@@ -130,10 +133,11 @@ def _apply_configuration(*, verbose: bool, disable: bool) -> None:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(console_level)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    if console:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(console_level)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
     gui_handler = _GuiBufferHandler()
     gui_handler.setLevel(console_level)
@@ -143,9 +147,11 @@ def _apply_configuration(*, verbose: bool, disable: bool) -> None:
     logger.addHandler(gui_handler)
 
 
-def configure_logging(*, verbose: bool = False, disable: bool = False) -> None:
+def configure_logging(
+    *, verbose: bool = False, disable: bool = False, console: bool = True
+) -> None:
     """Configures the shared "agentic_trading" logger's handlers using the
-    real `verbose`/`disable` flags. Only the *first explicit* call in a
+    real `verbose`/`disable`/`console` flags. Only the *first explicit* call in a
     process does anything — a second explicit call (e.g. the GUI
     re-executing render_dashboard() on every rerun) is a no-op, so it's
     always safe to call this unconditionally at the top of an entry point
@@ -164,13 +170,18 @@ def configure_logging(*, verbose: bool = False, disable: bool = False) -> None:
     verbose=True (the CLI's --verbose) raises the console and GUI-buffer
     handlers to DEBUG, surfacing detailed per-step timing. The file
     handler's level is independent of this flag — it always stays at INFO.
+
+    console=False attaches no stdout console handler; the log file and the
+    GUI buffer are configured as usual. It is for an entry point whose
+    stdout is machine-readable output, such as the `experiment` command's
+    JSON result. disable=True overrides it: nothing is attached either way.
     """
     global _configured, _explicitly_configured
     if _explicitly_configured:
         return
     _explicitly_configured = True
     _configured = True
-    _apply_configuration(verbose=verbose, disable=disable)
+    _apply_configuration(verbose=verbose, disable=disable, console=console)
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -182,7 +193,7 @@ def get_logger(name: str) -> logging.Logger:
     global _configured
     if not _configured:
         _configured = True
-        _apply_configuration(verbose=False, disable=False)
+        _apply_configuration(verbose=False, disable=False, console=True)
     return logging.getLogger(name)
 
 

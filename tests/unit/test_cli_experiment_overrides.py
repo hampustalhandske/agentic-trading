@@ -127,3 +127,29 @@ def test_experiment_rejects_max_leverage_override() -> None:
     assert result.exit_code != 0
     assert "firm.max_leverage" in result.output
     assert not calls
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ([], {"verbose": False, "disable": False, "console": False}),
+        (["--verbose"], {"verbose": True, "disable": False, "console": False}),
+        (["--no-log"], {"verbose": False, "disable": True, "console": False}),
+    ],
+)
+def test_experiment_configures_logging_without_the_stdout_console(
+    monkeypatch: pytest.MonkeyPatch, extra: list[str], expected: dict[str, bool]
+) -> None:
+    """`experiment` logs to the file but not to stdout, which carries its JSON result;
+    `--verbose` passes through and `--no-log` disables logging."""
+    recorded: list[dict[str, bool]] = []
+    monkeypatch.setattr(
+        "agentic_trading.cli.configure_logging", lambda **kwargs: recorded.append(kwargs)
+    )
+
+    result, _ = _run(extra)
+
+    assert result.exit_code == 0, result.output
+    assert len(recorded) == 1
+    # An argument the call omits takes `configure_logging`'s own default.
+    assert {"verbose": False, "disable": False, "console": True} | recorded[0] == expected
