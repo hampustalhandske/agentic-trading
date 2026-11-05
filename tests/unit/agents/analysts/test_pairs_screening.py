@@ -35,7 +35,7 @@ def _market_data(correlation: float = 0.9, n: int = 300) -> tuple[pd.DataFrame, 
 def _patch_direction_aware_stats(monkeypatch, p_ab: float, p_ba: float) -> None:
     """Engle-Granger results keyed on argument order via the first value
     of the dependent series, which differs between the two legs."""
-    monkeypatch.setattr(mod, "adf_test", lambda series: (-1.0, 0.5))
+    monkeypatch.setattr(mod, "adf_test", lambda series, **_kwargs: (-1.0, 0.5))
     first_values: dict[str, float] = {}
 
     def _engle_granger(y, x):
@@ -76,7 +76,7 @@ def test_verdict_keeps_first_direction_when_it_is_better(monkeypatch) -> None:
 def test_stationary_leg_is_rejected(monkeypatch) -> None:
     frame, as_of = _market_data()
     _patch_direction_aware_stats(monkeypatch, p_ab=0.01, p_ba=0.04)
-    monkeypatch.setattr(mod, "adf_test", lambda series: (-5.0, 0.001))
+    monkeypatch.setattr(mod, "adf_test", lambda series, **_kwargs: (-5.0, 0.001))
 
     assert mod.rescreen_pairs(frame, as_of, (("A", "B"),), FORMATION_DAYS) == {}
 

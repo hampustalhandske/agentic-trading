@@ -32,7 +32,7 @@ agentic-trading-experiment = "agentic_trading.cli:experiment_main"
 agentic-trading-stage-a = "agentic_trading.cli:stage_a_main"
 
 [tool.uv.sources]
-quantcore = { git = "https://github.com/hampustalhandske/quantcore.git", rev = "a041d0de28a587c55013dc67391ae8df48e512a7" }
+quantcore = { git = "https://github.com/hampustalhandske/quantcore.git", rev = "31a75997753179c8e9cf8342de29ae68218a2d8b" }
 
 [tool.setuptools]
 package-dir = {"" = "src"}

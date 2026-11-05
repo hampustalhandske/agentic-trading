@@ -297,7 +297,7 @@ def conditional_daily_volatility(
     and unconditional vol within 0.3x-3x of the sample vol — otherwise
     the RiskMetrics EWMA (`settings.managers.ewma_lambda`) volatility,
     which needs no estimation and cannot degenerate."""
-    from quantcore.risk import fit_garch_11, garch_11_variance
+    from quantcore.risk import fit_garch_11, garch_11_variance, variance_backcast
     from quantcore.risk.egarch import ewma_variance
 
     from agentic_trading.config import settings
@@ -318,7 +318,9 @@ def conditional_daily_volatility(
         low, high = _GARCH_UNCONDITIONAL_VOL_BAND
         if not low <= unconditional_ratio <= high:
             raise ValueError(f"unconditional vol {unconditional_ratio:.2f}x sample vol")
-        variance_path = garch_11_variance(centered, omega, alpha, beta)
+        variance_path = garch_11_variance(
+            centered, omega, alpha, beta, presample_variance=variance_backcast(returns)
+        )
         return float(np.sqrt(max(float(variance_path[-1]), 0.0)))
     except (RuntimeError, ValueError) as exc:
         logger.debug(

@@ -90,7 +90,7 @@ class ARIMAForecastAnalyst(AnalystAgent):
 
         pretest_returns = returns[-settings.analysts.arima_pretest_window :]
         n_lags = min(LJUNG_BOX_MAX_LAGS, pretest_returns.size // 5)
-        _, p_value = ljung_box_test(pretest_returns, n_lags)
+        _, p_value = ljung_box_test(pretest_returns, n_lags, model_df=0)
         if p_value >= LJUNG_BOX_SIGNIFICANCE:
             return self.abstain_signal(
                 asset, as_of_date, f"no serial dependence to forecast (Ljung-Box p={p_value:.3f})"
@@ -116,7 +116,7 @@ class ARIMAForecastAnalyst(AnalystAgent):
 
         residuals = arima_residuals(log_prices, ar_coefs, ma_coefs, d)
         residual_lags = min(LJUNG_BOX_MAX_LAGS, max(residuals.size // 5, 1))
-        _, residual_p_value = ljung_box_test(residuals, residual_lags)
+        _, residual_p_value = ljung_box_test(residuals, residual_lags, model_df=0)
         if residual_p_value < LJUNG_BOX_SIGNIFICANCE:
             return self.abstain_signal(
                 asset,

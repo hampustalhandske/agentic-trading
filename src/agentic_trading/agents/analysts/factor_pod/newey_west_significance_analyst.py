@@ -65,7 +65,7 @@ class NeweyWestSignificanceAnalyst(AnalystAgent):
         coefs, _std_errors, _r_squared = ols(forward_returns, design_matrix)
         residuals = forward_returns - design_matrix @ coefs
         n_lags = self.n_lags if self.n_lags is not None else newey_west_optimal_lags(residuals)
-        cov_matrix = newey_west_cov(design_matrix, residuals, n_lags)
+        cov_matrix = newey_west_cov(design_matrix, residuals, n_lags, small_sample_correction=False)
 
         slope = float(coefs[1])
         slope_std_error = float(np.sqrt(max(cov_matrix[1, 1], 0.0)))

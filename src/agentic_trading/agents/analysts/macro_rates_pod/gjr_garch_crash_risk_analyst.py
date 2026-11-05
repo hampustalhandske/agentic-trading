@@ -5,7 +5,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from pydantic import PrivateAttr
-from quantcore.risk import ConvergenceError
+from quantcore.risk import ConvergenceError, variance_backcast
 from quantcore.risk.egarch import GJRGARCHParams, gjr_garch_11_variance, gjr_garch_fit
 
 from agentic_trading.agents._market_math import RefitCache, clamp, market_slice
@@ -29,8 +29,10 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
     to the last `settings.analysts.risk_window_garch` returns of the
     asset, re-fitting at most once every `garch_refit_interval_days` per
     asset and computing the conditional-variance path daily from the
-    cached parameters; a fit that raises `ConvergenceError` is cached the
-    same way, so it is not retried before the interval ends. Only signals
+    cached parameters, on the window's demeaned residuals from quantcore's
+    `variance_backcast`, the start the fit uses; a fit that raises
+    `ConvergenceError` is cached the same way, so it is not retried before
+    the interval ends. Only signals
     defensively when conditional vol has jumped above `vol_jump_threshold`
     times its trailing average, and that jump is attributable to the
     fitted asymmetric (bad-news) term rather than the symmetric ARCH term.
@@ -99,9 +101,15 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
                 failed_check,
             )
 
+        residuals = returns - returns.mean()
         try:
             variance_path = gjr_garch_11_variance(
-                returns, fitted.omega, fitted.alpha, fitted.gamma, fitted.beta
+                residuals,
+                fitted.omega,
+                fitted.alpha,
+                fitted.gamma,
+                fitted.beta,
+                presample_variance=variance_backcast(returns),
             )
         except (RuntimeError, ValueError, ZeroDivisionError) as exc:
             logger.debug(
@@ -127,7 +135,7 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
         average_vol = float(np.sqrt(np.mean(variance_path)))
         jump_ratio = current_vol / average_vol if average_vol > 0 else 1.0
 
-        last_shock = float(returns[-1])
+        last_shock = float(residuals[-1])
         asymmetric_term = fitted.gamma * (last_shock**2) * (1.0 if last_shock < 0 else 0.0)
         symmetric_term = fitted.alpha * (last_shock**2)
         driven_by_bad_news = asymmetric_term > symmetric_term

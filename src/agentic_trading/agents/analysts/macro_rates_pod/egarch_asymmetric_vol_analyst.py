@@ -6,7 +6,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from pydantic import PrivateAttr
-from quantcore.risk import ConvergenceError
+from quantcore.risk import ConvergenceError, variance_backcast
 from quantcore.risk.egarch import EGARCHParams, egarch_11_variance, egarch_fit
 
 from agentic_trading.agents._market_math import RefitCache, clamp, market_slice
@@ -31,8 +31,10 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
     to the last `settings.analysts.risk_window_garch` returns of the asset,
     re-fitting at most once every `garch_refit_interval_days` per asset
     and computing the conditional-variance path daily from the cached
-    parameters; a fit that raises `ConvergenceError` is cached the same
-    way, so it is not retried before the interval ends. Signals from the
+    parameters, on the window's demeaned residuals from quantcore's
+    `variance_backcast`, the start the fit uses; a fit that raises
+    `ConvergenceError` is cached the same way, so it is not retried before
+    the interval ends. Signals from the
     sign and magnitude of the fitted leverage term's realized contribution
     on the most recent observation — a strongly negative recent shock
     combined with a positive fitted gamma signals elevated near-term
@@ -100,9 +102,15 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
                 failed_check,
             )
 
+        residuals = returns - returns.mean()
         try:
             log_variance_path = egarch_11_variance(
-                returns, fitted.omega, fitted.alpha, fitted.gamma, fitted.beta
+                residuals,
+                fitted.omega,
+                fitted.alpha,
+                fitted.gamma,
+                fitted.beta,
+                presample_variance=variance_backcast(returns),
             )
         except (RuntimeError, ValueError, ZeroDivisionError) as exc:
             logger.debug(
@@ -127,7 +135,7 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
                 failed_check,
             )
 
-        z_last = float(returns[-1] / conditional_std[-1])
+        z_last = float(residuals[-1] / conditional_std[-1])
         leverage_contribution = fitted.gamma * z_last
 
         direction: Literal["long", "short", "flat"]

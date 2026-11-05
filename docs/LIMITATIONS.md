@@ -309,11 +309,9 @@ edgelab strategy (AT-85) on edgelab's engine, which records and replays it
 
 quantcore:
 
-- AT-101, QC-16: until the re-pin onto the trimmed quantcore,
-  `cir_rate_regime_analyst` tells a no-mean-reversion CIR fit by its error
-  message rather than by `CIRNoMeanReversionError`. The re-pin also moves
-  the GARCH family and the statistical tests onto arch and statsmodels,
-  which shifts every pod's vol overlay, so it is a new trial.
+- QC-16: `cir_rate_regime_analyst` tells a no-mean-reversion CIR fit by
+  its `kappa <= 0` error message; quantcore v0.3.0 has no typed exception
+  for it, which comes with its next tag (AT-101).
 - QC-14 deletes the active-set QP solver; nothing here calls it (AT-117).
 - There is no implied-volatility surface primitive.
   `option_marks._surface_volatility` is the local fallback: linear in

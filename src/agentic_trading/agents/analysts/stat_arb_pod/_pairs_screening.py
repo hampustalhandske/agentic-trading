@@ -129,8 +129,8 @@ def _screen_pair(
     log_prices_a = np.cumsum(returns_a)
     log_prices_b = np.cumsum(returns_b)
     try:
-        _, p_a = adf_test(log_prices_a)
-        _, p_b = adf_test(log_prices_b)
+        _, p_a = adf_test(log_prices_a, max_lags=1, trend="c", autolag=None)
+        _, p_b = adf_test(log_prices_b, max_lags=1, trend="c", autolag=None)
         if p_a <= LEG_STATIONARITY_PVALUE or p_b <= LEG_STATIONARITY_PVALUE:
             return None
         beta_ab, _, p_ab = engle_granger_test(log_prices_a, log_prices_b)

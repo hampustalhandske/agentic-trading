@@ -612,7 +612,7 @@ def test_garch_sigma_path_checks(
 def _ljung_box(*p_values: float) -> Any:
     """A stand-in `ljung_box_test` returning `p_values` in order, one per call."""
     remaining = iter(p_values)
-    return lambda *_args: (0.0, next(remaining))
+    return lambda *_args, **_kwargs: (0.0, next(remaining))
 
 
 _ARIMA_FIT = (np.array([0.1]), np.array([]), 1e-4)

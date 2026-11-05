@@ -119,7 +119,9 @@ def test_newey_west_current_predictor_uses_todays_window_not_yesterdays(monkeypa
     monkeypatch.setattr(
         mod, "ols", lambda _y, _x: (np.array([0.0, 1.0]), np.zeros(_x.shape[0]), 1.0)
     )
-    monkeypatch.setattr(mod, "newey_west_cov", lambda *_args: np.array([[0.0, 0.0], [0.0, 0.01]]))
+    monkeypatch.setattr(
+        mod, "newey_west_cov", lambda *_args, **_kwargs: np.array([[0.0, 0.0], [0.0, 0.01]])
+    )
 
     signal = mod.NeweyWestSignificanceAnalyst().generate_signal("AAPL", market_data, dates[-1])
 
@@ -254,9 +256,9 @@ def test_egarch_analyst_uses_real_mle_fitted_parameters(monkeypatch) -> None:
     captured: dict[str, float] = {}
     real_fn = mod.egarch_11_variance
 
-    def _spy(returns, omega, alpha, gamma, beta):
+    def _spy(returns, omega, alpha, gamma, beta, **kwargs):
         captured.update(omega=omega, alpha=alpha, gamma=gamma, beta=beta)
-        return real_fn(returns, omega, alpha, gamma, beta)
+        return real_fn(returns, omega, alpha, gamma, beta, **kwargs)
 
     monkeypatch.setattr(mod, "egarch_11_variance", _spy)
 
@@ -281,9 +283,9 @@ def test_gjr_garch_analyst_uses_real_mle_fitted_parameters(monkeypatch) -> None:
     captured: dict[str, float] = {}
     real_fn = mod.gjr_garch_11_variance
 
-    def _spy(returns, omega, alpha, gamma, beta):
+    def _spy(returns, omega, alpha, gamma, beta, **kwargs):
         captured.update(omega=omega, alpha=alpha, gamma=gamma, beta=beta)
-        return real_fn(returns, omega, alpha, gamma, beta)
+        return real_fn(returns, omega, alpha, gamma, beta, **kwargs)
 
     monkeypatch.setattr(mod, "gjr_garch_11_variance", _spy)
 
