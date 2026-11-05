@@ -112,3 +112,12 @@ results/
 # Mac
 .DS_Store
 
+
+# Private working files: the issue tracker, handoff, design notes, exposure
+# record and research log carry internal session names and unpublished
+# results. They stay local and never go to a remote.
+docs/ISSUES.md
+docs/HANDOFF.md
+docs/AT-77-design-note.md
+docs/prior_exposure.json
+research/
