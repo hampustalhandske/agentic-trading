@@ -128,8 +128,12 @@ def _is_text(kind: pa.DataType) -> bool:
 def test_open_writes_spec_and_sources(tmp_path: Path) -> None:
     """open() writes spec.json and the row sources' after-close flags, and reopens unchanged."""
     analysts: list[tuple[AnalystAgent, dict[str, str], list[dict[str, Any]]]] = [
-        (CIRRateRegimeAnalyst(), _RATE_IDS, [{"name": "fred", "after_close": True}]),
-        (EarningsSurpriseAnalyst(), _EQUITY_IDS, [{"name": "earnings", "after_close": True}]),
+        (CIRRateRegimeAnalyst(), _RATE_IDS, [{"name": "fred", "can_publish_after_close": True}]),
+        (
+            EarningsSurpriseAnalyst(),
+            _EQUITY_IDS,
+            [{"name": "earnings", "can_publish_after_close": True}],
+        ),
         (GBMMomentumAnalyst(), _RATE_IDS, []),
     ]
     for analyst, ids, sources in analysts:

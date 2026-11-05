@@ -7,8 +7,11 @@
 - spec.json: the trial's `SpecRecord`;
 - sources.json: the source the trial's rows carry (`decisions.source_of`
   of the analyst's declared data requirements) with whether it can
-  publish after the close, `[{"name": ..., "after_close": ...}]`, or `[]`
-  for a price-only analyst;
+  publish after the close, `{"name": ..., "can_publish_after_close": ...}`, then each
+  undated input the analyst declares with its look-ahead limitation,
+  `{"name": ..., "undated": true, "limitation": ...}`
+  (`decisions.undated_declarations`); `[]` for a price-only analyst with
+  no undated input;
 - signals.parquet: one row per instrument per day, `date`,
   `instrument_id`, `status`, `direction`, `confidence`, `source_as_of`,
   `sample_count`;
@@ -45,6 +48,7 @@ from agentic_trading.stage_a.decisions import (
     check_source_as_of,
     decision_weights,
     source_of,
+    undated_declarations,
 )
 from agentic_trading.stage_a.spec import SpecRecord
 
@@ -116,10 +120,12 @@ class SignalStore:
     def __init__(self, store_dir: Path, record: SpecRecord) -> None:
         self.record = record
         self.trial_dir = Path(store_dir) / record.spec_hash
-        self._source = source_of(
+        declared = [
             requirement["source"]
             for requirement in record.spec.analyst_params.get("data_requirements", [])
-        )
+        ]
+        self._source = source_of(declared)
+        self._undated = undated_declarations(declared)
         self._signals = _frame([], _SIGNAL_COLUMNS)
         self._decisions = _frame([], _DECISION_COLUMNS)
         self._last_completed: date | None = None
@@ -139,11 +145,12 @@ class SignalStore:
                 raise StoreMismatchError(
                     f"{spec_path.name} of trial {self.record.spec_hash} holds another record"
                 )
-        sources = (
+        sources: list[dict[str, str | bool]] = (
             []
             if self._source is None
-            else [{"name": self._source, "after_close": SOURCES[self._source]}]
+            else [{"name": self._source, "can_publish_after_close": SOURCES[self._source]}]
         )
+        sources.extend(self._undated)
         sources_path = self.trial_dir / "sources.json"
         if sources_path.exists() and json.loads(sources_path.read_text()) != sources:
             raise StoreMismatchError(

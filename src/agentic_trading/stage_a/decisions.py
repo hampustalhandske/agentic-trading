@@ -8,9 +8,11 @@ and the look-ahead audit of each row's `source` and `source_as_of`.
 flat 0). An instrument whose status is `unavailable` or `error` weighs 0
 and is outside the denominator, so an active day's book has gross 1.0.
 
-`SOURCES` lists every data source an analyst can declare, with whether it
-can publish after 16:00 ET. `row_source` names the one source a row from
-an analyst carries, and `check_source_as_of` refuses a row whose
+`SOURCES` lists every dated data source an analyst can declare, with
+whether it can publish after 16:00 ET; `UNDATED_SOURCES` lists the inputs
+with no publication date, each with the look-ahead limitation a trial
+declares for it. `row_source` names the one dated source a row from an
+analyst carries, and `check_source_as_of` refuses a row whose
 `source_as_of` the decision date's close cannot know: `source` and
 `source_as_of` are both filled or both empty, the source is listed, and
 `source_as_of` is on or before the decision date, strictly before it for
@@ -26,7 +28,7 @@ from agentic_trading.stage_a.spec import DECISION_RULE
 
 __doc__ = f"{__doc__}\n\nDecision rule: {DECISION_RULE}"
 
-# Every source a `DataRequirement` can name, to whether it can publish
+# Every dated source a `DataRequirement` can name, to whether it can publish
 # after 16:00 ET (True) or always publishes before the close (False).
 SOURCES: dict[str, bool] = {
     # CFTC Commitments of Traders: released Friday 15:30 ET.
@@ -49,10 +51,22 @@ SOURCES: dict[str, bool] = {
     "sec_edgar_facts": True,
     # SEC Form 4 insider transactions: accepted until 22:00 ET on their filed date.
     "sec_insider_transactions": True,
-    # SEC SIC codes: a static classification with no release time.
-    "sec_sic": False,
     # S&P 500 membership: changes are announced days before their effective date.
     "sp500_membership": False,
+}
+
+
+# Every undated source a `DataRequirement` can name, to the look-ahead
+# limitation it brings. An undated source has no publication date, so a
+# decision row never names it (`source_of` skips it); each trial declares it
+# once with its limitation (`undated_declarations`), and edgelab's grade
+# carries it as a disclosed limitation.
+UNDATED_SOURCES: dict[str, str] = {
+    # SEC SIC codes: one current classification per ticker, no history.
+    "sec_sic": (
+        "current SIC code applied to past dates in the manager's pair screen to choose "
+        "candidate partners; signals use prices only"
+    ),
 }
 
 
@@ -90,16 +104,35 @@ def row_source(analyst: AnalystAgent) -> str | None:
     return source_of(requirement.source for requirement in analyst.data_requirements)
 
 
+def undated_declarations(sources: Iterable[str]) -> list[dict[str, str | bool]]:
+    """One declaration per undated source among `sources`, in name order:
+    `{"name": ..., "undated": True, "limitation": ...}` with the limitation
+    `UNDATED_SOURCES` gives it. Dated sources are left out."""
+    return [
+        {"name": name, "undated": True, "limitation": UNDATED_SOURCES[name]}
+        for name in sorted(set(sources))
+        if name in UNDATED_SOURCES
+    ]
+
+
+def undated_sources_of(analyst: AnalystAgent) -> list[dict[str, str | bool]]:
+    """`undated_declarations` of `analyst`'s data requirements."""
+    return undated_declarations(requirement.source for requirement in analyst.data_requirements)
+
+
 def source_of(sources: Iterable[str]) -> str | None:
-    """The one source a row resting on `sources` carries: `None` for no
-    sources, else the alphabetically first source that can publish after
-    the close, else the alphabetically first source. An after-close source
-    is chosen whenever there is one because it is audited more strictly.
-    Raises `LookAheadError` naming a source `SOURCES` does not list."""
-    names = sorted(set(sources))
-    unlisted = [name for name in names if name not in SOURCES]
+    """The one source a row resting on `sources` carries: `None` when none
+    of `sources` is dated, else the alphabetically first dated source that
+    can publish after the close, else the alphabetically first dated
+    source. Undated sources (`UNDATED_SOURCES`) never name a row. An
+    after-close source is chosen whenever there is one because it is
+    audited more strictly. Raises `LookAheadError` naming a source neither
+    `SOURCES` nor `UNDATED_SOURCES` lists."""
+    listed = sorted(set(sources))
+    unlisted = [name for name in listed if name not in SOURCES and name not in UNDATED_SOURCES]
     if unlisted:
         raise LookAheadError(f"sources not in SOURCES: {unlisted}")
+    names = [name for name in listed if name in SOURCES]
     if not names:
         return None
     after_close = [name for name in names if SOURCES[name]]

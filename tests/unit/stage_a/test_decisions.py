@@ -15,6 +15,7 @@ from agentic_trading.agents.roster import build_default_analysts
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.stage_a.decisions import (
     SOURCES,
+    UNDATED_SOURCES,
     LookAheadError,
     check_source_as_of,
     decision_weights,
@@ -35,7 +36,6 @@ _BEFORE_CLOSE = {
     "sp500_membership",
     "options_chain",
     "dividends",
-    "sec_sic",
 }
 
 
@@ -93,7 +93,8 @@ def test_decision_weights() -> None:
 
 
 def test_sources_classify_every_roster_source() -> None:
-    """SOURCES marks exactly the five after-close sources and covers every roster source."""
+    """SOURCES marks exactly the five after-close sources, and SOURCES with UNDATED_SOURCES
+    covers every roster source, the two disjoint."""
     roster_sources = {
         requirement.source
         for analyst in build_default_analysts()
@@ -103,7 +104,8 @@ def test_sources_classify_every_roster_source() -> None:
     assert {name for name, after_close in SOURCES.items() if after_close} == _AFTER_CLOSE
     assert {name for name, after_close in SOURCES.items() if not after_close} == _BEFORE_CLOSE
     assert all(isinstance(after_close, bool) for after_close in SOURCES.values())
-    assert roster_sources <= set(SOURCES)
+    assert roster_sources <= set(SOURCES) | set(UNDATED_SOURCES)
+    assert not set(SOURCES) & set(UNDATED_SOURCES)
 
 
 def test_row_source() -> None:

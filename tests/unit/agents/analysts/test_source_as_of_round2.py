@@ -10,8 +10,9 @@ on data read keeps that date, an unavailable signal with nothing read carries `N
 
 Chain snapshots are served by stubbing `load_options_snapshot_from_lakehouse` on `_options_data`,
 the module that imports it, so the shared ATM reduction runs for real; the dividend loader is
-stubbed on the analyst's own module. The SIC lookup behind the stat-arb pairs carries no date, so
-for those two analysts only the store refusal and the partnerless unavailable signal are
+stubbed on the analyst's own module. The SIC lookup behind the stat-arb pairs is an undated input
+(`decisions.UNDATED_SOURCES`), so their rows are price-only (see
+`tests/unit/stage_a/test_undated_sources.py`); only their partnerless unavailable signal is
 specified here."""
 
 from collections.abc import Callable
@@ -57,8 +58,6 @@ _ANALYSTS: tuple[type[AnalystAgent], ...] = (
     greeks_delta_hedge_analyst.GreeksDeltaHedgeAnalyst,
     heston_vol_surface_analyst.HestonVolSurfaceAnalyst,
     dividend_payout_analyst.DividendPayoutAnalyst,
-    PairsCointegrationAnalyst,
-    KalmanHedgeRatioAnalyst,
 )
 
 
