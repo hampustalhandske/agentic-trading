@@ -70,11 +70,11 @@ def test_company_facts_keep_only_latest_filing_per_period(fake_lake: Any) -> Non
     assert late is not None
     assert len(late) == 1
     assert late["filed"].iloc[0] == pd.Timestamp("2024-05-03")
-    assert late["available_date"].iloc[0] == pd.Timestamp("2024-05-03")
+    assert late["available_date"].iloc[0] == pd.Timestamp("2024-05-06")
     assert early is not None
     assert len(early) == 1
     assert early["filed"].iloc[0] == pd.Timestamp("2023-05-05")
-    assert lakehouse_loader.load_company_facts_from_lakehouse("AAPL", date(2023, 5, 4)) is None
+    assert lakehouse_loader.load_company_facts_from_lakehouse("AAPL", date(2023, 5, 5)) is None
 
 
 def test_company_facts_output_shape(fake_lake: Any) -> None:

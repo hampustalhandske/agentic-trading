@@ -3225,9 +3225,12 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     quarter, year-to-date, prior-year comparatives) as separate rows, and
     later filings repeat or restate earlier periods. Gated on when the
     filing became public, never the period it describes:
-    `available_date` is set from the filing's latest acceptance time in
-    `sec_filings` (`_sec_acceptance_query`) by `_sec_available_dates`,
-    and only rows with `available_date <= as_of_date` are kept. Of
+    `available_date` is the next NYSE session after the later of the
+    filed date and the America/New_York date of the filing's latest
+    acceptance time in `sec_filings` (`_sec_acceptance_query`), as
+    `_sec_available_dates` sets it, so a filing is never usable on the
+    day it is filed; only rows with `available_date <= as_of_date` are
+    kept. Of
     those, each (`concept`, `unit`, `period_start`, `period_end`) keeps
     the row with the latest `available_date`, ties broken by the latest
     `filed`, then the latest EDGAR acceptance; the query sorts on every
@@ -3309,25 +3312,29 @@ def _sec_acceptance_query() -> str:
     """
 
 
-# Decisions are taken at the NYSE close (16:00 America/New_York); an SEC
-# filing accepted before that time is public for that day's decision.
+# The time zone of the NYSE close decisions are taken at; EDGAR acceptance
+# times and crypto session bars are dated in it.
 _DECISION_TIMEZONE = "America/New_York"
-_DECISION_TIME = pd.Timedelta(hours=16)
 
 
 def _sec_available_dates(filed: pd.Series, accepted_at: pd.Series) -> pd.Series:
-    """The day each SEC filing is known at the decision time, from its
+    """The session at whose close each SEC filing is known, from its
     `filed` date and EDGAR `accepted_at` timestamp (time-zone aware, any
-    zone, or missing): the filed date when acceptance falls strictly
-    before 16:00 America/New_York on that date, otherwise — including a
-    missing `accepted_at` — the next NYSE session after the filed date.
-    Returns a datetime64 series aligned with `filed`."""
+    zone, or missing): the next NYSE session after the later of the filed
+    date and the America/New_York calendar date of `accepted_at`, or after
+    the filed date when `accepted_at` is missing. A filing is therefore
+    never known on the day it is filed, as for every source that can
+    publish after the close. Returns a datetime64 series aligned with
+    `filed`."""
     filed_days = pd.to_datetime(filed).dt.normalize()
-    cutoff = (filed_days + _DECISION_TIME).dt.tz_localize(_DECISION_TIMEZONE)
-    accepted = pd.to_datetime(accepted_at, utc=True).dt.tz_convert(_DECISION_TIMEZONE)
-    before_close = accepted < cutoff
-    following = filed_days.map(lambda day: pd.Timestamp(next_session(day.date())))
-    return filed_days.where(before_close, following)
+    accepted_days = (
+        pd.to_datetime(accepted_at, utc=True)
+        .dt.tz_convert(_DECISION_TIMEZONE)
+        .dt.tz_localize(None)
+        .dt.normalize()
+    )
+    known_from = filed_days.where(~(accepted_days > filed_days), accepted_days)
+    return pd.to_datetime(known_from.map(lambda day: pd.Timestamp(next_session(day.date()))))
 
 
 # FINRA publishes short interest about seven business days after the
@@ -3452,11 +3459,13 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
     lines in one filing also count once.
 
     The trade date is not when a trade became public; the filing is.
-    `available_date` (datetime64) is set from the filing's latest EDGAR
-    acceptance time in `sec_filings` (`_sec_acceptance_query`) by
-    `_sec_available_dates` (16:00 America/New_York, the close, is the
-    decision time), and only rows with `available_date <= as_of_date`
-    are returned, sorted on every returned column. Returns `None` if no
+    `available_date` (datetime64) is the next NYSE session after the
+    later of the filed date and the America/New_York date of the
+    filing's latest EDGAR acceptance time in `sec_filings`
+    (`_sec_acceptance_query`), as `_sec_available_dates` sets it, so a
+    filing is never usable on the day it is filed; only rows with
+    `available_date <= as_of_date` are returned, sorted on every
+    returned column. Returns `None` if no
     rows remain. Self-asserts point-in-time on `filed_date` (the SQL gate)
     and on `available_date` before returning."""
     _guard_data_end(as_of_date, "load_insider_transactions_from_lakehouse")

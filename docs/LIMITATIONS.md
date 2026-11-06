@@ -71,9 +71,11 @@ Per source, as coded:
 - **Earnings** (`dolthub_earnings_calendar` joined to `dolthub_eps_history`
   within 75 days after the period end): every announcement is usable from
   the next NYSE session, so a before-open report loses a day (AT-118).
-- **SEC company facts and Form 4 insider transactions**: usable on the
-  filed date when EDGAR accepted the filing before 16:00 ET, otherwise
-  (including no acceptance time) from the next session (AT-9). Both read
+- **SEC company facts and Form 4 insider transactions**: usable from the
+  next NYSE session after the later of the filed date and the ET date of
+  EDGAR's acceptance time (after the filed date when there is no
+  acceptance time), so a filing accepted before the close loses a day
+  (AT-9, AT-133). Both read
   the lake's `_log` views with a local de-duplication (AT-10, AT-11). A
   fiscal Q4 is derived as the annual value minus three discrete quarters,
   which is approximate for per-share concepts (AT-10).

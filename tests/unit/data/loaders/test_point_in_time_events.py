@@ -4,11 +4,11 @@
 
 Decisions are taken at the 16:00 America/New_York close of `as_of_date`. FINRA short
 interest is gated on the loader's own dissemination estimate, earnings on the
-announcement session implied by the `when` field, and SEC data on the filing's
-acceptance time.
+announcement session implied by the `when` field, and SEC data on the next NYSE session
+after the later of the filing's filed date and its New York acceptance date.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
@@ -241,39 +241,40 @@ def _seed_insiders(fake_lake: Any, rows: list[dict[str, Any]]) -> None:
 
 
 @pytest.mark.parametrize(
-    ("accepted_utc", "available", "same_day_visible"),
+    ("accepted_utc", "available"),
     [
-        (_EARLY, "2024-03-12", True),
-        (_LATE, "2024-03-13", False),
-        ("2024-03-12 19:59:59", "2024-03-12", True),
-        ("2024-03-12 20:00:00", "2024-03-13", False),
-        (None, "2024-03-13", False),
+        (_EARLY, date(2024, 3, 13)),
+        (_LATE, date(2024, 3, 13)),
+        ("2024-03-13 03:59:59", date(2024, 3, 13)),
+        ("2024-03-13 04:00:00", date(2024, 3, 14)),
+        (None, date(2024, 3, 13)),
     ],
-    ids=["early", "late", "just-before-close", "at-close", "no-filing-row"],
+    ids=["before-close", "after-close", "ny-day-end", "ny-next-day", "no-filing-row"],
 )
 def test_insider_transactions_gate_on_acceptance_time(
-    fake_lake: Any, accepted_utc: str | None, available: str, same_day_visible: bool
+    fake_lake: Any, accepted_utc: str | None, available: date
 ) -> None:
-    """Filings accepted before 16:00 ET are available on the filed date, others the next session."""
+    """A filing filed 2024-03-12 is available from the session after the later of its filed
+    date and its New York acceptance date, and not on the filed date or the day before that."""
     _seed_filings(fake_lake, {"0001-24-000001": accepted_utc or _EARLY, "OTHER": _EARLY})
     accession = "0001-24-000001" if accepted_utc else "0001-24-NOFILING"
     _seed_insiders(fake_lake, [_insider_row(accession)])
 
-    same_day = lakehouse_loader.load_insider_transactions_from_lakehouse("AAPL", date(2024, 3, 12))
-    next_day = lakehouse_loader.load_insider_transactions_from_lakehouse("AAPL", date(2024, 3, 13))
+    for as_of in (date(2024, 3, 12), available - timedelta(days=1)):
+        assert lakehouse_loader.load_insider_transactions_from_lakehouse("AAPL", as_of) is None
+    result = lakehouse_loader.load_insider_transactions_from_lakehouse("AAPL", available)
 
-    assert (same_day is not None) is same_day_visible
-    assert next_day is not None
-    assert len(next_day) == 1
-    assert next_day["available_date"].iloc[0] == pd.Timestamp(available)
-    assert str(next_day["available_date"].dtype).startswith("datetime64")
-    assert next_day["filed_date"].iloc[0] == pd.Timestamp("2024-03-12")
-    assert {"owner_cik", "shares", "price_per_share", "transaction_date"} <= set(next_day.columns)
+    assert result is not None
+    assert len(result) == 1
+    assert result["available_date"].iloc[0] == pd.Timestamp(available)
+    assert str(result["available_date"].dtype).startswith("datetime64")
+    assert result["filed_date"].iloc[0] == pd.Timestamp("2024-03-12")
+    assert {"owner_cik", "shares", "price_per_share", "transaction_date"} <= set(result.columns)
 
 
 def test_insider_transactions_over_weekend_roll_to_next_session(fake_lake: Any) -> None:
-    """A late Friday filing becomes available on Monday."""
-    _seed_filings(fake_lake, {"A1": "2024-03-15 21:30:00"})
+    """A Friday filing accepted before the close becomes available on Monday."""
+    _seed_filings(fake_lake, {"A1": "2024-03-15 14:00:00"})
     _seed_insiders(fake_lake, [_insider_row("A1", filed_date="2024-03-15")])
 
     assert (
@@ -295,19 +296,24 @@ def test_insider_transactions_filing_listed_under_two_tickers_uses_latest_accept
             {
                 "accession_number": ["A1", "A1"],
                 "ticker": ["AAPL", "MSFT"],
-                "accepted_at": [pd.Timestamp(_EARLY, tz=_UTC), pd.Timestamp(_LATE, tz=_UTC)],
+                "accepted_at": [
+                    pd.Timestamp(_EARLY, tz=_UTC),
+                    pd.Timestamp("2024-03-13 14:00:00", tz=_UTC),
+                ],
             }
         ),
     )
     _seed_insiders(fake_lake, [_insider_row("A1")])
 
-    same_day = lakehouse_loader.load_insider_transactions_from_lakehouse("AAPL", date(2024, 3, 12))
-    result = lakehouse_loader.load_insider_transactions_from_lakehouse("AAPL", date(2024, 3, 13))
+    first_session = lakehouse_loader.load_insider_transactions_from_lakehouse(
+        "AAPL", date(2024, 3, 13)
+    )
+    result = lakehouse_loader.load_insider_transactions_from_lakehouse("AAPL", date(2024, 3, 14))
 
-    assert same_day is None
+    assert first_session is None
     assert result is not None
     assert len(result) == 1
-    assert result["available_date"].iloc[0] == pd.Timestamp("2024-03-13")
+    assert result["available_date"].iloc[0] == pd.Timestamp("2024-03-14")
 
 
 def test_insider_transactions_deduplicate_scrapes_but_keep_distinct_lines(fake_lake: Any) -> None:
@@ -361,15 +367,20 @@ def _fact_row(accession: str) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
-    ("accepted_utc", "available", "same_day_visible"),
-    [(_EARLY, "2024-03-12", True), (_LATE, "2024-03-13", False)],
-    ids=["before-close", "after-close"],
+    ("accepted_utc", "available"),
+    [
+        (_EARLY, date(2024, 3, 13)),
+        (_LATE, date(2024, 3, 13)),
+        ("2024-03-13 14:00:00", date(2024, 3, 14)),
+    ],
+    ids=["before-close", "after-close", "accepted-day-after-filed"],
 )
 def test_company_facts_gate_on_acceptance_time(
-    fake_lake: Any, accepted_utc: str, available: str, same_day_visible: bool
+    fake_lake: Any, accepted_utc: str, available: date
 ) -> None:
-    """Facts from a filing accepted before 16:00 ET are available that day, otherwise the
-    next session."""
+    """Facts from a filing filed 2024-03-12 are available from the session after the later of
+    its filed date and its New York acceptance date, and not on the filed date or the day
+    before that."""
     _seed_filings(fake_lake, {"F1": accepted_utc})
     fake_lake.add(
         "sec_company_facts_log",
@@ -377,12 +388,142 @@ def test_company_facts_gate_on_acceptance_time(
         date_columns=("dt", "filed_date", "period_end", "period_start"),
     )
 
-    same_day = lakehouse_loader.load_company_facts_from_lakehouse("AAPL", date(2024, 3, 12))
-    next_day = lakehouse_loader.load_company_facts_from_lakehouse("AAPL", date(2024, 3, 13))
+    for as_of in (date(2024, 3, 12), available - timedelta(days=1)):
+        assert lakehouse_loader.load_company_facts_from_lakehouse("AAPL", as_of) is None
+    next_day = lakehouse_loader.load_company_facts_from_lakehouse("AAPL", available)
 
-    assert (same_day is not None) is same_day_visible
     assert next_day is not None
     assert next_day["available_date"].iloc[0] == pd.Timestamp(available)
     assert str(next_day["available_date"].dtype).startswith("datetime64")
     assert {"concept", "value", "fiscal_period", "filed"} <= set(next_day.columns)
     assert next_day["filed"].iloc[0] == pd.Timestamp("2024-03-12")
+
+
+_NY = "America/New_York"
+
+
+@pytest.mark.parametrize(
+    ("filed", "accepted_at", "available"),
+    [
+        ("2024-03-12", pd.Timestamp("2024-03-12 10:00", tz=_NY), "2024-03-13"),
+        ("2024-03-12", pd.Timestamp("2024-03-12 18:00", tz=_NY), "2024-03-13"),
+        ("2024-03-12", pd.Timestamp("2024-03-13 09:00", tz=_NY), "2024-03-14"),
+        ("2024-03-12", pd.Timestamp("2024-03-11 18:00", tz=_NY), "2024-03-13"),
+        ("2024-03-15", pd.Timestamp("2024-03-15 10:00", tz=_NY), "2024-03-18"),
+        ("2024-02-16", pd.Timestamp("2024-02-16 10:00", tz=_NY), "2024-02-20"),
+        ("2024-03-28", pd.Timestamp("2024-03-28 10:00", tz=_NY), "2024-04-01"),
+        ("2024-03-12", None, "2024-03-13"),
+        ("2024-03-15", None, "2024-03-18"),
+        ("2024-03-12", pd.Timestamp("2024-03-13 02:00", tz=_UTC), "2024-03-13"),
+        ("2024-03-12", pd.Timestamp("2024-03-13 05:00", tz=_UTC), "2024-03-14"),
+    ],
+    ids=[
+        "pre-close-on-filed-date",
+        "after-close-on-filed-date",
+        "accepted-day-after-filed",
+        "accepted-day-before-filed",
+        "friday-to-monday",
+        "friday-over-presidents-day",
+        "thursday-over-good-friday",
+        "missing-acceptance",
+        "missing-acceptance-friday",
+        "utc-next-day-is-ny-filed-date",
+        "utc-next-day-is-ny-next-day",
+    ],
+)
+def test_sec_available_dates_is_session_after_later_of_filed_and_ny_acceptance(
+    filed: str, accepted_at: pd.Timestamp | None, available: str
+) -> None:
+    """A filing is known at the close of the next NYSE session after the later of its filed
+    date and the New York calendar date of its acceptance; with no acceptance, after the
+    filed date."""
+    result = lakehouse_loader._sec_available_dates(
+        pd.Series([pd.Timestamp(filed)]), pd.Series([accepted_at], dtype=object)
+    )
+
+    assert result.iloc[0] == pd.Timestamp(available)
+    assert str(result.dtype).startswith("datetime64")
+
+
+def test_sec_available_dates_keeps_filed_index_and_mixes_missing_acceptance() -> None:
+    """The result is aligned with `filed`; present and missing acceptances resolve per row."""
+    filed = pd.Series(pd.to_datetime(["2024-03-12", "2024-03-15"]), index=[7, 3])
+    accepted = pd.Series([pd.Timestamp("2024-03-12 21:30", tz=_UTC), None], index=[7, 3])
+
+    result = lakehouse_loader._sec_available_dates(filed, accepted)
+
+    assert list(result.index) == [7, 3]
+    assert list(result) == [pd.Timestamp("2024-03-13"), pd.Timestamp("2024-03-18")]
+
+
+def _fetched_insider_frame(accepted_at: pd.Timestamp | None) -> pd.DataFrame:
+    """One `_fetch_insider_transactions` row of a Form 4 purchase filed 2024-03-12."""
+    return pd.DataFrame(
+        {
+            "owner_cik": [1214156],
+            "owner_name": ["COOK TIMOTHY D"],
+            "is_officer": [True],
+            "is_director": [False],
+            "is_ten_percent_owner": [False],
+            "transaction_date": [pd.Timestamp("2024-03-11")],
+            "transaction_code": ["P"],
+            "shares": [100.0],
+            "price_per_share": [170.0],
+            "acquired_disposed": ["A"],
+            "filed_date": [pd.Timestamp("2024-03-12")],
+            "accepted_at": pd.Series([accepted_at], dtype="datetime64[ns, UTC]"),
+        }
+    )
+
+
+def _fetched_fact_frame(accepted_at: pd.Timestamp | None) -> pd.DataFrame:
+    """One `_fetch_company_facts` row of a 10-Q filed 2024-03-12."""
+    return pd.DataFrame(
+        {
+            "concept": ["Revenues"],
+            "unit": ["USD"],
+            "period_start": [pd.Timestamp("2023-10-01")],
+            "period_end": [pd.Timestamp("2023-12-30")],
+            "value": [119.0e9],
+            "fiscal_year": [2024],
+            "fiscal_period": ["Q1"],
+            "form": ["10-Q"],
+            "filed": [pd.Timestamp("2024-03-12")],
+            "accepted_at": pd.Series([accepted_at], dtype="datetime64[ns, UTC]"),
+        }
+    )
+
+
+_PRE_CLOSE = pd.Timestamp("2024-03-12 10:00", tz=_NY).tz_convert(_UTC)
+
+
+@pytest.mark.parametrize("accepted_at", [_PRE_CLOSE, None], ids=["pre-close", "missing"])
+def test_select_insider_transactions_excludes_filed_date_includes_next_session(
+    accepted_at: pd.Timestamp | None,
+) -> None:
+    """A Form 4 filed and accepted before the close on D is not returned at D, only from the
+    next session."""
+    frame = _fetched_insider_frame(accepted_at)
+
+    assert lakehouse_loader._select_insider_transactions(frame, date(2024, 3, 12)) is None
+    result = lakehouse_loader._select_insider_transactions(frame, date(2024, 3, 13))
+
+    assert result is not None
+    assert list(result["available_date"]) == [pd.Timestamp("2024-03-13")]
+    assert "accepted_at" not in result.columns
+
+
+@pytest.mark.parametrize("accepted_at", [_PRE_CLOSE, None], ids=["pre-close", "missing"])
+def test_select_company_facts_excludes_filed_date_includes_next_session(
+    accepted_at: pd.Timestamp | None,
+) -> None:
+    """Facts of a filing filed and accepted before the close on D are not returned at D, only
+    from the next session."""
+    frame = _fetched_fact_frame(accepted_at)
+
+    assert lakehouse_loader._select_company_facts(frame, date(2024, 3, 12)) is None
+    result = lakehouse_loader._select_company_facts(frame, date(2024, 3, 13))
+
+    assert result is not None
+    assert list(result["available_date"]) == [pd.Timestamp("2024-03-13")]
+    assert "accepted_at" not in result.columns
