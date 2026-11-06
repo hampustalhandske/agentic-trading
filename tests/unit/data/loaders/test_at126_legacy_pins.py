@@ -5,13 +5,14 @@ The reference imports live helpers from the loader module and its
 neighbours, so it can change without an edit to its own file. The test walks
 every symbol the reference names (its `from agentic_trading... import` names
 and each `ll.<name>` of the loader module), then, through each function's
-global names, every `agentic_trading` function, class and plain constant those
-reach. It hashes each one's source: a function's or class's definition, and
-a plain constant's module-level assignment (so a test that patches the value
-at run time does not change its pin), and compares the result with
-`at126_legacy_pins.json`. Modules,
-loggers, the settings object and other runtime objects are not pinned;
-`agentic_trading.logging_config` is not followed.
+global names, every `agentic_trading` function and class those reach and
+every other name an `agentic_trading` module assigns at its top level. It
+hashes each one's source, a function's or class's definition or a name's
+top-level assignment, never a run-time value, so what a test patches or a
+registry collects does not change a pin. It compares the result with
+`at126_legacy_pins.json`. Modules and names a module only imports (such as
+the settings object) are not pinned; `agentic_trading.logging_config` is not
+followed.
 
 When a pinned symbol changes and the reference is meant to follow it, list
 the change among the exceptions in the module docstring of
@@ -34,7 +35,6 @@ _LEGACY = _SCRIPTS / "at126_legacy.py"
 _PINS = Path(__file__).with_name("at126_legacy_pins.json")
 _LOADER_ALIAS = "ll"
 _NOT_FOLLOWED = ("agentic_trading.logging_config",)
-_PLAIN = (str, int, float, bool, bytes, type(None))
 
 
 def _legacy_module() -> types.ModuleType:
@@ -44,18 +44,6 @@ def _legacy_module() -> types.ModuleType:
         return importlib.import_module("at126_legacy")
     finally:
         sys.path.remove(str(_SCRIPTS))
-
-
-def _is_plain(value: Any) -> bool:
-    """Whether `value` is a constant with a stable `repr`: a str, number,
-    bool, bytes or None, or a tuple, list, frozenset, set or dict of them."""
-    if isinstance(value, _PLAIN):
-        return True
-    if isinstance(value, tuple | list | frozenset | set):
-        return all(_is_plain(item) for item in value)
-    if isinstance(value, dict):
-        return all(_is_plain(key) and _is_plain(item) for key, item in value.items())
-    return False
 
 
 def _in_scope(module: str | None) -> bool:
@@ -88,8 +76,8 @@ def _assignment_source(module_name: str, name: str) -> str:
 
 def _digest(name: str, value: Any) -> str:
     """The sha256 hex digest of the source of the symbol `name`: the
-    definition of a function or class, or the module-level assignment of a
-    plain constant."""
+    definition of a function or class, or the top-level assignment of any
+    other name."""
     if inspect.isfunction(value) or inspect.isclass(value):
         text = inspect.getsource(value)
     else:
@@ -131,8 +119,8 @@ def _roots(legacy: types.ModuleType) -> dict[str, Any]:
 
 def legacy_pins() -> dict[str, str]:
     """Dotted name to source digest of every `agentic_trading` function,
-    class and plain constant the reference reaches (see the module
-    docstring), sorted by name."""
+    class and top-level assigned name the reference reaches (see the
+    module docstring), sorted by name."""
     pins: dict[str, str] = {}
     stack = list(_roots(_legacy_module()).items())
     while stack:
@@ -142,9 +130,12 @@ def legacy_pins() -> dict[str, str]:
         if inspect.isfunction(value) or inspect.isclass(value):
             if not _in_scope(value.__module__):
                 continue
-        elif not _is_plain(value):
+        elif inspect.ismodule(value) or not _in_scope(name.rpartition(".")[0]):
             continue
-        pins[name] = _digest(name, value)
+        try:
+            pins[name] = _digest(name, value)
+        except LookupError:
+            continue
         if not inspect.isfunction(value):
             continue
         function = inspect.unwrap(value)
