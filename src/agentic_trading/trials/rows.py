@@ -25,6 +25,7 @@ from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
 
+import yaml
 from pydantic import BaseModel, ConfigDict
 
 from agentic_trading import provenance as code_provenance
@@ -273,7 +274,7 @@ def ensure_firm_registration(
     not `FIRM_HYPOTHESIS_ID`, its `family` line is not `family`, its
     `registered_at` is not a timezone-aware ISO time, or the ledger refuses
     the registration (the id registered with another hash)."""
-    path = Path(repo_root) / settings.trials.registry_dir / f"{FIRM_HYPOTHESIS_ID}.yaml"
+    path = firm_registry_path(repo_root)
     if not path.exists():
         return None
     text = path.read_bytes().decode("utf-8", errors="replace")
@@ -300,6 +301,34 @@ def ensure_firm_registration(
     )
     ledger.register(registration)
     return registration
+
+
+def firm_registry_path(repo_root: Path) -> Path:
+    """The firm's registry file,
+    `<repo_root>/<settings.trials.registry_dir>/<FIRM_HYPOTHESIS_ID>.yaml`
+    (read at call time)."""
+    return Path(repo_root) / settings.trials.registry_dir / f"{FIRM_HYPOTHESIS_ID}.yaml"
+
+
+def firm_registered_trials(repo_root: Path) -> dict[str, Any] | None:
+    """The `trials` mapping of the firm's registry file (`firm_registry_path`)
+    as the file states it, `{}` when the file has no `trials` key, and
+    `None` when the file does not exist. The file is read as YAML. Raises
+    `LedgerError` when it is not valid YAML, is not a mapping, or its
+    `trials` is not a mapping."""
+    path = firm_registry_path(repo_root)
+    if not path.exists():
+        return None
+    try:
+        content = yaml.safe_load(path.read_bytes().decode("utf-8", errors="replace"))
+    except yaml.YAMLError as exc:
+        raise LedgerError(f"{path} is not valid YAML: {exc}") from None
+    if not isinstance(content, dict):
+        raise LedgerError(f"{path} does not hold a YAML mapping")
+    trials = content.get("trials", {})
+    if not isinstance(trials, dict):
+        raise LedgerError(f"{path} has a trials entry that is not a mapping")
+    return trials
 
 
 def firm_trial_row(

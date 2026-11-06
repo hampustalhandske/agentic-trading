@@ -25,8 +25,11 @@ resumes with the firm's state as it stood and ends with the rows of an
 unbroken pass. A pass killed after a day's rows were written but before its
 checkpoint drops the store's days past the checkpoint and computes them
 again. The checkpoint holds the book's value and stays outside the trial
-directory, which holds only the submission (spec.json, sources.json,
-decisions.parquet, progress.json).
+directory, which holds only the submission: the store's spec.json,
+sources.json, decisions.parquet and progress.json, and the edgelab replay
+folder around them (`firm_record.submission`: submission.json, strategy/,
+data/ and agentic_meta.json), written at each start of the pass for the
+commit it runs from.
 
 No performance figure leaves the pass: the result reports only what was
 written, and the engine's value and ratio log lines are held back while it
@@ -34,8 +37,11 @@ runs. With a ledger, the firm's hypothesis is registered from its
 hand-approved registry file before the first day is computed, and a pass
 that wrote a day records one trial row (`trials.rows.firm_trial_row`); a
 counted pass needs a clean `src/` tree at a known commit, which its
-spec.json records. Without the registry file the pass is uncounted and the
-ledger is not touched."""
+spec.json records, and a registry file stating `trials.declared_n` and
+`trials.prior_exposure`, which its submission.json declares. Without the
+registry file the pass is uncounted, the ledger is not touched, and its
+submission declares one trial; every pass needs a known commit, which its
+submission.json names."""
 
 import logging
 from collections.abc import Iterator, Sequence
@@ -65,6 +71,7 @@ from agentic_trading.firm_record.rows import (
     row_provenance,
 )
 from agentic_trading.firm_record.spec import build_firm_spec
+from agentic_trading.firm_record.submission import submission_for, write_submission_folder
 from agentic_trading.logging_config import get_logger
 from agentic_trading.provenance import source_tree_state
 from agentic_trading.scoring.track_record import TrackRecord
@@ -72,9 +79,9 @@ from agentic_trading.stage_a.spec import FirmSpecRecord, firm_spec_hash
 from agentic_trading.stage_a.store import FirmDecisionStore
 from agentic_trading.trials.ledger import TrialLedger
 from agentic_trading.trials.rows import (
-    FIRM_HYPOTHESIS_ID,
     current_trial_provenance,
     ensure_firm_registration,
+    firm_registered_trials,
     firm_trial_row,
 )
 
@@ -196,10 +203,14 @@ def run_firm_record(
 
     Raises `ValueError`, before writing anything, when the window is
     reversed, holds no session, or ends after `settings.stage_a.data_end`,
-    when `max_days` is below 1, or when a `ledger` is given without a
-    `repo_root`; `ValueError` when the engine checkpoint is ahead of the
-    store, so the pass cannot resume, or when the pass would be counted but
-    the `src/` tree has changes or no known commit.
+    when `max_days` is below 1, when a `ledger` is given without a
+    `repo_root`, when HEAD is unknown, when the pass would be counted but
+    the `src/` tree has changes or the registry file lacks
+    `trials.declared_n` or `trials.prior_exposure`, or when the submission
+    breaks edgelab's model (`pydantic.ValidationError`, a one-day window
+    among them); `ValueError` when the engine checkpoint is ahead of the
+    store, so the pass cannot resume. A registry file that is not a YAML
+    mapping raises `LedgerError` before anything is written.
     `HoldoutReadError` and the store's refusals propagate with the day
     unwritten; a `LedgerError` from registering or recording propagates."""
     data_end = settings.stage_a.data_end
@@ -225,20 +236,18 @@ def run_firm_record(
 
     tickers = list(universe)
     family = settings.trials.firm_family
-    registry_file = (
-        None
-        if repo_root is None
-        else Path(repo_root) / settings.trials.registry_dir / f"{FIRM_HYPOTHESIS_ID}.yaml"
-    )
-    will_count = ledger is not None and registry_file is not None and registry_file.exists()
-    git_sha: str | None = None
-    if will_count:
-        git_sha, dirty = source_tree_state()
-        if git_sha is None or dirty is not False:
-            raise ValueError(
-                "a counted firm record needs a clean src/ tree at a known commit; "
-                f"HEAD is {git_sha}, src/ has changes: {dirty}"
-            )
+    registered_trials = None if repo_root is None else firm_registered_trials(repo_root)
+    will_count = ledger is not None and registered_trials is not None
+    head_sha, dirty = source_tree_state()
+    if will_count and (head_sha is None or dirty is not False):
+        raise ValueError(
+            "a counted firm record needs a clean src/ tree at a known commit; "
+            f"HEAD is {head_sha}, src/ has changes: {dirty}"
+        )
+    if head_sha is None or dirty is None:
+        raise ValueError(
+            "a firm record's submission names the commit it ran from, and HEAD is unknown"
+        )
     spec = build_firm_spec(commander, tickers, window_start, window_end, lake_time)
     record = FirmSpecRecord(
         spec=spec,
@@ -246,17 +255,24 @@ def run_firm_record(
         lake_time=spec.lake_time,
         lake_version=lake_version,
         quantcore_version=quantcore_version,
-        git_sha=git_sha,
+        git_sha=head_sha if will_count else None,
     )
     analysts = [agent for agent in roster_agents(commander) if isinstance(agent, AnalystAgent)]
     option_rows = any(
         isinstance(manager, ConditionalValueAtRiskManager | TailHedgeManager)
         for manager in commander.managers
     )
-    store_dir = Path(store_dir)
-    store = FirmDecisionStore(
-        store_dir, record, sources=firm_sources(analysts, option_rows=option_rows)
+    sources = firm_sources(analysts, option_rows=option_rows)
+    submission, meta = submission_for(
+        record,
+        sources=sources,
+        git_sha=head_sha,
+        src_tree_clean=not dirty,
+        counted=will_count,
+        registered_trials=registered_trials,
     )
+    store_dir = Path(store_dir)
+    store = FirmDecisionStore(store_dir, record, sources=sources)
     sources_by_analyst = analyst_sources(analysts)
     kinds = {ticker: instrument_kind(ticker) for ticker in tickers}
     scopes = {
@@ -294,6 +310,7 @@ def run_firm_record(
                 ensure_firm_registration(ledger=ledger, repo_root=repo_root, family=family)
                 is not None
             )
+        write_submission_folder(store.trial_dir, record, submission, meta)
         pending = [day for day in sessions if last is None or day > last]
         logger.info(
             "Firm record (trial %s, %s): %d of %d sessions to compute",

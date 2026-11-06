@@ -120,6 +120,11 @@ class FirmConfig(BaseModel):
     # fractional-percent option budget buys whole contracts (one SPY put
     # is ~$1,000 of premium); $10M is a small multi-strategy sleeve.
     starting_cash: float = Field(default=10_000_000.0, gt=0.0)
+    # The `seed` of a firm record's edgelab submission (submission.json and
+    # its strategy.yaml): edgelab seeds every stochastic step of grading
+    # (bootstraps, noise draws) from it, so one fixed value grades every
+    # rerun of a record on the same draws. The value itself is arbitrary.
+    edgelab_seed: int = Field(default=20100104, ge=0)
 
 
 class OptionsConfig(BaseModel):

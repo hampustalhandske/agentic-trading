@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import jsonschema
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import pytest
+import yaml
 from pydantic import PrivateAttr
 
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, ManagerAgent
@@ -26,6 +28,7 @@ from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.backtest import checkpoint_store
+from agentic_trading.config import settings
 from agentic_trading.data.loaders import lakehouse_loader
 from agentic_trading.data.loaders.lakehouse_loader import HoldoutReadError
 from agentic_trading.data.trading_calendar import sessions_between
@@ -51,7 +54,16 @@ family: agentic-firm
 registered_at: 2026-11-07T09:00:00Z   # UTC, set when the master approves
 kind: firm
 metric_kind: return
+trials:
+  declared_n: 7
+  prior_exposure:
+    note: "Firm Sharpe diagnostics seen on earlier windows"
+    windows:
+      - {start: "2010-01-04", end: "2017-12-29"}
+    min_count: 3
 """
+# The registry file without the trial count a counted record declares.
+_REGISTRATION_WITHOUT_TRIALS = _REGISTRATION.split("trials:")[0]
 
 
 class _FredAnalyst(AnalystAgent):
@@ -272,16 +284,21 @@ def test_paused_record_resumes_to_the_unbroken_rows(tmp_path: Path) -> None:
 
 
 def test_trial_dir_holds_the_submission_only(tmp_path: Path) -> None:
-    """The trial directory holds spec, sources, decisions and progress; the engine checkpoint,
-    which carries the book's value, sits outside it; the result carries no performance."""
+    """The trial directory holds spec, sources, decisions and progress, and the edgelab replay
+    folder around them; the engine checkpoint, which carries the book's value, sits outside it;
+    the result carries no performance."""
     result = _run(tmp_path)
     trial = tmp_path / result.spec_hash
 
     assert sorted(path.name for path in trial.iterdir()) == [
+        "agentic_meta.json",
+        "data",
         "decisions.parquet",
         "progress.json",
         "sources.json",
         "spec.json",
+        "strategy",
+        "submission.json",
     ]
     assert set(FirmRecordResult.model_fields) == {
         "spec_hash",
@@ -313,12 +330,14 @@ def test_no_performance_figure_is_logged(tmp_path: Path, caplog: pytest.LogCaptu
     assert "Sharpe" not in text and "portfolio value" not in text
 
 
-def _ledger(tmp_path: Path, registered: bool) -> tuple[TrialLedger, Path]:
+def _ledger(
+    tmp_path: Path, registered: bool, registration: str = _REGISTRATION
+) -> tuple[TrialLedger, Path]:
     repo = tmp_path / "repo"
     registry = repo / "research" / "registry"
     registry.mkdir(parents=True)
     if registered:
-        (registry / f"{FIRM_HYPOTHESIS_ID}.yaml").write_text(_REGISTRATION)
+        (registry / f"{FIRM_HYPOTHESIS_ID}.yaml").write_text(registration)
     return TrialLedger(repo / "research" / "ledger.duckdb", repo), repo
 
 
@@ -458,3 +477,136 @@ def test_holdout_read_refuses_the_day(tmp_path: Path) -> None:
         _run(tmp_path, commander=_commander(peek=True))
     progress = list(tmp_path.glob("*/progress.json"))
     assert progress == []
+
+
+# edgelab's Submission schema, vendored (source in test_submission_schema_fixture.py).
+_SUBMISSION_SCHEMA = Path(__file__).resolve().parents[2] / "fixtures" / "edgelab_submission_v1.json"
+
+
+def _submission(trial: Path) -> dict[str, Any]:
+    return json.loads((trial / "submission.json").read_text())
+
+
+def _validate(submission: dict[str, Any]) -> None:
+    """Raise `jsonschema.ValidationError` when `submission` breaks the vendored schema."""
+    jsonschema.Draft202012Validator(
+        json.loads(_SUBMISSION_SCHEMA.read_text()),
+        format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
+    ).validate(submission)
+
+
+def test_uncounted_record_writes_a_valid_submission_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uncounted record's trial directory is an edgelab replay folder: submission.json
+    validates against edgelab's schema, names the HEAD commit, declares one trial keyed by the
+    spec hash with no prior exposure, scores the record's window and is a fast profile;
+    agentic_meta.json marks it uncounted with the src/ tree's state; strategy/ holds the
+    replay shim and data/ exists."""
+    monkeypatch.setattr(runner_module, "source_tree_state", lambda: ("a" * 40, True))
+    result = _run(tmp_path)
+    trial = tmp_path / result.spec_hash
+    submission = _submission(trial)
+
+    _validate(submission)
+    assert submission["kind"] == "replay"
+    assert submission["client"] == {
+        "project": "agentic-trading",
+        "git_sha": "a" * 40,
+        "hypothesis_id": FIRM_HYPOTHESIS_ID,
+    }
+    assert submission["trials"] == {
+        "family_id": FIRM_HYPOTHESIS_ID,
+        "declared_n": 1,
+        "ledger_ref": FIRM_HYPOTHESIS_ID,
+        "test_keys": [result.spec_hash],
+        "ledger_export_path": None,
+        "prior_exposure": None,
+    }
+    assert submission["test_window"] == {"start": _START.isoformat(), "end": _END.isoformat()}
+    assert submission["train_end"] is None and submission["profile"] == "fast"
+    assert json.loads((trial / "agentic_meta.json").read_text()) == {
+        "counted": False,
+        "git_sha": "a" * 40,
+        "src_tree_clean": False,
+        "declared_n_from": "uncounted_default",
+    }
+    strategy = yaml.safe_load((trial / "strategy" / "strategy.yaml").read_text())
+    assert strategy["strategy"] == "strategy.py:Replay"
+    assert strategy["data"]["params"]["path"] == "../data"
+    assert strategy["params"]["universe"]["symbols"] == _UNIVERSE
+    assert "class Replay(TargetWeightsReplay):" in (trial / "strategy" / "strategy.py").read_text()
+    assert (trial / "data").is_dir()
+
+
+def test_submission_sources_are_unique_and_cover_every_row_source(tmp_path: Path) -> None:
+    """submission.json lists each of sources.json's entries once under a unique name, and every
+    source a row names is a dated one of them."""
+    result = _run(tmp_path)
+    trial = tmp_path / result.spec_hash
+    sources = _submission(trial)["decisions"]["sources"]
+    names = [source["name"] for source in sources]
+    dated = {source["name"] for source in sources if not source.get("undated", False)}
+    row_sources = {row["source"] for row in _rows(tmp_path, result) if row["source"] is not None}
+
+    assert sources == json.loads((trial / "sources.json").read_text())
+    assert len(names) == len(set(names))
+    assert row_sources and row_sources <= dated
+
+
+@pytest.mark.parametrize(
+    "registration",
+    [
+        _REGISTRATION_WITHOUT_TRIALS,
+        _REGISTRATION.replace("  declared_n: 7\n", ""),
+        _REGISTRATION.split("  prior_exposure:")[0],
+    ],
+    ids=["no-trials", "no-declared-n", "no-prior-exposure"],
+)
+def test_counted_record_needs_the_registered_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registration: str
+) -> None:
+    """A record that would be counted is refused, before anything is written or registered,
+    when its registry file lacks trials.declared_n or trials.prior_exposure."""
+    monkeypatch.setattr(runner_module, "source_tree_state", lambda: ("c" * 40, False))
+    ledger, repo = _ledger(tmp_path, registered=True, registration=registration)
+
+    with pytest.raises(ValueError, match="registry file"):
+        _run(tmp_path / "store", ledger=ledger, repo_root=repo)
+    assert not (tmp_path / "store").exists() and not ledger.path.exists()
+
+
+def test_counted_record_declares_its_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A counted record's submission declares the registry file's trials.declared_n, copies
+    its trials.prior_exposure block as it stands, names the clean commit and is a full
+    profile; agentic_meta.json marks it counted."""
+    monkeypatch.setattr(runner_module, "source_tree_state", lambda: ("c" * 40, False))
+    ledger, repo = _ledger(tmp_path, registered=True)
+    result = _run(tmp_path / "store", ledger=ledger, repo_root=repo)
+    trial = tmp_path / "store" / result.spec_hash
+    submission = _submission(trial)
+    registered = yaml.safe_load(_REGISTRATION)["trials"]
+
+    _validate(submission)
+    assert submission["trials"]["declared_n"] == registered["declared_n"] == 7
+    assert submission["trials"]["prior_exposure"] == registered["prior_exposure"]
+    assert submission["client"]["git_sha"] == "c" * 40
+    assert submission["profile"] == "full"
+    meta = json.loads((trial / "agentic_meta.json").read_text())
+    assert meta["counted"] and meta["src_tree_clean"]
+    assert meta["declared_n_from"] == "registration"
+
+
+def test_submission_seed_is_constant(tmp_path: Path) -> None:
+    """Two records, and each one's strategy.yaml, carry the one configured edgelab seed."""
+    seeds = []
+    for name in ("first", "second"):
+        result = _run(tmp_path / name)
+        trial = tmp_path / name / result.spec_hash
+        strategy = yaml.safe_load((trial / "strategy" / "strategy.yaml").read_text())
+        seeds += [_submission(trial)["seed"], strategy["seed"]]
+
+    assert seeds == [settings.firm.edgelab_seed] * 4
+    assert settings.firm.edgelab_seed == 20100104
