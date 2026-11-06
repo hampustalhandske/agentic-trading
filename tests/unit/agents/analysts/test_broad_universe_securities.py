@@ -189,3 +189,36 @@ def test_fama_macbeth_reads_any_other_asset_by_ticker(monkeypatch: pytest.Monkey
     assert not isinstance(result, AgentSignal)
     assert result[1]["ZZZ"].tolist() == [0.01, -0.02]
     assert isinstance(missing, AgentSignal) and missing.status == "unavailable"
+
+
+def test_fama_macbeth_counts_a_firm_equity_held_under_another_ticker_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Alphabet class A (security 25819) sits in the S&P cross-section as GOOG while the asset
+    is GOOGL: the member is the asset, renamed in place, with no second read of its returns."""
+    min_size = fama._RISK_WINDOW // 2
+    roster = [
+        *(IndexMember(security_id=100 + i, ticker=f"T{i:03d}") for i in range(30)),
+        IndexMember(security_id=25819, ticker="GOOG"),
+    ]
+    calls: list[list[int]] = []
+
+    def returns(ids: list[int], start: date, end: date) -> dict[int, pd.Series]:
+        calls.append(list(ids))
+        return {m.security_id: _series(min_size, i) for i, m in enumerate(roster)}
+
+    monkeypatch.setattr(fama, "load_sp500_member_securities_asof", lambda d: roster)
+    monkeypatch.setattr(fama, "load_security_log_returns", returns)
+    monkeypatch.setattr(fama, "load_price_history_from_lakehouse", _forbidden)
+    analyst = FamaMacbethAnalyst()
+    universe = analyst._load_broad_lakehouse_universe(_AS_OF)
+    assert universe is not None
+
+    result = analyst._resolve_with_broad_universe(universe, "GOOGL", _AS_OF)
+
+    assert not isinstance(result, AgentSignal)
+    tickers, merged = result
+    assert tickers.count("GOOGL") == 1 and "GOOG" not in tickers
+    assert list(merged) == list(tickers) and len(tickers) == len(roster)
+    assert merged["GOOGL"] is universe[1]["GOOG"]
+    assert len(calls) == 1

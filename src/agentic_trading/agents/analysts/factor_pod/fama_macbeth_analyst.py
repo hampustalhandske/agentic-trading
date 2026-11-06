@@ -79,6 +79,8 @@ class FamaMacbethAnalyst(AnalystAgent):
     _universe_refit_cache: RefitCache = PrivateAttr(
         default_factory=lambda: RefitCache(refit_interval_days=5)
     )
+    # The ticker of each `security_id` in the cached universe, set with it.
+    _universe_tickers_by_security: dict[int, str] = PrivateAttr(default_factory=dict)
     # Factors over the `_RISK_WINDOW` reference dates; membership only as
     # of each decision date.
     data_requirements: tuple[DataRequirement, ...] = Field(
@@ -204,6 +206,9 @@ class FamaMacbethAnalyst(AnalystAgent):
         (`load_security_log_returns`). Returns `(tickers, returns)` with
         both keyed by each member's ticker on `as_of_date`.
 
+        Records the ticker of each kept member's `security_id` for
+        `_resolve_with_broad_universe`.
+
         A member needs at least `_RISK_WINDOW // 2` returns: a thin series
         would empty the caller's date-joined panel for every asset that
         day, not just its own. Members left out, including those with no
@@ -221,10 +226,12 @@ class FamaMacbethAnalyst(AnalystAgent):
         )
         min_returns = _RISK_WINDOW // 2
         universe_returns: dict[str, pd.Series] = {}
+        tickers_by_security: dict[int, str] = {}
         for member in members:
             returns = returns_by_security.get(member.security_id)
             if returns is not None and returns.size >= min_returns:
                 universe_returns[member.ticker] = returns
+                tickers_by_security[member.security_id] = member.ticker
         excluded = len(members) - len(universe_returns)
         if excluded:
             logger.info(
@@ -239,6 +246,7 @@ class FamaMacbethAnalyst(AnalystAgent):
             )
         if len(universe_returns) < _MIN_UNIVERSE_SIZE:
             return None
+        self._universe_tickers_by_security = tickers_by_security
         return tuple(universe_returns), universe_returns
 
     def _resolve_with_broad_universe(
@@ -251,11 +259,16 @@ class FamaMacbethAnalyst(AnalystAgent):
         they stand, only doing a fresh (single-asset, fast) lakehouse
         lookup if `asset` itself isn't already in the cached set — most
         of this project's traded assets are themselves S&P 500 members,
-        so this extra lookup is the exception, not the common path. The
-        lookup reads a registered-firm equity
-        (`roster.FIRM_V1_EQUITY_SECURITY_IDS`) by its `security_id`
-        (`load_security_log_returns`, the universe's own basis) and any
-        other asset by ticker (`load_price_history_from_lakehouse`)."""
+        so this extra lookup is the exception, not the common path.
+
+        A registered-firm equity (`roster.FIRM_V1_EQUITY_SECURITY_IDS`) is
+        matched by its `security_id`: when the cached universe holds that
+        security under another ticker (Alphabet class A as GOOG while the
+        asset is GOOGL), that member is the asset, renamed to `asset` in
+        place, so the security enters the cross-section once; otherwise it
+        is read by id (`load_security_log_returns`, the universe's own
+        basis). Any other asset is read by ticker
+        (`load_price_history_from_lakehouse`)."""
         # roster imports this module, so its constants are read at call time.
         from agentic_trading.agents.roster import FIRM_V1_EQUITY_SECURITY_IDS
 
@@ -263,8 +276,20 @@ class FamaMacbethAnalyst(AnalystAgent):
         if asset in universe_returns:
             return resolved_tickers, universe_returns
 
-        window_start = (as_of_date - timedelta(days=250)).date()
         security_id = FIRM_V1_EQUITY_SECURITY_IDS.get(asset)
+        member_ticker = (
+            None if security_id is None else self._universe_tickers_by_security.get(security_id)
+        )
+        if member_ticker is not None and member_ticker in universe_returns:
+            renamed = tuple(
+                asset if ticker == member_ticker else ticker for ticker in resolved_tickers
+            )
+            return renamed, {
+                asset if ticker == member_ticker else ticker: returns
+                for ticker, returns in universe_returns.items()
+            }
+
+        window_start = (as_of_date - timedelta(days=250)).date()
         asset_returns: pd.Series | None = None
         if security_id is not None:
             asset_returns = load_security_log_returns(

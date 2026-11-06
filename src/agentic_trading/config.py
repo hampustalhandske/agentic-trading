@@ -47,6 +47,15 @@ _GROUP_CONFIG = ConfigDict(validate_assignment=True, extra="forbid")
 
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
+# The first date the lake holds a single-name option chain (DoltHub's
+# `dolthub_option_chain`; before it only SPY, QQQ and IWM have chains).
+# Chain strikes are rescaled onto Yahoo's split-adjusted close, while a
+# ticker priced by security id has its traded `raw_close`, so
+# `data.loader.load_price_history_with_fallback` refuses to route an option
+# underlying by security id over a window reaching this date (AT-129). A
+# data fact, not a tunable, so it is no setting.
+SINGLE_NAME_OPTION_CHAINS_START = date(2019, 2, 1)
+
 
 def _env_value(name: str) -> str | None:
     """`name` from the process environment, else from a `KEY=VALUE` line in

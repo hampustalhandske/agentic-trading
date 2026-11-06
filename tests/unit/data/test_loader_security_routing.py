@@ -4,7 +4,8 @@
 `security_id` from `equity_daily_from_bars` and every other ticker as before, giving each routed
 ticker the frame layout a ticker read gives; and `check_price_coverage` refuses a firm equity
 missing a window session that is not a known lake gap and a fixed instrument starting late or
-ending early, and reports a short warm-up without failing it."""
+ending early, and reports a short warm-up without failing it; routing an option underlying by
+security id into the single-name chain era is refused (AT-129)."""
 
 from datetime import date
 from typing import Any
@@ -14,6 +15,7 @@ import pandas as pd
 import pytest
 
 from agentic_trading.backtest.preflight import PriceCoverageError, check_price_coverage
+from agentic_trading.config import SINGLE_NAME_OPTION_CHAINS_START
 from agentic_trading.data.loader import load_price_history_with_fallback
 from agentic_trading.data.trading_calendar import sessions_between
 
@@ -208,3 +210,36 @@ def test_a_fixed_instrument_fails_when_it_starts_late_or_ends_early() -> None:
     passing = _check(frame, ["GAPPY", "SLACK"])
     assert passing[0].longest_gap_sessions == 70
     assert passing[1].short_warmup is not None
+
+
+_CHAINS = date(2019, 2, 1)
+
+
+def test_routing_an_option_underlying_by_id_into_the_chain_era_is_refused(
+    preflight_lake: Any,
+) -> None:
+    """AT-129: AAPL, an option underlying the CVaR pod trades, routed by security id over a
+    window ending on the first single-name chain date raises before any query, naming AT-129,
+    the ticker and the date; a window ending the session before loads; a routed ticker that is
+    no underlying is unaffected."""
+    for day in sessions_between(date(2018, 12, 24), _CHAINS):
+        _bar(preflight_lake, 147, "AAPL", day, 150.0, 1000.0)
+        _bar(preflight_lake, _MON_ID, "MON", day, 80.0, 300.0)
+    assert SINGLE_NAME_OPTION_CHAINS_START == _CHAINS
+    sent = len(preflight_lake.calls)
+
+    with pytest.raises(ValueError, match=r"AT-129: \['AAPL'\].*2019-02-01") as raised:
+        load_price_history_with_fallback(
+            ["AAPL", "MON"], date(2019, 1, 2), _CHAINS, security_ids={"AAPL": 147, "MON": _MON_ID}
+        )
+
+    assert "MON" not in str(raised.value)
+    assert len(preflight_lake.calls) == sent
+    before, _ = load_price_history_with_fallback(
+        ["AAPL"], date(2018, 12, 24), date(2018, 12, 31), security_ids={"AAPL": 147}
+    )
+    assert before[("AAPL", "close")].notna().all()
+    after, _ = load_price_history_with_fallback(
+        ["MON"], date(2019, 1, 2), _CHAINS, security_ids={"MON": _MON_ID}
+    )
+    assert after.index[-1].date() == _CHAINS

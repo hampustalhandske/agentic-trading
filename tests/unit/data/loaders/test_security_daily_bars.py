@@ -335,3 +335,19 @@ def test_security_bar_queries_price_bars_with_the_one_raw_price_expression(lake:
         assert f"AND {SECURITY_RAW_PRICE_SQL} > 0" in query
     for query in (queries[1], queries[3]):
         assert "bars.volume / COALESCE(factors.cum_factor, 1.0)" in query
+
+
+def test_daily_bars_identical_factor_copies_act_as_one_row(lake: Any) -> None:
+    """Identical factor rows on one effective date (one per ticker that held the security)
+    give exactly the bars one such row gives."""
+    for security_id, copies in ((1, ("AAA",)), (2, ("AAA", "AAB", "AAC"))):
+        _bar(lake, security_id, _TUE, 200.0, volume=1000.0)
+        _bar(lake, security_id, _WED, 101.0, volume=2400.0)
+        _bar(lake, security_id, _THU, 102.0, volume=2000.0)
+        for ticker in copies:
+            _factor(lake, security_id, _WED, 0.5, split=2.0, ticker=ticker)
+
+    frame = load_security_daily_bars([1, 2], _TUE, _THU)
+
+    pd.testing.assert_frame_equal(frame[1], frame[2], check_exact=True)
+    assert list(frame.index) == _days(_TUE, _WED, _THU)

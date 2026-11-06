@@ -13,7 +13,10 @@ this module with `at126_ab.py` once the A/B has passed on the live lake.
 
 Each `legacy_<loader>` takes the arguments of the public loader of the
 same name (without `load_` and `_from_lakehouse`) and returns what that
-loader returned at c6b479a."""
+loader returned at c6b479a, with two exceptions in the security-bar
+references (`_legacy_adjusted_security_bars`), which match the loaders:
+a bar's raw price is this module's `SECURITY_RAW_PRICE_SQL`, and its
+`volume` is divided by the bar's `cum_factor`."""
 
 from datetime import date, timedelta
 

@@ -12,6 +12,8 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
+from agentic_trading.agents.managers.cvar_manager import OPTIONS_ASSETS
+from agentic_trading.config import SINGLE_NAME_OPTION_CHAINS_START
 from agentic_trading.data.instruments import futures_root
 from agentic_trading.data.loaders.lakehouse_loader import (
     _guard_data_end,
@@ -56,10 +58,14 @@ def load_price_history_with_fallback(
       a late listing does not cut the other tickers' history, and a bar
       on a day that is not a session (an FX or crypto bar on an exchange
       holiday or a weekend) is dropped. Each ticker's `log_return` is
-      recomputed as the log of its close over its previous close in the
-      returned frame, so a dropped bar's move lands on the next kept bar
-      and the returns sum to the log of the last close over the first.
-      Every other field is the lakehouse's.
+      recomputed over its kept closes, as the log of its close over its
+      previous close in the returned frame: a dropped bar's move lands on
+      the next kept bar, a bar after a session without one carries the
+      multi-day return a book holding the ticker earns over the gap, and
+      the returns sum to the log of the last close over the first. This
+      holds alike for a ticker routed by `security_ids`, whose bar
+      loader's own `log_return` is NaN after a gap. Every other field is
+      the lakehouse's.
     - `"intersection"`: only the rows on which every ticker has a close,
       every field as the lakehouse gives it; `calendar` is not used. The
       backtest engine's callers pass this, because the engine fills and
@@ -87,7 +93,10 @@ def load_price_history_with_fallback(
 
     Inside a `lake_session` with a `data_end`, raises `HoldoutReadError`
     before any other check or query when `end` is later than it (see
-    `lakehouse_loader._guard_data_end`).
+    `lakehouse_loader._guard_data_end`). Raises `ValueError` before any
+    query when a ticker routed by `security_ids` is an option underlying
+    the CVaR pod trades and `end` reaches the first single-name chains
+    (`_refuse_routed_option_underlyings`).
 
     Returns `(frame, source_label)` — `source_label` is always
     `"lakehouse data"`, kept in the return shape so existing callers
@@ -96,6 +105,7 @@ def load_price_history_with_fallback(
     _guard_data_end(end, "load_price_history_with_fallback")
     if warmup_days < 0:
         raise ValueError("warmup_days must be non-negative")
+    _refuse_routed_option_underlyings(tickers, security_ids, end)
     data_start = start - timedelta(days=warmup_days)
 
     by_id = security_ids or {}
@@ -139,6 +149,30 @@ def load_price_history_with_fallback(
             f"{data_start.isoformat()} to {end.isoformat()}"
         )
     return _with_rolls_since_previous_row(frame, lake_frame, futures), "lakehouse data"
+
+
+def _refuse_routed_option_underlyings(
+    tickers: list[str], security_ids: Mapping[str, int] | None, end: date
+) -> None:
+    """Raises `ValueError` naming AT-129, the tickers and the date when any
+    of `tickers` routed by `security_ids` is in `cvar_manager.OPTIONS_ASSETS`
+    and `end` is on or after `config.SINGLE_NAME_OPTION_CHAINS_START`. Its
+    chain strikes are rescaled onto Yahoo's split-adjusted close
+    (`lakehouse_loader.split_adjustment_factor`) while its routed
+    `raw_close` is the traded price, so its option marks, fills and spot
+    would sit on two bases."""
+    if not security_ids or end < SINGLE_NAME_OPTION_CHAINS_START:
+        return
+    underlyings = [
+        ticker for ticker in tickers if ticker in security_ids and ticker in OPTIONS_ASSETS
+    ]
+    if underlyings:
+        raise ValueError(
+            f"AT-129: {underlyings} are option underlyings routed by security id, whose "
+            "traded raw_close is not the split-adjusted basis their chain strikes are put on; "
+            f"a window ending {end.isoformat()} reaches the single-name option chains from "
+            f"{SINGLE_NAME_OPTION_CHAINS_START.isoformat()}"
+        )
 
 
 # The fields of a `load_price_history_from_lakehouse` ticker, in its column order.

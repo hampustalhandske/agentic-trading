@@ -1621,7 +1621,11 @@ def load_security_daily_bars(
       is null or not positive;
     - `volume`: the bar's volume divided by the same factor, so
       `close` times `volume` is the traded dollar volume; NaN when null
-      or not positive;
+      or not positive. It is on the price basis, not a share count: the
+      factor holds dividends as well as splits, so across an ex-date
+      inside a trailing window the days before it read high by
+      1 / (1 - that dividend's factor step) against the days after,
+      about 0.5-1% for a typical quarterly dividend;
     - `log_return`: the value `load_security_log_returns` gives for that
       security and day, NaN on every day it gives none.
 
