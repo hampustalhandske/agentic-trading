@@ -133,8 +133,9 @@ class _CrossSectionCache:
     call the analyst while another's does.
 
     A runtime memo, not strategy state: it pickles and deep-copies as a
-    new empty cache, so `carried_state` snapshots none of it and a
-    restored analyst recomputes each stage on first use."""
+    new empty cache, so it sits in `carried_state` as an empty cache that
+    holds no stages, and a restored analyst recomputes each stage on
+    first use."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -191,10 +192,15 @@ class FamaMacbethAnalyst(AnalystAgent):
     with a return on every reference date are kept — a ticker missing a
     date is dropped, never the date. `sample_count` is the number of
     reference dates; the rationale reports how many tickers were kept.
-    The cross-sectional stage depends on the day's universe, the
-    reference dates and the factor rows, not on `asset`: it runs once per
-    distinct set of those on a decision day and is shared by every asset
-    that builds the same panel (`_CrossSectionCache`).
+    The cross-sectional stage depends on the universe objects (the
+    ticker tuple and the returns dict), the reference dates and the
+    factor rows on them, not on `asset`. When the universe objects are
+    the ones `_universe_refit_cache` holds for the day, the stage runs
+    once per distinct reference dates and factor rows on a decision day
+    and is shared by every asset that builds the same panel
+    (`_CrossSectionCache`). An asset that extends the universe or renames
+    a member in it gets universe objects of its own: its stage is
+    computed for that call and not stored.
 
     The universe is resolved fresh each call as the real, point-in-time
     S&P 500 membership as of `as_of_date`, each member priced by its
@@ -229,7 +235,8 @@ class FamaMacbethAnalyst(AnalystAgent):
     # The ticker of each `security_id` in the cached universe, set with it.
     _universe_tickers_by_security: dict[int, str] = PrivateAttr(default_factory=dict)
     # The day's cross-sectional stages, shared by every asset whose call
-    # builds the same panel; never part of `carried_state`.
+    # builds the same panel; in `carried_state` it is an empty cache that
+    # holds no stages.
     _cross_section_cache: _CrossSectionCache = PrivateAttr(default_factory=_CrossSectionCache)
     # Factors over the `_RISK_WINDOW` reference dates; membership only as
     # of each decision date.
@@ -293,13 +300,17 @@ class FamaMacbethAnalyst(AnalystAgent):
         )
         if len(reference) < _MIN_JOINED_OBSERVATIONS:
             return self._insufficient_history(asset, as_of_date)
-        stage = self._cross_section_cache.get_or_compute(
-            as_of_date,
-            _cross_section_key(universe, universe_returns, reference, factor_columns),
-            universe,
-            universe_returns,
-            lambda: _cross_section(universe, universe_returns, reference, factor_columns),
-        )
+        cached_tickers, cached_returns = broad_universe_result
+        if universe is cached_tickers and universe_returns is cached_returns:
+            stage = self._cross_section_cache.get_or_compute(
+                as_of_date,
+                _cross_section_key(universe, universe_returns, reference, factor_columns),
+                universe,
+                universe_returns,
+                lambda: _cross_section(universe, universe_returns, reference, factor_columns),
+            )
+        else:
+            stage = _cross_section(universe, universe_returns, reference, factor_columns)
         if stage is None:
             return self._insufficient_history(asset, as_of_date)
         kept = stage.kept
