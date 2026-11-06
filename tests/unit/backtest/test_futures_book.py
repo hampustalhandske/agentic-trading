@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from agentic_trading.agents.schemas import BacktestResult, PortfolioDecision
+from agentic_trading.agents.schemas import MAX_LEVERAGE, BacktestResult, PortfolioDecision
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import MarkedPosition, Portfolio
 from agentic_trading.config import settings
@@ -136,6 +136,22 @@ def test_a_roll_charges_one_round_trip_on_the_held_notional(weight: float) -> No
     assert record.slippage_cost == pytest.approx(2.0 * held * _SLIPPAGE_BPS / 10_000.0)
     assert book.cash == pytest.approx(_CAPITAL - held * _ROUND_TRIP_RATE)
     assert book.marked_positions["CL=F"].quantity == weight * _CAPITAL / 50.0
+
+
+@pytest.mark.parametrize("quantity", [10_000.0, -10_000.0])
+def test_a_roll_at_a_near_zero_nav_records_a_bounded_target_weight(quantity: float) -> None:
+    """A held notional far above a near-zero NAV still yields a valid record: the target
+    weight is clipped to ±MAX_LEVERAGE, the previous weight is the actual one, and the
+    full round trip is charged."""
+    book = _book(commission_rate=_COMMISSION, slippage_bps=_SLIPPAGE_BPS)
+    book.marked_positions = {"CL=F": MarkedPosition(quantity=quantity, mark=50.0)}
+
+    records = book.charge_rolls(_DAY, {"CL=F": 50.0}, {"CL=F": 1.0}, 1e-9)
+
+    sign = 1.0 if quantity > 0 else -1.0
+    assert records[0].target_weight == sign * MAX_LEVERAGE
+    assert records[0].previous_weight == pytest.approx(quantity * 50.0 / 1e-9)
+    assert book.cash == pytest.approx(_CAPITAL - 500_000.0 * _ROUND_TRIP_RATE)
 
 
 def test_a_non_roll_day_charges_nothing() -> None:

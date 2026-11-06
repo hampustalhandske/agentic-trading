@@ -8,7 +8,12 @@ from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from quantcore.execution.financing import margin_financing_cost, short_borrow_cost
 from quantcore.execution.market_impact import square_root_market_impact
 
-from agentic_trading.agents.schemas import OptionContract, PortfolioDecision, TradeRecord
+from agentic_trading.agents.schemas import (
+    MAX_LEVERAGE,
+    OptionContract,
+    PortfolioDecision,
+    TradeRecord,
+)
 from agentic_trading.config import settings
 from agentic_trading.data.instruments import (
     currency_pair,
@@ -259,10 +264,12 @@ class Portfolio(BaseModel):
         charged.
 
         Returns one "roll" record per charged future: the position is
-        unchanged (`delta_shares` 0, both weights its weight in
-        `portfolio_value`), `notional` is the notional of every leg traded,
-        and the commission and slippage are its `transaction_cost` and
-        `slippage_cost`."""
+        unchanged (`delta_shares` 0, `previous_weight` its weight in
+        `portfolio_value`, and `target_weight` that weight clipped to the
+        record's ±`MAX_LEVERAGE` bound, which a near-zero
+        `portfolio_value` can push it past), `notional` is the notional of
+        every leg traded, and the commission and slippage are its
+        `transaction_cost` and `slippage_cost`."""
         records: list[TradeRecord] = []
         for asset, position in self.marked_positions.items():
             count = rolls.get(asset, 0.0)
@@ -282,7 +289,7 @@ class Portfolio(BaseModel):
                     as_of_date=as_of_date,
                     asset=asset,
                     action="roll",
-                    target_weight=weight,
+                    target_weight=min(max(weight, -MAX_LEVERAGE), MAX_LEVERAGE),
                     previous_weight=weight,
                     target_shares=position.quantity,
                     delta_shares=0.0,

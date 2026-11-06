@@ -148,7 +148,6 @@ READ_TABLES: tuple[str, ...] = (
     "finra_short_interest",
     "fred_vintages",
     "futures_continuous_daily",
-    "futures_roll_calendar",
     "instrument_prices",
     "option_chain_history",
     "sec_company_facts_log",
@@ -1723,23 +1722,26 @@ def load_futures_price_history_from_lakehouse(
     or `None` if it covers none of them. Raises `ValueError` for a ticker
     that is not a future.
 
-    `close` is a level built by chaining the daily returns of
-    `ratio_adjusted_close` (bars with a null or non-positive value are left
-    out) from the first bar's `unadjusted_close`, with the return of a roll
-    day whose `roll_gap_known` is false set to 0, since that day's change
-    of the adjusted close still holds the gap between the two contracts.
-    The level's returns are therefore the returns of the contract held, and
-    a later roll's back-adjustment of earlier rows does not change it.
+    The frame holds the kept bars: those with a positive
+    `ratio_adjusted_close`. `close` is a level built by chaining the
+    returns of `ratio_adjusted_close` from one kept bar to the next, from
+    the first kept bar's `unadjusted_close`. The return into a kept bar is
+    set to 0 when any row since the previous kept bar, this bar included,
+    is a roll day whose `roll_gap_known` is false, since that change of the
+    adjusted close still holds the gap between the two contracts. The
+    level's returns are therefore the returns of the contract held, and a
+    later roll's back-adjustment of earlier rows does not change it.
     `open` is that same level: the continuous series carries closes only,
     so a future fills at the close of its fill day. `raw_close` is the
     front contract's `unadjusted_close`, `volume` is NaN (the series has
     none), and `log_return` is the log of each level over the previous
     one (NaN on the first bar).
 
-    `roll` is 1.0 on a bar whose `futures_roll_calendar` front contract
-    differs from the calendar's previous session's, read from the calendar
-    up to `end` so a roll on the first bar is seen, and 0.0 otherwise
-    (also on a bar the calendar has no row for).
+    `roll` is 1.0 on a kept bar whose `front_contract` differs from the
+    previous kept bar's, and 0.0 otherwise, so a roll on a dropped row
+    lands on the next kept bar together with that bar's zeroed return. The
+    first bar compares against the last kept bar before `start`, read for
+    that purpose, and takes 0.0 when there is none.
 
     Point-in-time on the bar date, as prices are: only bars dated on or
     before `end` are read. Self-asserts point-in-time on the frame's date
@@ -1753,46 +1755,55 @@ def load_futures_price_history_from_lakehouse(
         ticker_by_root[root] = ticker
     placeholders = ", ".join("?" for _ in ticker_by_root)
     query = f"""
-        SELECT prices.root, prices.date, prices.unadjusted_close,
-               prices.ratio_adjusted_close, prices.is_roll_day, prices.roll_gap_known,
-               COALESCE(calendar.front_contract <> calendar.previous_front, FALSE) AS roll
+        SELECT root, date, front_contract, unadjusted_close, ratio_adjusted_close,
+               is_roll_day, roll_gap_known
         FROM (
-            SELECT root, date, unadjusted_close, ratio_adjusted_close,
-                   is_roll_day, roll_gap_known
+            SELECT root, date, front_contract, unadjusted_close, ratio_adjusted_close,
+                   is_roll_day, roll_gap_known,
+                   max(CASE WHEN date < ? AND ratio_adjusted_close > 0 THEN date END)
+                       OVER (PARTITION BY root) AS previous_kept
             FROM {_table_sql("futures_continuous_daily")}
             WHERE root IN ({placeholders})
-              AND date BETWEEN ? AND ?
-              AND ratio_adjusted_close > 0
-        ) AS prices
-        LEFT JOIN (
-            SELECT root, date, front_contract,
-                   lag(front_contract) OVER (PARTITION BY root ORDER BY date) AS previous_front
-            FROM {_table_sql("futures_roll_calendar")}
-            WHERE root IN ({placeholders})
               AND date <= ?
-        ) AS calendar
-          ON calendar.root = prices.root AND calendar.date = prices.date
-        ORDER BY prices.root, prices.date
+        ) AS daily
+        WHERE date >= COALESCE(previous_kept, ?)
+        ORDER BY root, date
     """
-    roots = list(ticker_by_root)
-    frame = _query(query, [*roots, start.isoformat(), end.isoformat(), *roots, end.isoformat()])
+    frame = _query(query, [start.isoformat(), *ticker_by_root, end.isoformat(), start.isoformat()])
     if frame.empty:
         return None
     frame["date"] = pd.to_datetime(frame["date"])
 
     per_ticker: dict[str, pd.DataFrame] = {}
     for lake_root, group in frame.groupby("root", sort=True):
-        index = pd.DatetimeIndex(group["date"])
-        adjusted = group["ratio_adjusted_close"].to_numpy(dtype=np.float64)
-        daily = np.zeros(len(adjusted))
-        daily[1:] = adjusted[1:] / adjusted[:-1] - 1.0
+        adjusted_all = group["ratio_adjusted_close"].astype(float)
+        kept = (adjusted_all > 0.0).to_numpy(dtype=bool)
         unknown_gap = group["is_roll_day"].eq(True).to_numpy(dtype=bool) & group[
             "roll_gap_known"
         ].eq(False).fillna(False).to_numpy(dtype=bool)
-        daily[unknown_gap] = 0.0
-        unadjusted = group["unadjusted_close"].astype(float)
+        # Unknown-gap rows up to each kept bar; a rise between two kept bars
+        # means the span into the later one holds an unknown gap.
+        unknown_gaps_so_far = np.cumsum(unknown_gap)[kept]
+        bars = group.loc[kept]
+        adjusted = adjusted_all.to_numpy(dtype=np.float64)[kept]
+        daily = np.zeros(len(adjusted))
+        daily[1:] = adjusted[1:] / adjusted[:-1] - 1.0
+        daily[1:][np.diff(unknown_gaps_so_far) > 0] = 0.0
+        fronts = bars["front_contract"]
+        previous_fronts = fronts.shift(1)
+        roll = fronts.ne(previous_fronts) & fronts.notna() & previous_fronts.notna()
+
+        in_range = (bars["date"] >= pd.Timestamp(start)).to_numpy(dtype=bool)
+        if not in_range.any():
+            continue
+        bars = bars.loc[in_range]
+        daily = daily[in_range]
+        daily[0] = 0.0
+        index = pd.DatetimeIndex(bars["date"])
+        unadjusted = bars["unadjusted_close"].astype(float)
         unadjusted = unadjusted.where(unadjusted > 0.0)
-        base = float(unadjusted.iloc[0]) if pd.notna(unadjusted.iloc[0]) else float(adjusted[0])
+        first_adjusted = float(adjusted[in_range][0])
+        base = float(unadjusted.iloc[0]) if pd.notna(unadjusted.iloc[0]) else first_adjusted
         close = pd.Series(base * np.cumprod(1.0 + daily), index=index)
         per_ticker[ticker_by_root[str(lake_root)]] = pd.DataFrame(
             {
@@ -1801,11 +1812,13 @@ def load_futures_price_history_from_lakehouse(
                 "raw_close": unadjusted.to_numpy(),
                 "volume": np.nan,
                 "log_return": np.log(close / close.shift(1)),
-                "roll": group["roll"].astype(float).to_numpy(),
+                "roll": roll.loc[in_range].astype(float).to_numpy(),
             },
             index=index,
         )
 
+    if not per_ticker:
+        return None
     combined = pd.concat(per_ticker, axis=1)
     assert_point_in_time(combined, end)
     return combined

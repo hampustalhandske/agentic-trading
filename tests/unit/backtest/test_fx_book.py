@@ -15,6 +15,7 @@ import pytest
 from agentic_trading.agents.schemas import BacktestResult, PortfolioDecision
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import MarkedPosition, Portfolio
+from agentic_trading.config import settings
 from agentic_trading.scoring.track_record import TrackRecord
 
 _CAPITAL = 1_000_000.0
@@ -97,19 +98,28 @@ class _FixedCommander:
         ]
 
 
-def _fx_frame(closes: dict[str, list[float]]) -> pd.DataFrame:
+def _fx_frame(
+    closes: dict[str, list[float]], opens: dict[str, list[float]] | None = None
+) -> pd.DataFrame:
+    """A `(ticker, field)` frame on business days from 2024-01-02; each open is its close
+    unless `opens` gives it."""
     index = pd.bdate_range("2024-01-02", periods=len(next(iter(closes.values()))))
     columns: dict[tuple[str, str], pd.Series] = {}
     for ticker, values in closes.items():
         close = pd.Series(values, index=index)
-        columns[(ticker, "open")] = close
+        columns[(ticker, "open")] = pd.Series((opens or {}).get(ticker, values), index=index)
         columns[(ticker, "close")] = close
         columns[(ticker, "log_return")] = np.log(close / close.shift(1))
     return pd.DataFrame(columns)
 
 
 def _run(
-    frame: pd.DataFrame, weights: dict[str, float], policy_rates: pd.DataFrame | None = None
+    frame: pd.DataFrame,
+    weights: dict[str, float],
+    policy_rates: pd.DataFrame | None = None,
+    *,
+    execution_lag_days: int = 0,
+    risk_free_rate_annual: float | None = None,
 ) -> BacktestResult:
     days = frame.index
     return BacktestEngine(
@@ -120,8 +130,90 @@ def _run(
         start_date=days[0].date(),
         end_date=days[-1].date(),
         assets=list(weights),
+        execution_lag_days=execution_lag_days,
+        risk_free_rate_series=(
+            None
+            if risk_free_rate_annual is None
+            else pd.Series(risk_free_rate_annual / settings.firm.trading_days_per_year, index=days)
+        ),
         policy_rates=policy_rates,
     ).run()
+
+
+def _usd_pnl(asset: str, quantity: float, start: float, end: float) -> float:
+    """USD profit of `quantity` units of `asset` moving from `start` to `end`: EURUSD pays
+    quantity x (end - start) in USD, USDJPY pays it in JPY, worth 1 / end USD per yen."""
+    move = quantity * (end - start)
+    return move / end if asset == "USDJPY=X" else move
+
+
+def _units(asset: str, usd_notional: float, price: float) -> float:
+    """Units of `asset` worth `usd_notional` USD at `price`: euros for EURUSD, dollars for
+    USDJPY."""
+    return usd_notional if asset == "USDJPY=X" else usd_notional / price
+
+
+def test_engine_lag_one_fx_fills_at_the_open_and_marks_at_the_close() -> None:
+    """With a one-day lag, day t's NAV marks the held units at day t's close, then day t-1's
+    target fills at day t's open: held units move from that close back to the open, and the
+    new units, half of day t's NAV each, are held from the open on."""
+    closes = {"EURUSD=X": _EURUSD, "USDJPY=X": _USDJPY}
+    opens = {
+        "EURUSD=X": [1.09, 1.115, 1.10, 1.105, 1.12],
+        "USDJPY=X": [149.0, 151.0, 149.5, 148.5, 150.0],
+    }
+    weights = {"EURUSD=X": 0.5, "USDJPY=X": 0.5}
+
+    result = _run(_fx_frame(closes, opens), weights, execution_lag_days=1)
+
+    cash = _CAPITAL
+    held: dict[str, tuple[float, float]] = {}
+    expected: list[float] = []
+    for day in range(len(_EURUSD)):
+        for asset, (quantity, mark) in held.items():
+            cash += _usd_pnl(asset, quantity, mark, closes[asset][day])
+            held[asset] = (quantity, closes[asset][day])
+        nav = cash
+        expected.append(nav)
+        if day == 0:
+            continue
+        for asset, weight in weights.items():
+            open_price = opens[asset][day]
+            quantity, mark = held.get(asset, (0.0, open_price))
+            cash += _usd_pnl(asset, quantity, mark, open_price)
+            held[asset] = (_units(asset, weight * nav, open_price), open_price)
+    values = [value for _, value in result.portfolio_value_history]
+    assert values == pytest.approx(expected, rel=1e-12)
+    assert values[1] == _CAPITAL
+    assert values[2] != pytest.approx(_CAPITAL)
+
+
+def test_engine_futures_and_fx_cash_earns_the_account_rate_and_notional_nothing() -> None:
+    """At a 4% risk-free rate, with a future and a pair rebalanced to half of NAV each and no
+    policy rates, each day's NAV is the previous NAV plus the day's mark-to-market, all in
+    cash, grown by 4% x calendar days / 365: the notionals earn no interest and pay none."""
+    rate = 0.04
+    cl = [50.0, 51.0, 49.5, 49.5, 52.0]
+    frame = _fx_frame({"CL=F": cl, "EURUSD=X": _EURUSD})
+
+    result = _run(frame, {"CL=F": 0.5, "EURUSD=X": 0.5}, risk_free_rate_annual=rate)
+
+    days = [stamp.date() for stamp in frame.index]
+    expected = [_CAPITAL]
+    interest = 0.0
+    for day in range(1, len(days)):
+        previous = expected[-1]
+        cash = previous * (
+            1.0
+            + 0.5 * (cl[day] / cl[day - 1] - 1.0)
+            + 0.5 * (_EURUSD[day] / _EURUSD[day - 1] - 1.0)
+        )
+        accrued = cash * rate * (days[day] - days[day - 1]).days / 365
+        interest += accrued
+        expected.append(cash + accrued)
+    values = [value for _, value in result.portfolio_value_history]
+    assert values == pytest.approx(expected, rel=1e-12)
+    assert result.total_financing_cost == pytest.approx(-interest, rel=1e-12)
 
 
 def test_engine_books_the_exact_usd_pnl_of_eurusd_and_usdjpy() -> None:
