@@ -24,8 +24,8 @@ from agentic_trading.agents.roster import (
 from agentic_trading.agents.schemas import BacktestResult
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystCommander
-from agentic_trading.backtest.engine import BacktestEngine
-from agentic_trading.backtest.portfolio import Portfolio
+from agentic_trading.backtest.engine import BacktestEngine, CommanderLike
+from agentic_trading.backtest.engine_inputs import load_engine_inputs
 from agentic_trading.backtest.preflight import check_data_availability, check_price_coverage
 from agentic_trading.config import apply_overrides, parse_override, settings
 from agentic_trading.data.loader import (
@@ -39,10 +39,6 @@ from agentic_trading.data.loaders.lakehouse_loader import (
     loader_store_usage,
     reset_loader_query_counts,
     verify_rebuilt_whole_builds,
-)
-from agentic_trading.data.loaders.macro_loader import (
-    load_fx_policy_rates,
-    load_risk_free_rate_series,
 )
 
 # NOTE: adjust this import to wherever ticker_catalog.py actually lives in the
@@ -514,28 +510,29 @@ def run(
         )
         # Pre-fetched once, lakehouse-only, rather than passed to
         # BacktestEngine as a lazy callable: this way the CLI can log the
-        # source_label the run actually used, and the engine's data_loader
+        # source label the run actually used, and the engine's data_loader
         # stays a trivial pass-through.
-        market_data, source_label = load_price_history_with_fallback(
+        inputs = load_engine_inputs(
             resolved_assets,
             parsed_start_date,
             parsed_end_date,
             warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
             align="intersection",
         )
-        logger.info("Market data source: %s", source_label)
+        logger.info("Market data source: %s", inputs.market_data_source)
         engine = BacktestEngine(
             commander=commander,
-            portfolio=Portfolio(cash=settings.firm.starting_cash, positions={}),
+            portfolio=inputs.portfolio(),
             track_record=TrackRecord(),
-            data_loader=lambda _assets, _start, _end: market_data,
+            data_loader=inputs.data_loader,
             start_date=parsed_start_date,
             end_date=parsed_end_date,
-            assets=resolved_assets,
-            market_data_source=source_label,
-            execution_lag_days=settings.firm.execution_lag_days,
-            risk_free_rate_series=load_risk_free_rate_series(parsed_start_date, parsed_end_date),
-            policy_rates=load_fx_policy_rates(resolved_assets, parsed_start_date, parsed_end_date),
+            assets=inputs.assets,
+            market_data_source=inputs.market_data_source,
+            execution_lag_days=inputs.execution_lag_days,
+            risk_free_rate_series=inputs.risk_free_rate_series,
+            policy_rates=inputs.policy_rates,
+            benchmark_returns=inputs.benchmark_returns,
         )
         try:
             result = engine.run()
@@ -749,63 +746,62 @@ def experiment(
             weighting_strategy=ShrinkageWeight(Hedge()),
             parallel_workers=parallel_workers,
         )
-        market_data, source_label = load_price_history_with_fallback(
+        # Every engine of the experiment (both phases, the baselines and any
+        # --include-isolated run) shares one set of inputs: the prices, the
+        # risk-free rate (FRED DGS3MO) for excess-return Sharpe/Sortino, the
+        # BIS policy rates FX carry accrues from, and an S&P 500
+        # buy-and-hold's daily returns as the information-ratio benchmark.
+        inputs = load_engine_inputs(
             resolved_assets,
             parsed_train_start,
             parsed_test_end,
             warmup_days=warmup_days,
             align="intersection",
+            benchmark=SP500_BENCHMARK_TICKER,
         )
+        source_label = inputs.market_data_source
         typer.echo(
-            f"Market data ready: {source_label}; {len(market_data)} aligned rows. "
+            f"Market data ready: {source_label}; {len(inputs.market_data)} aligned rows. "
             "Starting calibration...",
             err=True,
         )
         track_record = TrackRecord()
 
-        # Every Sharpe/Sortino/Information-Ratio this experiment reports (system,
-        # baselines, and any --include-isolated run) shares these two inputs, so
-        # they're loaded once here rather than per-engine: a real 3-month T-bill
-        # rate (FRED DGS3MO from the lakehouse) for excess-return Sharpe/Sortino, and an
-        # S&P 500 buy-and-hold's own daily returns as the market benchmark
-        # information_ratio is computed against.
-        risk_free_rate_series = load_risk_free_rate_series(parsed_train_start, parsed_test_end)
-        # The BIS policy rates every FX pair's carry accrues from, shared the same way.
-        policy_rates = load_fx_policy_rates(resolved_assets, parsed_train_start, parsed_test_end)
-        sp500_frame, _sp500_source = load_price_history_with_fallback(
-            [SP500_BENCHMARK_TICKER],
-            parsed_train_start,
-            parsed_test_end,
-            warmup_days=0,
-            align="intersection",
-        )
-        benchmark_returns = (
-            sp500_frame[SP500_BENCHMARK_TICKER]["close"].dropna().pct_change().dropna()
-        )
-
-        def build_engine(start: date, end: date) -> BacktestEngine:
+        def experiment_engine(
+            engine_commander: CommanderLike,
+            engine_track_record: TrackRecord,
+            start: date,
+            end: date,
+            checkpoint_path: str | None = None,
+            resume_checkpoint: bool = False,
+        ) -> BacktestEngine:
             return BacktestEngine(
-                commander=commander,
-                portfolio=Portfolio(
-                    cash=settings.firm.starting_cash,
-                    positions={},
-                    commission_rate=resolved_commission_rate,
-                    slippage_bps=resolved_slippage_bps,
-                ),
-                track_record=track_record,
-                data_loader=lambda _assets, _start, _end: market_data,
+                commander=engine_commander,
+                portfolio=inputs.portfolio(),
+                track_record=engine_track_record,
+                data_loader=inputs.data_loader,
                 start_date=start,
                 end_date=end,
-                assets=resolved_assets,
-                market_data_source=source_label,
-                execution_lag_days=resolved_execution_lag_days,
+                assets=inputs.assets,
+                market_data_source=inputs.market_data_source,
+                execution_lag_days=inputs.execution_lag_days,
+                checkpoint_path=checkpoint_path,
+                resume=resume_checkpoint,
+                risk_free_rate_series=inputs.risk_free_rate_series,
+                policy_rates=inputs.policy_rates,
+                benchmark_returns=inputs.benchmark_returns,
+            )
+
+        def build_engine(start: date, end: date) -> BacktestEngine:
+            return experiment_engine(
+                commander,
+                track_record,
+                start,
+                end,
                 checkpoint_path=(
                     calibration_checkpoint if start == parsed_train_start else test_checkpoint
                 ),
-                resume=resume,
-                risk_free_rate_series=risk_free_rate_series,
-                policy_rates=policy_rates,
-                benchmark_returns=benchmark_returns,
+                resume_checkpoint=resume,
             )
 
         def run_phase(label: str, start: date, end: date) -> BacktestResult:
@@ -827,74 +823,32 @@ def experiment(
         baseline_results: dict[str, dict[str, object]] = {}
         if include_baselines:
             for strategy in ("equal_weight", "buy_and_hold", "momentum", "volatility_target"):
-                baseline_engine = BacktestEngine(
-                    commander=BaselineCommander(strategy),
-                    portfolio=Portfolio(
-                        cash=settings.firm.starting_cash,
-                        positions={},
-                        commission_rate=resolved_commission_rate,
-                        slippage_bps=resolved_slippage_bps,
-                    ),
-                    track_record=TrackRecord(),
-                    data_loader=lambda _assets, _start, _end: market_data,
-                    start_date=parsed_test_start,
-                    end_date=parsed_test_end,
-                    assets=resolved_assets,
-                    market_data_source=source_label,
-                    execution_lag_days=resolved_execution_lag_days,
-                    risk_free_rate_series=risk_free_rate_series,
-                    policy_rates=policy_rates,
-                    benchmark_returns=benchmark_returns,
+                baseline_engine = experiment_engine(
+                    BaselineCommander(strategy), TrackRecord(), parsed_test_start, parsed_test_end
                 )
                 baseline_results[strategy] = baseline_engine.run().model_dump(mode="json")
         isolated_results: dict[str, dict[str, object]] = {}
         if include_isolated:
             for analyst in analysts:
-                isolated_engine = BacktestEngine(
-                    commander=SingleAnalystCommander(analyst),
-                    portfolio=Portfolio(
-                        cash=settings.firm.starting_cash,
-                        positions={},
-                        commission_rate=resolved_commission_rate,
-                        slippage_bps=resolved_slippage_bps,
-                    ),
-                    track_record=TrackRecord(),
-                    data_loader=lambda _assets, _start, _end: market_data,
-                    start_date=parsed_test_start,
-                    end_date=parsed_test_end,
-                    assets=resolved_assets,
-                    market_data_source=source_label,
-                    execution_lag_days=resolved_execution_lag_days,
-                    risk_free_rate_series=risk_free_rate_series,
-                    policy_rates=policy_rates,
-                    benchmark_returns=benchmark_returns,
+                isolated_engine = experiment_engine(
+                    SingleAnalystCommander(analyst),
+                    TrackRecord(),
+                    parsed_test_start,
+                    parsed_test_end,
                 )
                 isolated_results[f"analyst:{analyst.agent_id}"] = isolated_engine.run().model_dump(
                     mode="json"
                 )
             for manager in build_default_managers(analysts):
-                isolated_engine = BacktestEngine(
-                    commander=Commander(
+                isolated_engine = experiment_engine(
+                    Commander(
                         managers=[manager],
                         weighting_strategy=ShrinkageWeight(Hedge()),
                         parallel_workers=parallel_workers,
                     ),
-                    portfolio=Portfolio(
-                        cash=settings.firm.starting_cash,
-                        positions={},
-                        commission_rate=resolved_commission_rate,
-                        slippage_bps=resolved_slippage_bps,
-                    ),
-                    track_record=TrackRecord(),
-                    data_loader=lambda _assets, _start, _end: market_data,
-                    start_date=parsed_test_start,
-                    end_date=parsed_test_end,
-                    assets=resolved_assets,
-                    market_data_source=source_label,
-                    execution_lag_days=resolved_execution_lag_days,
-                    risk_free_rate_series=risk_free_rate_series,
-                    policy_rates=policy_rates,
-                    benchmark_returns=benchmark_returns,
+                    TrackRecord(),
+                    parsed_test_start,
+                    parsed_test_end,
                 )
                 isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump(
                     mode="json"
@@ -1157,19 +1111,21 @@ def firm_record(
     The firm is the default roster without `roster.FIRM_V1_EXCLUDED_ANALYST_IDS`
     and the default managers under a Commander weighting pods by
     `ShrinkageWeight(Hedge())`, over `roster.FIRM_V1_UNIVERSE`. Loads the
+    engine's inputs (`backtest.engine_inputs.load_engine_inputs`): the
     universe's prices aligned on `stage_a.session_calendar`, from --start
     minus `stage_a.warmup_days` calendar days to --end, each of
     `roster.FIRM_V1_EQUITIES` by its `roster.FIRM_V1_EQUITY_SECURITY_IDS`
-    id from `equity_daily_from_bars` and every other instrument by ticker.
-    Before anything is written, checks the universe's price coverage
+    id from `equity_daily_from_bars` and every other instrument by ticker,
+    and the risk-free rate and the spot FX pairs' BIS policy rates for
+    --start to --end. Before anything is written, checks the universe's price coverage
     (`backtest.preflight.check_price_coverage`): each firm equity needs a
     bar on every session from --start to --end bar the
     `firm.known_price_gaps`, and every other instrument a bar near both
     ends of the window, the crypto pairs near its end only. It raises
     `PriceCoverageError` listing each failing instrument. An instrument
     whose bars start inside the warm-up passes, and its `ShortWarmup` goes
-    to agentic_meta.json. Then loads the risk-free rate and runs
-    `firm_record.runner.run_firm_record`, all inside one lake session cut
+    to agentic_meta.json. Then runs `firm_record.runner.run_firm_record`
+    on those inputs, all inside one lake session cut
     at `stage_a.data_end`. With --loader-store (the
     default) the session's loader window store is declared over the same
     span, --start minus `stage_a.warmup_days` to --end
@@ -1223,7 +1179,7 @@ def firm_record(
     with lake_session(requested_lake_time, data_end=data_end) as session:
         typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
         declare_run_window(loader_store, window_start, window_end, settings.stage_a.warmup_days)
-        market_data, source_label = load_price_history_with_fallback(
+        inputs = load_engine_inputs(
             tickers,
             window_start,
             window_end,
@@ -1232,9 +1188,12 @@ def firm_record(
             calendar=settings.stage_a.session_calendar,
             security_ids=FIRM_V1_EQUITY_SECURITY_IDS,
         )
-        typer.echo(f"Market data ready: {source_label}; {len(market_data)} rows.", err=True)
+        typer.echo(
+            f"Market data ready: {inputs.market_data_source}; {len(inputs.market_data)} rows.",
+            err=True,
+        )
         coverage = check_price_coverage(
-            market_data,
+            inputs.market_data,
             tickers,
             window_start - timedelta(days=settings.stage_a.warmup_days),
             window_start,
@@ -1244,7 +1203,6 @@ def firm_record(
             known_gaps=settings.firm.known_price_gaps,
             start_exempt=CRYPTO_ASSETS,
         )
-        risk_free_rate_series = load_risk_free_rate_series(window_start, window_end)
         lake_version = (
             session.lake_version
             if session.lake_version is not None
@@ -1256,11 +1214,10 @@ def firm_record(
             window_start,
             window_end,
             store_dir,
-            market_data,
+            inputs,
             lake_time=session.lake_time,
             lake_version=lake_version,
             quantcore_version=metadata.version("quantcore"),
-            risk_free_rate_series=risk_free_rate_series,
             max_days=max_days,
             ledger=TrialLedger(_REPO_ROOT / settings.trials.ledger_path, _REPO_ROOT),
             repo_root=_REPO_ROOT,

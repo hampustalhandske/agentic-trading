@@ -262,7 +262,8 @@ def test_callers_choose_the_alignment(
     benchmark.columns = pd.MultiIndex.from_tuples(benchmark.columns)
     loaded = (benchmark, "lakehouse data")
     monkeypatch.setattr(
-        "agentic_trading.cli.load_risk_free_rate_series", lambda *_: pd.Series(0.0, index=index)
+        "agentic_trading.backtest.engine_inputs.load_risk_free_rate_series",
+        lambda *_: pd.Series(0.0, index=index),
     )
     monkeypatch.setattr(
         "agentic_trading.cli.check_data_availability",
@@ -270,7 +271,10 @@ def test_callers_choose_the_alignment(
     )
     run_args = ["AAPL", "MSFT", "--start-date", "2024-01-02", "--end-date", "2024-01-05", "--yes"]
     with (
-        patch("agentic_trading.cli.load_price_history_with_fallback", return_value=loaded) as load,
+        patch(
+            "agentic_trading.backtest.engine_inputs.load_price_history_with_fallback",
+            return_value=loaded,
+        ) as load,
         patch("agentic_trading.cli.BacktestEngine") as engine,
     ):
         engine.return_value.run.return_value = _fake_backtest_result()

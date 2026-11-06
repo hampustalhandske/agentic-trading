@@ -72,6 +72,7 @@ from agentic_trading.agents.managers.tail_hedge_manager import TailHedgeManager
 from agentic_trading.agents.schemas import PortfolioDecision, ShortWarmup, UnfilledOrder
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.engine import BacktestEngine
+from agentic_trading.backtest.engine_inputs import EngineInputs, require_policy_rates
 from agentic_trading.backtest.portfolio import Portfolio
 from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.config import settings
@@ -236,12 +237,11 @@ def run_firm_record(
     window_start: date,
     window_end: date,
     store_dir: Path,
-    market_data: pd.DataFrame,
+    inputs: EngineInputs,
     *,
     lake_time: datetime,
     lake_version: str,
     quantcore_version: str,
-    risk_free_rate_series: pd.Series | None = None,
     max_days: int | None = None,
     ledger: TrialLedger | None = None,
     repo_root: Path | None = None,
@@ -252,12 +252,13 @@ def run_firm_record(
     `window_start` to `window_end` under `store_dir` (see the module
     docstring), writing at most `max_days` days in this call.
 
-    Takes `market_data` in `load_price_history_from_lakehouse`'s (asset,
-    field) column shape, aligned on the session calendar, covering the
-    window and its warm-up. The book starts at `settings.firm.starting_cash`
-    with the firm's commission and slippage, fills
-    `settings.firm.execution_lag_days` after each decision and accrues
-    `risk_free_rate_series` on cash. The spec is recorded with `lake_time`
+    Runs the engine on `inputs` (`backtest.engine_inputs.load_engine_inputs`
+    builds them), whose assets are `universe` and whose `market_data` is
+    aligned on the session calendar, covering the window and its warm-up.
+    The book starts at `inputs.starting_cash` with its commission and
+    slippage, fills `inputs.execution_lag_days` after each decision,
+    accrues `inputs.risk_free_rate_series` on cash and each spot FX pair's
+    carry from `inputs.policy_rates`. The spec is recorded with `lake_time`
     (aware), `lake_version` and `quantcore_version`. With a `ledger`,
     `repo_root` is the repository root its registry files live under.
     `short_warmup` lists the instruments whose bars start inside the
@@ -267,7 +268,9 @@ def run_firm_record(
 
     Raises `ValueError`, before writing anything, when the window is
     reversed, holds no session, or ends after `settings.stage_a.data_end`,
-    when `max_days` is below 1, when a `ledger` is given without a
+    when `inputs` are for other assets than `universe`, when `universe`
+    holds a spot FX pair and `inputs` carry no policy rates (naming the
+    pairs), when `max_days` is below 1, when a `ledger` is given without a
     `repo_root`, when HEAD is unknown, when the pass would be counted but
     the `src/` tree has changes or the registry file lacks
     `trials.declared_n` or `trials.prior_exposure`, or when the submission
@@ -292,6 +295,11 @@ def run_firm_record(
         raise ValueError(f"max_days must be at least 1, got {max_days}")
     if ledger is not None and repo_root is None:
         raise ValueError("a ledger needs the repo_root its registry files live under")
+    if list(inputs.assets) != list(universe):
+        raise ValueError(
+            f"the engine inputs are for {list(inputs.assets)}, not the universe {list(universe)}"
+        )
+    require_policy_rates(list(universe), inputs.policy_rates)
     calendar = settings.stage_a.session_calendar
     sessions = sessions_between(window_start, window_end, calendar)
     if not sessions:
@@ -391,25 +399,23 @@ def run_firm_record(
         )
         written = 0
         if pending:
-            frame = _on_sessions(market_data, sessions)
+            frame = _on_sessions(inputs.market_data, sessions)
+            aligned = inputs.model_copy(update={"market_data": frame})
             engine = BacktestEngine(
                 commander=commander,
-                portfolio=Portfolio(
-                    cash=settings.firm.starting_cash,
-                    positions={},
-                    commission_rate=settings.firm.commission_rate,
-                    slippage_bps=settings.firm.slippage_bps,
-                ),
+                portfolio=aligned.portfolio(),
                 track_record=TrackRecord(),
-                data_loader=lambda _assets, _start, _end: frame,
+                data_loader=aligned.data_loader,
                 start_date=window_start,
                 end_date=window_end,
-                assets=tickers,
-                market_data_source="lakehouse data",
-                execution_lag_days=settings.firm.execution_lag_days,
+                assets=aligned.assets,
+                market_data_source=aligned.market_data_source,
+                execution_lag_days=aligned.execution_lag_days,
                 checkpoint_path=checkpoint_path,
                 resume=checkpoint_path.exists(),
-                risk_free_rate_series=risk_free_rate_series,
+                risk_free_rate_series=aligned.risk_free_rate_series,
+                policy_rates=aligned.policy_rates,
+                benchmark_returns=aligned.benchmark_returns,
             )
             refused_before = len(session.holdout_violations)
             previous = row_provenance(store.day_rows(last)) if last is not None else {}

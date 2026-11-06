@@ -126,11 +126,11 @@ def _stubbed_cli(seen: dict[str, list[Any]]) -> Iterator[MagicMock]:
             ),
         ),
         patch(
-            "agentic_trading.cli.load_price_history_with_fallback",
+            "agentic_trading.backtest.engine_inputs.load_price_history_with_fallback",
             side_effect=lambda *a, **k: record("prices", (frame, "lakehouse data")),
         ),
         patch(
-            "agentic_trading.cli.load_risk_free_rate_series",
+            "agentic_trading.backtest.engine_inputs.load_risk_free_rate_series",
             side_effect=lambda *a, **k: record("risk_free", pd.Series(0.0, index=_INDEX)),
         ),
         patch("agentic_trading.cli.BacktestEngine") as engine_cls,

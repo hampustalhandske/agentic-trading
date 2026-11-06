@@ -8,7 +8,7 @@ performance figure."""
 
 import inspect
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import date, timedelta
 from importlib import import_module
 from pathlib import Path
@@ -35,6 +35,7 @@ from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.cli import firm_record_app
 from agentic_trading.config import settings
 from agentic_trading.data.loader import load_price_history_with_fallback
+from agentic_trading.data.loaders import lakehouse_loader as ll
 from agentic_trading.firm_record.runner import FirmRecordResult, run_firm_record
 from agentic_trading.trials.ledger import TrialLedger
 
@@ -43,6 +44,11 @@ _PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MARKET = pd.DataFrame(
     {("SPY", "close"): [100.0, 101.0]}, index=pd.DatetimeIndex(["2010-01-04", "2010-01-05"])
+)
+# A BIS policy-rate frame for every currency of the universe's spot FX pairs.
+_POLICY_RATES = pd.DataFrame(
+    {currency: [0.01] for currency in ("AUD", "EUR", "GBP", "JPY", "USD")},
+    index=pd.DatetimeIndex(["2009-12-31"], name="date"),
 )
 _RESULT = FirmRecordResult(
     spec_hash="0" * 64,
@@ -56,19 +62,31 @@ _RESULT = FirmRecordResult(
 def _invoke(
     args: list[str], coverage: MagicMock | None = None
 ) -> tuple[Result, MagicMock, MagicMock, MagicMock]:
-    """Runs the command with the price load, the rate load and the record mocked, and the
-    price coverage preflight replaced by `coverage` (a passing mock by default)."""
+    """Runs the command with the price load, the risk-free rate load and the record mocked
+    (the policy rates by `_policy_rates`), and the price coverage preflight replaced by
+    `coverage` (a passing mock by default)."""
     with (
         patch(
-            "agentic_trading.cli.load_price_history_with_fallback",
+            "agentic_trading.backtest.engine_inputs.load_price_history_with_fallback",
             return_value=(_MARKET, "lakehouse data"),
         ) as load,
-        patch("agentic_trading.cli.load_risk_free_rate_series", return_value=None) as rates,
+        patch(
+            "agentic_trading.backtest.engine_inputs.load_risk_free_rate_series", return_value=None
+        ) as rates,
         patch("agentic_trading.cli.run_firm_record", return_value=_RESULT) as record,
         patch("agentic_trading.cli.check_price_coverage", coverage or MagicMock()),
     ):
         result = runner.invoke(firm_record_app, args)
     return result, load, rates, record
+
+
+@pytest.fixture(autouse=True)
+def _policy_rates() -> Iterator[MagicMock]:
+    """Stubs the BIS policy-rate load (no lake in unit tests) with `_POLICY_RATES`."""
+    with patch(
+        "agentic_trading.backtest.engine_inputs.load_fx_policy_rates", return_value=_POLICY_RATES
+    ) as policy:
+        yield policy
 
 
 def _bound(function: Callable[..., Any], mock: MagicMock) -> dict[str, Any]:
@@ -117,7 +135,8 @@ def test_firm_record_runs_the_registered_firm(tmp_path: Path, preflight_lake: An
     assert agent_ids.isdisjoint(FIRM_V1_EXCLUDED_ANALYST_IDS)
     assert "tail_hedge_manager" in agent_ids and "ou_mean_reversion_analyst" in agent_ids
     assert list(called["universe"]) == list(FIRM_V1_UNIVERSE)
-    assert called["market_data"] is _MARKET
+    assert called["inputs"].market_data is _MARKET
+    assert list(called["inputs"].assets) == list(FIRM_V1_UNIVERSE)
     assert called["max_days"] == 20
     assert called["store_dir"] == tmp_path
     assert isinstance(called["ledger"], TrialLedger)
@@ -189,3 +208,30 @@ def test_price_coverage_preflight_runs_before_the_record(tmp_path: Path) -> None
 
     assert isinstance(result.exception, PriceCoverageError)
     record.assert_not_called()
+
+
+def test_firm_record_passes_the_policy_rates(
+    tmp_path: Path, preflight_lake: Any, _policy_rates: MagicMock
+) -> None:
+    """The BIS policy rates of the universe's spot FX pairs are read for --start to --end inside
+    the lake session, under the declared window store, which covers the loader's look-back, and
+    reach run_firm_record in its engine inputs."""
+    windows: list[ll.LoaderWindow | None] = []
+
+    def read(*_args: Any) -> pd.DataFrame:
+        windows.append(ll.loader_window())
+        return _POLICY_RATES
+
+    _policy_rates.side_effect = read
+    args = ["--start", "2010-01-04", "--end", "2010-01-05", "--store-dir", str(tmp_path)]
+    result, _, _, record = _invoke(args)
+
+    assert result.exit_code == 0, result.output
+    _policy_rates.assert_called_once_with(
+        list(FIRM_V1_UNIVERSE), date(2010, 1, 4), date(2010, 1, 5)
+    )
+    [window] = windows
+    assert window is not None
+    assert window.start <= date(2010, 1, 4) - timedelta(days=ll.POLICY_RATE_LOOKBACK_DAYS)
+    assert window.end == date(2010, 1, 5)
+    assert _bound(run_firm_record, record)["inputs"].policy_rates is _POLICY_RATES

@@ -5,8 +5,9 @@ documented convention): cli.py's `run` command is expected to construct and invo
 `agentic_trading.cli.BacktestEngine` (imported by that exact name into cli.py's own
 namespace, e.g. `from agentic_trading.backtest.engine import BacktestEngine`) to execute the
 backtest. Patching `BacktestEngine` guarantees no real backtest/LLM call occurs, but `run`
-also calls `agentic_trading.cli.load_price_history_with_fallback` *before* constructing the
-engine (to log which data source the run used) — that must be patched too, or these tests
+also loads the engine's inputs through `agentic_trading.backtest.engine_inputs`, whose
+`load_price_history_with_fallback` runs *before* the engine is constructed (to log which
+data source the run used) — that must be patched too, or these tests
 would make a real lakehouse read despite BacktestEngine being mocked. `run` also runs the
 real-data preflight (`agentic_trading.cli.check_data_availability`) before either of those —
 tests that don't care about preflight behavior pass `--yes` to skip its prompt.
@@ -41,7 +42,9 @@ runner = CliRunner()
 def _no_risk_free_series(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stubs the CLI's risk-free series loader (no lake in unit tests); a
     test that inspects it patches it again itself."""
-    monkeypatch.setattr("agentic_trading.cli.load_risk_free_rate_series", lambda _s, _e: None)
+    monkeypatch.setattr(
+        "agentic_trading.backtest.engine_inputs.load_risk_free_rate_series", lambda _s, _e: None
+    )
 
 
 def _fake_backtest_result() -> BacktestResult:
@@ -61,7 +64,7 @@ def _fake_backtest_result() -> BacktestResult:
     )
 
 
-@patch("agentic_trading.cli.load_price_history_with_fallback")
+@patch("agentic_trading.backtest.engine_inputs.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_run_with_valid_arguments_exits_zero_and_prints_summary(
     mock_engine_cls: MagicMock, mock_load: MagicMock, preflight_lake: object
@@ -80,7 +83,7 @@ def test_run_with_valid_arguments_exits_zero_and_prints_summary(
     assert result.stdout.strip() != ""
 
 
-@patch("agentic_trading.cli.load_price_history_with_fallback")
+@patch("agentic_trading.backtest.engine_inputs.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_run_never_executes_a_real_backtest(
     mock_engine_cls: MagicMock, mock_load: MagicMock, preflight_lake: object
@@ -128,7 +131,7 @@ def _failing_preflight_report() -> PreflightReport:
 
 
 @patch("agentic_trading.cli.check_data_availability")
-@patch("agentic_trading.cli.load_price_history_with_fallback")
+@patch("agentic_trading.backtest.engine_inputs.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_run_yes_flag_auto_drops_failing_analysts_without_prompting(
     mock_engine_cls: MagicMock, mock_load: MagicMock, mock_preflight: MagicMock
@@ -147,7 +150,7 @@ def test_run_yes_flag_auto_drops_failing_analysts_without_prompting(
 
 
 @patch("agentic_trading.cli.check_data_availability")
-@patch("agentic_trading.cli.load_price_history_with_fallback")
+@patch("agentic_trading.backtest.engine_inputs.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_run_prompts_and_continues_on_confirm(
     mock_engine_cls: MagicMock, mock_load: MagicMock, mock_preflight: MagicMock
@@ -168,7 +171,7 @@ def test_run_prompts_and_continues_on_confirm(
 
 
 @patch("agentic_trading.cli.check_data_availability")
-@patch("agentic_trading.cli.load_price_history_with_fallback")
+@patch("agentic_trading.backtest.engine_inputs.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_run_aborts_on_decline(
     mock_engine_cls: MagicMock, mock_load: MagicMock, mock_preflight: MagicMock
@@ -186,7 +189,7 @@ def test_run_aborts_on_decline(
     mock_engine_cls.return_value.run.assert_not_called()
 
 
-@patch("agentic_trading.cli.load_price_history_with_fallback")
+@patch("agentic_trading.backtest.engine_inputs.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_run_builds_engine_with_execution_defaults_from_settings(
     mock_engine_cls: MagicMock, mock_load: MagicMock, preflight_lake: object
@@ -259,7 +262,7 @@ def _json_payload(stdout: str) -> dict[str, Any]:
 
 
 @patch("agentic_trading.cli.build_run_provenance", side_effect=_echoing_provenance)
-@patch("agentic_trading.cli.load_price_history_with_fallback")
+@patch("agentic_trading.backtest.engine_inputs.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_run_prints_provenance_alongside_result(
     mock_engine_cls: MagicMock,
@@ -288,8 +291,8 @@ def test_run_prints_provenance_alongside_result(
 
 @patch("agentic_trading.cli.build_run_provenance", side_effect=_echoing_provenance)
 @patch("agentic_trading.cli.check_data_availability")
-@patch("agentic_trading.cli.load_risk_free_rate_series")
-@patch("agentic_trading.cli.load_price_history_with_fallback")
+@patch("agentic_trading.backtest.engine_inputs.load_risk_free_rate_series")
+@patch("agentic_trading.backtest.engine_inputs.load_price_history_with_fallback")
 @patch("agentic_trading.cli.BacktestEngine")
 def test_experiment_prints_provenance_at_top_level(
     mock_engine_cls: MagicMock,

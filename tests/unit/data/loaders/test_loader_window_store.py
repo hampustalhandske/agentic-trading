@@ -1438,10 +1438,16 @@ def test_firm_record_declares_the_run_window(
     args = ["--start", "2010-01-04", "--end", "2010-01-05", "--store-dir", str(tmp_path)]
     with (
         patch(
-            "agentic_trading.cli.load_price_history_with_fallback",
+            "agentic_trading.backtest.engine_inputs.load_price_history_with_fallback",
             return_value=(market, "lakehouse data"),
         ),
-        patch("agentic_trading.cli.load_risk_free_rate_series", return_value=None),
+        patch(
+            "agentic_trading.backtest.engine_inputs.load_risk_free_rate_series", return_value=None
+        ),
+        patch(
+            "agentic_trading.backtest.engine_inputs.load_fx_policy_rates",
+            return_value=pd.DataFrame({"USD": [0.0]}),
+        ),
         patch("agentic_trading.cli.run_firm_record", side_effect=record),
         patch("agentic_trading.cli.check_price_coverage"),
     ):

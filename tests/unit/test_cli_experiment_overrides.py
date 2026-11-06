@@ -60,8 +60,8 @@ def _run(extra: list[str]) -> tuple[Any, list[Any]]:
     )
     with (
         patch("agentic_trading.cli.check_data_availability") as preflight,
-        patch("agentic_trading.cli.load_risk_free_rate_series") as risk_free,
-        patch("agentic_trading.cli.load_price_history_with_fallback") as load,
+        patch("agentic_trading.backtest.engine_inputs.load_risk_free_rate_series") as risk_free,
+        patch("agentic_trading.backtest.engine_inputs.load_price_history_with_fallback") as load,
         patch("agentic_trading.cli.BacktestEngine") as engine_cls,
     ):
         load.return_value = (frame, "lakehouse data")

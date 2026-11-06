@@ -30,6 +30,7 @@ from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.schemas import AgentSignal, ShortWarmup, UnfilledOrder
 from agentic_trading.backtest import checkpoint_store
+from agentic_trading.backtest.engine_inputs import EngineInputs
 from agentic_trading.config import settings
 from agentic_trading.data.loaders import lakehouse_loader
 from agentic_trading.data.loaders.lakehouse_loader import HoldoutReadError
@@ -173,6 +174,11 @@ def _frame() -> pd.DataFrame:
     return pd.DataFrame(columns).drop(index=_HOLE_DAY)
 
 
+def _inputs(frame: pd.DataFrame) -> EngineInputs:
+    """The engine inputs of a record over `_UNIVERSE` on `frame`, with no rate series."""
+    return EngineInputs(assets=_UNIVERSE, market_data=frame, market_data_source="lakehouse data")
+
+
 def _run(store_dir: Path, **kwargs: Any) -> FirmRecordResult:
     options: dict[str, Any] = {
         "lake_time": _T,
@@ -182,7 +188,7 @@ def _run(store_dir: Path, **kwargs: Any) -> FirmRecordResult:
     commander = options.pop("commander", None) or _commander()
     frame = options.pop("frame", None)
     frame = _frame() if frame is None else frame
-    return run_firm_record(commander, _UNIVERSE, _START, _END, store_dir, frame, **options)
+    return run_firm_record(commander, _UNIVERSE, _START, _END, store_dir, _inputs(frame), **options)
 
 
 def _rows(store_dir: Path, result: FirmRecordResult) -> list[dict[str, Any]]:
@@ -465,10 +471,10 @@ def test_unregistered_record_writes_no_trial_row(tmp_path: Path) -> None:
 def test_refusals(tmp_path: Path) -> None:
     """A window ending after stage_a.data_end, or a ledger without a repo root, is refused
     before anything is written."""
-    frame = _frame()
+    inputs = _inputs(_frame())
     with pytest.raises(ValueError, match="data_end"):
         run_firm_record(
-            _commander(), _UNIVERSE, _START, date(2025, 1, 2), tmp_path, frame,
+            _commander(), _UNIVERSE, _START, date(2025, 1, 2), tmp_path, inputs,
             lake_time=_T, lake_version="v", quantcore_version="q",
         )  # fmt: skip
     with pytest.raises(ValueError, match="repo_root"):
