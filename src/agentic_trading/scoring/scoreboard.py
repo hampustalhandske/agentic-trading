@@ -174,11 +174,7 @@ class PerformanceScoreboard:
         """Full snapshot of every known analyst's and manager's current
         metrics (sharpe_ratio, max_drawdown, cumulative_return) as of
         `as_of_date`, keyed by source_id."""
-        source_ids = {
-            entry.source_id
-            for entry in self.track_record._entries
-            if entry.as_of_date <= as_of_date
-        }
+        source_ids = self.track_record.source_ids_as_of(as_of_date)
         result: dict[str, dict[str, float]] = {}
         for source_id in sorted(source_ids):
             try:
