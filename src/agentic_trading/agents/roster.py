@@ -202,6 +202,17 @@ STAT_ARB_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
         "regime_hmm_analyst",
     }
 )
+# Analysts the registered firm (registry id agentic-firm-v1) runs without,
+# passed as `build_default_analysts(excluded_analyst_ids=...)`. Both trade
+# pairs seeded from `_COINTEGRATED_PAIRS`, which were screened on
+# 2017-04..2018-03 data, so on any earlier decision day the pair choice
+# looks ahead; StatArb keeps ou_mean_reversion and regime_hmm.
+FIRM_V1_EXCLUDED_ANALYST_IDS: frozenset[str] = frozenset(
+    {
+        "pairs_cointegration_analyst",
+        "kalman_hedge_ratio_analyst",
+    }
+)
 MACRO_RATES_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
     {
         "egarch_asymmetric_vol_analyst",
