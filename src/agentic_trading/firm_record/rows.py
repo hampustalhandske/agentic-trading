@@ -32,13 +32,19 @@ carried target (see `Commander.decide`); one without a bar and without a
 decided target gets one `unavailable` row at weight 0 per pod whose scope
 holds it. A held put (`PodTarget.hold_contracts`) is written at the
 premium weight of the contracts the book holds, at the decision day's
-mark, with its delta-equivalent weight scaled to match."""
+close mark (`PodTarget.mark_mid`), with its delta-equivalent weight scaled
+to match.
+
+Known limit: an instrument that stops trading (a delisting) has no bar
+again, so it is carried at its last decided target to the end of the
+window; edgelab settles delistings in replay."""
 
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, timedelta
 
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.schemas import ManagerSignal, PodTarget, SignalStatus
+from agentic_trading.config import settings
 from agentic_trading.data.instruments import futures_root
 from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.stage_a.decisions import (
@@ -187,7 +193,8 @@ def firm_day_rows(
     instrument_kinds: Mapping[str, DecisionKind],
     calendar: str,
     previous: Mapping[tuple[str, str], Provenance] | None = None,
-    held_premium: Mapping[str, float] | None = None,
+    held_contracts: Mapping[str, float] | None = None,
+    nav: float | None = None,
 ) -> list[DecisionRow]:
     """The decision rows of `day`: one per `targets` entry that carries a
     contributing signal or a nonzero weight, then, for each instrument of
@@ -197,9 +204,10 @@ def firm_day_rows(
     (an option row is `option`, keyed by its contract id), and `calendar`
     is the decision calendar the after-close rule counts sessions on.
     `previous` maps (instrument id, pod id) to the provenance of the pod's
-    row on the previous day, which a held target keeps; `held_premium`
-    maps a held put's contract id to the premium weight of the contracts
-    the book holds.
+    row on the previous day, which a held target keeps; `held_contracts`
+    maps each option the book holds to its signed contracts, which a held
+    put is written at, priced at its `mark_mid` against `nav`, the book's
+    value on `day`.
 
     Raises `ValueError` when a target is dated another day, a ticker has no
     kind, a signal comes from an analyst outside `analyst_sources`, or an
@@ -207,7 +215,8 @@ def firm_day_rows(
     `LookAheadError` as `_row_source` documents, or when a kept
     provenance fails `decisions.check_source_as_of`."""
     previous = previous or {}
-    held_premium = held_premium or {}
+    held_contracts = held_contracts or {}
+    multiplier = float(settings.options.contract_multiplier)
     day_signals = [
         signal for target in targets if not target.carried for signal in target.contributing_signals
     ]
@@ -223,8 +232,14 @@ def firm_day_rows(
             raise ValueError(f"{target.asset} has no bar on {day.isoformat()} but has a target")
         targeted.add(target.asset)
         weight, delta_equiv = target.target_weight, target.delta_equiv_weight
-        if target.hold_contracts and target.asset in held_premium:
-            weight = held_premium[target.asset]
+        if (
+            target.hold_contracts
+            and target.asset in held_contracts
+            and target.mark_mid is not None
+            and nav is not None
+            and nav > 0.0
+        ):
+            weight = held_contracts[target.asset] * target.mark_mid * multiplier / nav
             delta_equiv = (
                 None
                 if delta_equiv is None or target.target_weight == 0.0

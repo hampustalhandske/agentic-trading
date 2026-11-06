@@ -146,15 +146,10 @@ def _checkpoint_last_day(path: Path) -> date | None:
     return date.fromisoformat(payload["portfolio_value_history"][-1][0])
 
 
-def _held_premium(portfolio: Portfolio, value: float) -> dict[str, float]:
-    """Each open option position's contract id to its premium weight in
-    the book of `value`: contracts x its last mid x the contract
-    multiplier / `value`; empty when `value` is not positive."""
-    if not value > 0.0:
-        return {}
-    multiplier = float(settings.options.contract_multiplier)
+def _held_contracts(portfolio: Portfolio) -> dict[str, float]:
+    """Each open option position's contract id to its signed contracts."""
     return {
-        contract_id: position.contracts * position.last_mid * multiplier / value
+        contract_id: position.contracts
         for contract_id, position in portfolio.option_positions.items()
     }
 
@@ -351,7 +346,8 @@ def run_firm_record(
                     instrument_kinds=kinds,
                     calendar=calendar,
                     previous=previous,
-                    held_premium=_held_premium(engine.portfolio, value),
+                    held_contracts=_held_contracts(engine.portfolio),
+                    nav=value,
                 )
                 store.write_day(day, rows)
                 previous = row_provenance(rows)

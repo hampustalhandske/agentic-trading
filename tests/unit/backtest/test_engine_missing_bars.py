@@ -22,6 +22,7 @@ from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.backtest.engine import BacktestEngine, _valuation_prices
 from agentic_trading.backtest.portfolio import Portfolio
+from agentic_trading.data.loader import _with_rolls_since_previous_row
 from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import EqualWeight
@@ -257,3 +258,50 @@ def test_valuation_carries_the_last_close_and_skips_unpriced() -> None:
         "GAP": pytest.approx(float(frame.loc[_SESSIONS[5], ("GAP", "close")])),
     }
     assert _valuation_prices(frame, _SESSIONS[1], early, set()) == {"SPY": early["SPY"]}
+
+
+def test_a_roll_inside_a_gap_is_charged_once_on_the_next_bar() -> None:
+    """A front-contract roll dated on a day the session frame does not hold (the future traded on
+    an exchange holiday, then missed a session) is charged once, on the future's next bar."""
+    holiday = pd.Timestamp("2016-01-18")
+    gap, next_bar = _SESSIONS[10], _SESSIONS[11]
+    sessions = _gap_frame(("SPY", "GC=F"), {"GC=F": [gap]})
+    lake = sessions.copy()
+    lake.loc[holiday] = sessions.loc[_SESSIONS[9]]
+    lake = lake.sort_index()
+    lake[("GC=F", "roll")] = 0.0
+    lake.loc[holiday, ("GC=F", "roll")] = 1.0
+    lake.loc[gap, ("GC=F", "roll")] = np.nan
+    frame = _with_rolls_since_previous_row(lake.loc[_SESSIONS], lake, ["GC=F"])
+    result = _engine(frame).run()
+
+    rolls = [t for t in result.trade_log if t.asset == "GC=F" and t.action == "roll"]
+    assert [t.as_of_date for t in rolls] == [next_bar.date()]
+
+
+def test_fx_carry_accrues_each_calendar_day_once_across_a_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held pair accrues carry over every calendar day of the window exactly once, its
+    missing session included."""
+    frame = _gap_frame(("SPY", "EURUSD=X"), {"EURUSD=X": [_GAP_DAY]})
+    rates = pd.DataFrame(
+        {"EUR": [0.01] * len(_SESSIONS), "USD": [0.03] * len(_SESSIONS)}, index=_SESSIONS
+    )
+    engine = _engine(frame)
+    engine.policy_rates = rates
+    accrued: list[int] = []
+    apply_carry = Portfolio.apply_carry
+
+    def recording(self: Portfolio, carry_rates: dict[str, float], days_held: int) -> float:
+        if self.marked_positions.get("EURUSD=X") is not None:
+            accrued.append(days_held)
+        return apply_carry(self, carry_rates, days_held)
+
+    monkeypatch.setattr(Portfolio, "apply_carry", recording)
+    engine.run()
+    held_from = next(
+        day for day in range(len(_SESSIONS)) if len(accrued) == len(_SESSIONS) - 1 - day
+    )
+
+    assert sum(accrued) == (_SESSIONS[-1] - _SESSIONS[held_from]).days

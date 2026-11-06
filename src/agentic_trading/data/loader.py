@@ -129,19 +129,31 @@ def _with_rolls_since_previous_row(
     frame: pd.DataFrame, lake_frame: pd.DataFrame, futures: list[str]
 ) -> pd.DataFrame:
     """`frame` (rows selected from `lake_frame`) with each of `futures`'
-    `roll` field replaced by the rolls in `lake_frame` after the previous
-    row of `frame` up to and including this one; the first row keeps its
-    own count (0.0 when the ticker has no bar there). A futures ticker
-    without a `roll` field is left as is."""
+    `roll` field replaced, on each row where the ticker has a close in
+    `frame`, by the rolls in `lake_frame` after its previous such row up to
+    and including this one, and 0.0 on a row without its close, so a roll
+    during a session without the future's bar is counted once, on its next
+    bar. The ticker's first bar counts the rolls from `frame`'s first row.
+    A futures ticker without a `roll` field is left as is."""
     rolled = [ticker for ticker in futures if (ticker, "roll") in lake_frame.columns]
     if not rolled:
         return frame
     frame = frame.copy()
     for ticker in rolled:
         rolls = lake_frame[(ticker, "roll")].fillna(0.0)
-        since_previous = rolls.cumsum().reindex(frame.index).diff()
-        since_previous.iloc[0] = float(rolls.loc[frame.index[0]])
-        frame[(ticker, "roll")] = since_previous
+        cumulative = rolls.cumsum().reindex(frame.index)
+        has_bar = (
+            frame[(ticker, "close")].notna()
+            if (ticker, "close") in frame.columns
+            else pd.Series(True, index=frame.index)
+        )
+        on_bars = cumulative[has_bar].diff()
+        if not on_bars.empty:
+            first = frame.index[0]
+            on_bars.iloc[0] = float(
+                cumulative.loc[on_bars.index[0]] - cumulative.loc[first] + rolls.loc[first]
+            )
+        frame[(ticker, "roll")] = on_bars.reindex(frame.index).fillna(0.0)
     return frame
 
 

@@ -995,8 +995,27 @@ class Commander:
         # Each pod's own sized weights of yesterday: a weight it keeps
         # unchanged is a target it holds rather than sets.
         previous_pod_weights = self._pod_return_tracker.last_weights
+        # A pod's option legs on an underlying without a bar today stand as
+        # they were: the tracker keeps them at the pod's weight of
+        # yesterday, so the pod's next return counts their P&L.
+        tracked_decisions: list[tuple[str, list[PortfolioDecision]]] = []
+        for manager_id, decisions in pod_decisions:
+            decided = {decision.asset for decision in decisions}
+            legs = [
+                PortfolioDecision(
+                    asset=contract_id,
+                    as_of_date=as_of,
+                    target_weight=previous_pod_weights.get(manager_id, {}).get(contract_id, 0.0),
+                    contributing_signals=list(target.contributing_signals),
+                    instrument=target.instrument,
+                    hold_contracts=target.hold_contracts,
+                )
+                for contract_id, target in carried_targets.get(manager_id, {}).items()
+                if target.instrument is not None and contract_id not in decided
+            ]
+            tracked_decisions.append((manager_id, decisions + legs))
         pod_return_history = self._pod_return_tracker.record_and_get_history(
-            pod_decisions, market_data, as_of_date, instrument_returns
+            tracked_decisions, market_data, as_of_date, instrument_returns
         )
 
         # The tail-hedge pod (if present) gets a fixed, protected budget
@@ -1213,6 +1232,7 @@ class Commander:
                             else weight * delta_mark[0] * delta_mark[1] / delta_mark[2]
                         ),
                         mark_as_of=None if delta_mark is None else delta_mark[3],
+                        mark_mid=None if delta_mark is None else delta_mark[2],
                         held=(
                             kept_carried
                             if is_carried

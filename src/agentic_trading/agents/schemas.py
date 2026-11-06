@@ -197,7 +197,8 @@ class PodTarget(BaseModel):
     with a mark: `target_weight x delta x spot / mid`, the signed delta
     exposure as a fraction of NAV (a long put is negative); `None`
     otherwise. `mark_as_of` is the date of the option-chain snapshot that
-    mark rests on, `None` without one.
+    mark rests on and `mark_mid` its mid (the decision day's close mark),
+    both `None` without one.
 
     `held` is `True` when the pod keeps a target it set on an earlier day
     rather than setting one: on a day its instrument has no bar
@@ -217,6 +218,7 @@ class PodTarget(BaseModel):
     instrument: OptionContract | None = None
     delta_equiv_weight: float | None = None
     mark_as_of: date | None = None
+    mark_mid: float | None = None
     held: bool = False
     carried: bool = False
     hold_contracts: bool = False

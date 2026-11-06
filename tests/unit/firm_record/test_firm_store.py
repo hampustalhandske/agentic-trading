@@ -325,3 +325,14 @@ def test_rows_are_sorted_by_instrument_then_pod(tmp_path: Path) -> None:
     keys = [(row["instrument_id"], row["pod_id"]) for row in _json_rows(trial)]
 
     assert keys == sorted(keys)
+
+
+def test_resume_on_another_commit_is_refused(tmp_path: Path) -> None:
+    """A record that ran on one commit resumes only on it; on another the store says to
+    restart, or resume on the same commit."""
+    store, _ = _open(tmp_path, _record())
+    store.write_day(_DAYS[0], _day_rows(_DAYS[0]))
+    moved = _record().model_copy(update={"git_sha": "f" * 40})
+
+    with pytest.raises(StoreMismatchError, match=r"restart the record.*same commit"):
+        _open(tmp_path, moved)

@@ -22,7 +22,7 @@ from agentic_trading.agents.schemas import AgentSignal, ManagerSignal, OptionCon
 from agentic_trading.backtest.portfolio import OptionPosition, Portfolio
 from agentic_trading.config import settings
 from agentic_trading.firm_record.rows import firm_day_rows, firm_sources, row_instrument_id
-from agentic_trading.firm_record.runner import _held_premium
+from agentic_trading.firm_record.runner import _held_contracts
 from agentic_trading.stage_a.decisions import LookAheadError
 
 _DAY = date(2016, 1, 6)
@@ -302,9 +302,10 @@ def test_option_row_counts_its_chain_snapshot() -> None:
 
 def test_held_put_is_written_at_its_held_premium() -> None:
     """After the put's mark rose fivefold, the held put's row is the held contracts' premium
-    weight at that mark, not the nominal weight, and its delta-equivalent weight scales with
-    it."""
-    nominal = 0.004
+    weight at the decision day's close mark, not the nominal weight, and its delta-equivalent
+    weight scales with it."""
+    nominal, contracts, nav = 0.004, 4.0, 1_000_000.0
+    entry_mid = nominal * nav / (contracts * settings.options.contract_multiplier)
     (row,) = firm_day_rows(
         _DAY,
         [
@@ -315,6 +316,7 @@ def test_held_put_is_written_at_its_held_premium() -> None:
                 asset=_PUT.contract_id,
                 instrument=_PUT,
                 delta_equiv_weight=-0.1,
+                mark_mid=5 * entry_mid,
                 hold_contracts=True,
                 held=True,
             )
@@ -323,23 +325,47 @@ def test_held_put_is_written_at_its_held_premium() -> None:
         analyst_sources=_SOURCES,
         instrument_kinds=_KINDS,
         calendar="XNYS",
-        held_premium={_PUT.contract_id: 5 * nominal},
+        held_contracts={_PUT.contract_id: contracts},
+        nav=nav,
     )
 
     assert row.target_weight == pytest.approx(5 * nominal)
     assert row.delta_equiv_weight == pytest.approx(-0.5)
 
 
-def test_held_premium_reads_the_book() -> None:
-    """The held premium weight is contracts x last mid x the contract multiplier / NAV."""
+def test_held_contracts_read_the_book_not_its_fill_mid() -> None:
+    """The row prices the held contracts at the decision day's close mark: the position's own
+    last mid (the lag-1 fill's open mid) does not enter."""
     portfolio = Portfolio(cash=100_000.0, positions={})
     portfolio.option_positions[_PUT.contract_id] = OptionPosition(
-        contract=_PUT, contracts=2.0, entry_price=1.0, last_mid=5.0
+        contract=_PUT, contracts=2.0, entry_price=1.0, last_mid=9.0
+    )
+    held = _held_contracts(portfolio)
+    (row,) = firm_day_rows(
+        _DAY,
+        [
+            _target(
+                0.004,
+                _signal("price_analyst"),
+                pod="tail_hedge_manager",
+                asset=_PUT.contract_id,
+                instrument=_PUT,
+                mark_mid=5.0,
+                hold_contracts=True,
+            )
+        ],
+        absent={},
+        analyst_sources=_SOURCES,
+        instrument_kinds=_KINDS,
+        calendar="XNYS",
+        held_contracts=held,
+        nav=100_000.0,
     )
 
-    assert _held_premium(portfolio, 100_000.0) == {
-        _PUT.contract_id: pytest.approx(2.0 * 5.0 * settings.options.contract_multiplier / 1e5)
-    }
+    assert held == {_PUT.contract_id: 2.0}
+    assert row.target_weight == pytest.approx(
+        2.0 * 5.0 * settings.options.contract_multiplier / 100_000.0
+    )
 
 
 @pytest.mark.parametrize(

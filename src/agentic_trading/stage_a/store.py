@@ -202,14 +202,19 @@ class _TrialStore:
         its progress and rows. Writes spec.json and sources.json when
         absent. Raises `StoreMismatchError`, writing nothing, when an
         existing spec.json holds a record other than this store's or an
-        existing sources.json other sources."""
+        existing sources.json other sources. The whole record is compared,
+        the fields outside the hash included, so a firm record that ran on
+        one commit (`FirmSpecRecord.git_sha`) resumes only on that commit:
+        on another it must restart in a new store."""
         self.trial_dir.mkdir(parents=True, exist_ok=True)
         spec_path = self.trial_dir / "spec.json"
         if spec_path.exists():
             stored = type(self.record).model_validate_json(spec_path.read_text())
             if stored != self.record:
                 raise StoreMismatchError(
-                    f"{spec_path.name} of trial {self.record.spec_hash} holds another record"
+                    f"{spec_path.name} of trial {self.record.spec_hash} holds another record "
+                    "(another lake version, quantcore version or commit); restart the record "
+                    "in a new store, or resume it on the same commit"
                 )
         sources_path = self.trial_dir / "sources.json"
         if sources_path.exists() and json.loads(sources_path.read_text()) != self._sources:

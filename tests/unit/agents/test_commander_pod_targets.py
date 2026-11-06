@@ -651,3 +651,44 @@ def test_a_carried_target_is_held_only_while_no_limit_scales_it() -> None:
     assert unscaled == before and held
     before, scaled, held = gld_on_gap_day({"firm.max_gross_exposure": 0.2})
     assert 0.0 < scaled < before and not held
+
+
+class _OptionPod(_ScriptedManager):
+    """A scripted pod that, like the CVaR pod, emits no option row on an underlying without a
+    bar today."""
+
+    def construct_portfolio(self, assets, market_data, as_of_date, scoreboard, *, carried=None):
+        decisions = super().construct_portfolio(assets, market_data, as_of_date, scoreboard)
+        return [
+            decision
+            for decision in decisions
+            if decision.instrument is None or decision.instrument.underlying not in (carried or {})
+        ]
+
+
+def test_option_legs_over_a_gap_stay_in_the_pod_tracker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On AAPL's missing day the pod's AAPL call stays in the pod-return tracker at the pod's
+    weight of the day before, and in the firm book at its carried target."""
+    monkeypatch.setattr(option_marks, "load_option_mark", lambda *args, **kwargs: None)
+    frame = _frame()
+    frame.loc[_DAY, ("AAPL", ["close", "open", "log_return"])] = np.nan
+    pod = _OptionPod(
+        agent_id="a_manager",
+        managed_analysts=[],
+        weighting_strategy=EqualWeight(),
+        portfolio_constructor=_ZeroConstructor(),
+        weights={"AAPL": 0.1, "SPY": 0.1},
+        option_weights={_CALL.contract_id: 0.02},
+    )
+    commander = _commander(pod)
+    commander.decide(frame.loc[: _INDEX[-2]], _INDEX[-2], _scoreboard())
+    before = commander.risk_state().last_pod_weights["a_manager"][_CALL.contract_id]
+    (carried_call,) = [t for t in commander.pod_targets() if t.asset == _CALL.contract_id]
+    commander.decide(frame, _DAY, _scoreboard())
+    after = commander.risk_state().last_pod_weights["a_manager"]
+    (call,) = [t for t in commander.pod_targets() if t.asset == _CALL.contract_id]
+
+    assert before == pytest.approx(0.02)
+    assert after[_CALL.contract_id] == before
+    assert call.carried and call.held
+    assert call.target_weight == carried_call.target_weight
