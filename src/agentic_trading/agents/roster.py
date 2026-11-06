@@ -108,6 +108,8 @@ carries the reasoning for that pod's row.
 
 from __future__ import annotations
 
+from datetime import date
+
 from agentic_trading.agents.analysts import (
     ARIMAForecastAnalyst,
     BlackScholesValuationAnalyst,
@@ -213,6 +215,70 @@ FIRM_V1_EXCLUDED_ANALYST_IDS: frozenset[str] = frozenset(
         "kalman_hedge_ratio_analyst",
     }
 )
+# The registered firm's (agentic-firm-v1) equities: the 30 S&P 500 members on
+# 2009-12-31 with the highest average daily dollar volume over the 2009 XNYS
+# sessions, using only data known by 2009-12-31, as selected by
+# scripts/select_firm_v1_equities.py; in its rank order, by their tickers on
+# 2009-12-31.
+FIRM_V1_EQUITIES: tuple[str, ...] = (
+    "BAC",
+    "AAPL",
+    "GS",
+    "JPM",
+    "WFC",
+    "XOM",
+    "C",
+    "GOOGL",
+    "GE",
+    "MSFT",
+    "INTC",
+    "CSCO",
+    "WMT",
+    "FCX",
+    "PFE",
+    "IBM",
+    "CVX",
+    "MS",
+    "AMZN",
+    "QCOM",
+    "JNJ",
+    "T",
+    "PG",
+    "HPQ",
+    "ORCL",
+    "AIG",
+    "COP",
+    "MON",
+    "V",
+    "FSLR",
+)
+# The registered firm's whole universe: `FIRM_V1_EQUITIES`, then the fixed
+# instruments the registration names (index, bond and credit ETFs, futures,
+# FX pairs and crypto).
+FIRM_V1_UNIVERSE: tuple[str, ...] = (
+    *FIRM_V1_EQUITIES,
+    "SPY",
+    "SHY",
+    "IEF",
+    "TLT",
+    "HYG",
+    "LQD",
+    "GC=F",
+    "CL=F",
+    "SI=F",
+    "NG=F",
+    "HG=F",
+    "EURUSD=X",
+    "GBPUSD=X",
+    "USDJPY=X",
+    "AUDUSD=X",
+    "BTC-USD",
+    "ETH-USD",
+)
+# The registered firm's (agentic-firm-v1) decision window: the first and last
+# XNYS sessions of 2010 through 2017.
+FIRM_V1_WINDOW_START = date(2010, 1, 4)
+FIRM_V1_WINDOW_END = date(2017, 12, 29)
 MACRO_RATES_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
     {
         "egarch_asymmetric_vol_analyst",

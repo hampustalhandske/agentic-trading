@@ -11,7 +11,14 @@ import typer
 from agentic_trading import provenance
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
-from agentic_trading.agents.roster import build_default_analysts, build_default_managers
+from agentic_trading.agents.roster import (
+    FIRM_V1_EXCLUDED_ANALYST_IDS,
+    FIRM_V1_UNIVERSE,
+    FIRM_V1_WINDOW_END,
+    FIRM_V1_WINDOW_START,
+    build_default_analysts,
+    build_default_managers,
+)
 from agentic_trading.agents.schemas import BacktestResult
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystCommander
@@ -41,6 +48,7 @@ from agentic_trading.data.ticker_catalog import (
     TickerGroup,
     tickers_by_asset_class,
 )
+from agentic_trading.firm_record.runner import run_firm_record
 from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.provenance import build_run_provenance
 from agentic_trading.scoring.track_record import TrackRecord
@@ -52,6 +60,7 @@ from agentic_trading.trials.ledger import TrialLedger
 app = typer.Typer()
 experiment_app = typer.Typer()
 stage_a_app = typer.Typer()
+firm_record_app = typer.Typer()
 
 # Every asset class CATALOG actually classifies into (see ticker_catalog.py's
 # AssetClass) — options are deliberately excluded there, so they're
@@ -1033,6 +1042,134 @@ def stage_a(
         raise typer.Exit(code=_EXIT_STOPPED_FOR_RESOURCES)
 
 
+@firm_record_app.command()
+def firm_record(
+    start: str = typer.Option(
+        ...,
+        "--start",
+        help=f"First decision date, {_DATE_FORMAT_HINT}; the registered window starts "
+        f"{FIRM_V1_WINDOW_START.isoformat()}.",
+    ),
+    end: str = typer.Option(
+        ...,
+        "--end",
+        help=f"Last decision date, {_DATE_FORMAT_HINT}, at most stage_a.data_end; the "
+        f"registered window ends {FIRM_V1_WINDOW_END.isoformat()}.",
+    ),
+    store_dir: Path = typer.Option(  # noqa: B008
+        ...,
+        "--store-dir",
+        help="Directory outside the repository holding one subdirectory per firm spec hash.",
+    ),
+    max_days: int | None = typer.Option(
+        None,
+        "--max-days",
+        min=1,
+        help="Write at most this many days in this call; rerun to resume (default: all).",
+    ),
+    lake_time: str | None = typer.Option(None, "--lake-time", help=_LAKE_TIME_HELP),
+    parallel_workers: int = typer.Option(
+        4,
+        min=1,
+        help="Concurrent manager-signal workers per decision day; not part of the spec.",
+    ),
+    set_override: list[str] = typer.Option(  # noqa: B008
+        [],
+        "--set",
+        help="Override one strategy constant for this record, as group.field=value; repeat "
+        "for several. Hashed settings enter the firm's spec; trials.ledger_path moves the "
+        "trial ledger. See agentic_trading/config.py for every key.",
+    ),
+) -> None:
+    """Record the registered firm (agentic-firm-v1) from --start to --end:
+    the Commander's daily pod targets written as a `decision_file.v1` trial
+    under --store-dir, resuming from its store.
+
+    The firm is the default roster without `roster.FIRM_V1_EXCLUDED_ANALYST_IDS`
+    and the default managers under a Commander weighting pods by
+    `ShrinkageWeight(Hedge())`, over `roster.FIRM_V1_UNIVERSE`. Loads the
+    universe's prices aligned on `stage_a.session_calendar`, from --start
+    minus `stage_a.warmup_days` calendar days to --end, and the risk-free
+    rate, then runs `firm_record.runner.run_firm_record`, all inside one
+    lake session cut at `stage_a.data_end`. The firm's hypothesis is
+    registered in the trial ledger at `trials.ledger_path` from its
+    registry file before the first day; without that file the record is
+    uncounted. Prints the result as JSON, which holds no performance
+    figure. Exits 2 on a usage error: a reversed window, one ending after
+    stage_a.data_end, a --store-dir inside the repository, a naive
+    --lake-time or a bad --set. `--set` overrides apply before any setting
+    is read."""
+    _apply_cli_overrides(set_override)
+    requested_lake_time = _parse_lake_time_flag(lake_time)
+    data_end = settings.stage_a.data_end
+    window_start = _parse_date_flag(start, "--start")
+    window_end = _parse_date_flag(end, "--end")
+    if window_start > window_end:
+        raise typer.BadParameter(
+            f"--start ({window_start.isoformat()}) is after --end ({window_end.isoformat()})."
+        )
+    if window_end > data_end:
+        raise typer.BadParameter(
+            f"--end ({window_end.isoformat()}) is after stage_a.data_end "
+            f"({data_end.isoformat()}); the holdout stays locked."
+        )
+    if store_dir.resolve().is_relative_to(_REPO_ROOT):
+        raise typer.BadParameter(
+            f"{store_dir} is inside the repository; give a directory outside it.",
+            param_hint="--store-dir",
+        )
+    analysts = build_default_analysts(excluded_analyst_ids=FIRM_V1_EXCLUDED_ANALYST_IDS)
+    commander = Commander(
+        managers=build_default_managers(analysts),
+        weighting_strategy=ShrinkageWeight(Hedge()),
+        parallel_workers=parallel_workers,
+    )
+    tickers = list(FIRM_V1_UNIVERSE)
+
+    configure_logging()
+    logger = get_logger(__name__)
+    logger.info(
+        "Firm record: %d instruments, %s to %s, store %s",
+        len(tickers),
+        window_start,
+        window_end,
+        store_dir,
+    )
+    with lake_session(requested_lake_time, data_end=data_end) as session:
+        typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
+        market_data, source_label = load_price_history_with_fallback(
+            tickers,
+            window_start,
+            window_end,
+            warmup_days=settings.stage_a.warmup_days,
+            align="sessions",
+            calendar=settings.stage_a.session_calendar,
+        )
+        typer.echo(f"Market data ready: {source_label}; {len(market_data)} rows.", err=True)
+        risk_free_rate_series = load_risk_free_rate_series(window_start, window_end)
+        lake_version = (
+            session.lake_version
+            if session.lake_version is not None
+            else provenance.lake_provenance().lake_version
+        )
+        result = run_firm_record(
+            commander,
+            tickers,
+            window_start,
+            window_end,
+            store_dir,
+            market_data,
+            lake_time=session.lake_time,
+            lake_version=lake_version,
+            quantcore_version=metadata.version("quantcore"),
+            risk_free_rate_series=risk_free_rate_series,
+            max_days=max_days,
+            ledger=TrialLedger(_REPO_ROOT / settings.trials.ledger_path, _REPO_ROOT),
+            repo_root=_REPO_ROOT,
+        )
+    typer.echo(result.model_dump_json(indent=2))
+
+
 def main(args: list[str] | None = None) -> None:
     app(args=args)
 
@@ -1043,3 +1180,7 @@ def experiment_main(args: list[str] | None = None) -> None:
 
 def stage_a_main(args: list[str] | None = None) -> None:
     stage_a_app(args=args)
+
+
+def firm_record_main(args: list[str] | None = None) -> None:
+    firm_record_app(args=args)

@@ -1,6 +1,7 @@
 # spec.py
 
-"""The frozen definition of one stage (a) trial and its hash.
+"""The frozen definition of one stage (a) trial and its hash, and of one
+firm record (`FirmSpec`, `FirmSpecRecord`), hashed the same way.
 
 `StageASpec` holds everything that defines a trial: the analyst (its
 `agent_id`, class and constructor parameters), the `settings` snapshot
@@ -144,6 +145,100 @@ class SpecRecord(BaseModel):
         expected = spec_hash(self.spec)
         if self.spec_hash != expected:
             raise ValueError(f"spec_hash {self.spec_hash} is not the spec's hash {expected}")
+        return self
+
+
+class FirmSpec(BaseModel):
+    """Everything that defines one firm record (a firm trial), the firm
+    counterpart of `StageASpec`; every field is hashed by
+    `firm_spec_hash`.
+
+    - `commander`: the Commander's class and the parameters that move its
+      allocation (its weighting strategy, pod-return lookback and drawdown
+      breaker), as JSON values;
+    - `roster`: each agent's `built_parameters()`, in roster order (each
+      manager followed by its analysts);
+    - `settings`: `settings` as JSON values, minus
+      `RUNTIME_SETTINGS_FIELDS` and any group they empty;
+    - `module_hashes`: dotted module name to the sha256 hex digest of its
+      source file, for every `agentic_trading` module loaded when the
+      record starts (the GUI and CLI aside), every agent's module, the
+      record's own modules and every `agentic_trading.agents` and
+      `agentic_trading.data` module reachable through imports from them;
+    - `universe`: the instrument ids the firm runs over;
+    - `window_start`, `window_end`: the first and last decision date,
+      inclusive;
+    - `decision_rule`: how the Commander's targets become decision rows;
+    - `quantcore_sha`: the commit the installed quantcore was built from;
+    - `lake_time`: the lake time T every read of the record is pinned to
+      (timezone-aware), since another lake time is another trial.
+
+    Raises `ValueError` when `window_start` is after `window_end`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    commander: dict[str, Any]
+    roster: list[dict[str, Any]]
+    settings: dict[str, Any]
+    module_hashes: dict[str, str]
+    universe: list[str]
+    window_start: date
+    window_end: date
+    decision_rule: str
+    quantcore_sha: str
+    lake_time: AwareDatetime
+
+    @model_validator(mode="after")
+    def _window_is_ordered(self) -> Self:
+        if self.window_start > self.window_end:
+            raise ValueError(
+                f"window_start {self.window_start.isoformat()} is after window_end "
+                f"{self.window_end.isoformat()}"
+            )
+        return self
+
+
+def canonical_firm_spec_json(spec: FirmSpec) -> str:
+    """`spec`'s canonical JSON: its JSON-mode dump with `universe` sorted,
+    through `canonical_json`; the roster keeps its order."""
+    payload = spec.model_dump(mode="json")
+    payload["universe"] = sorted(payload["universe"])
+    return canonical_json(payload)
+
+
+def firm_spec_hash(spec: FirmSpec) -> str:
+    """The sha256 hex digest of `canonical_firm_spec_json(spec)`, UTF-8
+    encoded: the firm trial's `config_hash` in the trial ledger."""
+    return hashlib.sha256(canonical_firm_spec_json(spec).encode("utf-8")).hexdigest()
+
+
+class FirmSpecRecord(BaseModel):
+    """The contents of one firm record's spec.json: `spec` and its
+    `spec_hash`, plus `lake_time` (the spec's lake time), `lake_version`,
+    `quantcore_version` and `git_sha` (the repository HEAD the record ran
+    from, `None` when unknown), recorded outside the hash. Raises
+    `ValueError` when `spec_hash` is not the hash of `spec` or `lake_time`
+    is not `spec.lake_time`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    spec: FirmSpec
+    spec_hash: str
+    lake_time: AwareDatetime
+    lake_version: str
+    quantcore_version: str
+    git_sha: str | None = None
+
+    @model_validator(mode="after")
+    def _hash_matches_spec(self) -> Self:
+        expected = firm_spec_hash(self.spec)
+        if self.spec_hash != expected:
+            raise ValueError(f"spec_hash {self.spec_hash} is not the spec's hash {expected}")
+        if self.lake_time != self.spec.lake_time:
+            raise ValueError(
+                f"lake_time {self.lake_time.isoformat()} is not the spec's lake time "
+                f"{self.spec.lake_time.isoformat()}"
+            )
         return self
 
 

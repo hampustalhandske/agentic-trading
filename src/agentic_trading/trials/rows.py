@@ -1,5 +1,5 @@
-"""The trial-ledger rows of this project: stage (a) signal batches and the imported record of
-past windows whose results were seen.
+"""The trial-ledger rows of this project: stage (a) signal batches, firm records and the imported
+record of past windows whose results were seen.
 
 Every hypothesis of the firm is counted in one family (`settings.trials.firm_family`), so a
 grade is deflated by the firm's whole trial count. A trial is keyed by
@@ -10,6 +10,10 @@ grade is deflated by the firm's whole trial count. A trial is keyed by
   config is the frozen `StageASpec`, window included, and its `config_hash` the spec hash. Each
   batch that writes a day records one row (`stage_a_trial_row`), so a rerun or a resumed batch
   is another row under the same key;
+- the firm is one hypothesis (`FIRM_HYPOTHESIS_ID`), declared by a hand-approved registry file
+  that is registered as it stands (`ensure_firm_registration`); its config is the frozen
+  `FirmSpec` and its `config_hash` the firm spec hash, and each record pass that writes a day
+  records one row (`firm_trial_row`);
 - each (window, issue) of `docs/prior_exposure.json`'s `results_seen` is its own key under one
   imported hypothesis (`imported_trial_rows`, `import_prior_exposure`), never merged with
   another; its other lists hold no result and count as no trial."""
@@ -26,10 +30,18 @@ from pydantic import BaseModel, ConfigDict
 from agentic_trading import provenance as code_provenance
 from agentic_trading.config import settings
 from agentic_trading.data.trading_calendar import sessions_between
-from agentic_trading.stage_a.spec import SpecRecord, canonical_spec_json
+from agentic_trading.stage_a.spec import (
+    FirmSpecRecord,
+    SpecRecord,
+    canonical_firm_spec_json,
+    canonical_spec_json,
+)
 from agentic_trading.trials.ledger import LedgerError, Registration, TrialLedger, TrialRow
 from agentic_trading.trials.registry import config_hash_of, file_registration
 
+# The registered firm's hypothesis id: its registry file is
+# `<settings.trials.registry_dir>/agentic-firm-v1.yaml`, approved by hand.
+FIRM_HYPOTHESIS_ID = "agentic-firm-v1"
 # The registry file's `kind` of a stage (a) hypothesis.
 _STAGE_A_KIND = "stage_a_signal_batch"
 # A stage (a) hypothesis's primary metric and its kind; `"return"` counts its trials in an
@@ -221,6 +233,95 @@ def stage_a_trial_row(
         hypothesis_id=hypothesis_id,
         family=family,
         config_json=canonical_spec_json(record.spec),
+        config_hash=record.spec_hash,
+        git_sha=provenance.agentic_sha or _UNKNOWN,
+        data_snapshot=f"{record.lake_time.isoformat()}|{record.lake_version}",
+        n=n_days,
+        metric_name=_SUBMITTED_METRIC,
+        metric_value=None,
+        ci_lo=None,
+        ci_hi=None,
+        p_value=None,
+        direction=_DIRECTION,
+        extra_json=_extra_json(provenance, imported=False),
+        **fields,
+    )
+
+
+def _registry_field(text: str, name: str) -> str | None:
+    """The value of the first `<name>: <value>` line of the registry file
+    `text`, with any `# comment` after it removed; `None` when no line has
+    it."""
+    prefix = f"{name}:"
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return line.removeprefix(prefix).split(" #", 1)[0].strip()
+    return None
+
+
+def ensure_firm_registration(
+    *, ledger: TrialLedger, repo_root: Path, family: str
+) -> Registration | None:
+    """The registration of the firm hypothesis `FIRM_HYPOTHESIS_ID`, recorded
+    in `ledger`, or `None` when its registry file
+    `<repo_root>/<settings.trials.registry_dir>/<FIRM_HYPOTHESIS_ID>.yaml`
+    (read at call time) does not exist. The firm's registry file is written
+    and approved by hand, never by this function; it is registered as it
+    stands, unless already recorded with the same hash.
+
+    Raises `LedgerError`, recording nothing, when the file's `id` line is
+    not `FIRM_HYPOTHESIS_ID`, its `family` line is not `family`, its
+    `registered_at` is not a timezone-aware ISO time, or the ledger refuses
+    the registration (the id registered with another hash)."""
+    path = Path(repo_root) / settings.trials.registry_dir / f"{FIRM_HYPOTHESIS_ID}.yaml"
+    if not path.exists():
+        return None
+    text = path.read_bytes().decode("utf-8", errors="replace")
+    declared_id = _registry_field(text, "id")
+    declared_family = _registry_field(text, "family")
+    if declared_id != FIRM_HYPOTHESIS_ID or declared_family != family:
+        raise LedgerError(
+            f"{path} declares id {declared_id!r} in family {declared_family!r}, not "
+            f"{FIRM_HYPOTHESIS_ID!r} in {family!r}"
+        )
+    stamp = _registry_field(text, "registered_at") or ""
+    try:
+        registered_at = datetime.fromisoformat(stamp)
+    except ValueError:
+        raise LedgerError(f"{path} has no ISO registered_at, got {stamp!r}") from None
+    if registered_at.tzinfo is None:
+        raise LedgerError(f"{path} has a registered_at without a UTC offset: {stamp!r}")
+    registration = file_registration(
+        path,
+        repo_root,
+        family=family,
+        registered_at=registered_at,
+        metric_kind=_registry_field(text, "metric_kind") or _METRIC_KIND,
+    )
+    ledger.register(registration)
+    return registration
+
+
+def firm_trial_row(
+    record: FirmSpecRecord,
+    family: str,
+    *,
+    n_days: int,
+    provenance: TrialProvenance,
+    run_at: datetime | None = None,
+) -> TrialRow:
+    """The trial row of one firm record pass of `record`, under
+    `FIRM_HYPOTHESIS_ID` in `family`, shaped as `stage_a_trial_row`'s:
+    `config_json` is `canonical_firm_spec_json(record.spec)` and
+    `config_hash` `record.spec_hash`; `n` is `n_days`, the sessions stored;
+    the metric is `"submitted"` with no value, since edgelab grades the
+    record. The firm's Sharpe, recorded elsewhere as
+    `"firm_sharpe_diagnostic"`, never enters this row."""
+    fields: dict[str, Any] = {} if run_at is None else {"run_at": run_at}
+    return TrialRow(
+        hypothesis_id=FIRM_HYPOTHESIS_ID,
+        family=family,
+        config_json=canonical_firm_spec_json(record.spec),
         config_hash=record.spec_hash,
         git_sha=provenance.agentic_sha or _UNKNOWN,
         data_snapshot=f"{record.lake_time.isoformat()}|{record.lake_version}",

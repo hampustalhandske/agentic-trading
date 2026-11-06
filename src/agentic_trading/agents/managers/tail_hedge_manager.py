@@ -1,5 +1,6 @@
 # tail_hedge_manager.py
 
+from collections.abc import Mapping
 from datetime import date, timedelta
 
 import pandas as pd
@@ -136,9 +137,17 @@ class TailHedgeManager(ManagerAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
         scoreboard: PerformanceScoreboard,
+        *,
+        carried: Mapping[str, list[ManagerSignal]] | None = None,
     ) -> list[PortfolioDecision]:
-        decisions = super().construct_portfolio(assets, market_data, as_of_date, scoreboard)
+        decisions = super().construct_portfolio(
+            assets, market_data, as_of_date, scoreboard, carried=carried
+        )
         underlying = TAIL_HEDGE_ASSETS[0]
+        if carried and underlying in carried:
+            # No SPY bar today: the held put stands, and the Commander
+            # carries its last target.
+            return decisions
         equity = next((decision for decision in decisions if decision.asset == underlying), None)
         if equity is None:
             return decisions

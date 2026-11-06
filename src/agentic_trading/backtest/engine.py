@@ -493,7 +493,12 @@ class BacktestEngine:
             }
         return performance
 
-    def run(self, on_day_complete: DayCompleteCallback | None = None) -> BacktestResult:
+    def run(
+        self,
+        on_day_complete: DayCompleteCallback | None = None,
+        *,
+        before_checkpoint: DayCompleteCallback | None = None,
+    ) -> BacktestResult:
         """Steps through every simulated day from start_date to end_date,
         point-in-time slicing data (see data/point_in_time.py), calling
         the Commander for decisions, applying them to the Portfolio, and
@@ -506,6 +511,12 @@ class BacktestEngine:
         that day's trades are applied — the hook a live progress UI hangs
         off of. Purely a notification; this method's own behavior does not
         depend on it being present.
+
+        `before_checkpoint`, if given, is called with the same arguments
+        once per simulated day after the day is fully accounted and before
+        the day is appended to the checkpoint, so what it writes is never
+        behind the checkpoint; an exception it raises stops the run with
+        the checkpoint still at the day before.
         """
         logger.info(
             "Backtest starting: assets=%s, %s to %s", self.assets, self.start_date, self.end_date
@@ -783,7 +794,17 @@ class BacktestEngine:
             trade_log.extend(expired)
             for trade in expired:
                 _charge(day_pod_costs.transaction_cost, trade.transaction_cost, None)
-            portfolio_value = self.portfolio.total_value(prices, marks)
+            # An asset without a close today (no bar on this session) is
+            # valued at its last close and never filled at that price; a
+            # future or FX pair has no price at all that day, so it is not
+            # re-marked and its P&L for the day is zero.
+            valuation_prices = _valuation_prices(
+                raw_market_data,
+                as_of_timestamp,
+                prices,
+                set(self.portfolio.marked_positions) if trades_marked else set(),
+            )
+            portfolio_value = self.portfolio.total_value(valuation_prices, marks)
             # A future held through a roll pays one round trip on its
             # notional, split across the pods whose contributions it holds.
             if trades_marked:
@@ -819,7 +840,7 @@ class BacktestEngine:
                 else 0
             )
             financing_cost = self.portfolio.apply_financing(
-                prices,
+                valuation_prices,
                 (
                     self._risk_free_rate_annual(previous_valuation_date)
                     if previous_valuation_date is not None
@@ -1021,6 +1042,8 @@ class BacktestEngine:
             )
             sizing_diagnostics.extend(day_sizing_diagnostics)
             pod_cost_days.append(day_pod_costs)
+            if before_checkpoint is not None:
+                before_checkpoint(day_index, len(days), as_of_timestamp.date(), portfolio_value)
             connection = self._checkpoint()
             if connection is not None:
                 risk_state = self._commander_risk_state()
@@ -1218,6 +1241,36 @@ def _holding_shares(
             if weight != 0.0:
                 shares.setdefault(asset, {})[pod_id] = abs(weight)
     return shares
+
+
+def _valuation_prices(
+    raw_market_data: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    prices: dict[str, float],
+    marked: set[str],
+) -> dict[str, float]:
+    """The prices a day's book is valued at: each of `prices` (the day's
+    closes) that is finite, and for each that is not (no bar that day) the
+    asset's last finite close before `as_of_date` in `raw_market_data`; an
+    asset with no close yet is left out, since nothing can have filled it.
+    An asset of `marked` (a held future or spot FX pair) without a finite
+    close is left out too: it keeps its mark, so its unsettled P&L that day
+    is zero. Equal to `prices` when every close is finite, and for a
+    single-asset frame."""
+    if not isinstance(raw_market_data.columns, pd.MultiIndex):
+        return dict(prices)
+    valued: dict[str, float] = {}
+    for asset, price in prices.items():
+        if math.isfinite(price):
+            valued[asset] = price
+            continue
+        if asset in marked:
+            continue
+        history = raw_market_data[(asset, "close")]
+        earlier = history[history.index < as_of_date].dropna()
+        if not earlier.empty:
+            valued[asset] = float(earlier.iloc[-1])
+    return valued
 
 
 def _lake_time_text(lake_time: datetime | None) -> str:

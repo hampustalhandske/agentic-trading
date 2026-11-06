@@ -1,5 +1,7 @@
 # stat_arb_manager.py
 
+from collections.abc import Mapping
+
 import pandas as pd
 from pydantic import PrivateAttr
 
@@ -16,7 +18,7 @@ from agentic_trading.agents.analysts.stat_arb_pod.pairs_cointegration_analyst im
     PairsCointegrationAnalyst,
 )
 from agentic_trading.agents.base import ManagerAgent
-from agentic_trading.agents.schemas import AgentSignal, PortfolioDecision
+from agentic_trading.agents.schemas import AgentSignal, ManagerSignal, PortfolioDecision
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
@@ -209,9 +211,13 @@ class StatArbManager(ManagerAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
         scoreboard: PerformanceScoreboard,
+        *,
+        carried: Mapping[str, list[ManagerSignal]] | None = None,
     ) -> list[PortfolioDecision]:
         self._maybe_rescreen_pairs(assets, market_data, as_of_date)
-        return super().construct_portfolio(assets, market_data, as_of_date, scoreboard)
+        return super().construct_portfolio(
+            assets, market_data, as_of_date, scoreboard, carried=carried
+        )
 
     def scale_factor(
         self,

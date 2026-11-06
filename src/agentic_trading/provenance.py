@@ -69,6 +69,17 @@ def _git_state() -> tuple[str | None, bool | None]:
     return sha.strip(), bool(status.strip())
 
 
+def source_tree_state() -> tuple[str | None, bool | None]:
+    """The HEAD sha and whether the source tree this package lives in (its
+    parent directory, `src/` in a checkout) has changes, untracked files
+    included; both `None` outside a git checkout."""
+    sha = _git_output("rev-parse", "HEAD")
+    status = _git_output("status", "--porcelain", "--", str(Path(__file__).resolve().parent.parent))
+    if sha is None or status is None:
+        return None, None
+    return sha.strip(), bool(status.strip())
+
+
 def quantcore_sha() -> str | None:
     """The VCS commit quantcore was installed from, read from its
     `direct_url.json`; `None` when quantcore was not installed from a VCS URL."""

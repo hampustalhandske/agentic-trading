@@ -183,6 +183,48 @@ class PortfolioDecision(BaseModel):
         }
 
 
+class PodTarget(BaseModel):
+    """One pod's part of the Commander's final target for one instrument on
+    one day (`Commander.pod_targets`).
+
+    `pod_id` is the manager's `agent_id`. `target_weight` is the pod's
+    contribution after firm limits, the short-premium cap and the leverage
+    clamp, so the targets of every pod for an instrument sum to that
+    instrument's `PortfolioDecision.target_weight`; for an option it is a
+    signed premium weight. `contributing_signals` are the pod's own signals
+    for the instrument. `instrument` is set on an option row, and `asset`
+    is then its `contract_id`. `delta_equiv_weight` is set on an option row
+    with a mark: `target_weight x delta x spot / mid`, the signed delta
+    exposure as a fraction of NAV (a long put is negative); `None`
+    otherwise. `mark_as_of` is the date of the option-chain snapshot that
+    mark rests on, `None` without one.
+
+    `held` is `True` when the pod keeps a target it set on an earlier day
+    rather than setting one: on a day its instrument has no bar
+    (`carried`), when its own sized weight is unchanged from the day
+    before (its no-trade band held it), and on a held option row whose
+    contract count is kept (`hold_contracts`). `carried` is `True` on a
+    day the instrument (or an option's underlying) has no bar: the pod's
+    target is its last decided one, carried forward."""
+
+    pod_id: str
+    asset: str
+    as_of_date: date
+    target_weight: float = Field(ge=-MAX_LEVERAGE, le=MAX_LEVERAGE)
+    contributing_signals: list[ManagerSignal]
+    instrument: OptionContract | None = None
+    delta_equiv_weight: float | None = None
+    mark_as_of: date | None = None
+    held: bool = False
+    carried: bool = False
+    hold_contracts: bool = False
+
+    @model_validator(mode="after")
+    def _instrument_matches_asset(self) -> "PodTarget":
+        _check_instrument_matches_asset(self.asset, self.instrument)
+        return self
+
+
 class TradeRecord(BaseModel):
     """One asset's realized position change for one day, produced by
     `Portfolio.apply_decision()`. The single source of truth for "what did

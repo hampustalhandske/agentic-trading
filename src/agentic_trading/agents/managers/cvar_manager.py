@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import date
 from typing import Literal
 
@@ -129,13 +130,22 @@ class ConditionalValueAtRiskManager(ManagerAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
         scoreboard: PerformanceScoreboard,
+        *,
+        carried: Mapping[str, list[ManagerSignal]] | None = None,
     ) -> list[PortfolioDecision]:
-        decisions = super().construct_portfolio(assets, market_data, as_of_date, scoreboard)
+        decisions = super().construct_portfolio(
+            assets, market_data, as_of_date, scoreboard, carried=carried
+        )
         day = as_of_date.date()
         equity_rows: list[PortfolioDecision] = []
         option_rows: list[PortfolioDecision] = []
         for decision in decisions:
             asset = decision.asset
+            if carried and asset in carried:
+                # No bar today: its option legs are held as they stand,
+                # and the Commander carries their last targets.
+                equity_rows.append(decision)
+                continue
             held = self._held.get(asset, _HeldExpression())
             in_scope = self.assets is None or asset in self.assets
             spot = raw_spot(market_data, as_of_date, asset) if in_scope else None

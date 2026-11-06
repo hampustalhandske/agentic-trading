@@ -9,7 +9,7 @@ import io
 import math
 import pickle
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date
 from typing import Any, Literal
 
@@ -346,7 +346,15 @@ class ManagerAgent(Agent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> list["AgentSignal"]:
-        """Gathers one AgentSignal from every analyst this manager owns"""
+        """Gathers one AgentSignal from every analyst this manager owns.
+        When `asset` has a missing close (NaN) on some row of a
+        (ticker, field) `market_data`, each analyst sees only the rows on
+        which `asset` has a close, every column kept, so no signal on
+        `asset` rests on a row without its bar."""
+        if (asset, "close") in market_data.columns:
+            closes = market_data[(asset, "close")]
+            if bool(closes.isna().any()):
+                market_data = market_data.loc[closes.notna()]
         signals = []
         for analyst in self.managed_analysts:
             try:
@@ -450,6 +458,8 @@ class ManagerAgent(Agent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
         scoreboard: "PerformanceScoreboard",
+        *,
+        carried: Mapping[str, list["ManagerSignal"]] | None = None,
     ) -> list["PortfolioDecision"]:
         """Turns this pod's own analysts' signals into a complete,
         risk-managed set of per-asset target weights — this manager's own
@@ -472,7 +482,14 @@ class ManagerAgent(Agent):
         no contributing signals, the same shape an insufficient-history
         day already produces, so an asset-class-scoped pod (see
         `self.assets`' own docstring) never runs its analysts against an
-        instrument it was never built for."""
+        instrument it was never built for.
+
+        `carried` maps each asset of `assets` without a bar on `as_of_date`
+        to the signals this pod's decision on it last carried. No analyst
+        is asked about such an asset: those signals form its view, so the
+        constructor sizes the other assets as it would with the asset
+        present, and its target is this pod's previous sized weight for it
+        (0 without one), carried forward into tomorrow's previous weights."""
         scoped_assets = (
             [asset for asset in assets if asset in self.assets]
             if self.assets is not None
@@ -494,9 +511,15 @@ class ManagerAgent(Agent):
 
         views: dict[str, PodView] = {}
         signals_by_asset: dict[str, list[ManagerSignal]] = {}
+        carried = carried or {}
         for asset in scoped_assets:
-            analyst_signals = self.collect_signals(asset, market_data, as_of_date)
-            manager_signals = self.evaluate(analyst_signals, market_data, as_of_date, scoreboard)
+            if asset in carried:
+                manager_signals = list(carried[asset])
+            else:
+                analyst_signals = self.collect_signals(asset, market_data, as_of_date)
+                manager_signals = self.evaluate(
+                    analyst_signals, market_data, as_of_date, scoreboard
+                )
             signals_by_asset[asset] = manager_signals
             active = [
                 signal
@@ -520,6 +543,9 @@ class ManagerAgent(Agent):
         sized_weights = self.portfolio_constructor.construct(
             views, returns_history, as_of_date, self._previous_weights
         )
+        for asset in scoped_assets:
+            if asset in carried:
+                sized_weights[asset] = self._previous_weights.get(asset, 0.0)
         self._previous_weights = dict(sized_weights)
 
         return [
