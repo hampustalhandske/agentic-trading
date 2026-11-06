@@ -1555,9 +1555,11 @@ def _firm_record_run(
     sharpe: float = 0.5,
     complete: bool = True,
     code: int = 0,
+    readme: str = "data\n",
 ) -> Any:
-    """A firm-record run directory holding a one-trial store and a
-    BacktestResult, and the CliRun that printed its FirmRecordResult."""
+    """A firm-record run directory holding a one-trial store (with a
+    nested `data/README.md` holding `readme`) and a BacktestResult, and
+    the CliRun that printed its FirmRecordResult."""
     spec_hash = "a" * 64
     trial = run_dir / "store" / spec_hash
     trial.mkdir(parents=True)
@@ -1570,6 +1572,8 @@ def _firm_record_run(
         }
     ).to_parquet(trial / "decisions.parquet")
     (trial / "progress.json").write_text('{"last_completed": "2010-01-04"}\n')
+    (trial / "data").mkdir()
+    (trial / "data" / "README.md").write_text(readme)
     (run_dir / ab.FIRM_RECORD_RESULT_FILE).write_text(
         f'{{\n  "start_date": "2010-01-04",\n  "final_sharpe_ratio": {sharpe}\n}}'
     )
@@ -1592,7 +1596,17 @@ def test_firm_record_comparison_needs_identical_files_and_result(
     same = ab.compare_firm_records(direct, _firm_record_run(ab, tmp_path / "same", True))
     assert same["identical"] and same["store"]["queries"] == 2
     assert same["direct"]["firm_record"]["spec_hash"] == "a" * 64
-    assert set(same["trial_dir"]["files"]) == {"decisions.parquet", "progress.json"}
+    assert set(same["trial_dir"]["files"]) == {
+        "data/README.md",
+        "decisions.parquet",
+        "progress.json",
+    }
+
+    nested = ab.compare_firm_records(
+        direct, _firm_record_run(ab, tmp_path / "nested", True, readme="other\n")
+    )
+    assert not nested["identical"] and nested["backtest_result"]["identical"]
+    assert not nested["trial_dir"]["files"]["data/README.md"]["identical"]
 
     weights = ab.compare_firm_records(
         direct, _firm_record_run(ab, tmp_path / "weights", True, weight=0.3)

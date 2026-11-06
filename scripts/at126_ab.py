@@ -1548,12 +1548,18 @@ def first_frame_difference(expected: pd.DataFrame, actual: pd.DataFrame) -> str:
     return "the files differ in bytes but not in their rows"
 
 
+def _relative_files(root: Path) -> set[str]:
+    """Each file under `root`, at any depth, as its POSIX path relative to `root`."""
+    return {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
+
+
 def compare_trial_dirs(expected: Path, actual: Path) -> dict[str, Any]:
-    """Each file of two trial directories, byte for byte: `identical` when
-    both hold the same file names with the same bytes, and per file
-    whether it matches, with where a differing Parquet or text file first
-    differs (`first_frame_difference`, `first_difference`)."""
-    names = sorted({path.name for path in (*expected.iterdir(), *actual.iterdir())})
+    """Each file of two trial directories, at any depth, byte for byte:
+    `identical` when both hold the same relative file paths with the same
+    bytes, and per relative path whether it matches, with where a
+    differing Parquet or text file first differs (`first_frame_difference`,
+    `first_difference`)."""
+    names = sorted(_relative_files(expected) | _relative_files(actual))
     files: dict[str, Any] = {}
     for name in names:
         left, right = expected / name, actual / name
@@ -1650,7 +1656,9 @@ def _firm_record_main(args: argparse.Namespace, extra: list[str]) -> int:
         command = firm_record_command(
             args.start_date, args.end_date, lake_time, store, run_dir, extra
         )
-        records.append(FirmRecordRun(run=_run_cli(command, store), run_dir=run_dir))
+        run = _run_cli(command, store)
+        (run_dir / "run.stderr").write_text(run.stderr)
+        records.append(FirmRecordRun(run=run, run_dir=run_dir))
     summary = {
         "lake_time": lake_time,
         "work_dir": str(work_dir),
