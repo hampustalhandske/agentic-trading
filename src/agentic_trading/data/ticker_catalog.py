@@ -176,6 +176,7 @@ CATALOG: tuple[TickerInfo, ...] = (
     TickerInfo(
         symbol="NG=F", name="Natural Gas Futures", asset_class="commodity", quote_type="FUTURE"
     ),
+    TickerInfo(symbol="HG=F", name="Copper Futures", asset_class="commodity", quote_type="FUTURE"),
     # --- forex (quoteType: CURRENCY) ---
     TickerInfo(symbol="EURUSD=X", name="EUR/USD", asset_class="forex", quote_type="CURRENCY"),
     TickerInfo(symbol="GBPUSD=X", name="GBP/USD", asset_class="forex", quote_type="CURRENCY"),

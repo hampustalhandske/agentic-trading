@@ -36,13 +36,14 @@ from agentic_trading.agents.schemas import (
     UnfilledOrder,
 )
 from agentic_trading.backtest import checkpoint_store
-from agentic_trading.backtest.portfolio import OptionPosition, Portfolio
+from agentic_trading.backtest.portfolio import MarkedPosition, OptionPosition, Portfolio
 from agentic_trading.backtest.resume_fingerprint import (
     agents_by_id,
     roster_fingerprint,
     settings_fingerprint,
 )
 from agentic_trading.config import settings
+from agentic_trading.data.instruments import currency_pair, is_marked
 from agentic_trading.data.loaders import lakehouse_loader
 from agentic_trading.data.loaders.option_marks import OptionMark, load_option_mark
 from agentic_trading.data.point_in_time import get_point_in_time_data
@@ -129,6 +130,7 @@ class BacktestEngine:
         resume: bool = False,
         risk_free_rate_series: pd.Series | None = None,
         benchmark_returns: pd.Series | None = None,
+        policy_rates: pd.DataFrame | None = None,
     ) -> None:
         self.commander = commander
         self.portfolio = portfolio
@@ -159,6 +161,14 @@ class BacktestEngine:
         # `final_information_ratio` is computed against. Left `None`
         # (rather than an arbitrary stand-in) when no caller supplies one.
         self.benchmark_returns = benchmark_returns
+        # Central-bank policy rates as annual decimals, one column per
+        # currency (ISO code), indexed by observation date (e.g.
+        # `data/loaders/macro_loader.py::load_fx_policy_rates`). A spot FX
+        # pair accrues carry over each gap between valuation dates at its
+        # base minus its quote currency's rate in force on the earlier date
+        # (`_carry_rates`). Omitted, or without either currency of a pair,
+        # the pair accrues no carry.
+        self.policy_rates = policy_rates
         self._checkpoint_connection: sqlite3.Connection | None = None
         # Previous day's close mark per option contract, for attribution
         # (log of today's mid over yesterday's); a contract seen for the
@@ -175,6 +185,29 @@ class BacktestEngine:
             return 0.0
         daily_rate = float(self.risk_free_rate_series.get(pd.Timestamp(day), 0.0))
         return max(daily_rate * settings.firm.trading_days_per_year, 0.0)
+
+    def _carry_rates(self, day: date) -> dict[str, float]:
+        """Each spot FX pair among `assets` mapped to its base currency's
+        policy rate minus its quote currency's in `policy_rates`, each the
+        latest observation dated on or before `day`. A pair missing either
+        rate has no entry; empty without `policy_rates`."""
+        if self.policy_rates is None:
+            return {}
+        rates = self.policy_rates.sort_index()
+        position = int(rates.index.searchsorted(pd.Timestamp(day), side="right"))
+        in_force = rates.iloc[:position].ffill()
+        if in_force.empty:
+            return {}
+        latest = in_force.iloc[-1]
+        carry: dict[str, float] = {}
+        for asset in self.assets:
+            pair = currency_pair(asset)
+            if pair is None or pair.base not in latest.index or pair.quote not in latest.index:
+                continue
+            differential = float(latest[pair.base]) - float(latest[pair.quote])
+            if math.isfinite(differential):
+                carry[asset] = differential
+        return carry
 
     def _risk_free_accrual_array(self, valuation_dates: list[date]) -> np.ndarray:
         """Risk-free accrual over each gap between consecutive
@@ -509,6 +542,9 @@ class BacktestEngine:
 
         run_config = self._run_config() if self.checkpoint_path is not None else {}
         checkpoint = self._restore_checkpoint(run_config)
+        # Only a run that trades a future or a spot FX pair can hold a
+        # marked position to settle, roll or accrue carry on.
+        trades_marked = any(is_marked(asset) for asset in self.assets)
         start_day_index = int(checkpoint.get("next_day_index", 0)) if checkpoint else 0
 
         scoreboard = PerformanceScoreboard(self.track_record)
@@ -583,6 +619,10 @@ class BacktestEngine:
             self.portfolio.cash = float(portfolio_state["cash"])
             self.portfolio.positions = {
                 asset: float(quantity) for asset, quantity in portfolio_state["positions"].items()
+            }
+            self.portfolio.marked_positions = {
+                asset: MarkedPosition.model_validate(position)
+                for asset, position in portfolio_state.get("marked_positions", {}).items()
             }
             self.portfolio.option_positions = {
                 contract_id: OptionPosition.model_validate(position)
@@ -735,17 +775,41 @@ class BacktestEngine:
                     underlying_prices[underlying] = spot
             trades_before = len(trade_log)
             unfilled_before = len(unfilled_orders)
+            # Futures and spot FX settle the day's move into cash at the
+            # close, before the day is valued.
+            if trades_marked:
+                self.portfolio.settle_marked_positions(prices)
             expired = self.portfolio.settle_expired(marks, as_of_timestamp.date())
             trade_log.extend(expired)
             for trade in expired:
                 _charge(day_pod_costs.transaction_cost, trade.transaction_cost, None)
             portfolio_value = self.portfolio.total_value(prices, marks)
+            # A future held through a roll pays one round trip on its
+            # notional, split across the pods whose contributions it holds.
+            if trades_marked:
+                rolled = self.portfolio.charge_rolls(
+                    as_of_timestamp.date(),
+                    prices,
+                    _frame_field(raw_market_data, self.assets, as_of_timestamp, "roll"),
+                    portfolio_value,
+                )
+                held = (
+                    pod_cost_days[-1 - self.execution_lag_days].contributions
+                    if len(pod_cost_days) > self.execution_lag_days
+                    else None
+                )
+                for trade in rolled:
+                    trade_log.append(trade)
+                    _charge_fill(day_pod_costs, trade, _holding_shares(held))
+                    portfolio_value -= trade.transaction_cost + trade.slippage_cost
             # Financing (net of the interest cash earns) accrues over the
             # calendar days since the previous simulated day (a
             # Friday-to-Monday gap accrues three days), on the book carried
             # across that gap, at the risk-free rate in force on the
             # previous valuation date, when the gap starts. It is booked
             # after the mark so the day's recorded value already reflects it.
+            # Spot FX carry accrues over the same gap at the policy-rate
+            # differential in force on that previous date.
             previous_valuation_date = (
                 portfolio_value_history[-1][0] if portfolio_value_history else None
             )
@@ -764,6 +828,10 @@ class BacktestEngine:
                 days_held,
                 spots=underlying_prices,
             )
+            if trades_marked and previous_valuation_date is not None:
+                financing_cost += self.portfolio.apply_carry(
+                    self._carry_rates(previous_valuation_date), days_held
+                )
             total_financing_cost += financing_cost
             portfolio_value -= financing_cost
             portfolio_values.append(portfolio_value)
@@ -1113,6 +1181,43 @@ class BacktestEngine:
             pod_costs=_pod_cost_attribution(pod_cost_days, len(portfolio_value_history)),
             unfactored_split_moves=lakehouse_loader.unfactored_split_move_registry(),
         )
+
+
+def _frame_field(
+    raw_market_data: pd.DataFrame, assets: list[str], as_of_date: pd.Timestamp, field: str
+) -> dict[str, float]:
+    """Each of `assets`' finite `field` value on `as_of_date` in the
+    run's `(ticker, field)` frame (a future's `roll` count). An asset
+    without the field, a NaN value, a date the frame does not hold and a
+    frame without `(ticker, field)` columns all give no entry."""
+    if not isinstance(raw_market_data.columns, pd.MultiIndex):
+        return {}
+    if as_of_date not in raw_market_data.index:
+        return {}
+    values: dict[str, float] = {}
+    for asset in assets:
+        if (asset, field) not in raw_market_data.columns:
+            continue
+        value = float(cast(float, raw_market_data.loc[as_of_date, (asset, field)]))
+        if math.isfinite(value):
+            values[asset] = value
+    return values
+
+
+def _holding_shares(
+    contributions: dict[str, dict[str, float]] | None,
+) -> dict[str, dict[str, float]] | None:
+    """`contributions` (pod id to asset to contribution) turned into asset
+    to pod id to |contribution|, the shares `_charge_fill` splits a held
+    position's cost by; `None` for `None`."""
+    if contributions is None:
+        return None
+    shares: dict[str, dict[str, float]] = {}
+    for pod_id, weights in contributions.items():
+        for asset, weight in weights.items():
+            if weight != 0.0:
+                shares.setdefault(asset, {})[pod_id] = abs(weight)
+    return shares
 
 
 def _lake_time_text(lake_time: datetime | None) -> str:

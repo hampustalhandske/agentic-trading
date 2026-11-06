@@ -2,9 +2,10 @@
 
 """Every data read a run makes, from the lakehouse's HTTP API (`POST
 /v1/sql`, through `data/lakehouse_client.py`): equities/ETFs/indices/
-commodities/FX/crypto prices, point-in-time S&P 500 membership, option
-chains, dividends, CFTC positioning, earnings, SIC codes, FRED series, Ken
-French factors, FINRA short interest and SEC company facts. The service
+FX/crypto prices, continuous futures prices and roll days, point-in-time
+S&P 500 membership, option chains, dividends, CFTC positioning, earnings,
+SIC codes, FRED series, BIS central-bank policy rates, Ken French factors,
+FINRA short interest and SEC company facts. The service
 URL and token come from `LAKEHOUSE_API_URL` and `LAKEHOUSE_API_TOKEN`
 (process environment or the repo-root `.env`). Every query passes its
 values as `?` parameters.
@@ -60,6 +61,7 @@ from pydantic import BaseModel, PrivateAttr
 
 from agentic_trading.agents.schemas import UnfactoredSplitMove
 from agentic_trading.config import _env_value
+from agentic_trading.data.instruments import futures_root
 from agentic_trading.data.lakehouse_client import Lake, LakehouseError
 from agentic_trading.data.point_in_time import assert_point_in_time
 from agentic_trading.data.trading_calendar import add_sessions, is_session, next_session
@@ -131,6 +133,7 @@ def _lake() -> Lake:
 
 # Every table the loader's queries read.
 READ_TABLES: tuple[str, ...] = (
+    "bis_observations",
     "cftc_cot_disaggregated",
     "cftc_cot_publication",
     "cftc_cot_tff",
@@ -144,6 +147,8 @@ READ_TABLES: tuple[str, ...] = (
     "famafrench_returns",
     "finra_short_interest",
     "fred_vintages",
+    "futures_continuous_daily",
+    "futures_roll_calendar",
     "instrument_prices",
     "option_chain_history",
     "sec_company_facts_log",
@@ -1708,6 +1713,104 @@ def load_price_history_from_lakehouse(
     return combined
 
 
+def load_futures_price_history_from_lakehouse(
+    tickers: list[str], start: date, end: date
+) -> pd.DataFrame | None:
+    """A `MultiIndex(ticker, field)` frame (`open`/`close`/`raw_close`/
+    `volume`/`log_return`/`roll`) for every futures ticker in `tickers`
+    (`data/instruments.futures_root`; `CL=F` reads root `CL`) that
+    `futures_continuous_daily` covers between `start` and `end` inclusive,
+    or `None` if it covers none of them. Raises `ValueError` for a ticker
+    that is not a future.
+
+    `close` is a level built by chaining the daily returns of
+    `ratio_adjusted_close` (bars with a null or non-positive value are left
+    out) from the first bar's `unadjusted_close`, with the return of a roll
+    day whose `roll_gap_known` is false set to 0, since that day's change
+    of the adjusted close still holds the gap between the two contracts.
+    The level's returns are therefore the returns of the contract held, and
+    a later roll's back-adjustment of earlier rows does not change it.
+    `open` is that same level: the continuous series carries closes only,
+    so a future fills at the close of its fill day. `raw_close` is the
+    front contract's `unadjusted_close`, `volume` is NaN (the series has
+    none), and `log_return` is the log of each level over the previous
+    one (NaN on the first bar).
+
+    `roll` is 1.0 on a bar whose `futures_roll_calendar` front contract
+    differs from the calendar's previous session's, read from the calendar
+    up to `end` so a roll on the first bar is seen, and 0.0 otherwise
+    (also on a bar the calendar has no row for).
+
+    Point-in-time on the bar date, as prices are: only bars dated on or
+    before `end` are read. Self-asserts point-in-time on the frame's date
+    index against `end` before returning."""
+    _guard_data_end(end, "load_futures_price_history_from_lakehouse")
+    ticker_by_root: dict[str, str] = {}
+    for ticker in tickers:
+        root = futures_root(ticker)
+        if root is None:
+            raise ValueError(f"{ticker} is not a futures ticker")
+        ticker_by_root[root] = ticker
+    placeholders = ", ".join("?" for _ in ticker_by_root)
+    query = f"""
+        SELECT prices.root, prices.date, prices.unadjusted_close,
+               prices.ratio_adjusted_close, prices.is_roll_day, prices.roll_gap_known,
+               COALESCE(calendar.front_contract <> calendar.previous_front, FALSE) AS roll
+        FROM (
+            SELECT root, date, unadjusted_close, ratio_adjusted_close,
+                   is_roll_day, roll_gap_known
+            FROM {_table_sql("futures_continuous_daily")}
+            WHERE root IN ({placeholders})
+              AND date BETWEEN ? AND ?
+              AND ratio_adjusted_close > 0
+        ) AS prices
+        LEFT JOIN (
+            SELECT root, date, front_contract,
+                   lag(front_contract) OVER (PARTITION BY root ORDER BY date) AS previous_front
+            FROM {_table_sql("futures_roll_calendar")}
+            WHERE root IN ({placeholders})
+              AND date <= ?
+        ) AS calendar
+          ON calendar.root = prices.root AND calendar.date = prices.date
+        ORDER BY prices.root, prices.date
+    """
+    roots = list(ticker_by_root)
+    frame = _query(query, [*roots, start.isoformat(), end.isoformat(), *roots, end.isoformat()])
+    if frame.empty:
+        return None
+    frame["date"] = pd.to_datetime(frame["date"])
+
+    per_ticker: dict[str, pd.DataFrame] = {}
+    for lake_root, group in frame.groupby("root", sort=True):
+        index = pd.DatetimeIndex(group["date"])
+        adjusted = group["ratio_adjusted_close"].to_numpy(dtype=np.float64)
+        daily = np.zeros(len(adjusted))
+        daily[1:] = adjusted[1:] / adjusted[:-1] - 1.0
+        unknown_gap = group["is_roll_day"].eq(True).to_numpy(dtype=bool) & group[
+            "roll_gap_known"
+        ].eq(False).fillna(False).to_numpy(dtype=bool)
+        daily[unknown_gap] = 0.0
+        unadjusted = group["unadjusted_close"].astype(float)
+        unadjusted = unadjusted.where(unadjusted > 0.0)
+        base = float(unadjusted.iloc[0]) if pd.notna(unadjusted.iloc[0]) else float(adjusted[0])
+        close = pd.Series(base * np.cumprod(1.0 + daily), index=index)
+        per_ticker[ticker_by_root[str(lake_root)]] = pd.DataFrame(
+            {
+                "open": close,
+                "close": close,
+                "raw_close": unadjusted.to_numpy(),
+                "volume": np.nan,
+                "log_return": np.log(close / close.shift(1)),
+                "roll": group["roll"].astype(float).to_numpy(),
+            },
+            index=index,
+        )
+
+    combined = pd.concat(per_ticker, axis=1)
+    assert_point_in_time(combined, end)
+    return combined
+
+
 def load_raw_close_from_lakehouse(
     ticker: str, as_of_date: date, lookback_days: int
 ) -> float | None:
@@ -1822,6 +1925,90 @@ _KEN_FRENCH_FREQUENCY = "daily"
 # Ken French posts each month's daily factors after that month closes, so
 # the end of the following month is the conservative public date.
 _KEN_FRENCH_PUBLICATION_LAG_MONTHS = 1
+
+
+# BIS reference area of each currency's central-bank policy rate in the
+# `WS_CBPOL` dataflow (`XM` is the euro area, the ECB's rate).
+_BIS_POLICY_RATE_AREAS = {
+    "AUD": "AU",
+    "CAD": "CA",
+    "CHF": "CH",
+    "EUR": "XM",
+    "GBP": "GB",
+    "JPY": "JP",
+    "NOK": "NO",
+    "NZD": "NZ",
+    "SEK": "SE",
+    "USD": "US",
+}
+_BIS_POLICY_RATE_DATAFLOW = "WS_CBPOL"
+_BIS_DAILY = "D"
+# Calendar days before `start` that `load_policy_rates_from_lakehouse`
+# also reads, so the rate in force on `start` is there when `start` has
+# no observation of its own (BIS stores no weekend or holiday rows).
+POLICY_RATE_LOOKBACK_DAYS = 14
+
+
+def load_policy_rates_from_lakehouse(
+    currencies: list[str], start: date, end: date
+) -> pd.DataFrame | None:
+    """Central-bank policy rates for `currencies` (ISO codes) as annual
+    decimals, from the daily (`freq = 'D'`) `WS_CBPOL` observations in
+    `bis_observations` (per cent per year, divided by 100), dated from
+    `POLICY_RATE_LOOKBACK_DAYS` calendar days before `start` to `end`
+    inclusive: one column per currency in the order given, one row per
+    observation date on an ascending `DatetimeIndex` named `date`, NaN
+    where a currency has no observation that day. A daily policy rate is
+    the rate in force on its date. Returns `None` when no currency has an
+    observation in the window; raises `ValueError` for a currency without
+    a BIS reference area here (`_BIS_POLICY_RATE_AREAS`).
+
+    Point-in-time on the observation date: BIS publishes no release date
+    and a rate is announced before it takes effect, so an observation
+    dated on or before `end` is read as known on its date; inside a
+    `lake_session` the value is the one the lake held at its lake time
+    (BIS revisions are kept as later versions). Self-asserts
+    point-in-time on the index against `end` before returning."""
+    _guard_data_end(end, "load_policy_rates_from_lakehouse")
+    wanted = list(dict.fromkeys(currencies))
+    currency_by_area: dict[str, str] = {}
+    for currency in wanted:
+        area = _BIS_POLICY_RATE_AREAS.get(currency)
+        if area is None:
+            raise ValueError(f"no BIS policy-rate reference area for currency {currency}")
+        currency_by_area[area] = currency
+    placeholders = ", ".join("?" for _ in currency_by_area)
+    query = f"""
+        SELECT ref_area, date, value
+        FROM {_table_sql("bis_observations")}
+        WHERE dataflow = ?
+          AND freq = ?
+          AND ref_area IN ({placeholders})
+          AND date BETWEEN ? AND ?
+          AND value IS NOT NULL
+        ORDER BY date, ref_area
+    """
+    window_start = start - timedelta(days=POLICY_RATE_LOOKBACK_DAYS)
+    frame = _query(
+        query,
+        [
+            _BIS_POLICY_RATE_DATAFLOW,
+            _BIS_DAILY,
+            *currency_by_area,
+            window_start.isoformat(),
+            end.isoformat(),
+        ],
+    )
+    if frame.empty:
+        return None
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame["currency"] = frame["ref_area"].map(currency_by_area)
+    rates = frame.pivot(index="date", columns="currency", values="value").astype(float) / 100.0
+    rates = rates.reindex(columns=wanted).sort_index()
+    rates.index.name = "date"
+    rates.columns.name = None
+    assert_point_in_time(rates, end)
+    return rates
 
 
 def ken_french_public_date(day: date) -> date:

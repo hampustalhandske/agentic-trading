@@ -1,5 +1,6 @@
 """Unit tests for agentic_trading.data.ticker_catalog."""
 
+from agentic_trading.agents.managers.cross_asset_manager import COMMODITIES_ASSETS, FX_ASSETS
 from agentic_trading.data.ticker_catalog import (
     CATALOG,
     TICKER_GROUPS,
@@ -59,3 +60,15 @@ def test_ticker_groups_are_non_empty_and_reference_stock_symbols() -> None:
     for group in TICKER_GROUPS:
         assert group.symbols
         assert set(group.symbols) <= catalog_symbols
+
+
+def test_every_cross_asset_ticker_is_catalogued() -> None:
+    """Each future and FX pair the cross-asset pod trades has its catalog row."""
+    for symbol in COMMODITIES_ASSETS:
+        info = get_ticker_info(symbol)
+        assert info is not None, symbol
+        assert (info.asset_class, info.quote_type) == ("commodity", "FUTURE")
+    for symbol in FX_ASSETS:
+        info = get_ticker_info(symbol)
+        assert info is not None, symbol
+        assert (info.asset_class, info.quote_type) == ("forex", "CURRENCY")

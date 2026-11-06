@@ -64,6 +64,12 @@ _EMPTY_CASES: dict[str, Callable[[], Any]] = {
     "load_price_history_from_lakehouse": lambda: lakehouse_loader.load_price_history_from_lakehouse(
         ["AAPL", "MSFT"], _START, _END
     ),
+    "load_futures_price_history_from_lakehouse": lambda: (
+        lakehouse_loader.load_futures_price_history_from_lakehouse(["CL=F", "GC=F"], _START, _END)
+    ),
+    "load_policy_rates_from_lakehouse": lambda: lakehouse_loader.load_policy_rates_from_lakehouse(
+        ["USD", "JPY"], _START, _END
+    ),
     "load_raw_close_from_lakehouse": lambda: lakehouse_loader.load_raw_close_from_lakehouse(
         "AAPL", _AS_OF, 10
     ),

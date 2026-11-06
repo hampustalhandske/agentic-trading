@@ -8,6 +8,7 @@ import pandas as pd
 from agentic_trading.agents._market_math import clamp
 from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.data.instruments import ACCOUNT_CURRENCY, currency_pair
 from agentic_trading.data.loaders.lakehouse_loader import (
     DEFAULT_COT_LOOKBACK_DAYS,
     DEFAULT_COT_TICKER_BY_ASSET,
@@ -30,6 +31,12 @@ class COTPositioningAnalyst(AnalystAgent):
     its own trailing window. Extreme net-long positioning is treated as
     contrarian-bearish (a crowded long is exposed to unwind risk), extreme
     net-short as contrarian-bullish — not a trend-following read.
+
+    An FX pair's COT market is the CME future on its non-USD currency,
+    long that currency against USD. For a USD-quoted pair (EURUSD=X) a
+    long future is long the pair; for a USD-base pair (USDJPY=X, read from
+    the long-JPY future) it is short the pair, so the z-score's sign is
+    flipped before it sets the direction.
 
     `cot_ticker_by_asset` remaps `asset` to whatever ticker COT actually
     tracks positioning for (only needed for the Rates pod's Treasury
@@ -105,14 +112,24 @@ class COTPositioningAnalyst(AnalystAgent):
             )
 
         z_score = (float(window[-1]) - mean) / std
+        # The currency future of an FX pair is long the pair's non-USD
+        # currency against USD: long a USD-quoted pair, short a USD-base one.
+        pair = currency_pair(asset)
+        inverted = pair is not None and pair.base == ACCOUNT_CURRENCY
+        pair_z_score = -z_score if inverted else z_score
         direction: Literal["long", "short", "flat"]
-        if z_score > 0.0:
+        if pair_z_score > 0.0:
             direction = "short"  # crowded long -> contrarian bearish
-        elif z_score < 0.0:
+        elif pair_z_score < 0.0:
             direction = "long"  # crowded short -> contrarian bullish
         else:
             direction = "flat"
         confidence = clamp(abs(z_score) / 3.0)
+        inversion = (
+            f"; the future is long {pair.quote}, so {asset} reads it inverted"
+            if pair is not None and inverted
+            else ""
+        )
 
         return AgentSignal(
             agent_id=self.agent_id,
@@ -122,7 +139,7 @@ class COTPositioningAnalyst(AnalystAgent):
             confidence=confidence,
             rationale=(
                 f"COT net positioning z-score={z_score:.2f} for {cot_ticker} "
-                f"vs its own {_RISK_WINDOW}-report trailing window"
+                f"vs its own {_RISK_WINDOW}-report trailing window{inversion}"
             ),
             source_as_of=source_as_of,
         )

@@ -2,13 +2,18 @@
 
 """FRED series identifiers shared across analysts and the backtest's
 risk-free-rate report, plus the risk-free rate series itself, read from
-the lakehouse's `fred_vintages` table."""
+the lakehouse's `fred_vintages` table, and the BIS policy rates the
+backtest accrues spot FX carry from."""
 
 from datetime import date
 
 import pandas as pd
 
-from agentic_trading.data.loaders.lakehouse_loader import load_fred_series_from_lakehouse
+from agentic_trading.data.instruments import currency_pair
+from agentic_trading.data.loaders.lakehouse_loader import (
+    load_fred_series_from_lakehouse,
+    load_policy_rates_from_lakehouse,
+)
 
 DGS3MO = "DGS3MO"
 DGS2 = "DGS2"
@@ -66,3 +71,41 @@ def load_risk_free_rate_series(start_date: date, end_date: date) -> pd.Series:
     daily_rate = annualized_percent / 100.0 / TRADING_DAYS_PER_YEAR
     calendar = pd.date_range(start_date, end_date, freq="D")
     return daily_rate.reindex(calendar).ffill()
+
+
+def load_fx_policy_rates(
+    assets: list[str], start_date: date, end_date: date
+) -> pd.DataFrame | None:
+    """The BIS central-bank policy rates of every currency of the spot FX
+    pairs among `assets` (`data/instruments.currency_pair`), as
+    `load_policy_rates_from_lakehouse` reads them for `start_date` to
+    `end_date`: annual decimals, one column per currency, one row per
+    observation date. This is the backtest engine's `policy_rates`; a
+    pair's carry on a day is its base currency's rate minus its quote
+    currency's, each the latest observation on or before that day.
+
+    Returns `None` when `assets` holds no FX pair. Raises `ValueError`
+    naming every currency with no observation in the window, so a pair is
+    never carried at an invented rate."""
+    currencies = sorted(
+        {
+            currency
+            for asset in assets
+            if (pair := currency_pair(asset)) is not None
+            for currency in (pair.base, pair.quote)
+        }
+    )
+    if not currencies:
+        return None
+    rates = load_policy_rates_from_lakehouse(currencies, start_date, end_date)
+    missing = [
+        currency
+        for currency in currencies
+        if rates is None or currency not in rates.columns or rates[currency].isna().all()
+    ]
+    if rates is None or missing:
+        raise ValueError(
+            f"lakehouse has no BIS policy rate for {missing} over {start_date.isoformat()} to "
+            f"{end_date.isoformat()}; FX carry cannot be accrued without it"
+        )
+    return rates

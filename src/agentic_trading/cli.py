@@ -27,7 +27,10 @@ from agentic_trading.data.loaders.lakehouse_loader import (
     lake_session,
     verify_rebuilt_whole_builds,
 )
-from agentic_trading.data.loaders.macro_loader import load_risk_free_rate_series
+from agentic_trading.data.loaders.macro_loader import (
+    load_fx_policy_rates,
+    load_risk_free_rate_series,
+)
 
 # NOTE: adjust this import to wherever ticker_catalog.py actually lives in the
 # repo (it reads as a data/ module from its own docstring — "data/loader.py"
@@ -470,6 +473,7 @@ def run(
             market_data_source=source_label,
             execution_lag_days=settings.firm.execution_lag_days,
             risk_free_rate_series=load_risk_free_rate_series(parsed_start_date, parsed_end_date),
+            policy_rates=load_fx_policy_rates(resolved_assets, parsed_start_date, parsed_end_date),
         )
         try:
             result = engine.run()
@@ -693,6 +697,8 @@ def experiment(
         # S&P 500 buy-and-hold's own daily returns as the market benchmark
         # information_ratio is computed against.
         risk_free_rate_series = load_risk_free_rate_series(parsed_train_start, parsed_test_end)
+        # The BIS policy rates every FX pair's carry accrues from, shared the same way.
+        policy_rates = load_fx_policy_rates(resolved_assets, parsed_train_start, parsed_test_end)
         sp500_frame, _sp500_source = load_price_history_with_fallback(
             [SP500_BENCHMARK_TICKER],
             parsed_train_start,
@@ -725,6 +731,7 @@ def experiment(
                 ),
                 resume=resume,
                 risk_free_rate_series=risk_free_rate_series,
+                policy_rates=policy_rates,
                 benchmark_returns=benchmark_returns,
             )
 
@@ -763,6 +770,7 @@ def experiment(
                     market_data_source=source_label,
                     execution_lag_days=resolved_execution_lag_days,
                     risk_free_rate_series=risk_free_rate_series,
+                    policy_rates=policy_rates,
                     benchmark_returns=benchmark_returns,
                 )
                 baseline_results[strategy] = baseline_engine.run().model_dump(mode="json")
@@ -785,6 +793,7 @@ def experiment(
                     market_data_source=source_label,
                     execution_lag_days=resolved_execution_lag_days,
                     risk_free_rate_series=risk_free_rate_series,
+                    policy_rates=policy_rates,
                     benchmark_returns=benchmark_returns,
                 )
                 isolated_results[f"analyst:{analyst.agent_id}"] = isolated_engine.run().model_dump(
@@ -811,6 +820,7 @@ def experiment(
                     market_data_source=source_label,
                     execution_lag_days=resolved_execution_lag_days,
                     risk_free_rate_series=risk_free_rate_series,
+                    policy_rates=policy_rates,
                     benchmark_returns=benchmark_returns,
                 )
                 isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump(

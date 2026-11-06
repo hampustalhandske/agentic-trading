@@ -9,6 +9,20 @@
  "frozen_on": "2026-10-27",
  "log_views": "each <view>_log has the same columns as <view> (contract CHANGELOG)",
  "views": {
+  "bis_observations": {
+   "dataflow": "VARCHAR",
+   "series_key": "VARCHAR",
+   "period": "VARCHAR",
+   "date": "DATE",
+   "ref_area": "VARCHAR",
+   "freq": "VARCHAR",
+   "value": "DOUBLE",
+   "obs_status": "VARCHAR",
+   "pre_break_value": "DOUBLE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
   "cftc_cot_disaggregated": {
    "cftc_contract_market_code": "VARCHAR",
    "contract_market_name": "VARCHAR",
@@ -220,6 +234,32 @@
    "series_id": "VARCHAR",
    "table": "VARCHAR",
    "value": "DOUBLE"
+  },
+  "futures_continuous_daily": {
+   "root": "VARCHAR",
+   "date": "DATE",
+   "front_contract": "VARCHAR",
+   "unadjusted_close": "DOUBLE",
+   "ratio_adjusted_close": "DOUBLE",
+   "diff_adjusted_close": "DOUBLE",
+   "is_roll_day": "BOOLEAN",
+   "roll_return": "DOUBLE",
+   "roll_gap_known": "BOOLEAN",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "futures_roll_calendar": {
+   "root": "VARCHAR",
+   "date": "DATE",
+   "front_contract": "VARCHAR",
+   "front_expiry": "DATE",
+   "second_contract": "VARCHAR",
+   "second_expiry": "DATE",
+   "roll_rule": "VARCHAR",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
   },
   "instrument_prices": {
    "adj_close": "DOUBLE",

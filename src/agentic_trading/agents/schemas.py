@@ -195,7 +195,11 @@ class TradeRecord(BaseModel):
     per-share premium, `contracts` is the signed contract delta of the
     fill and `premium` its signed cash flow (negative when premium is
     paid, positive when received). An "expire" record is the settlement
-    of a position at intrinsic value on or after its expiry.
+    of a position at intrinsic value on or after its expiry. A "roll"
+    record is a held future's round trip from its front contract to the
+    next (`Portfolio.charge_rolls`): the position is unchanged, `notional`
+    is the notional of both legs, and its costs are the legs' commission
+    and slippage.
 
     `reference_price` is the price the fill is measured against before
     any execution cost: the market price handed to the fill for an
@@ -203,14 +207,16 @@ class TradeRecord(BaseModel):
     (`None` on a record that does not carry one). `transaction_cost` is
     the commission. `slippage_cost` and `impact_cost` are an equity
     fill's |delta_shares| x `reference_price` x `slippage_bps` and
-    x `impact_bps`, over 10,000; `spread_cost` is an option fill's
+    x `impact_bps`, over 10,000 (for a future or spot FX fill,
+    |delta_shares| x the USD value of one unit at `reference_price`
+    instead; see `data/instruments.unit_value_usd`); `spread_cost` is an option fill's
     |contracts| x |price - reference_price| x the contract multiplier.
     Every cost is in currency, already in the fill's cash flow, and 0 on
     a hold or expiry."""
 
     as_of_date: date
     asset: str
-    action: Literal["buy", "sell", "hold", "expire"]
+    action: Literal["buy", "sell", "hold", "expire", "roll"]
     target_weight: float = Field(ge=-MAX_LEVERAGE, le=MAX_LEVERAGE)
     previous_weight: float
     target_shares: float

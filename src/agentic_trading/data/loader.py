@@ -11,8 +11,10 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
+from agentic_trading.data.instruments import futures_root
 from agentic_trading.data.loaders.lakehouse_loader import (
     _guard_data_end,
+    load_futures_price_history_from_lakehouse,
     load_price_history_from_lakehouse,
 )
 from agentic_trading.data.trading_calendar import sessions_between
@@ -60,6 +62,14 @@ def load_price_history_with_fallback(
       backtest engine's callers pass this, because the engine fills and
       marks every ticker on every bar and so needs a close for each.
 
+    A futures ticker (`data/instruments.futures_root`) is read from the
+    continuous futures series
+    (`lakehouse_loader.load_futures_price_history_from_lakehouse`), whose
+    level is both what the analysts read and what the book earns; every
+    other ticker from `load_price_history_from_lakehouse`. A future's
+    `roll` field counts the rolls since the previous returned row, so a
+    roll on a row the alignment drops lands on the next row kept.
+
     Lakehouse-only: this project never calls a live price API or
     fabricates data during a run. Raises `ValueError` naming whichever
     tickers the lakehouse doesn't cover for the requested range —
@@ -81,7 +91,19 @@ def load_price_history_with_fallback(
         raise ValueError("warmup_days must be non-negative")
     data_start = start - timedelta(days=warmup_days)
 
-    lake_frame = load_price_history_from_lakehouse(list(tickers), data_start, end)
+    futures = [ticker for ticker in tickers if futures_root(ticker) is not None]
+    others = [ticker for ticker in tickers if futures_root(ticker) is None]
+    parts = []
+    if others:
+        parts.append(load_price_history_from_lakehouse(others, data_start, end))
+    if futures:
+        parts.append(load_futures_price_history_from_lakehouse(futures, data_start, end))
+    priced = [part for part in parts if part is not None]
+    lake_frame: pd.DataFrame | None = None
+    if len(priced) == 1:
+        lake_frame = priced[0]
+    elif priced:
+        lake_frame = pd.concat(priced, axis=1, sort=True)
     lake_tickers = set(lake_frame.columns.get_level_values(0)) if lake_frame is not None else set()
     missing_tickers = [ticker for ticker in tickers if ticker not in lake_tickers]
     if lake_frame is None or missing_tickers:
@@ -100,7 +122,27 @@ def load_price_history_with_fallback(
             f"lakehouse price data for {tickers} was empty over "
             f"{data_start.isoformat()} to {end.isoformat()}"
         )
-    return frame, "lakehouse data"
+    return _with_rolls_since_previous_row(frame, lake_frame, futures), "lakehouse data"
+
+
+def _with_rolls_since_previous_row(
+    frame: pd.DataFrame, lake_frame: pd.DataFrame, futures: list[str]
+) -> pd.DataFrame:
+    """`frame` (rows selected from `lake_frame`) with each of `futures`'
+    `roll` field replaced by the rolls in `lake_frame` after the previous
+    row of `frame` up to and including this one; the first row keeps its
+    own count (0.0 when the ticker has no bar there). A futures ticker
+    without a `roll` field is left as is."""
+    rolled = [ticker for ticker in futures if (ticker, "roll") in lake_frame.columns]
+    if not rolled:
+        return frame
+    frame = frame.copy()
+    for ticker in rolled:
+        rolls = lake_frame[(ticker, "roll")].fillna(0.0)
+        since_previous = rolls.cumsum().reindex(frame.index).diff()
+        since_previous.iloc[0] = float(rolls.loc[frame.index[0]])
+        frame[(ticker, "roll")] = since_previous
+    return frame
 
 
 def _align_on_sessions(frame: pd.DataFrame, tickers: list[str], calendar: str) -> pd.DataFrame:
