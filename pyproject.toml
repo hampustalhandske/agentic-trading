@@ -12,6 +12,7 @@ dependencies = [
     "pandas-stubs>=3.0.5.260730",
     "pyarrow>=25.0.1",
     "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
     "quantcore",
     "scipy>=1.18.1",
     "streamlit>=1.62.0",
@@ -48,6 +49,7 @@ dev = [
     "mypy>=1.11",
     "pytest>=8.3",
     "ruff>=0.6",
+    "types-pyyaml>=6.0.12.20261103",
 ]
 
 [tool.ruff]
