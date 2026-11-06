@@ -210,8 +210,9 @@ def test_source_ids_as_of_on_an_empty_record() -> None:
 
 
 def test_history_for_cost_does_not_grow_with_other_sources_history() -> None:
-    """200k records over 50 sources: 1000 windowed lookups stay far below
-    what a scan of the full log per call would take."""
+    """200k records over 50 sources: 1000 windowed lookups, timed after the
+    record is built, finish within 0.2 s. A scan of the full log per call
+    takes several milliseconds each, seconds in total."""
     rng = random.Random(42)
     source_ids = [f"source-{index:02d}" for index in range(50)]
     days = 1000
@@ -248,4 +249,4 @@ def test_history_for_cost_does_not_grow_with_other_sources_history() -> None:
         track_record.history_for(source_id, as_of_date, lookback_days, source_type)
     elapsed = time.perf_counter() - started
 
-    assert elapsed < 2.0
+    assert elapsed < 0.2

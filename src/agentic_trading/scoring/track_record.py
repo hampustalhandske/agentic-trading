@@ -48,6 +48,25 @@ class _SourceHistory:
         ]
 
 
+def _index_into(
+    by_source: dict[str, _SourceHistory],
+    by_source_and_type: dict[tuple[str, str], _SourceHistory],
+    entry: PerformanceRecord,
+) -> None:
+    """Appends `entry` to its `source_id` history and to its
+    `(source_id, source_type)` history in the given dicts, creating
+    either history on first use."""
+    history = by_source.get(entry.source_id)
+    if history is None:
+        history = by_source[entry.source_id] = _SourceHistory()
+    history.append(entry)
+    key = (entry.source_id, entry.source_type)
+    typed_history = by_source_and_type.get(key)
+    if typed_history is None:
+        typed_history = by_source_and_type[key] = _SourceHistory()
+    typed_history.append(entry)
+
+
 class TrackRecord:
     """Append-only log of realized, attributable performance for every
     analyst and manager in the system.
@@ -60,10 +79,17 @@ class TrackRecord:
     `_entries` is the full log in insertion order. Beside it sits an index
     of the same records keyed by `source_id` and by `(source_id,
     source_type)`, so per-source lookups cost the size of that source's
-    history rather than the whole log. `_entries` is a property: assigning
-    it (as `restore` does) rebuilds the index, and every lookup first
-    rebuilds the index if the log's length no longer matches what was
-    indexed, which covers a caller appending to the list in place.
+    history rather than the whole log.
+
+    The index follows the log through `record`, `restore` and any
+    assignment to `_entries`, each of which updates or rebuilds it. Beyond
+    those, the only change it detects is a change in the log's length:
+    every lookup rebuilds the index when `len(_entries)` differs from the
+    count indexed, which covers appending, extending, popping or clearing
+    the list in place. An in-place edit that keeps the length (replacing
+    or reordering items) is not detected, nor is a change to a recorded
+    record's `source_id`, `source_type` or `as_of_date`; records must not
+    be changed once recorded.
     """
 
     def __init__(self) -> None:
@@ -83,23 +109,18 @@ class TrackRecord:
         self._rebuild_index()
 
     def _rebuild_index(self) -> None:
-        self._by_source = {}
-        self._by_source_and_type = {}
-        self._indexed_count = 0
+        """Indexes the whole log into new dicts and a new count, and
+        assigns them to the instance only once complete, so the index
+        attributes never hold a partly built index."""
+        by_source: dict[str, _SourceHistory] = {}
+        by_source_and_type: dict[tuple[str, str], _SourceHistory] = {}
+        indexed_count = 0
         for entry in self._log:
-            self._index(entry)
-
-    def _index(self, entry: PerformanceRecord) -> None:
-        by_source = self._by_source.get(entry.source_id)
-        if by_source is None:
-            by_source = self._by_source[entry.source_id] = _SourceHistory()
-        by_source.append(entry)
-        key = (entry.source_id, entry.source_type)
-        by_type = self._by_source_and_type.get(key)
-        if by_type is None:
-            by_type = self._by_source_and_type[key] = _SourceHistory()
-        by_type.append(entry)
-        self._indexed_count += 1
+            _index_into(by_source, by_source_and_type, entry)
+            indexed_count += 1
+        self._by_source = by_source
+        self._by_source_and_type = by_source_and_type
+        self._indexed_count = indexed_count
 
     def _sync_index(self) -> None:
         """Rebuilds the index when the log's length differs from what was
@@ -114,7 +135,8 @@ class TrackRecord:
         as_of_date — that is the caller's responsibility."""
         self._sync_index()
         self._log.append(entry)
-        self._index(entry)
+        _index_into(self._by_source, self._by_source_and_type, entry)
+        self._indexed_count += 1
 
     @property
     def entries(self) -> list[PerformanceRecord]:
