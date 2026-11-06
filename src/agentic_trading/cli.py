@@ -529,7 +529,7 @@ def run(
             end_date=parsed_end_date,
             assets=inputs.assets,
             market_data_source=inputs.market_data_source,
-            execution_lag_days=inputs.execution_lag_days,
+            execution_lag_days=settings.firm.execution_lag_days,
             risk_free_rate_series=inputs.risk_free_rate_series,
             policy_rates=inputs.policy_rates,
             benchmark_returns=inputs.benchmark_returns,
@@ -784,7 +784,7 @@ def experiment(
                 end_date=end,
                 assets=inputs.assets,
                 market_data_source=inputs.market_data_source,
-                execution_lag_days=inputs.execution_lag_days,
+                execution_lag_days=settings.firm.execution_lag_days,
                 checkpoint_path=checkpoint_path,
                 resume=resume_checkpoint,
                 risk_free_rate_series=inputs.risk_free_rate_series,
@@ -1116,8 +1116,11 @@ def firm_record(
     minus `stage_a.warmup_days` calendar days to --end, each of
     `roster.FIRM_V1_EQUITIES` by its `roster.FIRM_V1_EQUITY_SECURITY_IDS`
     id from `equity_daily_from_bars` and every other instrument by ticker,
-    and the risk-free rate and the spot FX pairs' BIS policy rates for
-    --start to --end. Before anything is written, checks the universe's price coverage
+    the risk-free rate for --start to --end, and the spot FX pairs' BIS
+    policy rates for --start to --end plus the loader's look-back of
+    `lakehouse_loader.POLICY_RATE_LOOKBACK_DAYS` (14) calendar days before
+    --start, so the rate in force on --start is there. Before anything is
+    written, checks the universe's price coverage
     (`backtest.preflight.check_price_coverage`): each firm equity needs a
     bar on every session from --start to --end bar the
     `firm.known_price_gaps`, and every other instrument a bar near both

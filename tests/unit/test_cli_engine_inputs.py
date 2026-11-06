@@ -15,11 +15,13 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
+from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.roster import FIRM_V1_EQUITY_SECURITY_IDS, FIRM_V1_UNIVERSE
 from agentic_trading.agents.schemas import BacktestResult
+from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystCommander
 from agentic_trading.backtest.engine_inputs import EngineInputs, load_engine_inputs
 from agentic_trading.backtest.preflight import PreflightReport
-from agentic_trading.cli import app, firm_record_app
+from agentic_trading.cli import app, experiment_app, firm_record_app
 from agentic_trading.config import settings, temporary_overrides
 from agentic_trading.data.loader import DEFAULT_BACKTEST_WARMUP_DAYS
 from agentic_trading.firm_record.runner import FirmRecordResult, run_firm_record
@@ -48,6 +50,10 @@ _ENGINE_VIEW: dict[str, Callable[[dict[str, Any]], Any]] = {
     "policy_rates": lambda kwargs: kwargs["policy_rates"],
     "benchmark_returns": lambda kwargs: kwargs["benchmark_returns"],
     "starting_cash": lambda kwargs: kwargs["portfolio"].cash,
+}
+# The engine's costs, which it reads from `settings.firm` at use time rather than from its
+# inputs.
+_COSTS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "commission_rate": lambda kwargs: kwargs["portfolio"].commission_rate,
     "slippage_bps": lambda kwargs: kwargs["portfolio"].slippage_bps,
     "execution_lag_days": lambda kwargs: kwargs["execution_lag_days"],
@@ -91,7 +97,13 @@ def test_both_cli_paths_hand_the_engine_the_same_inputs(
     builds receives the same value of every input field: the risk-free and policy rates read
     once per run for the window, the prices, the source and the firm's costs."""
     with (
-        temporary_overrides({"firm.commission_rate": 0.002, "firm.slippage_bps": 3.0}),
+        temporary_overrides(
+            {
+                "firm.commission_rate": 0.002,
+                "firm.slippage_bps": 3.0,
+                "firm.execution_lag_days": 0,
+            }
+        ),
         patch(
             "agentic_trading.backtest.engine_inputs.load_price_history_with_fallback",
             return_value=(_MARKET, "lakehouse data"),
@@ -184,21 +196,23 @@ def test_both_cli_paths_hand_the_engine_the_same_inputs(
     assert firm_kwargs["policy_rates"] is _POLICY_RATES
     assert single_kwargs["risk_free_rate_series"] is _RISK_FREE
     assert firm_kwargs["risk_free_rate_series"] is _RISK_FREE
-    assert single_kwargs["portfolio"].commission_rate == pytest.approx(0.002)
-    assert firm_kwargs["portfolio"].slippage_bps == pytest.approx(3.0)
+    expected_costs = {"commission_rate": 0.002, "slippage_bps": 3.0, "execution_lag_days": 0}
+    for cost, view in _COSTS.items():
+        assert view(single_kwargs) == view(firm_kwargs) == pytest.approx(expected_costs[cost])
 
 
 def test_load_engine_inputs_reads_every_input_for_the_run() -> None:
     """Prices over the window and its warm-up with the given alignment, the risk-free rate and
-    the policy rates over the window, the benchmark's close-to-close returns, and the costs as
-    `settings.firm` holds them at the call."""
+    the policy rates over the window, the benchmark's close-to-close returns, and the starting
+    cash as `settings.firm` holds it at the call; the book's costs are `settings.firm`'s when
+    the book is made."""
     benchmark = pd.DataFrame(
         {("^GSPC", "close"): [100.0, 102.0, 101.0]},
         index=pd.DatetimeIndex(["2010-01-04", "2010-01-05", "2010-01-06"]),
     )
     prices = MagicMock(side_effect=[(_MARKET, "lakehouse data"), (benchmark, "lakehouse data")])
     with (
-        temporary_overrides({"firm.execution_lag_days": 0, "firm.starting_cash": 5_000.0}),
+        temporary_overrides({"firm.starting_cash": 5_000.0}),
         patch("agentic_trading.backtest.engine_inputs.load_price_history_with_fallback", prices),
         patch(
             "agentic_trading.backtest.engine_inputs.load_risk_free_rate_series",
@@ -235,7 +249,7 @@ def test_load_engine_inputs_reads_every_input_for_the_run() -> None:
     assert inputs.policy_rates is _POLICY_RATES
     assert inputs.benchmark_returns is not None
     assert inputs.benchmark_returns.tolist() == pytest.approx([0.02, 101.0 / 102.0 - 1.0])
-    assert (inputs.starting_cash, inputs.execution_lag_days) == (5_000.0, 0)
+    assert inputs.starting_cash == 5_000.0
     assert inputs.data_loader([], _START, _END) is _MARKET
     book = inputs.portfolio()
     assert (book.cash, book.positions, book.commission_rate, book.slippage_bps) == (
@@ -244,6 +258,9 @@ def test_load_engine_inputs_reads_every_input_for_the_run() -> None:
         settings.firm.commission_rate,
         settings.firm.slippage_bps,
     )
+    with temporary_overrides({"firm.commission_rate": 0.004, "firm.slippage_bps": 8.0}):
+        later = inputs.portfolio()
+    assert (later.commission_rate, later.slippage_bps) == (0.004, 8.0)
 
 
 def test_engine_inputs_refuse_a_pair_without_policy_rates() -> None:
@@ -260,3 +277,75 @@ def test_engine_inputs_refuse_a_pair_without_policy_rates() -> None:
         EngineInputs(assets=["SPY"], market_data=_MARKET, market_data_source="x").policy_rates
         is None
     )
+
+
+def test_every_experiment_engine_gets_the_rates_and_the_benchmark(
+    tmp_path: Path, preflight_lake: Any
+) -> None:
+    """Each experiment engine (both phases, every baseline and every isolated analyst and
+    manager run) receives the policy rates and the benchmark returns; the calibration and
+    test phases keep their own checkpoint and --resume, and no other engine checkpoints."""
+    benchmark = pd.DataFrame(
+        {("^GSPC", "close"): [100.0, 101.0, 102.0, 103.0]},
+        index=pd.DatetimeIndex(["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]),
+    )
+    calibration, test = str(tmp_path / "calibration.json"), str(tmp_path / "test.json")
+    with (
+        patch(
+            "agentic_trading.backtest.engine_inputs.load_price_history_with_fallback",
+            return_value=(benchmark, "lakehouse data"),
+        ),
+        patch(
+            "agentic_trading.backtest.engine_inputs.load_risk_free_rate_series",
+            return_value=_RISK_FREE,
+        ),
+        patch(
+            "agentic_trading.backtest.engine_inputs.load_fx_policy_rates",
+            return_value=_POLICY_RATES,
+        ) as policy,
+        patch(
+            "agentic_trading.cli.check_data_availability",
+            return_value=PreflightReport(checked_at=date(2024, 1, 2), results=[]),
+        ),
+        patch("agentic_trading.cli.BacktestEngine") as engine_cls,
+    ):
+        engine_cls.return_value.run.return_value = _result()
+        result = runner.invoke(
+            experiment_app,
+            [
+                "EURUSD=X",
+                "AAPL",
+                "--train-start",
+                "2024-01-02",
+                "--train-end",
+                "2024-01-05",
+                "--test-start",
+                "2024-01-08",
+                "--test-end",
+                "2024-01-12",
+                "--calibration-checkpoint",
+                calibration,
+                "--test-checkpoint",
+                test,
+                "--resume",
+                "--include-isolated",
+                "--yes",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    policy.assert_called_once_with(["EURUSD=X", "AAPL"], date(2024, 1, 2), date(2024, 1, 12))
+    calls = [call.kwargs for call in engine_cls.call_args_list]
+    commanders = [type(kwargs["commander"]) for kwargs in calls]
+    assert commanders[:2] == [Commander, Commander]
+    assert commanders[2:6] == [BaselineCommander] * 4
+    assert SingleAnalystCommander in commanders[6:] and Commander in commanders[6:]
+    expected_benchmark = benchmark["^GSPC"]["close"].pct_change().dropna()
+    for kwargs in calls:
+        assert kwargs["policy_rates"] is _POLICY_RATES
+        _same(kwargs["benchmark_returns"], expected_benchmark)
+    phases = [
+        (kwargs["start_date"], kwargs["checkpoint_path"], kwargs["resume"]) for kwargs in calls
+    ]
+    assert phases[:2] == [(date(2024, 1, 2), calibration, True), (date(2024, 1, 8), test, True)]
+    assert all(checkpoint is None and not resume for _, checkpoint, resume in phases[2:])

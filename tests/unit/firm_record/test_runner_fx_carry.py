@@ -7,7 +7,7 @@ anything is written."""
 
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,7 @@ from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.backtest.engine_inputs import EngineInputs
 from agentic_trading.backtest.portfolio import Portfolio
+from agentic_trading.data.instruments import currency_pair
 from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.firm_record import runner as runner_module
 from agentic_trading.firm_record.runner import FirmRecordResult, run_firm_record
@@ -35,8 +36,28 @@ _SESSIONS = pd.DatetimeIndex(sessions_between(_START, _END))
 _USD_RATE, _JPY_RATE = 0.05, 0.001
 
 
-class _LongAnalyst(AnalystAgent):
-    agent_id: str = "long_stub_analyst"
+class _CarryCase(NamedTuple):
+    """A record over one `pair` held in `direction`, its first close near `level`, at the
+    policy rates `base_rate` and `quote_rate`; `usd_base` when one unit held is one USD."""
+
+    pair: str
+    direction: Literal["long", "short"]
+    level: float
+    base_rate: float
+    quote_rate: float
+    usd_base: bool
+
+
+_CASES = [
+    _CarryCase("USDJPY=X", "long", 120.0, _USD_RATE, _JPY_RATE, usd_base=True),
+    _CarryCase("USDJPY=X", "short", 120.0, _USD_RATE, _JPY_RATE, usd_base=True),
+    _CarryCase("EURUSD=X", "long", 1.08, 0.0005, _USD_RATE, usd_base=False),
+]
+
+
+class _StubAnalyst(AnalystAgent):
+    agent_id: str = "fx_stub_analyst"
+    direction: Literal["long", "short"] = "long"
 
     def generate_signal(
         self, asset: str, market_data: pd.DataFrame, as_of_date: pd.Timestamp
@@ -45,7 +66,7 @@ class _LongAnalyst(AnalystAgent):
             agent_id=self.agent_id,
             asset=asset,
             as_of_date=as_of_date.date(),
-            direction="long",
+            direction=self.direction,
             confidence=0.5,
             rationale="stub",
         )
@@ -61,10 +82,10 @@ class _PassThroughManager(ManagerAgent):
         return 1.0
 
 
-def _commander() -> Commander:
+def _commander(direction: Literal["long", "short"] = "long") -> Commander:
     manager = _PassThroughManager(
         agent_id="fx_manager",
-        managed_analysts=[_LongAnalyst()],
+        managed_analysts=[_StubAnalyst(direction=direction)],
         weighting_strategy=EqualWeight(),
         portfolio_constructor=_ViewConstructor(),
         assets=None,
@@ -72,38 +93,47 @@ def _commander() -> Commander:
     return Commander(managers=[manager], weighting_strategy=EqualWeight())
 
 
-def _frame() -> pd.DataFrame:
+def _frame(pair: str = _PAIR, level: float = 120.0) -> pd.DataFrame:
     index = _WARMUP.append(_SESSIONS)
     rng = np.random.default_rng(7)
-    close = pd.Series(120.0 * np.exp(np.cumsum(rng.normal(0.0, 0.004, len(index)))), index)
+    close = pd.Series(level * np.exp(np.cumsum(rng.normal(0.0, 0.004, len(index)))), index)
     return pd.DataFrame(
         {
-            (_PAIR, "open"): close,
-            (_PAIR, "close"): close,
-            (_PAIR, "log_return"): np.log(close / close.shift(1)),
+            (pair, "open"): close,
+            (pair, "close"): close,
+            (pair, "log_return"): np.log(close / close.shift(1)),
         }
     )
 
 
-def _rates(usd: float, jpy: float) -> pd.DataFrame:
-    """One policy-rate observation per currency, in force from before the warm-up."""
+def _rates(base_rate: float, quote_rate: float, pair: str = _PAIR) -> pd.DataFrame:
+    """One policy-rate observation for each currency of `pair`, in force from before the
+    warm-up."""
+    pair_currencies = currency_pair(pair)
+    assert pair_currencies is not None
     return pd.DataFrame(
-        {"USD": [usd], "JPY": [jpy]}, index=pd.DatetimeIndex(["2015-11-30"], name="date")
+        {pair_currencies.base: [base_rate], pair_currencies.quote: [quote_rate]},
+        index=pd.DatetimeIndex(["2015-11-30"], name="date"),
     )
 
 
-def _inputs(policy_rates: pd.DataFrame) -> EngineInputs:
+def _inputs(policy_rates: pd.DataFrame, pair: str = _PAIR, level: float = 120.0) -> EngineInputs:
     return EngineInputs(
-        assets=_UNIVERSE,
-        market_data=_frame(),
+        assets=[pair],
+        market_data=_frame(pair, level),
         market_data_source="lakehouse data",
         policy_rates=policy_rates,
     )
 
 
-def _run(store_dir: Path, inputs: EngineInputs, **kwargs: Any) -> FirmRecordResult:
+def _run(
+    store_dir: Path,
+    inputs: EngineInputs,
+    direction: Literal["long", "short"] = "long",
+    **kwargs: Any,
+) -> FirmRecordResult:
     return run_firm_record(
-        _commander(), _UNIVERSE, _START, _END, store_dir, inputs,
+        _commander(direction), list(inputs.assets), _START, _END, store_dir, inputs,
         lake_time=_T, lake_version="lake", quantcore_version="0.3.1", **kwargs,
     )  # fmt: skip
 
@@ -127,26 +157,42 @@ def _portfolio(payload: dict[str, Any]) -> Portfolio:
     )
 
 
-def test_a_record_over_a_pair_accrues_its_carry(tmp_path: Path) -> None:
-    """The pair is first held from the second session, a Friday; on the Monday after it the
-    book is worth its USD notional x (USD rate - JPY rate) x 3 / 365 more than the same record
-    at zero policy rates, which matches it to the cent up to the Friday."""
+@pytest.mark.parametrize("case", _CASES, ids=["long-usdjpy", "short-usdjpy", "long-eurusd"])
+def test_a_record_over_a_pair_accrues_its_carry(tmp_path: Path, case: _CarryCase) -> None:
+    """The pair is first held from the second session, a Friday. On the Monday after it the
+    book differs from the same record at zero policy rates by the position's signed USD
+    notional x (base rate - quote rate) x 3 / 365: credited on a long USDJPY (USD above JPY),
+    debited on a short one, and debited on a long EURUSD (EUR below USD) over a notional of
+    its quantity x Monday's close, the mark the position is settled to before carry accrues.
+    The two records match up to the Friday."""
     friday, monday = _SESSIONS[1].date(), _SESSIONS[2].date()
     assert (friday.weekday(), (monday - friday).days) == (4, 3)
+    rated = _rates(case.base_rate, case.quote_rate, case.pair)
 
     carried_dir = tmp_path / "carried"
-    paused = _run(carried_dir, _inputs(_rates(_USD_RATE, _JPY_RATE)), max_days=2)
-    held = _portfolio(_checkpoint(carried_dir, paused)).marked_positions[_PAIR].quantity
-    carried = _run(carried_dir, _inputs(_rates(_USD_RATE, _JPY_RATE)))
-    flat = _run(tmp_path / "flat", _inputs(_rates(0.0, 0.0)))
+    paused = _run(carried_dir, _inputs(rated, case.pair, case.level), case.direction, max_days=2)
+    held = _portfolio(_checkpoint(carried_dir, paused)).marked_positions[case.pair].quantity
+    carried = _run(carried_dir, _inputs(rated, case.pair, case.level), case.direction)
+    flat = _run(
+        tmp_path / "flat",
+        _inputs(_rates(0.0, 0.0, case.pair), case.pair, case.level),
+        case.direction,
+    )
 
-    assert paused.last_completed == friday and held > 0.0
+    assert paused.last_completed == friday
+    assert held > 0.0 if case.direction == "long" else held < 0.0
     assert carried.complete and flat.complete
     carried_values = _values(_checkpoint(carried_dir, carried))
     flat_values = _values(_checkpoint(tmp_path / "flat", flat))
     assert carried_values[friday] == pytest.approx(flat_values[friday], abs=1e-6)
-    # USDJPY's base is USD, so one unit held is one USD of notional.
-    expected = held * (_USD_RATE - _JPY_RATE) * 3 / 365.0
+    # One unit of a USD-base pair is one USD; one unit of a USD-quoted pair is worth its price.
+    monday_close = float(
+        _frame(case.pair, case.level).loc[pd.Timestamp(monday), (case.pair, "close")]
+    )
+    notional = held if case.usd_base else held * monday_close
+    expected = notional * (case.base_rate - case.quote_rate) * 3 / 365.0
+    # A position earns carry when its sign matches the rate differential's, and pays it otherwise.
+    assert (expected < 0.0) == ((case.direction == "short") != (case.base_rate < case.quote_rate))
     assert carried_values[monday] - flat_values[monday] == pytest.approx(expected, rel=1e-9)
 
 
@@ -165,9 +211,6 @@ def test_a_pair_without_policy_rates_is_refused_before_anything_is_written(
         policy_rates=None,
         benchmark_returns=None,
         starting_cash=1_000_000.0,
-        commission_rate=0.0,
-        slippage_bps=0.0,
-        execution_lag_days=1,
     )
 
     with pytest.raises(ValueError, match=r"spot FX pair\(s\) \['USDJPY=X'\]"):
@@ -180,7 +223,10 @@ def test_inputs_for_another_universe_are_refused(tmp_path: Path) -> None:
     other = EngineInputs(assets=["SPY"], market_data=_frame(), market_data_source="lakehouse data")
 
     with pytest.raises(ValueError, match="not the universe"):
-        _run(tmp_path, other)
+        run_firm_record(
+            _commander(), _UNIVERSE, _START, _END, tmp_path, other,
+            lake_time=_T, lake_version="lake", quantcore_version="0.3.1",
+        )  # fmt: skip
     assert list(tmp_path.iterdir()) == []
 
 

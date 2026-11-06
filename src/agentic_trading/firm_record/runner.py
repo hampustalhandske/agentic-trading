@@ -255,8 +255,8 @@ def run_firm_record(
     Runs the engine on `inputs` (`backtest.engine_inputs.load_engine_inputs`
     builds them), whose assets are `universe` and whose `market_data` is
     aligned on the session calendar, covering the window and its warm-up.
-    The book starts at `inputs.starting_cash` with its commission and
-    slippage, fills `inputs.execution_lag_days` after each decision,
+    The book starts at `inputs.starting_cash` with the firm's commission and
+    slippage, fills `settings.firm.execution_lag_days` after each decision,
     accrues `inputs.risk_free_rate_series` on cash and each spot FX pair's
     carry from `inputs.policy_rates`. The spec is recorded with `lake_time`
     (aware), `lake_version` and `quantcore_version`. With a `ledger`,
@@ -410,7 +410,7 @@ def run_firm_record(
                 end_date=window_end,
                 assets=aligned.assets,
                 market_data_source=aligned.market_data_source,
-                execution_lag_days=aligned.execution_lag_days,
+                execution_lag_days=settings.firm.execution_lag_days,
                 checkpoint_path=checkpoint_path,
                 resume=checkpoint_path.exists(),
                 risk_free_rate_series=aligned.risk_free_rate_series,

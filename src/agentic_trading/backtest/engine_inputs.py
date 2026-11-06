@@ -7,10 +7,12 @@ the firm record) hands it the same inputs.
 
 `EngineInputs` holds the price frame and its source label, the risk-free
 rate series, the BIS policy rates spot FX carry accrues from, an optional
-benchmark return series, and the book's starting cash, commission,
-slippage and execution lag. An `EngineInputs` whose assets hold a spot FX
-pair always carries policy rates (`require_policy_rates`), so no run
-holds a pair without its carry."""
+benchmark return series, and the book's starting cash. The commission,
+slippage and execution lag are not inputs: `EngineInputs.portfolio` and
+every engine read them from `settings.firm` at use time, as the no-trade
+band, the settings fingerprint and the provenance do. An `EngineInputs`
+whose assets hold a spot FX pair always carries policy rates
+(`require_policy_rates`), so no run holds a pair without its carry."""
 
 from collections.abc import Mapping, Sequence
 from datetime import date
@@ -50,9 +52,8 @@ class EngineInputs(BaseModel):
     policy rate per currency spot FX carry accrues from
     (`load_fx_policy_rates`, `None` only when `assets` holds no pair), and
     `benchmark_returns` the daily returns the information ratio is measured
-    against, `None` for none. `starting_cash`, `commission_rate`,
-    `slippage_bps` and `execution_lag_days` default to `settings.firm`'s
-    values when the model is built. Construction raises a `ValueError`
+    against, `None` for none. `starting_cash` defaults to
+    `settings.firm.starting_cash` when the model is built. Construction raises a `ValueError`
     (`pydantic.ValidationError`) naming the spot FX pairs of `assets` when
     `policy_rates` is `None`."""
 
@@ -65,9 +66,6 @@ class EngineInputs(BaseModel):
     policy_rates: pd.DataFrame | None = None
     benchmark_returns: pd.Series | None = None
     starting_cash: float = Field(default_factory=lambda: settings.firm.starting_cash)
-    commission_rate: float = Field(default_factory=lambda: settings.firm.commission_rate)
-    slippage_bps: float = Field(default_factory=lambda: settings.firm.slippage_bps)
-    execution_lag_days: int = Field(default_factory=lambda: settings.firm.execution_lag_days)
 
     @model_validator(mode="after")
     def _fx_pairs_have_rates(self) -> "EngineInputs":
@@ -76,12 +74,13 @@ class EngineInputs(BaseModel):
 
     def portfolio(self) -> Portfolio:
         """A fresh, empty book holding `starting_cash`, filled at
-        `commission_rate` and `slippage_bps`."""
+        `settings.firm.commission_rate` and `settings.firm.slippage_bps` as
+        they stand at the call."""
         return Portfolio(
             cash=self.starting_cash,
             positions={},
-            commission_rate=self.commission_rate,
-            slippage_bps=self.slippage_bps,
+            commission_rate=settings.firm.commission_rate,
+            slippage_bps=settings.firm.slippage_bps,
         )
 
     def data_loader(self, _assets: list[str], _start: date, _end: date) -> pd.DataFrame:
@@ -110,8 +109,7 @@ def load_engine_inputs(
     `load_fx_policy_rates`, which reads its own look-back before `start` so
     the rate in force on `start` is there). With a `benchmark` ticker, the
     benchmark returns are its daily close-to-close returns from `start` to
-    `end`, aligned on its own bars. The cost settings are `settings.firm`'s
-    at the call.
+    `end`, aligned on its own bars.
 
     Raises `ValueError` when the lake has no policy rate for a currency of a
     spot FX pair among `assets` over the run; every loader's own errors
