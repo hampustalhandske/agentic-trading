@@ -34,6 +34,7 @@ from agentic_trading.data.loaders.lakehouse_loader import (
     declare_loader_window,
     lake_session,
     loader_query_counts,
+    loader_store_usage,
     reset_loader_query_counts,
     verify_rebuilt_whole_builds,
 )
@@ -209,15 +210,18 @@ _LOADER_STORE_HELP = (
 
 # Prefix of the stderr line holding the run's loader query counts as JSON.
 LOADER_QUERY_COUNTS_PREFIX = "loader-query-counts "
+# Prefix of the stderr line holding the window store's memory as JSON.
+LOADER_STORE_USAGE_PREFIX = "loader-store-usage "
 
 
-def declare_run_window(enabled: bool, start: date, end: date) -> None:
+def declare_run_window(enabled: bool, start: date, end: date, warmup_days: int) -> None:
     """Resets the loader query counts and, when `enabled`, declares the
-    open session's window store from `start` (the first day minus the
-    warm-up) to `end` (the last day)."""
+    open session's window store for a run from `start` to `end` with
+    `warmup_days` calendar days of warm-up: from `start - warmup_days`
+    to `end`."""
     reset_loader_query_counts()
     if enabled:
-        declare_loader_window(start, end)
+        declare_loader_window(start - timedelta(days=warmup_days), end)
 
 
 def echo_loader_query_counts() -> None:
@@ -225,6 +229,14 @@ def echo_loader_query_counts() -> None:
     list of `loader_query_counts()`."""
     counts = [count.model_dump() for count in loader_query_counts()]
     typer.echo(LOADER_QUERY_COUNTS_PREFIX + json.dumps(counts), err=True)
+
+
+def echo_loader_store_usage() -> None:
+    """Writes one stderr line: `LOADER_STORE_USAGE_PREFIX` and the JSON of
+    `loader_store_usage()` (`null` when no window store is declared)."""
+    usage = loader_store_usage()
+    text = "null" if usage is None else usage.model_dump_json()
+    typer.echo(LOADER_STORE_USAGE_PREFIX + text, err=True)
 
 
 def _parse_lake_time_flag(value: str | None) -> datetime | None:
@@ -391,8 +403,9 @@ def run(
     one lake session, at `--lake-time` or the default lake time, and the
     provenance records it. Unless `--no-loader-store`, the session's
     window store is declared from the start date minus the warm-up to the
-    end date. The loader query counts go to stderr as one
-    `LOADER_QUERY_COUNTS_PREFIX` line.
+    end date. The loader query counts and the window store's memory go to
+    stderr as one `LOADER_QUERY_COUNTS_PREFIX` and one
+    `LOADER_STORE_USAGE_PREFIX` line.
 
     Run with every argument given (assets + --start-date + --end-date) for a
     fully non-interactive, scriptable invocation — nothing is prompted, and a
@@ -465,9 +478,7 @@ def run(
     with lake_session(requested_lake_time) as session:
         logger.info("Reading the lake at lake time %s", session.lake_time.isoformat())
         declare_run_window(
-            loader_store,
-            parsed_start_date - timedelta(days=DEFAULT_BACKTEST_WARMUP_DAYS),
-            parsed_end_date,
+            loader_store, parsed_start_date, parsed_end_date, DEFAULT_BACKTEST_WARMUP_DAYS
         )
         analysts = resolve_roster_after_preflight(
             build_default_analysts(),
@@ -536,6 +547,7 @@ def run(
             raise
         verify_rebuilt_whole_builds()
         echo_loader_query_counts()
+        echo_loader_store_usage()
         typer.echo(
             json.dumps(
                 {
@@ -646,7 +658,8 @@ def experiment(
     end.
 
     The JSON result is the only thing on stdout; progress messages and
-    one `LOADER_QUERY_COUNTS_PREFIX` line of loader query counts go to
+    one `LOADER_QUERY_COUNTS_PREFIX` line of loader query counts and one
+    `LOADER_STORE_USAGE_PREFIX` line of window-store memory go to
     stderr, and the run log to `log/agentic_trading.log` (none with
     `--no-log`).
     """
@@ -691,9 +704,7 @@ def experiment(
     )
     with lake_session(requested_lake_time) as session:
         typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
-        declare_run_window(
-            loader_store, parsed_train_start - timedelta(days=warmup_days), parsed_test_end
-        )
+        declare_run_window(loader_store, parsed_train_start, parsed_test_end, warmup_days)
         analysts = resolve_roster_after_preflight(
             analysts,
             resolved_assets,
@@ -888,6 +899,7 @@ def experiment(
                 )
         verify_rebuilt_whole_builds()
         echo_loader_query_counts()
+        echo_loader_store_usage()
         typer.echo(
             json.dumps(
                 {

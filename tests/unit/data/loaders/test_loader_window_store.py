@@ -608,8 +608,10 @@ def _plan(ab: ModuleType, days: list[date] = _DAYS) -> Any:
     )
 
 
-def _window(ab: ModuleType) -> ll.LoaderWindow:
-    return ab.plan_window(_plan(ab))
+def _window(ab: ModuleType) -> Any:
+    """A run from the first test day to the end of the synthetic data, so
+    every trap call is served from the store on the store path."""
+    return ab.RunWindow(start=_DAYS[0], end=date(2019, 6, 28))
 
 
 def _three_ways(ab: ModuleType, loader: str, *args: Any) -> tuple[Any, Any, Any]:
@@ -671,10 +673,13 @@ def test_every_stored_loader_answers_exactly_as_the_reference_on_both_paths(
     assert not any(isinstance(output, ab.RaisedError) for output in passes["legacy"].outputs)
     totals = {path: sum(summary.queries[path] for summary in report.loaders) for path in ab.PATHS}
     assert totals["store"] * 5 < totals["direct"]
-    assert {
-        "load_futures_price_history_from_lakehouse",
-        "load_policy_rates_from_lakehouse",
-    } <= answered
+    assert answered == set(ab.STORED_LOADERS)
+    assert {summary.loader for summary in report.loaders} == set(ab.STORED_LOADERS)
+    # The run's window ends a day before the last call day, as the CLI declares it.
+    assert window.end < _EQUALITY_DAYS[-1]
+    assert report.window.start == _EQUALITY_DAYS[0] - timedelta(days=window.warmup_days)
+    assert any(count.path == "direct" and count.calls for count in passes["store"].counts)
+    assert passes["store"].usage is not None and passes["store"].usage.peak_bytes > 0
 
 
 # ---------------------------------------------------------------- per trap
@@ -1193,7 +1198,7 @@ def _pass(ab: ModuleType, path: str, outputs: list[Any]) -> Any:
 
 
 def test_a_tie_difference_passes_only_where_the_reference_varies_too(ab: ModuleType) -> None:
-    window = ll.LoaderWindow(start=date(2019, 1, 1), end=date(2019, 2, 28))
+    window = ab.RunWindow(start=date(2019, 2, 1), end=date(2019, 2, 28))
     days = [date(2019, 2, 1), date(2019, 2, 4)]
     calls = [ab.LoaderCall(loader=_SHORT_INTEREST, args=("AAA", day), day=day) for day in days]
     tied = _short_interest(("2019-01-15", 1), ("2019-01-15", 2))
@@ -1205,7 +1210,7 @@ def test_a_tie_difference_passes_only_where_the_reference_varies_too(ab: ModuleT
         "direct": _pass(ab, "direct", [tied, swapped]),
         "store": _pass(ab, "store", [swapped, swapped]),
     }
-    report = ab.compare_passes(calls, varies, window)
+    report = ab.compare_passes(calls, varies, window, required=[_SHORT_INTEREST])
     (summary,) = report.loaders
     assert summary.verdict == "PASS" and report.verdict == "PASS"
     assert summary.legacy_self_mismatches == 2
@@ -1217,7 +1222,7 @@ def test_a_tie_difference_passes_only_where_the_reference_varies_too(ab: ModuleT
     ]
 
     stable = {**varies, "legacy_repeat": _pass(ab, "legacy_repeat", [tied, tied])}
-    report = ab.compare_passes(calls, stable, window)
+    report = ab.compare_passes(calls, stable, window, required=[_SHORT_INTEREST])
     assert report.loaders[0].verdict == "FAIL" and report.verdict == "FAIL"
     assert report.allowed_ties == []
     assert all(not m.legacy_varies and m.tie is None for m in report.mismatches)
@@ -1226,7 +1231,7 @@ def test_a_tie_difference_passes_only_where_the_reference_varies_too(ab: ModuleT
 def test_a_difference_that_is_not_a_tie_fails_even_where_the_reference_varies(
     ab: ModuleType,
 ) -> None:
-    window = ll.LoaderWindow(start=date(2019, 1, 1), end=date(2019, 2, 28))
+    window = ab.RunWindow(start=date(2019, 2, 1), end=date(2019, 2, 28))
     calls = [ab.LoaderCall(loader=_SHORT_INTEREST, args=("AAA", _DAYS[0]), day=_DAYS[0])]
     legacy = _short_interest(("2019-01-15", 1), ("2019-01-31", 3))
     passes = {
@@ -1235,11 +1240,123 @@ def test_a_difference_that_is_not_a_tie_fails_even_where_the_reference_varies(
         "direct": _pass(ab, "direct", [legacy]),
         "store": _pass(ab, "store", [_short_interest(("2019-01-15", 1), ("2019-02-15", 3))]),
     }
-    report = ab.compare_passes(calls, passes, window)
+    report = ab.compare_passes(calls, passes, window, required=[_SHORT_INTEREST])
     (mismatch,) = report.mismatches
     assert mismatch.legacy_varies and mismatch.tie is not None and not mismatch.allowed
     assert report.verdict == "FAIL"
     assert report.loaders[0].queries == {"legacy": 1, "legacy_repeat": 1, "direct": 1, "store": 1}
+
+
+def test_an_unexercised_stored_loader_fails_the_verdict(ab: ModuleType) -> None:
+    """A required loader that was never called, answered only `None`, or
+    raised in the reference fails, though no answer mismatched."""
+    window = ab.RunWindow(start=date(2019, 2, 1), end=date(2019, 2, 28))
+    calls = [
+        ab.LoaderCall(loader=_SHORT_INTEREST, args=("AAA", _DAYS[0]), day=_DAYS[0]),
+        ab.LoaderCall(loader="load_dividends_from_lakehouse", args=("ZZZ", _DAYS[0]),
+                      day=_DAYS[0]),
+        ab.LoaderCall(loader="load_sic_code_from_lakehouse", args=("AAA",), day=_DAYS[0]),
+    ]  # fmt: skip
+    error = ab.RaisedError(type="ValueError", message="boom")
+    outputs = [_short_interest(("2019-01-15", 1)), None, error]
+    passes = {path: _pass(ab, path, outputs) for path in ab.PATHS}
+    required = [_SHORT_INTEREST, "load_dividends_from_lakehouse",
+                "load_sic_code_from_lakehouse", "load_cot_reports_from_lakehouse"]  # fmt: skip
+    report = ab.compare_passes(calls, passes, window, required=required)
+    verdicts = {s.loader: (s.verdict, s.calls, s.reference_answers, s.reference_errors)
+                for s in report.loaders}  # fmt: skip
+    assert verdicts == {
+        _SHORT_INTEREST: ("PASS", 1, 1, 0),
+        "load_dividends_from_lakehouse": ("FAIL", 1, 0, 0),
+        "load_sic_code_from_lakehouse": ("FAIL", 1, 0, 1),
+        "load_cot_reports_from_lakehouse": ("FAIL", 0, 0, 0),
+    }
+    assert report.mismatches == [] and report.verdict == "FAIL"
+    assert set(ab.STORED_LOADERS) == set(ab.TIE_COLUMNS)
+
+
+def test_coverage_finds_each_firm_v1_event(ab: ModuleType) -> None:
+    day = date(2017, 8, 1)
+    index = pd.DatetimeIndex([pd.Timestamp(2017, 7, 31), pd.Timestamp(day)], name="date")
+    futures = pd.concat(
+        {"CL=F": pd.DataFrame({"close": [50.0, 51.0], "roll": [0.0, 1.0]}, index=index)}, axis=1
+    )
+    prices = pd.concat(
+        {
+            "EURUSD=X": pd.DataFrame({"close": [1.17, 1.18]}, index=index),
+            "BTC-USD": pd.DataFrame({"close": [np.nan, np.nan]}, index=index),
+        },
+        axis=1,
+    )
+    vintages = pd.DataFrame(
+        {"value": [1.0], "realtime_start": [pd.Timestamp(2017, 7, 20)]},
+        index=pd.DatetimeIndex([pd.Timestamp(2017, 7, 3)]),
+    )
+    facts = pd.DataFrame(
+        {"filed": [pd.Timestamp(2017, 7, 27)], "available_date": [pd.Timestamp(2017, 7, 28)]}
+    )
+    cot = pd.DataFrame({"net_positioning_ratio": [0.1]}, index=index[:1])
+    quote = pd.DataFrame({"date": [pd.Timestamp(day)]})
+
+    def call(loader: str, *args: Any, on: date = day) -> Any:
+        return ab.LoaderCall(loader=loader, args=args, day=on)
+
+    calls = [
+        call("load_futures_price_history_from_lakehouse", ["CL=F"], day, day),
+        call("load_price_history_from_lakehouse", ["EURUSD=X", "BTC-USD"], day, day),
+        call("load_fred_vintages_from_lakehouse", "DGS10", day),
+        call("load_company_facts_from_lakehouse", "AAA", day),
+        call("load_cot_reports_from_lakehouse", "GC=F", date(2017, 7, 28), on=date(2017, 7, 28)),
+        call("load_cot_reports_from_lakehouse", "GC=F", day),
+        call("load_option_quote_from_lakehouse", "SPY", day, "put", 240.0, day, 45),
+    ]
+    outputs = [futures, prices, vintages, facts, cot, pd.concat([cot, cot]), quote]
+    assert ab.coverage(calls, outputs) == dict.fromkeys(
+        ["futures_roll", "fx_pair", "cot_release", "fred_revision", "sec_filing_after_close",
+         "spy_option_quote", "missing_bar"],
+        True,
+    )  # fmt: skip
+    assert not any(ab.coverage(calls, [None] * len(calls)).values())
+
+
+def test_firm_v1_days_lie_in_2010_to_2017_and_end_past_the_window(ab: ModuleType) -> None:
+    days = ab.firm_v1_days()
+    assert days == sorted(days) and len(days) == len(set(days))
+    assert date(2010, 1, 1) <= days[0] and days[-1] <= date(2017, 12, 31)
+    # Days on both sides of the first crypto klines (2017-08-17).
+    assert any(day < date(2017, 8, 17) for day in days[3:])
+    assert any(day > date(2017, 8, 17) for day in days)
+    universe = ab.firm_v1_universe([{"security_id": 1, "ticker": "AAA"}])
+    assert len(universe) == 1 + 6 + 5 + 4 + 2
+    assert ab.cot_tickers_for(universe) == [
+        "ZT=F", "ZN=F", "ZB=F", "GC=F", "CL=F", "SI=F", "NG=F", "HG=F",
+        "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X",
+    ]  # fmt: skip
+
+
+def test_the_store_reports_its_memory_and_logs_it_when_dropped(
+    ab_lake: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    with ll.lake_session():
+        ll.declare_loader_window(date(2019, 1, 2), date(2019, 6, 28))
+        ll.load_dividends_from_lakehouse("AAA", date(2019, 4, 1))
+        ll.load_options_snapshot_from_lakehouse("AAA", date(2019, 3, 1))
+        before = ll.loader_store_usage()
+        ll.load_options_snapshot_from_lakehouse("AAA", date(2019, 6, 3))
+        after = ll.loader_store_usage()
+        with caplog.at_level("INFO", logger=ll.logger.name):
+            ll.clear_loader_window()
+    assert before is not None and after is not None
+    sources = {source.source: source for source in before.sources}
+    assert sources["equity_distributions"].keys == 1 and sources["equity_distributions"].rows == 6
+    assert after.peak_bytes >= before.held_bytes > 0
+    assert after.peak_bytes > after.held_bytes  # the March months were evicted
+    assert ll.loader_store_usage() is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        m.startswith("Window store held equity_distributions: 1 key(s), 6 rows") for m in messages
+    )
+    assert any("peak ~" in m for m in messages)
 
 
 def test_a_float_only_difference_is_flagged(ab: ModuleType) -> None:

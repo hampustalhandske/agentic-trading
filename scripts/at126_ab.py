@@ -3,43 +3,63 @@
 """A/B check of the loaders' window store against the per-call loaders.
 
 `loaders` mode: inside one `lake_session` pinned to one lake time, calls
-every stored public loader for each decision day (the XNYS sessions from
-`--start` to `--end`, every `--every`th) and each ticker, security, FRED
-series, option contract, futures ticker and policy-rate currency, in four
-passes: the frozen per-call reference loaders (`at126_legacy.py`) twice
-("legacy", "legacy_repeat"), the current loaders with no window declared
-("direct") and the current loaders with the window declared ("store").
-A direct or store answer matches when it equals the reference exactly:
-frames and series by `assert_frame_equal`/`assert_series_equal` with
-`check_exact=True`, floats bit for bit (NaN equal to NaN), `None` only
-where the reference gives `None`, and a raised error by type and message.
+every stored public loader (`STORED_LOADERS`) for each decision day and
+each ticker, security, FRED series, COT ticker, option contract, futures
+ticker and policy-rate currency, in four passes: the frozen per-call
+reference loaders (`at126_legacy.py`) twice ("legacy", "legacy_repeat"),
+the current loaders with no window declared ("direct") and the current
+loaders with the window store declared as the CLI declares it for the run
+(`declare_run_window`: the first day minus the warm-up to the run's last
+day; "store"). The decision days are the XNYS sessions from `--start` to
+`--end` (every `--every`th) plus the session after, or with `--firm-v1`
+the preset's days (`firm_v1_days`); the last day lies past the run's
+window, so the store pass also runs the direct fallback. A direct or
+store answer matches when it equals the reference exactly: frames and
+series by `assert_frame_equal`/`assert_series_equal` with
+`check_exact=True`, `check_index_type=True` and `check_column_type=True`,
+floats bit for bit (NaN equal to NaN), `None` only where the reference
+gives `None`, and a raised error by type and message.
 
 Acceptance: a mismatch is allowed only when the reference's two runs of
 that call differ as well and the difference traces to a tie
 (`trace_tie`): at every row where the answers differ, both rows hold
 the same values in every column of the reference query's ORDER BY
-(`TIE_COLUMNS`). Any other mismatch fails its loader, as does a
-judged path's unfactored split-move registry differing from the
-reference's. Prints JSON with, per loader, the calls, the reference's
-self-mismatches, the mismatches and allowed ones per path, whether any
-is float-only (equal within `FLOAT_ONLY_RTOL`, as a reordered split
-product is), the `/v1/sql` queries and wall seconds per path and the
-verdict; the allowed ties per loader, path and key with their count; and
-the first mismatches in full. Then prints `PASS` or `FAIL` per loader and
+(`TIE_COLUMNS`). Any other mismatch fails its loader, as does a stored
+loader with no calls, with no reference answer other than `None`, or
+with any reference error, and a judged path's unfactored split-move
+registry differing from the reference's. With `--firm-v1` the reference
+answers must also cover every event `coverage` lists. Prints JSON with
+the days, the window, the coverage, per loader the calls, the reference's
+answers, errors and self-mismatches, the mismatches and allowed ones per
+path, whether any is float-only (equal within `FLOAT_ONLY_RTOL`, as a
+reordered split product is), the `/v1/sql` queries and wall seconds per
+path and the verdict; the allowed ties per loader, path and key with
+their count; the store pass's memory (`LoaderStoreUsage`); and the first
+mismatches in full. Then prints `PASS` or `FAIL` per loader (with its
+call count), the coverage verdict with `--firm-v1`, and
 `OVERALL PASS|FAIL`; exits 1 on an overall FAIL.
+
+`--firm-v1` reads the registered firm's universe: the 30 equities that
+`scripts/select_firm_v1_equities.py` selects (from `--firm-equities`, the
+JSON its `--out` writes, or by running it), `FIRM_V1_ETFS`,
+`FIRM_V1_FUTURES`, `FIRM_V1_FX` and `FIRM_V1_CRYPTO`.
 
 `backtest` mode: runs the single-phase CLI backtest twice at one lake
 time (the given `--lake-time`, or the default T of a session opened now),
-once with `--no-loader-store` and once with `--loader-store`, and compares
-the two runs' `result` (the BacktestResult JSON) byte for byte. Prints
-JSON with each run's wall seconds, total queries and per-loader query
-counts, and the first differing line; exits 1 when the results differ.
+on the given assets (with `--firm-v1`, the firm's universe first), once
+with `--no-loader-store` and once with `--loader-store`, and compares the
+two runs' `result` (the BacktestResult JSON) byte for byte. Prints JSON
+with each run's wall seconds, total queries, per-loader query counts and
+window-store memory, and the first differing line, then the store run's
+memory per source and its peak, and `OVERALL PASS|FAIL`; exits 1 when
+the results differ.
 
 Usage:
+  uv run python scripts/at126_ab.py loaders --firm-v1 [--firm-equities PATH] [--lake-time T]
   uv run python scripts/at126_ab.py loaders --start 2019-01-02 --end 2019-06-28 \\
-      --ticker AAPL --ticker MSFT --ticker SPY [--lake-time T] [--every 5] [--out PATH]
-  uv run python scripts/at126_ab.py backtest SPY TLT GLD --start-date 2019-01-02 \\
-      --end-date 2019-06-28 [--lake-time T] [--out PATH] [<extra CLI options, e.g. --set g.f=v>]
+      --ticker AAPL --ticker SPY [--cot-ticker GC=F] [--lake-time T] [--every 5] [--out PATH]
+  uv run python scripts/at126_ab.py backtest --firm-v1 --start-date 2010-01-04 \\
+      --end-date 2017-12-29 [--lake-time T] [--out PATH] [<extra CLI options, e.g. --set g.f=v>]
 """
 
 import argparse
@@ -47,6 +67,7 @@ import json
 import math
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
@@ -58,14 +79,22 @@ import pandas as pd
 from at126_legacy import LEGACY_LOADERS
 from pydantic import BaseModel, ConfigDict
 
-from agentic_trading.cli import LOADER_QUERY_COUNTS_PREFIX
+from agentic_trading.cli import (
+    LOADER_QUERY_COUNTS_PREFIX,
+    LOADER_STORE_USAGE_PREFIX,
+    declare_run_window,
+)
 from agentic_trading.config import settings
 from agentic_trading.data.instruments import currency_pair, futures_root, is_marked
+from agentic_trading.data.loader import DEFAULT_BACKTEST_WARMUP_DAYS
 from agentic_trading.data.loaders import lakehouse_loader as ll
-from agentic_trading.data.trading_calendar import sessions_between
+from agentic_trading.data.trading_calendar import next_session, sessions_between
 
 RunPath = Literal["legacy", "legacy_repeat", "direct", "store"]
 PATHS: tuple[RunPath, ...] = ("legacy", "legacy_repeat", "direct", "store")
+# Every public loader the window store serves; each must be called and
+# answered in a loaders A/B.
+STORED_LOADERS: tuple[str, ...] = tuple(sorted(LEGACY_LOADERS))
 # The paths judged against the "legacy" pass.
 JUDGED: tuple[RunPath, ...] = ("direct", "store")
 
@@ -142,8 +171,9 @@ def compare(expected: Any, actual: Any, path: str = "", rtol: float | None = Non
     the first difference found, prefixed with its `path` inside the value.
 
     Two values match when they have the same type and: for DataFrames and
-    Series, `pandas.testing` finds them equal with `check_exact=True`
-    (values, dtypes, index, columns and names); for floats, the same bits
+    Series, `pandas.testing` finds them equal with `check_exact=True`,
+    `check_index_type=True` and (frames) `check_column_type=True`
+    (values, dtypes, index and column types, and names); for floats, the same bits
     or both NaN; for dicts, the same keys in the same order and matching
     values; for lists and tuples, the same length and matching items; for
     Pydantic models, matching `model_dump()`s; for Timestamps, equal and of
@@ -157,16 +187,18 @@ def compare(expected: Any, actual: Any, path: str = "", rtol: float | None = Non
     if type(expected) is not type(actual):
         return f"{where}: expected type {type(expected).__name__}, got {type(actual).__name__}"
     exact = rtol is None
-    tolerance = {} if exact else {"rtol": rtol, "atol": 0.0}
+    tolerance: dict[str, Any] = {"check_index_type": True, "check_exact": exact}
+    if not exact:
+        tolerance.update(rtol=rtol, atol=0.0)
     if isinstance(expected, pd.DataFrame):
         try:
-            pd.testing.assert_frame_equal(expected, actual, check_exact=exact, **tolerance)
+            pd.testing.assert_frame_equal(expected, actual, check_column_type=True, **tolerance)
         except AssertionError as error:
             return f"{where}: {error}"
         return None
     if isinstance(expected, pd.Series):
         try:
-            pd.testing.assert_series_equal(expected, actual, check_exact=exact, **tolerance)
+            pd.testing.assert_series_equal(expected, actual, **tolerance)
         except AssertionError as error:
             return f"{where}: {error}"
         return None
@@ -322,6 +354,7 @@ class PassResult(BaseModel):
     registry: list[Any]
     counts: list[ll.LoaderQueryCount]
     seconds: dict[str, float]
+    usage: ll.LoaderStoreUsage | None = None
 
 
 class Mismatch(BaseModel):
@@ -357,13 +390,18 @@ class AllowedTie(BaseModel):
 
 
 class LoaderSummary(BaseModel):
-    """Per loader: calls made, the reference's self-mismatches, the
-    mismatches per judged path (all, and allowed ones), whether any is
-    float-only, the `/v1/sql` queries and wall seconds per path, and the
-    verdict (`PASS` when every mismatch is allowed)."""
+    """Per loader: calls made, the reference's answers that are neither
+    `None` nor an error and the errors it raised, its self-mismatches,
+    the mismatches per judged path (all, and allowed ones), whether any
+    is float-only, the `/v1/sql` queries and wall seconds per path, and
+    the verdict: `PASS` when the loader was called, the reference gave at
+    least one real answer and raised no error, and every mismatch is
+    allowed."""
 
     loader: str
     calls: int
+    reference_answers: int
+    reference_errors: int
     legacy_self_mismatches: int
     mismatches: dict[str, int]
     allowed: dict[str, int]
@@ -378,7 +416,8 @@ class LoadersReport(BaseModel):
     allowed tie differences per loader and key, the registry comparison
     per path against the reference, every mismatch, and the overall
     verdict (`PASS` when every loader passes and the judged paths'
-    registries match the reference's)."""
+    registries match the reference's). `store_usage` is what the store
+    pass's window store held when it ended."""
 
     window: ll.LoaderWindow
     days: int
@@ -386,6 +425,7 @@ class LoadersReport(BaseModel):
     allowed_ties: list[AllowedTie]
     registry_differences: dict[str, str | None]
     mismatches: list[Mismatch]
+    store_usage: ll.LoaderStoreUsage | None = None
 
     @property
     def verdict(self) -> Literal["PASS", "FAIL"]:
@@ -405,18 +445,36 @@ def _loader(path: RunPath, name: str) -> Callable[..., Any]:
     return function
 
 
-def run_pass(path: RunPath, calls: Sequence[LoaderCall], window: ll.LoaderWindow) -> PassResult:
-    """Runs every call on `path` inside the open session: "store" with
-    `window` declared, the others ("legacy" and "legacy_repeat" with the
-    reference loaders) with no window. Starts from an empty split-move
-    registry and zeroed query counts; leaves no window declared."""
+class RunWindow(BaseModel):
+    """The run a loaders A/B imitates: its first decision day `start`, its
+    last day `end` and its `warmup_days`. The store pass declares the
+    window store as the CLI does for such a run (`declare_run_window`)."""
+
+    start: date
+    end: date
+    warmup_days: int = DEFAULT_BACKTEST_WARMUP_DAYS
+
+    @property
+    def loader_window(self) -> ll.LoaderWindow:
+        """The window `declare_run_window` declares for this run."""
+        return ll.LoaderWindow(start=self.start - timedelta(days=self.warmup_days), end=self.end)
+
+
+def run_pass(path: RunPath, calls: Sequence[LoaderCall], window: RunWindow) -> PassResult:
+    """Runs every call on `path` inside the open session: "store" with the
+    run's window store declared by `declare_run_window`, the others
+    ("legacy" and "legacy_repeat" with the reference loaders) with no
+    window. Starts from an empty split-move registry and zeroed query
+    counts; records the store's usage before dropping it; leaves no
+    window declared."""
     ll.clear_loader_window()
     if path == "store":
-        ll.declare_loader_window(window.start, window.end)
+        declare_run_window(True, window.start, window.end, window.warmup_days)
     ll.clear_unfactored_split_move_registry()
     ll.reset_loader_query_counts()
     outputs: list[Any] = []
     seconds: dict[str, float] = {}
+    usage = None
     try:
         for call in calls:
             function = _loader(path, call.loader)
@@ -427,6 +485,7 @@ def run_pass(path: RunPath, calls: Sequence[LoaderCall], window: ll.LoaderWindow
                 output = RaisedError(type=type(error).__name__, message=str(error))
             seconds[call.loader] = seconds.get(call.loader, 0.0) + time.perf_counter() - started
             outputs.append(output)
+        usage = ll.loader_store_usage()
     finally:
         ll.clear_loader_window()
     return PassResult(
@@ -435,6 +494,7 @@ def run_pass(path: RunPath, calls: Sequence[LoaderCall], window: ll.LoaderWindow
         registry=ll.unfactored_split_move_registry(),
         counts=ll.loader_query_counts(),
         seconds=seconds,
+        usage=usage,
     )
 
 
@@ -458,12 +518,17 @@ def judge(call: LoaderCall, path: str, expected: Any, repeat: Any, actual: Any) 
 
 
 def compare_passes(
-    calls: Sequence[LoaderCall], passes: dict[RunPath, PassResult], window: ll.LoaderWindow
+    calls: Sequence[LoaderCall],
+    passes: dict[RunPath, PassResult],
+    window: RunWindow,
+    required: Sequence[str] = STORED_LOADERS,
 ) -> LoadersReport:
     """Judges the "direct" and "store" passes against the "legacy" pass,
     call by call and on the registry, with "legacy_repeat" telling where
     the reference varies against itself, and tallies the counts per
-    loader."""
+    loader. Every loader in `required` (by default every stored loader)
+    is summarised, and fails when it was not called or the reference gave
+    no real answer or raised an error."""
     reference, repeat = passes["legacy"], passes["legacy_repeat"]
     mismatches: list[Mismatch] = []
     for path in JUDGED:
@@ -478,29 +543,42 @@ def compare_passes(
             if mismatch is not None:
                 mismatches.append(mismatch)
     self_mismatches: dict[str, int] = {}
+    answers: dict[str, int] = {}
+    errors: dict[str, int] = {}
     for index, call in enumerate(calls):
-        if compare(reference.outputs[index], repeat.outputs[index]) is not None:
+        output = reference.outputs[index]
+        if compare(output, repeat.outputs[index]) is not None:
             self_mismatches[call.loader] = self_mismatches.get(call.loader, 0) + 1
+        if isinstance(output, RaisedError):
+            errors[call.loader] = errors.get(call.loader, 0) + 1
+        elif output is not None:
+            answers[call.loader] = answers.get(call.loader, 0) + 1
     queries: dict[str, dict[str, int]] = {}
     for path, result in passes.items():
         for count in result.counts:
             per_loader = queries.setdefault(count.loader, {})
             per_loader[path] = per_loader.get(path, 0) + count.queries
-    loaders = sorted({call.loader for call in calls} | set(queries))
+    loaders = sorted({call.loader for call in calls} | set(queries) | set(required))
     summaries = []
     for name in loaders:
         own = [mismatch for mismatch in mismatches if mismatch.loader == name]
+        called = sum(call.loader == name for call in calls)
+        exercised = name not in required or (
+            called > 0 and answers.get(name, 0) > 0 and errors.get(name, 0) == 0
+        )
         summaries.append(
             LoaderSummary(
                 loader=name,
-                calls=sum(call.loader == name for call in calls),
+                calls=called,
+                reference_answers=answers.get(name, 0),
+                reference_errors=errors.get(name, 0),
                 legacy_self_mismatches=self_mismatches.get(name, 0),
                 mismatches={path: sum(m.path == path for m in own) for path in JUDGED},
                 allowed={path: sum(m.path == path and m.allowed for m in own) for path in JUDGED},
                 float_only=any(m.float_only for m in own),
                 queries={path: queries.get(name, {}).get(path, 0) for path in PATHS},
                 seconds={path: round(passes[path].seconds.get(name, 0.0), 3) for path in PATHS},
-                verdict="PASS" if all(m.allowed for m in own) else "FAIL",
+                verdict="PASS" if exercised and all(m.allowed for m in own) else "FAIL",
             )
         )
     ties: dict[tuple[str, str, str], int] = {}
@@ -509,7 +587,7 @@ def compare_passes(
             tie_key = (mismatch.loader, mismatch.path, mismatch.key)
             ties[tie_key] = ties.get(tie_key, 0) + 1
     return LoadersReport(
-        window=window,
+        window=window.loader_window,
         days=len({call.day for call in calls}),
         loaders=summaries,
         allowed_ties=[
@@ -521,15 +599,19 @@ def compare_passes(
             for path in ("legacy_repeat", *JUDGED)
         },
         mismatches=mismatches,
+        store_usage=passes["store"].usage,
     )
 
 
 class CallPlan(BaseModel):
-    """What `build_calls` asks about: the decision days, the tickers (used
-    for every per-ticker loader), the security ids (for the bar loaders),
-    the FRED series, Ken French models, COT tickers, option underlyings
-    and option contracts `(underlying, expiration, option_type, strike)`,
-    the futures tickers, the policy-rate currencies, and the lookbacks."""
+    """What `build_calls` asks about: the decision days, the tickers the
+    per-ticker loaders read, the price-history tickers, the security ids
+    (for the bar loaders), the FRED series, Ken French models, COT
+    tickers, option underlyings and option contracts `(underlying,
+    expiration, option_type, strike)`, the futures tickers, the
+    policy-rate currencies, the lookbacks and the run's warm-up. The last
+    `days_past_window` days lie after the run's end, so the store pass
+    serves them by the direct fallback."""
 
     days: list[date]
     tickers: list[str]
@@ -541,9 +623,12 @@ class CallPlan(BaseModel):
     contracts: list[tuple[str, date, str, float]]
     futures_tickers: list[str] = []
     currencies: list[str] = []
+    price_tickers: list[str] | None = None
     price_lookback_days: int = DEFAULT_PRICE_LOOKBACK_DAYS
     raw_close_lookback_days: int = DEFAULT_RAW_CLOSE_LOOKBACK_DAYS
     quote_lookback_days: int = settings.options.max_mark_age_days
+    warmup_days: int = DEFAULT_BACKTEST_WARMUP_DAYS
+    days_past_window: int = 1
 
 
 def build_calls(plan: CallPlan) -> list[LoaderCall]:
@@ -551,6 +636,7 @@ def build_calls(plan: CallPlan) -> list[LoaderCall]:
     SIC reads (no knowledge time) on the first day."""
     calls: list[LoaderCall] = []
     first = plan.days[0]
+    price_tickers = plan.tickers if plan.price_tickers is None else plan.price_tickers
     for ticker in plan.tickers:
         calls.append(LoaderCall(loader="load_sic_code_from_lakehouse", args=(ticker,), day=first))
     for day in plan.days:
@@ -563,8 +649,8 @@ def build_calls(plan: CallPlan) -> list[LoaderCall]:
         if plan.security_ids:
             add("load_security_log_returns", list(plan.security_ids), start, day)
             add("load_security_daily_bars", list(plan.security_ids), start, day)
-        if plan.tickers:
-            add("load_price_history_from_lakehouse", list(plan.tickers), start, day)
+        if price_tickers:
+            add("load_price_history_from_lakehouse", list(price_tickers), start, day)
         if plan.futures_tickers:
             add("load_futures_price_history_from_lakehouse", list(plan.futures_tickers),
                 start, day)  # fmt: skip
@@ -601,42 +687,114 @@ def build_calls(plan: CallPlan) -> list[LoaderCall]:
     return calls
 
 
-def plan_window(plan: CallPlan) -> ll.LoaderWindow:
-    """The window a run over `plan` declares: its first day minus the
-    longest lookback, through its last day."""
-    longest = max(
-        plan.price_lookback_days + ll.POLICY_RATE_LOOKBACK_DAYS,
-        plan.raw_close_lookback_days,
-        plan.quote_lookback_days,
-        ll.DEFAULT_COT_LOOKBACK_DAYS,
-        ll.DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS,
+def plan_window(plan: CallPlan) -> RunWindow:
+    """The run `plan` imitates: from its first day to the last day before
+    its `days_past_window` days, with its warm-up."""
+    if len(plan.days) <= plan.days_past_window:
+        raise ValueError("a plan needs at least one day inside the run's window")
+    return RunWindow(
+        start=plan.days[0],
+        end=plan.days[-1 - plan.days_past_window],
+        warmup_days=plan.warmup_days,
     )
-    return ll.LoaderWindow(start=plan.days[0] - timedelta(days=longest), end=plan.days[-1])
 
 
-def discover_contracts(underlyings: Sequence[str], day: date) -> list[tuple[str, date, str, float]]:
+def discover_contracts(
+    underlyings: Sequence[str], days: Sequence[date]
+) -> list[tuple[str, date, str, float]]:
     """One contract per underlying to quote: the middle row of the
-    reference snapshot on `day`, plus the same expiry and type at a strike
-    no chain lists (so the quote path's `None` is exercised)."""
+    reference snapshot on the first of `days` with one, plus the same
+    expiry and type at a strike no chain lists (so the quote path's
+    `None` is exercised). An underlying with no snapshot on any day gets
+    none, and the quote loader's verdict shows whether any was found."""
     contracts: list[tuple[str, date, str, float]] = []
     for underlying in underlyings:
-        snapshot = LEGACY_LOADERS["load_options_snapshot_from_lakehouse"](underlying, day)
-        if snapshot is None:
-            continue
-        row = snapshot.iloc[len(snapshot) // 2]
-        expiration = pd.Timestamp(row["expiration"]).date()
-        contracts.append((underlying, expiration, str(row["option_type"]), float(row["strike"])))
-        contracts.append((underlying, expiration, str(row["option_type"]), 1.0e9))
+        for day in days:
+            snapshot = LEGACY_LOADERS["load_options_snapshot_from_lakehouse"](underlying, day)
+            if snapshot is None:
+                continue
+            row = snapshot.iloc[len(snapshot) // 2]
+            expiration = pd.Timestamp(row["expiration"]).date()
+            option_type = str(row["option_type"])
+            contracts.append((underlying, expiration, option_type, float(row["strike"])))
+            contracts.append((underlying, expiration, option_type, 1.0e9))
+            break
     return contracts
 
 
-def run_loaders_ab(plan: CallPlan) -> LoadersReport:
-    """Runs the four passes of `plan` inside the open session and
-    judges them."""
+def coverage(calls: Sequence[LoaderCall], outputs: Sequence[Any]) -> dict[str, bool]:
+    """Whether the reference answers to `calls` hold each event the
+    firm-v1 preset must exercise:
+
+    - `futures_roll`: a futures bar with `roll` 1.0;
+    - `fx_pair`: an FX pair's close in a price history;
+    - `cot_release`: a COT ticker with more reports on a day than on its
+      previous call day;
+    - `fred_revision`: a FRED vintage released more than 7 days after
+      its observation date;
+    - `sec_filing_after_close`: a company fact or insider filing known
+      only after its filed date;
+    - `spy_option_quote`: a quote of a SPY contract;
+    - `missing_bar`: a price history, futures or bar answer in which a
+      requested instrument has no close on the answer's last date."""
+    found = dict.fromkeys(
+        ["futures_roll", "fx_pair", "cot_release", "fred_revision", "sec_filing_after_close",
+         "spy_option_quote", "missing_bar"],
+        False,
+    )  # fmt: skip
+    cot_rows: dict[str, int] = {}
+    for call, output in zip(calls, outputs, strict=True):
+        if output is None or isinstance(output, RaisedError):
+            continue
+        name = call.loader
+        if name == "load_futures_price_history_from_lakehouse":
+            rolls = output.xs("roll", axis=1, level=1)
+            found["futures_roll"] |= bool((rolls == 1.0).to_numpy().any())
+        if name in (
+            "load_price_history_from_lakehouse",
+            "load_futures_price_history_from_lakehouse",
+        ):
+            last = output.iloc[-1]
+            for ticker in call.args[0]:
+                if currency_pair(ticker) is not None and ticker in output.columns.get_level_values(
+                    0
+                ):
+                    found["fx_pair"] |= bool(output[(ticker, "close")].notna().any())
+                missing = ticker not in output.columns.get_level_values(0) or pd.isna(
+                    last[(ticker, "close")]
+                )
+                found["missing_bar"] |= missing
+        if name == "load_security_daily_bars":
+            last = output.iloc[-1]
+            for security_id in call.args[0]:
+                present = security_id in output.columns.get_level_values(0)
+                found["missing_bar"] |= not present or pd.isna(last[(security_id, "close")])
+        if name == "load_cot_reports_from_lakehouse":
+            ticker = call.args[0]
+            found["cot_release"] |= len(output) > cot_rows.get(ticker, len(output))
+            cot_rows[ticker] = len(output)
+        if name == "load_fred_vintages_from_lakehouse":
+            lag = output["realtime_start"] - output.index.to_series()
+            found["fred_revision"] |= bool((lag > pd.Timedelta(days=7)).any())
+        if name == "load_company_facts_from_lakehouse":
+            found["sec_filing_after_close"] |= bool(
+                (output["available_date"] > output["filed"]).any()
+            )
+        if name == "load_insider_transactions_from_lakehouse":
+            later = output["available_date"] > output["filed_date"]
+            found["sec_filing_after_close"] |= bool(later.any())
+        if name == "load_option_quote_from_lakehouse" and call.args[0] == "SPY":
+            found["spy_option_quote"] = True
+    return found
+
+
+def run_loaders_ab(plan: CallPlan) -> tuple[LoadersReport, dict[str, bool]]:
+    """Runs the four passes of `plan` inside the open session, judges
+    them, and reports the events the reference answers cover."""
     calls = sorted(build_calls(plan), key=lambda call: call.day)
     window = plan_window(plan)
     passes = {path: run_pass(path, calls, window) for path in PATHS}
-    return compare_passes(calls, passes, window)
+    return compare_passes(calls, passes, window), coverage(calls, passes["legacy"].outputs)
 
 
 def _member_ids(tickers: Sequence[str], day: date) -> list[int]:
@@ -645,50 +803,148 @@ def _member_ids(tickers: Sequence[str], day: date) -> list[int]:
     return sorted({member.security_id for member in members if member.ticker in wanted})
 
 
+# ---------------------------------------------------------------- the firm-v1 preset
+
+# The registered firm's (agentic-firm-v1) non-equity instruments: the
+# bond and credit ETFs with SPY, the five futures the futures book trades,
+# the four FX pairs the COT TFF codes cover, and the two crypto pairs.
+FIRM_V1_ETFS = ("SPY", "SHY", "IEF", "TLT", "HYG", "LQD")
+FIRM_V1_FUTURES = ("GC=F", "CL=F", "SI=F", "NG=F", "HG=F")
+FIRM_V1_FX = ("EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X")
+FIRM_V1_CRYPTO = ("BTC-USD", "ETH-USD")
+
+
+def firm_v1_days() -> list[date]:
+    """The firm-v1 preset's decision days, all from 2010-2017:
+
+    - 2013-10-30, 2013-11-01 and 2013-11-06, inside the Q3 10-Q season
+      (filings accepted after the close) and two COT Fridays apart;
+    - every other XNYS session from 2017-07-24 to 2017-09-08: the Q2
+      10-Q season, CL's September and October rolls, weekly COT
+      releases, the first Binance klines of BTC and ETH (2017-08-17, so
+      the earlier days have no crypto bar), and SPY's history chains;
+    - 2017-09-11, the session after, which lies past the run's window so
+      the store pass falls back to direct reads."""
+    early = [date(2013, 10, 30), date(2013, 11, 1), date(2013, 11, 6)]
+    late = sessions_between(date(2017, 7, 24), date(2017, 9, 8))[::2]
+    return [*early, *late, date(2017, 9, 11)]
+
+
+def firm_v1_equities(path: Path | None) -> list[dict[str, Any]]:
+    """The firm's 30 equities (`security_id`, `ticker`) from the JSON that
+    `scripts/select_firm_v1_equities.py --out PATH` writes, running that
+    script into a temporary file when `path` is `None`."""
+    if path is None:
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "firm_v1_equities.json"
+            script = Path(__file__).with_name("select_firm_v1_equities.py")
+            subprocess.run([sys.executable, str(script), "--out", str(out)], check=True)
+            selected = json.loads(out.read_text())["selected"]
+    else:
+        selected = json.loads(path.read_text())["selected"]
+    return [{"security_id": int(row["security_id"]), "ticker": str(row["ticker"])}
+            for row in selected]  # fmt: skip
+
+
+def firm_v1_universe(equities: Sequence[dict[str, Any]]) -> list[str]:
+    """Every ticker of the firm-v1 universe: the equities, ETFs, futures,
+    FX pairs and crypto pairs."""
+    return [
+        *(row["ticker"] for row in equities),
+        *FIRM_V1_ETFS,
+        *FIRM_V1_FUTURES,
+        *FIRM_V1_FX,
+        *FIRM_V1_CRYPTO,
+    ]
+
+
+def cot_tickers_for(tickers: Sequence[str]) -> list[str]:
+    """The COT tickers `tickers` read (a Treasury ETF its future), keeping
+    those with a contract-market code."""
+    return [
+        ticker
+        for ticker in dict.fromkeys(ll.DEFAULT_COT_TICKER_BY_ASSET.get(t, t) for t in tickers)
+        if ticker in ll._COT_DISAGGREGATED_CODES or ticker in ll._COT_TFF_CODES
+    ]
+
+
+def firm_v1_plan(equities: Sequence[dict[str, Any]], days: Sequence[date]) -> CallPlan:
+    """The plan of the firm-v1 preset over `days`, its SPY contracts found
+    on those days."""
+    universe = firm_v1_universe(equities)
+    stocks = [*(row["ticker"] for row in equities), *FIRM_V1_ETFS]
+    return CallPlan(
+        days=list(days),
+        tickers=stocks,
+        price_tickers=[ticker for ticker in universe if futures_root(ticker) is None],
+        security_ids=[row["security_id"] for row in equities],
+        fred_series=list(DEFAULT_FRED_SERIES),
+        fama_french_models=["3factor", "5factor"],
+        cot_tickers=cot_tickers_for(universe),
+        option_underlyings=["SPY"],
+        contracts=discover_contracts(["SPY"], days),
+        futures_tickers=list(FIRM_V1_FUTURES),
+        currencies=sorted(
+            {
+                code
+                for t in FIRM_V1_FX
+                if (pair := currency_pair(t))
+                for code in (pair.base, pair.quote)
+            }
+        ),
+    )
+
+
 def _loaders_main(args: argparse.Namespace) -> int:
     lake_time = None if args.lake_time is None else datetime.fromisoformat(args.lake_time)
-    days = sessions_between(date.fromisoformat(args.start), date.fromisoformat(args.end))
-    days = days[:: args.every]
-    if not days:
+    if args.firm_v1:
+        equities = firm_v1_equities(args.firm_equities)
+        days = firm_v1_days()
+    else:
+        if args.start is None or args.end is None or not args.ticker:
+            raise SystemExit("give --firm-v1, or --start, --end and at least one --ticker")
+        days = sessions_between(date.fromisoformat(args.start), date.fromisoformat(args.end))
+        days = days[:: args.every]
+        if days:
+            days.append(next_session(days[-1]))
+    if len(days) < 2:
         raise SystemExit("no XNYS sessions in the range")
-    tickers = list(dict.fromkeys(args.ticker))
     with ll.lake_session(lake_time) as session:
-        security_ids = args.security_id or _member_ids(tickers, days[0])
-        cot_tickers = [
-            ticker
-            for ticker in dict.fromkeys(
-                [ll.DEFAULT_COT_TICKER_BY_ASSET.get(ticker, ticker) for ticker in tickers]
+        if args.firm_v1:
+            plan = firm_v1_plan(equities, days)
+        else:
+            tickers = list(dict.fromkeys(args.ticker))
+            pairs = [pair for t in tickers if (pair := currency_pair(t)) is not None]
+            underlyings = args.option_underlying or [t for t in tickers if not is_marked(t)]
+            plan = CallPlan(
+                days=days,
+                tickers=[t for t in tickers if not is_marked(t)],
+                price_tickers=[t for t in tickers if futures_root(t) is None],
+                security_ids=args.security_id or _member_ids(tickers, days[0]),
+                fred_series=args.fred_series or list(DEFAULT_FRED_SERIES),
+                fama_french_models=["3factor", "5factor"],
+                cot_tickers=args.cot_ticker or cot_tickers_for(tickers),
+                option_underlyings=underlyings,
+                contracts=discover_contracts(underlyings, days),
+                futures_tickers=[t for t in tickers if futures_root(t)],
+                currencies=sorted({c for pair in pairs for c in (pair.base, pair.quote)}),
+                price_lookback_days=args.price_lookback_days,
             )
-            if ticker in ll._COT_DISAGGREGATED_CODES or ticker in ll._COT_TFF_CODES
-        ]
-        underlyings = args.option_underlying or [
-            ticker for ticker in tickers if not is_marked(ticker)
-        ]
-        pairs = [pair for ticker in tickers if (pair := currency_pair(ticker)) is not None]
-        plan = CallPlan(
-            days=days,
-            tickers=tickers,
-            security_ids=security_ids,
-            fred_series=args.fred_series or list(DEFAULT_FRED_SERIES),
-            fama_french_models=["3factor", "5factor"],
-            cot_tickers=cot_tickers,
-            option_underlyings=underlyings,
-            contracts=discover_contracts(underlyings, days[0]),
-            futures_tickers=[ticker for ticker in tickers if futures_root(ticker)],
-            currencies=sorted({code for pair in pairs for code in (pair.base, pair.quote)}),
-            price_lookback_days=args.price_lookback_days,
-        )
-        report = run_loaders_ab(plan)
+        report, covered = run_loaders_ab(plan)
         lake_time_used = session.lake_time.isoformat()
+    covered_ok = all(covered.values()) or not args.firm_v1
+    verdict = "PASS" if report.ok and covered_ok else "FAIL"
     payload = {
         "lake_time": lake_time_used,
-        "verdict": report.verdict,
+        "verdict": verdict,
+        "days": [day.isoformat() for day in plan.days],
         "window": report.window.model_dump(mode="json"),
-        "days": report.days,
+        "coverage": covered,
         "loaders": [summary.model_dump() for summary in report.loaders],
         "allowed_ties": [tie.model_dump() for tie in report.allowed_ties],
         "float_only_loaders": [s.loader for s in report.loaders if s.float_only],
         "registry_differences": report.registry_differences,
+        "store_usage": None if report.store_usage is None else report.store_usage.model_dump(),
         "mismatch_count": len(report.mismatches),
         "mismatches": [
             {**item.model_dump(mode="json"), "allowed": item.allowed}
@@ -697,9 +953,14 @@ def _loaders_main(args: argparse.Namespace) -> int:
     }
     _emit(payload, args.out)
     for summary in report.loaders:
-        print(f"{summary.verdict} {summary.loader}")
-    print(f"OVERALL {report.verdict}")
-    return 0 if report.ok else 1
+        print(f"{summary.verdict} {summary.loader} ({summary.calls} calls)")
+    if args.firm_v1:
+        missing = [event for event, seen in covered.items() if not seen]
+        print(
+            f"{'PASS' if covered_ok else 'FAIL'} coverage" + (f" missing {missing}" * bool(missing))
+        )
+    print(f"OVERALL {verdict}")
+    return 0 if verdict == "PASS" else 1
 
 
 # ---------------------------------------------------------------- backtest mode
@@ -741,6 +1002,17 @@ def query_counts(stderr: str) -> list[dict[str, Any]]:
     for line in stderr.splitlines():
         if line.startswith(LOADER_QUERY_COUNTS_PREFIX):
             found = json.loads(line[len(LOADER_QUERY_COUNTS_PREFIX) :])
+    return found
+
+
+def store_usage(stderr: str) -> dict[str, Any] | None:
+    """The window store's memory the CLI printed on stderr (the last line
+    starting with `LOADER_STORE_USAGE_PREFIX`), or `None` when it printed
+    none or no store was declared."""
+    found: dict[str, Any] | None = None
+    for line in stderr.splitlines():
+        if line.startswith(LOADER_STORE_USAGE_PREFIX):
+            found = json.loads(line[len(LOADER_STORE_USAGE_PREFIX) :])
     return found
 
 
@@ -793,7 +1065,8 @@ def _run_cli(command: list[str], store: bool) -> CliRun:
 def compare_backtests(direct: CliRun, stored: CliRun) -> dict[str, Any]:
     """The comparison of a `--no-loader-store` and a `--loader-store` run:
     `identical` when both exited 0 and their results are byte-identical,
-    the first differing line, and each run's seconds and query counts."""
+    the first differing line, and each run's seconds, query counts and
+    window-store memory."""
     summary: dict[str, Any] = {}
     texts: dict[str, str | None] = {}
     for label, run in (("direct", direct), ("store", stored)):
@@ -803,6 +1076,7 @@ def compare_backtests(direct: CliRun, stored: CliRun) -> dict[str, Any]:
             "seconds": run.seconds,
             "queries": sum(int(count["queries"]) for count in counts),
             "counts": counts,
+            "store_usage": store_usage(run.stderr),
         }
         try:
             texts[label] = result_text(run.stdout) if run.returncode == 0 else None
@@ -827,15 +1101,27 @@ def _backtest_main(args: argparse.Namespace, extra: list[str]) -> int:
     if lake_time is None:
         with ll.lake_session() as session:
             lake_time = session.lake_time.isoformat()
+    assets = list(args.assets)
+    if args.firm_v1:
+        assets = [*firm_v1_universe(firm_v1_equities(args.firm_equities)), *assets]
+    if not assets:
+        raise SystemExit("give --firm-v1 or at least one asset")
     runs = [
         _run_cli(
-            backtest_command(args.assets, args.start_date, args.end_date, lake_time, store, extra),
+            backtest_command(assets, args.start_date, args.end_date, lake_time, store, extra),
             store,
         )
         for store in (False, True)
     ]
     summary = {"lake_time": lake_time, **compare_backtests(runs[0], runs[1])}
     _emit(summary, args.out)
+    usage = summary["store"]["store_usage"]
+    if usage is not None:
+        for source in usage["sources"]:
+            print(f"store {source['source']}: {source['keys']} keys, {source['rows']} rows, "
+                  f"~{source['bytes']} bytes")  # fmt: skip
+        print(f"store held ~{usage['held_bytes']} bytes, peak ~{usage['peak_bytes']} bytes")
+    print(f"OVERALL {'PASS' if summary['identical'] else 'FAIL'}")
     return 0 if summary["identical"] else 1
 
 
@@ -854,10 +1140,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     modes = parser.add_subparsers(dest="mode", required=True)
 
-    loaders = modes.add_parser("loaders", help="compare every loader on the three paths")
-    loaders.add_argument("--start", required=True)
-    loaders.add_argument("--end", required=True)
-    loaders.add_argument("--ticker", action="append", default=[], required=True)
+    loaders = modes.add_parser("loaders", help="judge every stored loader on four passes")
+    loaders.add_argument("--firm-v1", action="store_true")
+    loaders.add_argument("--firm-equities", type=Path, default=None)
+    loaders.add_argument("--start", default=None)
+    loaders.add_argument("--end", default=None)
+    loaders.add_argument("--ticker", action="append", default=[])
+    loaders.add_argument("--cot-ticker", action="append", default=[])
     loaders.add_argument("--security-id", action="append", type=int, default=[])
     loaders.add_argument("--fred-series", action="append", default=[])
     loaders.add_argument("--option-underlying", action="append", default=[])
@@ -867,7 +1156,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     loaders.add_argument("--out", type=Path, default=None)
 
     backtest = modes.add_parser("backtest", help="diff a backtest with and without the store")
-    backtest.add_argument("assets", nargs="+")
+    backtest.add_argument("assets", nargs="*")
+    backtest.add_argument("--firm-v1", action="store_true")
+    backtest.add_argument("--firm-equities", type=Path, default=None)
     backtest.add_argument("--start-date", required=True)
     backtest.add_argument("--end-date", required=True)
     backtest.add_argument("--lake-time", default=None)

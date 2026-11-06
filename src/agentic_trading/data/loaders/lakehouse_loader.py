@@ -849,11 +849,31 @@ def _approximate_size(value: Any) -> tuple[int, int]:
     return 1, 0
 
 
+class SourceUsage(BaseModel):
+    """What the window store holds for one source: its stored `keys`, and
+    their `rows` and approximate `bytes` (`_approximate_size`)."""
+
+    source: str
+    keys: int
+    rows: int
+    bytes: int
+
+
+class LoaderStoreUsage(BaseModel):
+    """The window store's memory: per source what it holds now, the bytes
+    it holds in all (`held_bytes`), and the most it has held at once
+    since it was declared (`peak_bytes`)."""
+
+    sources: list[SourceUsage]
+    held_bytes: int
+    peak_bytes: int
+
+
 class _LoaderStore:
     """The window store of one `lake_session`: the declared `window` and,
-    per source name, the value fetched for each key. Every source has its
-    own lock, held while a miss is fetched, so concurrent calls for one
-    source fetch it once."""
+    per source name, the value fetched for each key with its size. Every
+    source has its own lock, held while a miss is fetched, so concurrent
+    calls for one source fetch it once."""
 
     def __init__(self, session: LakeSession, window: LoaderWindow) -> None:
         self.session = session
@@ -861,10 +881,26 @@ class _LoaderStore:
         self._lock = threading.Lock()
         self._entries: dict[str, dict[Hashable, _StoreEntry]] = {}
         self._source_locks: dict[str, threading.Lock] = {}
+        # (rows, bytes) per source and key, the bytes held, and their peak.
+        self._sizes: dict[str, dict[Hashable, tuple[int, int]]] = {}
+        self._held_bytes = 0
+        self._peak_bytes = 0
 
     def _source_lock(self, name: str) -> threading.Lock:
         with self._lock:
             return self._source_locks.setdefault(name, threading.Lock())
+
+    def _record_size(self, name: str, key: Hashable, size: tuple[int, int] | None) -> None:
+        """Records `size` as the (rows, bytes) of `key` of source `name`
+        (`None`: the key was removed) and updates the bytes held and peak."""
+        with self._lock:
+            sizes = self._sizes.setdefault(name, {})
+            previous = sizes.pop(key, (0, 0))
+            self._held_bytes -= previous[1]
+            if size is not None:
+                sizes[key] = size
+                self._held_bytes += size[1]
+            self._peak_bytes = max(self._peak_bytes, self._held_bytes)
 
     def read(
         self, source: "StoreSource[Any, Any]", keys: Sequence[Hashable], start: date
@@ -885,6 +921,7 @@ class _LoaderStore:
                 fetched = source.fetch(missing, fetch_start, self.window.end)
                 for key in missing:
                     entries[key] = _StoreEntry(fetch_start, fetched[key])
+                    self._record_size(source.name, key, _approximate_size(fetched[key]))
                 rows, size = _approximate_size({key: fetched[key] for key in missing})
                 logger.debug(
                     "window store fetched %s for %d key(s) from %s to %s: %d rows, ~%d bytes",
@@ -903,11 +940,29 @@ class _LoaderStore:
             entries = self._entries.get(source.name, {})
             for key in [key for key in entries if drop(key)]:
                 del entries[key]
+                self._record_size(source.name, key, None)
 
     def keys(self, source: "StoreSource[Any, Any]") -> list[Hashable]:
         """The keys currently stored for `source`."""
         with self._source_lock(source.name):
             return list(self._entries.get(source.name, {}))
+
+    def usage(self) -> LoaderStoreUsage:
+        """What the store holds now per source, sorted by source, with the
+        bytes held and their peak."""
+        with self._lock:
+            sources = [
+                SourceUsage(
+                    source=name,
+                    keys=len(sizes),
+                    rows=sum(rows for rows, _ in sizes.values()),
+                    bytes=sum(size for _, size in sizes.values()),
+                )
+                for name, sizes in sorted(self._sizes.items())
+            ]
+            return LoaderStoreUsage(
+                sources=sources, held_bytes=self._held_bytes, peak_bytes=self._peak_bytes
+            )
 
 
 # The window store of the open session, shared by every thread.
@@ -978,7 +1033,10 @@ def declare_loader_window(start: date, end: date) -> LoaderWindow:
     session is replaced, emptied. Raises `RuntimeError` when no session is
     open, `ValueError` when `end` precedes `start`, and `HoldoutReadError`
     when `end` is after the session's `data_end`, so no fetch reads past
-    the cut."""
+    the cut. A window refused for ending after `data_end` is recorded as a
+    holdout violation (`_guard_data_end`), so the session also raises
+    `HoldoutReadError` when it closes, even if the caller catches this
+    one."""
     global _STORE
     session = _current_session()
     if session is None:
@@ -1001,13 +1059,39 @@ def loader_window() -> LoaderWindow | None:
     return None if store is None else store.window
 
 
+def loader_store_usage() -> LoaderStoreUsage | None:
+    """What the store declared for the open session holds now, per
+    source, and its peak; `None` when none is declared."""
+    store = _active_store()
+    return None if store is None else store.usage()
+
+
 def clear_loader_window() -> None:
     """Drops the window store, so every loader call fetches for itself
     until a window is declared again. Closing the session that opened
-    it does this too."""
+    it does this too. When a store is dropped, logs at INFO each
+    source's stored keys, rows and approximate bytes, and the store's
+    peak bytes."""
     global _STORE
     with _STORE_LOCK:
+        store = _STORE
         _STORE = None
+    if store is None:
+        return
+    usage = store.usage()
+    for source in usage.sources:
+        logger.info(
+            "Window store held %s: %d key(s), %d rows, ~%d bytes",
+            source.source,
+            source.keys,
+            source.rows,
+            source.bytes,
+        )
+    logger.info(
+        "Window store dropped holding ~%d bytes; peak ~%d bytes",
+        usage.held_bytes,
+        usage.peak_bytes,
+    )
 
 
 def _as_read(
