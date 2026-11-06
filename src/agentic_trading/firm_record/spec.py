@@ -1,7 +1,10 @@
 # spec.py
 
 """The frozen spec of one firm record (`stage_a.spec.FirmSpec`), built from
-the Commander that runs it."""
+the Commander that runs it. Its module hashes cover the code that decides
+the record, the engine-input builder (`backtest.engine_inputs`) and the
+loaders it reads prices and rates through included, so a record whose
+engine inputs come from other code gets another spec hash."""
 
 import hashlib
 import sys
@@ -40,10 +43,13 @@ FIRM_DECISION_RULE = (
 
 # The modules, besides each agent's own, whose source decides the record
 # even when it starts before they are imported: their hashes, and those of
-# every agents/data module they import, enter the spec.
+# every agents/data module they import, enter the spec. The engine-input
+# builder reaches `data.loader` and `data.loaders.lakehouse_loader`, which
+# decide the prices and rates the engine sees.
 _HASHED_ROOTS = (
     "agentic_trading.agents.commander",
     "agentic_trading.backtest.engine",
+    "agentic_trading.backtest.engine_inputs",
     "agentic_trading.backtest.portfolio",
     "agentic_trading.firm_record.rows",
     "agentic_trading.firm_record.runner",
@@ -87,7 +93,10 @@ def build_firm_spec(
     class, weighting strategy, pod-return lookback and drawdown breaker,
     never its worker count. The module hashes cover every `agentic_trading`
     module loaded at the call (`_loaded_module_hashes`) and every module
-    reachable from the agents' modules and `_HASHED_ROOTS`. Raises
+    reachable from the agents' modules and `_HASHED_ROOTS`, among them the
+    engine-input builder (`backtest.engine_inputs`) and the price and rate
+    loaders it imports (`data.loader`, `data.loaders.lakehouse_loader`,
+    `data.loaders.macro_loader`), whether or not they are loaded. Raises
     `ValueError` when the window is reversed, `lake_time` is naive, the
     installed quantcore's commit is unknown, or a hashed module has no
     source file."""
