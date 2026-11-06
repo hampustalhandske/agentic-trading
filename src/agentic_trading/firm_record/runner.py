@@ -29,7 +29,10 @@ directory, which holds only the submission: the store's spec.json,
 sources.json, decisions.parquet and progress.json, and the edgelab replay
 folder around them (`firm_record.submission`: submission.json, strategy/,
 data/ and agentic_meta.json), written at each start of the pass for the
-commit it runs from.
+commit it runs from. unfilled_orders.json lists the orders the engine
+could not fill, and agentic_meta.json their number; both are derived from
+the engine checkpoint at the start and at the end of each pass, so a
+resumed pass reports the orders of every day its checkpoint holds.
 
 No performance figure leaves the pass: the result reports only what was
 written, and the engine's value and ratio log lines are held back while it
@@ -48,6 +51,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict
@@ -56,6 +60,7 @@ from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.managers.cvar_manager import ConditionalValueAtRiskManager
 from agentic_trading.agents.managers.tail_hedge_manager import TailHedgeManager
+from agentic_trading.agents.schemas import UnfilledOrder
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
@@ -71,7 +76,11 @@ from agentic_trading.firm_record.rows import (
     row_provenance,
 )
 from agentic_trading.firm_record.spec import build_firm_spec
-from agentic_trading.firm_record.submission import submission_for, write_submission_folder
+from agentic_trading.firm_record.submission import (
+    submission_for,
+    write_submission_folder,
+    write_unfilled_orders,
+)
 from agentic_trading.logging_config import get_logger
 from agentic_trading.provenance import source_tree_state
 from agentic_trading.scoring.track_record import TrackRecord
@@ -138,19 +147,34 @@ def _on_sessions(market_data: pd.DataFrame, sessions: list[date]) -> pd.DataFram
     return pd.concat([market_data.loc[market_data.index < first], window])
 
 
-def _checkpoint_last_day(path: Path) -> date | None:
-    """The last day the engine checkpoint at `path` holds, `None` when the
-    file is absent or holds no day."""
+def _checkpoint_payload(path: Path) -> dict[str, Any] | None:
+    """`checkpoint_store.read_all` of the engine checkpoint at `path`,
+    `None` when the file is absent or holds no state."""
     if not path.exists():
         return None
     connection = checkpoint_store.connect(path, resume=True)
     try:
-        payload = checkpoint_store.read_all(connection)
+        return checkpoint_store.read_all(connection)
     finally:
         connection.close()
+
+
+def _checkpoint_last_day(path: Path) -> date | None:
+    """The last day the engine checkpoint at `path` holds, `None` when the
+    file is absent or holds no day."""
+    payload = _checkpoint_payload(path)
     if payload is None or not payload["portfolio_value_history"]:
         return None
     return date.fromisoformat(payload["portfolio_value_history"][-1][0])
+
+
+def _checkpoint_unfilled_orders(path: Path) -> list[UnfilledOrder]:
+    """Every order the engine checkpoint at `path` records as unfilled, in
+    day order; empty when the file is absent or holds no state."""
+    payload = _checkpoint_payload(path)
+    if payload is None:
+        return []
+    return [UnfilledOrder.model_validate(order) for order in payload["unfilled_orders"]]
 
 
 def _held_contracts(portfolio: Portfolio) -> dict[str, float]:
@@ -311,6 +335,9 @@ def run_firm_record(
                 is not None
             )
         write_submission_folder(store.trial_dir, record, submission, meta)
+        meta = write_unfilled_orders(
+            store.trial_dir, _checkpoint_unfilled_orders(checkpoint_path), meta
+        )
         pending = [day for day in sessions if last is None or day > last]
         logger.info(
             "Firm record (trial %s, %s): %d of %d sessions to compute",
@@ -375,6 +402,9 @@ def run_firm_record(
             except _RecordPausedError:
                 commander.close()
                 logger.info("Firm record paused after %d day(s)", written)
+            write_unfilled_orders(
+                store.trial_dir, _checkpoint_unfilled_orders(checkpoint_path), meta
+            )
         last_completed = store.last_completed()
         if counted and written and ledger is not None and last_completed is not None:
             ledger.record_trial(

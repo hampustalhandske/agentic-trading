@@ -13,14 +13,19 @@ progress.json, the trial directory holds:
   edgelab's `TargetWeightsReplay`;
 - data/: the Parquet bundle folder, holding only a README line;
 - agentic_meta.json: an `AgenticMeta`, what edgelab's model has no field
-  for: whether the record is counted in the trial ledger and whether its
-  `src/` tree was clean.
+  for: whether the record is counted in the trial ledger, whether its
+  `src/` tree was clean, and how many orders went unfilled;
+- unfilled_orders.json: an `UnfilledOrdersRecord`, the orders the engine
+  could not fill and their count per reason.
 
-`submission_for` builds the `Submission` of a record and
-`write_submission_folder` writes these files. Nothing here imports
+`submission_for` builds the `Submission` of a record,
+`write_submission_folder` writes these files but the last, and
+`write_unfilled_orders` writes it and the count. Nothing here imports
 edgelab."""
 
 import json
+import math
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
@@ -29,6 +34,7 @@ from typing import Any, Literal, Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
 
+from agentic_trading.agents.schemas import UnfilledOrder
 from agentic_trading.config import settings
 from agentic_trading.firm_record.edgelab_strategy import REPLAY_STRATEGY_PY, REPLAY_STRATEGY_YAML
 from agentic_trading.firm_record.rows import row_instrument_id
@@ -38,6 +44,7 @@ from agentic_trading.trials.rows import FIRM_HYPOTHESIS_ID
 
 SUBMISSION_FILE = "submission.json"
 META_FILE = "agentic_meta.json"
+UNFILLED_ORDERS_FILE = "unfilled_orders.json"
 STRATEGY_DIR = "strategy"
 DATA_DIR = "data"
 DECISIONS_FILE = "decisions.parquet"
@@ -214,7 +221,9 @@ class AgenticMeta(BaseModel):
     (`git_sha`), whether its `src/` tree had no changes
     (`src_tree_clean`), and whether its `declared_n` comes from the
     registry file (`"registration"`) or is the uncounted default of 1
-    (`"uncounted_default"`)."""
+    (`"uncounted_default"`), and how many of the engine's orders went
+    unfilled over the days its checkpoint holds (`unfilled_orders`, listed
+    in unfilled_orders.json)."""
 
     model_config = _SPEC
 
@@ -222,6 +231,18 @@ class AgenticMeta(BaseModel):
     git_sha: str
     src_tree_clean: bool
     declared_n_from: Literal["registration", "uncounted_default"]
+    unfilled_orders: int = Field(default=0, ge=0)
+
+
+class UnfilledOrdersRecord(BaseModel):
+    """What unfilled_orders.json holds: every order the engine could not
+    fill (`orders`, in day order; a `price` that was missing or NaN is
+    null) and their count per reason (`by_reason`, reasons sorted)."""
+
+    model_config = _SPEC
+
+    orders: list[UnfilledOrder]
+    by_reason: dict[str, int]
 
 
 def decision_sources(entries: Sequence[Mapping[str, Any]]) -> tuple[SubmissionSource, ...]:
@@ -369,3 +390,27 @@ def write_submission_folder(
         for source in submission.decisions.sources
     ]
     _write_text(trial_dir / SUBMISSION_FILE, json.dumps(content, indent=2) + "\n")
+
+
+def write_unfilled_orders(
+    trial_dir: Path, orders: Sequence[UnfilledOrder], meta: AgenticMeta
+) -> AgenticMeta:
+    """Write `orders` to `trial_dir`'s unfilled_orders.json as an
+    `UnfilledOrdersRecord`, a non-finite `price` as null, then `meta` with
+    `unfilled_orders` set to their number as its agentic_meta.json, each
+    atomically and replacing what is there; return that `meta`."""
+    trial_dir = Path(trial_dir)
+    written = [
+        order
+        if order.price is None or math.isfinite(order.price)
+        else order.model_copy(update={"price": None})
+        for order in orders
+    ]
+    counts = Counter(order.reason for order in written)
+    record = UnfilledOrdersRecord(
+        orders=written, by_reason={reason: counts[reason] for reason in sorted(counts)}
+    )
+    _write_text(trial_dir / UNFILLED_ORDERS_FILE, record.model_dump_json(indent=2) + "\n")
+    updated = meta.model_copy(update={"unfilled_orders": len(written)})
+    _write_text(trial_dir / META_FILE, updated.model_dump_json(indent=2) + "\n")
+    return updated

@@ -178,7 +178,9 @@ def _run(store_dir: Path, **kwargs: Any) -> FirmRecordResult:
         "quantcore_version": "0.3.1",
     } | kwargs
     commander = options.pop("commander", None) or _commander()
-    return run_firm_record(commander, _UNIVERSE, _START, _END, store_dir, _frame(), **options)
+    frame = options.pop("frame", None)
+    frame = _frame() if frame is None else frame
+    return run_firm_record(commander, _UNIVERSE, _START, _END, store_dir, frame, **options)
 
 
 def _rows(store_dir: Path, result: FirmRecordResult) -> list[dict[str, Any]]:
@@ -299,6 +301,7 @@ def test_trial_dir_holds_the_submission_only(tmp_path: Path) -> None:
         "spec.json",
         "strategy",
         "submission.json",
+        "unfilled_orders.json",
     ]
     assert set(FirmRecordResult.model_fields) == {
         "spec_hash",
@@ -530,6 +533,7 @@ def test_uncounted_record_writes_a_valid_submission_folder(
         "git_sha": "a" * 40,
         "src_tree_clean": False,
         "declared_n_from": "uncounted_default",
+        "unfilled_orders": len(json.loads((trial / "unfilled_orders.json").read_text())["orders"]),
     }
     strategy = yaml.safe_load((trial / "strategy" / "strategy.yaml").read_text())
     assert strategy["strategy"] == "strategy.py:Replay"
@@ -610,3 +614,51 @@ def test_submission_seed_is_constant(tmp_path: Path) -> None:
 
     assert seeds == [settings.firm.edgelab_seed] * 4
     assert settings.firm.edgelab_seed == 20100104
+
+
+# A session whose SPY open is masked (NaN) while its close stands: the fill due that morning
+# has no price.
+_NAN_OPEN_DAY = _SESSIONS[5]
+
+
+def _nan_open_frame() -> pd.DataFrame:
+    frame = _frame()
+    frame.loc[_NAN_OPEN_DAY, ("SPY", "open")] = np.nan
+    return frame
+
+
+def _unfilled(store_dir: Path, result: FirmRecordResult) -> dict[str, Any]:
+    return json.loads((store_dir / result.spec_hash / "unfilled_orders.json").read_text())
+
+
+def test_unfilled_orders_are_written_and_survive_a_resume(tmp_path: Path) -> None:
+    """A NaN open leaves SPY's fill that day undone: unfilled_orders.json lists it as
+    no_fill_price with a null price, counts each reason, and agentic_meta.json holds the total.
+    A record paused after the NaN-open day and resumed ends with the same file as an
+    unbroken record."""
+    unbroken = _run(tmp_path / "unbroken", frame=_nan_open_frame())
+    record = _unfilled(tmp_path / "unbroken", unbroken)
+    orders = record["orders"]
+    spy = [
+        order
+        for order in orders
+        if order["asset"] == "SPY" and order["as_of_date"] == _NAN_OPEN_DAY.date().isoformat()
+    ]
+    meta = json.loads(
+        (tmp_path / "unbroken" / unbroken.spec_hash / "agentic_meta.json").read_text()
+    )
+
+    assert len(spy) == 1
+    assert spy[0]["reason"] == "no_fill_price" and spy[0]["price"] is None
+    assert set(spy[0]) == {"as_of_date", "asset", "target_weight", "reason", "price"}
+    assert sum(record["by_reason"].values()) == len(orders) == meta["unfilled_orders"]
+    assert record["by_reason"]["no_fill_price"] == sum(
+        order["reason"] == "no_fill_price" for order in orders
+    )
+
+    paused = _run(tmp_path / "paused", frame=_nan_open_frame(), max_days=7)
+    assert paused.last_completed == _SESSIONS[6].date()
+    resumed = _run(tmp_path / "paused", frame=_nan_open_frame())
+
+    assert resumed.complete
+    assert _unfilled(tmp_path / "paused", resumed) == record
