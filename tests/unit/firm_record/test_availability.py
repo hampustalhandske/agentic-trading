@@ -61,7 +61,8 @@ def test_counts_by_year_and_total() -> None:
             ],
             _DAY_2016: [_decision(_DAY_2016, [_signal("a", "unavailable", _DAY_2016)])],
             _NEXT_2016: [_decision(_NEXT_2016, [_signal("a", "active", _NEXT_2016)])],
-        }
+        },
+        ["a"],
     ).root
 
     assert list(record["a"]) == ["2015", "2016", TOTAL_KEY]
@@ -96,7 +97,8 @@ def test_option_rows_and_carried_signals_are_not_counted_again() -> None:
                 ),
                 _decision(_NEXT_2016, [_signal("a", "active", _DAY_2016, "GAP")], "GAP"),
             ]
-        }
+        },
+        ["a"],
     ).root
 
     assert record["a"][TOTAL_KEY] == AvailabilityCounts(
@@ -119,7 +121,8 @@ def test_low_availability_marks_undeclared_analysts() -> None:
                     ],
                 )
             ]
-        }
+        },
+        ["c", "b", "a"],
     )
 
     flagged = low_availability(record, 0.5, {"b": "from 2017-01-03"})
@@ -128,6 +131,30 @@ def test_low_availability_marks_undeclared_analysts() -> None:
         ("a", 0.0, True),
         ("b", 0.0, False),
     ]
+
+
+def test_a_roster_analyst_without_signals_is_listed_and_always_flagged() -> None:
+    """A roster analyst that emitted no signal is listed with zero counts in every recorded year
+    and a share of 0, and is flagged even at a threshold of 0, undeclared unless the expected
+    availability names it; an analyst outside the roster that signaled is listed too."""
+    record = analyst_availability(
+        {
+            _DAY_2015: [_decision(_DAY_2015, [_signal("a", "active", _DAY_2015)])],
+            _DAY_2016: [_decision(_DAY_2016, [_signal("outside", "active", _DAY_2016)])],
+        },
+        ["silent", "a"],
+    )
+    zero = AvailabilityCounts(active=0, unavailable=0, error=0, available_share=0.0)
+
+    assert list(record.root) == ["a", "outside", "silent"]
+    assert record.root["silent"] == {"2015": zero, "2016": zero, TOTAL_KEY: zero}
+    assert record.root["a"]["2016"] == zero
+    for expected, undeclared in (({}, True), ({"silent": "none in window"}, False)):
+        flagged = low_availability(record, 0.0, expected)
+        assert [
+            (entry.analyst_id, entry.available_share, entry.signals, entry.undeclared)
+            for entry in flagged
+        ] == [("silent", 0.0, 0, undeclared)]
 
 
 def _registry(tmp_path: Path, body: str) -> Path:

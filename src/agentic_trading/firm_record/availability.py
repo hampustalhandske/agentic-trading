@@ -9,13 +9,17 @@ them. A signal counts once, on its decision day, for each decision of an
 instrument (an equity, a future, an FX pair or a coin) it fed, when the
 signal itself is dated that day: an option row repeats its underlying's
 signals, and a decision on an instrument without its bar carries the
-signals of an earlier day, so neither is counted again. A signal counts under the status
-its pod carried it with (`ManagerSignal.status`); `active` includes a flat
-signal at confidence 0. An analyst run by several pods counts once per pod
-for each instrument."""
+signals of an earlier day, so neither is counted again. A signal counts
+under the status its pod carried it with (`ManagerSignal.status`); `active`
+includes a flat signal at confidence 0. An analyst run by several pods
+counts once per pod for each instrument.
+
+Every analyst of the record's roster is listed, with every year of the
+recorded days, whether or not it signaled: one that emitted no signal
+shows zero counts and an available share of 0, and is always flagged."""
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import date
 from typing import Self
 
@@ -57,32 +61,39 @@ class AvailabilityCounts(BaseModel):
 
 
 class AnalystAvailability(RootModel[dict[str, dict[str, AvailabilityCounts]]]):
-    """What analyst_availability.json holds: each analyst id that signaled
-    in the record, sorted, to its counts per calendar year (`"2016"`, ...,
-    in order) and over the whole record (`TOTAL_KEY`)."""
+    """What analyst_availability.json holds: each analyst id of the roster
+    and each other one that signaled, sorted, to its counts per calendar
+    year of the recorded days (`"2016"`, ..., in order) and over the whole
+    record (`TOTAL_KEY`)."""
 
     model_config = ConfigDict(frozen=True)
 
 
 class LowAvailability(BaseModel):
     """An analyst whose whole-record `available_share` is below the firm's
-    threshold, and whether the record's registration leaves its availability
-    undeclared (`undeclared`)."""
+    threshold or that emitted no signal, its number of `signals` of every
+    status over the record, and whether the record's registration leaves
+    its availability undeclared (`undeclared`)."""
 
     model_config = _SPEC
 
     analyst_id: str
     available_share: float = Field(ge=0.0, le=1.0)
+    signals: int = Field(ge=0)
     undeclared: bool
 
 
 def analyst_availability(
     decisions_by_day: Mapping[date, Sequence[PortfolioDecision]],
+    roster: Iterable[str],
 ) -> AnalystAvailability:
-    """Each analyst's signals in `decisions_by_day` (decision day to the
-    Commander's decisions of that day) counted by status per calendar year
-    of the decision day and over every day (see the module docstring)."""
-    by_year: dict[str, dict[str, Counter[SignalStatus]]] = {}
+    """The signals in `decisions_by_day` (decision day to the Commander's
+    decisions of that day) of each analyst id of `roster`, and of any other
+    analyst that signaled, counted by status in every calendar year of the
+    decision days and over every day (see the module docstring); an
+    analyst without a signal in a period counts 0 in it."""
+    years_recorded = sorted({str(day.year) for day in decisions_by_day})
+    by_year: dict[str, dict[str, Counter[SignalStatus]]] = {analyst_id: {} for analyst_id in roster}
     for day, decisions in decisions_by_day.items():
         year = str(day.year)
         for decision in decisions:
@@ -100,7 +111,7 @@ def analyst_availability(
         for counts in years.values():
             total.update(counts)
         record[analyst_id] = {
-            **{year: AvailabilityCounts.of(years[year]) for year in sorted(years)},
+            **{year: AvailabilityCounts.of(years.get(year, {})) for year in years_recorded},
             TOTAL_KEY: AvailabilityCounts.of(total),
         }
     return AnalystAvailability(record)
@@ -112,14 +123,21 @@ def low_availability(
     expected: Mapping[str, str],
 ) -> list[LowAvailability]:
     """The analysts of `availability` whose whole-record share is below
-    `threshold`, in analyst order, each `undeclared` when `expected` (the
-    registration's expected availability per analyst id) does not name it."""
+    `threshold` or that emitted no signal at all, in analyst order, each
+    `undeclared` when `expected` (the registration's expected availability
+    per analyst id) does not name it."""
     return [
         LowAvailability(
             analyst_id=analyst_id,
             available_share=periods[TOTAL_KEY].available_share,
+            signals=_signals(periods[TOTAL_KEY]),
             undeclared=analyst_id not in expected,
         )
         for analyst_id, periods in availability.root.items()
-        if periods[TOTAL_KEY].available_share < threshold
+        if periods[TOTAL_KEY].available_share < threshold or _signals(periods[TOTAL_KEY]) == 0
     ]
+
+
+def _signals(counts: AvailabilityCounts) -> int:
+    """The number of signals `counts` holds, of every status."""
+    return counts.active + counts.unavailable + counts.error

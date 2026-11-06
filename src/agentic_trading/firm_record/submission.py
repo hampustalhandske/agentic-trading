@@ -26,7 +26,8 @@ progress.json, the trial directory holds:
 `write_submission_folder` writes these files but the last two,
 `write_unfilled_orders` writes unfilled_orders.json and the count, and
 `write_analyst_availability` writes analyst_availability.json and the
-analysts under the threshold. Nothing here imports edgelab."""
+analysts under the threshold or without a signal. Nothing here imports
+edgelab."""
 
 import json
 import math
@@ -237,8 +238,9 @@ class AgenticMeta(BaseModel):
     in unfilled_orders.json), the instruments whose bars start inside
     the warm-up (`short_warmup`, in universe order), the analysts whose
     share of available signals over those days is below
-    `settings.firm.low_availability_threshold` (`low_availability`, in
-    analyst order; analyst_availability.json holds every analyst's counts),
+    `settings.firm.low_availability_threshold` or that emitted no signal
+    (`low_availability`, in analyst order; analyst_availability.json holds
+    every roster analyst's counts),
     and the registry file's `expected_availability` as it states it, empty
     without one."""
 
@@ -446,7 +448,8 @@ def write_analyst_availability(
 ) -> AgenticMeta:
     """Write `availability` to `trial_dir`'s analyst_availability.json, then
     `meta` with `low_availability` set to its analysts under
-    `settings.firm.low_availability_threshold` (read at call time), each
+    `settings.firm.low_availability_threshold` (read at call time) or
+    without any signal (`firm_record.availability.low_availability`), each
     `undeclared` when `meta.expected_availability` does not name it, as its
     agentic_meta.json, each atomically and replacing what is there; return
     that `meta`."""

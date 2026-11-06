@@ -749,7 +749,12 @@ def test_unavailable_analyst_is_flagged_undeclared(
     assert availability["fred_stub_analyst"]["total"]["available_share"] == 1.0
     assert availability["price_stub_analyst"]["total"]["available_share"] == 1.0
     assert meta["low_availability"] == [
-        {"analyst_id": "dark_stub_analyst", "available_share": 0.0, "undeclared": True}
+        {
+            "analyst_id": "dark_stub_analyst",
+            "available_share": 0.0,
+            "signals": _priced_signals(),
+            "undeclared": True,
+        }
     ]
     assert meta["expected_availability"] == {}
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -767,7 +772,12 @@ def test_declared_availability_is_copied_and_marks_the_analyst_declared(tmp_path
 
     assert meta["expected_availability"] == {"dark_stub_analyst": "none in window"}
     assert meta["low_availability"] == [
-        {"analyst_id": "dark_stub_analyst", "available_share": 0.0, "undeclared": False}
+        {
+            "analyst_id": "dark_stub_analyst",
+            "available_share": 0.0,
+            "signals": _priced_signals(),
+            "undeclared": False,
+        }
     ]
 
 
@@ -804,7 +814,7 @@ def test_availability_leaves_the_decisions_unchanged(
     """decisions.parquet holds the same bytes whether or not the pass counts availability."""
     counted = _run(tmp_path / "counted", commander=_dark_commander())
 
-    def unfilled_only(trial_dir: Path, checkpoint_path: Path, meta: Any) -> Any:
+    def unfilled_only(trial_dir: Path, checkpoint_path: Path, meta: Any, _roster: Any) -> Any:
         payload = runner_module._checkpoint_payload(checkpoint_path)
         orders = [] if payload is None else payload["unfilled_orders"]
         return runner_module.write_unfilled_orders(
@@ -818,3 +828,36 @@ def test_availability_leaves_the_decisions_unchanged(
     assert (tmp_path / "plain" / plain.spec_hash / "decisions.parquet").read_bytes() == (
         tmp_path / "counted" / counted.spec_hash / "decisions.parquet"
     ).read_bytes()
+
+
+def test_a_roster_analyst_that_never_signals_is_listed_and_flagged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An analyst whose pod's scope holds no instrument of the universe emits no signal on any
+    day: analyst_availability.json still lists it, with zero counts, agentic_meta.json flags it
+    as undeclared with no signals, and the pass warns about it."""
+    commander = _commander()
+    silent = _PassThroughManager(
+        agent_id="silent_manager",
+        managed_analysts=[_DarkAnalyst(agent_id="silent_stub_analyst")],
+        weighting_strategy=EqualWeight(),
+        portfolio_constructor=_ViewConstructor(),
+        assets=("NOT-IN-UNIVERSE",),
+    )
+    firm = Commander(
+        managers=[*commander.managers, silent], weighting_strategy=commander.weighting_strategy
+    )
+    with caplog.at_level(logging.WARNING, logger="agentic_trading.firm_record.runner"):
+        result = _run(tmp_path, commander=firm)
+    zero = {"active": 0, "unavailable": 0, "error": 0, "available_share": 0.0}
+
+    assert _availability(tmp_path, result)["silent_stub_analyst"] == {"2016": zero, "total": zero}
+    assert _meta(tmp_path, result)["low_availability"] == [
+        {
+            "analyst_id": "silent_stub_analyst",
+            "available_share": 0.0,
+            "signals": 0,
+            "undeclared": True,
+        }
+    ]
+    assert [r for r in caplog.records if "silent_stub_analyst" in r.getMessage()]

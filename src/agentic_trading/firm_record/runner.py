@@ -31,15 +31,17 @@ folder around them (`firm_record.submission`: submission.json, strategy/,
 data/ and agentic_meta.json), written at each start of the pass for the
 commit it runs from. unfilled_orders.json lists the orders the engine
 could not fill, and agentic_meta.json their number; analyst_availability.json
-counts each analyst's signals by status per year and over the record
-(`firm_record.availability`), and agentic_meta.json lists the analysts whose
-share of available signals is below `settings.firm.low_availability_threshold`
-(`low_availability`), each marked `undeclared` when the registry file's
-`expected_availability` does not name it, a mapping agentic_meta.json
-copies. All of these are derived from the engine checkpoint at the start
-and at the end of each pass, so a resumed pass reports the days its
-checkpoint holds as an unbroken one does; at the end of each pass every
-analyst under the threshold is logged as a warning.
+counts the signals of every analyst of the roster by status per year and
+over the record, zero for one that emitted none (`firm_record.availability`),
+and agentic_meta.json lists the analysts whose share of available signals
+is below `settings.firm.low_availability_threshold` or that emitted no
+signal (`low_availability`), each marked `undeclared` when the registry
+file's `expected_availability` does not name it, a mapping
+agentic_meta.json copies. All of these are derived from the engine
+checkpoint at the start and at the end of each pass, so a resumed pass
+reports the days its checkpoint holds as an unbroken one does; at the end
+of each pass every analyst listed in `low_availability` is logged as a
+warning.
 
 No performance figure leaves the pass: the result reports only what was
 written, and the engine's value and ratio log lines are held back while it
@@ -180,14 +182,14 @@ def _checkpoint_last_day(path: Path) -> date | None:
 
 
 def _write_checkpoint_reports(
-    trial_dir: Path, checkpoint_path: Path, meta: AgenticMeta
+    trial_dir: Path, checkpoint_path: Path, meta: AgenticMeta, roster: Sequence[str]
 ) -> AgenticMeta:
     """Write `trial_dir`'s unfilled_orders.json and analyst_availability.json
     from the engine checkpoint at `checkpoint_path` (every unfilled order it
-    records, in day order, and the analysts' signals in the decisions of
-    every day it holds; neither has any when the file is absent or holds no
-    state), with `meta` updated to match as agentic_meta.json; return that
-    `meta`."""
+    records, in day order, and the signals of each analyst id of `roster`,
+    and of any other analyst, in the decisions of every day it holds; it
+    holds none when the file is absent or holds no state), with `meta`
+    updated to match as agentic_meta.json; return that `meta`."""
     payload = _checkpoint_payload(checkpoint_path)
     orders = (
         []
@@ -205,7 +207,9 @@ def _write_checkpoint_reports(
         }
     )
     meta = write_unfilled_orders(trial_dir, orders, meta)
-    return write_analyst_availability(trial_dir, analyst_availability(decisions_by_day), meta)
+    return write_analyst_availability(
+        trial_dir, analyst_availability(decisions_by_day, roster), meta
+    )
 
 
 def _held_contracts(portfolio: Portfolio) -> dict[str, float]:
@@ -338,6 +342,7 @@ def run_firm_record(
     store_dir = Path(store_dir)
     store = FirmDecisionStore(store_dir, record, sources=sources)
     sources_by_analyst = analyst_sources(analysts)
+    roster_ids = list(dict.fromkeys(analyst.agent_id for analyst in analysts))
     kinds = {ticker: instrument_kind(ticker) for ticker in tickers}
     scopes = {
         ticker: [
@@ -375,7 +380,7 @@ def run_firm_record(
                 is not None
             )
         write_submission_folder(store.trial_dir, record, submission, meta)
-        meta = _write_checkpoint_reports(store.trial_dir, checkpoint_path, meta)
+        meta = _write_checkpoint_reports(store.trial_dir, checkpoint_path, meta, roster_ids)
         pending = [day for day in sessions if last is None or day > last]
         logger.info(
             "Firm record (trial %s, %s): %d of %d sessions to compute",
@@ -440,14 +445,15 @@ def run_firm_record(
             except _RecordPausedError:
                 commander.close()
                 logger.info("Firm record paused after %d day(s)", written)
-            meta = _write_checkpoint_reports(store.trial_dir, checkpoint_path, meta)
+            meta = _write_checkpoint_reports(store.trial_dir, checkpoint_path, meta, roster_ids)
         for flagged in meta.low_availability:
             logger.warning(
-                "Firm record (trial %s): analyst %s had an available signal in %.1f%% of its "
-                "signals, below the %.1f%% threshold (%s)",
+                "Firm record (trial %s): analyst %s had %.1f%% of its %d signal(s) available, "
+                "low against the %.1f%% threshold (%s)",
                 record.spec_hash,
                 flagged.analyst_id,
                 100.0 * flagged.available_share,
+                flagged.signals,
                 100.0 * settings.firm.low_availability_threshold,
                 "undeclared in the registration"
                 if flagged.undeclared
