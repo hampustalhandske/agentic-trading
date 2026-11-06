@@ -5,9 +5,11 @@ per-call reference loaders (`scripts/at126_legacy.py`) do, on the direct
 path and on the store path, over a synthetic lake holding each source's
 point-in-time traps; the store's own mechanics (one fetch per key, the
 data_end guard, copies, eviction, threads); and the A/B harness's
-comparison logic (`scripts/at126_ab.py`)."""
+comparison logic and probe guards (`scripts/at126_ab.py`)."""
 
 import importlib
+import json
+import logging
 import math
 import sys
 import threading
@@ -34,7 +36,7 @@ from agentic_trading.cli import (
     LOADER_STORE_USAGE_PREFIX,
     firm_record_app,
 )
-from agentic_trading.config import settings
+from agentic_trading.config import settings, temporary_overrides
 from agentic_trading.data.loaders import lakehouse_loader as ll
 from agentic_trading.data.loaders import option_marks
 from agentic_trading.data.trading_calendar import sessions_between
@@ -1574,3 +1576,148 @@ def test_the_firm_record_command_is_uncounted_and_switches_the_store(
     assert f"trials.ledger_path={tmp_path / 'ledger.duckdb'}" in command
     assert f"trials.registry_dir={tmp_path / 'registry'}" in command
     assert "--loader-store" in ab.firm_record_command("s", "e", "T", True, tmp_path, [])
+
+
+# ---------------------------------------------------------------- probes and counts-only output
+
+_EARNINGS = "load_earnings_surprise_from_lakehouse"
+_PROBED = (_EARNINGS, _SHORT_INTEREST)
+# A short position `_short_interest_rows` gives AAA (its 2018-11-30
+# settlement), in every short-interest answer from 2019 on.
+_FIXTURE_SHORT_POSITION = "1001000"
+# The short position the poisoned reference loader reports instead.
+_POISONED_SHORT_POSITION = 987654321
+
+
+def _probe_args(*extra: str, ticker: str = "AAA") -> list[str]:
+    """`loaders` arguments probing the two loaders on two fixture days."""
+    only = [arg for name in _PROBED for arg in ("--only-loader", name)]
+    return ["loaders", "--day", "2019-03-15", "--day", "2019-04-16", "--ticker", ticker,
+            *only, *extra]  # fmt: skip
+
+
+def _poison_short_interest(ab: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Makes the reference short-interest loader report
+    `_POISONED_SHORT_POSITION` for every row, so the direct and store
+    answers mismatch it."""
+    reference = ab.LEGACY_LOADERS[_SHORT_INTEREST]
+
+    def poisoned(*args: Any) -> Any:
+        frame = reference(*args)
+        if frame is not None:
+            shares = frame["short_interest_shares"]
+            frame["short_interest_shares"] = shares * 0 + _POISONED_SHORT_POSITION
+        return frame
+
+    monkeypatch.setitem(ab.LEGACY_LOADERS, _SHORT_INTEREST, poisoned)
+
+
+def test_only_loader_builds_the_named_loaders_calls_only(ab: ModuleType) -> None:
+    plan = _plan(ab, _EQUALITY_DAYS)
+    every = ab.build_calls(plan)
+    limited = ab.build_calls(plan, _PROBED)
+    assert {call.loader for call in limited} == set(_PROBED)
+    assert limited == [call for call in every if call.loader in _PROBED]
+    assert len(limited) == 2 * len(_TICKERS) * len(_EQUALITY_DAYS)
+
+
+def test_only_loader_runs_and_judges_the_named_loaders_and_skips_coverage(
+    ab: ModuleType, ab_lake: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "probe.json"
+    assert ab.main(_probe_args("--out", str(out))) == 0
+    payload = json.loads(out.read_text())
+    assert [summary["loader"] for summary in payload["loaders"]] == list(_PROBED)
+    assert all(summary["calls"] == 3 for summary in payload["loaders"])
+    assert payload["coverage"] == "skipped: --only-loader given"
+    assert payload["days"] == ["2019-03-15", "2019-04-16", "2019-04-17"]
+    printed = capsys.readouterr().out
+    assert "SKIPPED coverage (--only-loader given)" in printed
+    assert "OVERALL PASS" in printed
+    # No lake read for the other loaders' plan inputs (members, option snapshots).
+    queries = " ".join(query for query, _ in ab_lake.calls)
+    assert "sp500" not in queries and "option_chain" not in queries
+
+
+def test_counts_only_output_holds_no_answer_value(
+    ab: ModuleType,
+    ab_lake: Any,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a reference answer that mismatches, the full output shows the
+    fixture's values in the mismatch; the counts-only output (stdout,
+    stderr, the --out file and the log) holds none of them, only counts."""
+    _poison_short_interest(ab, monkeypatch)
+    assert ab.main(_probe_args("--out", str(tmp_path / "full.json"))) == 1
+    full = capsys.readouterr()
+    assert str(_POISONED_SHORT_POSITION) in full.out
+    assert _FIXTURE_SHORT_POSITION in full.out
+
+    out = tmp_path / "counts.json"
+    with caplog.at_level(logging.DEBUG):
+        assert ab.main(_probe_args("--counts-only", "--out", str(out))) == 1
+    counted = capsys.readouterr()
+    written = out.read_text()
+    for text in (counted.out, counted.err, written):
+        assert str(_POISONED_SHORT_POSITION) not in text
+        assert _FIXTURE_SHORT_POSITION not in text
+        assert "short_interest_shares" not in text
+    assert caplog.records == []
+    assert logging.root.manager.disable == logging.NOTSET
+
+    payload = json.loads(written)
+    assert set(payload) == {"lake_time", "verdict", "days", "tickers", "coverage", "loaders"}
+    assert payload["verdict"] == "FAIL" and payload["coverage"] == "skipped"
+    assert payload["tickers"] == ["AAA"]
+    assert all(tuple(summary) == ab.COUNT_ONLY_FIELDS for summary in payload["loaders"])
+    short = next(s for s in payload["loaders"] if s["loader"] == _SHORT_INTEREST)
+    assert short["mismatches"] == {"direct": 3, "store": 3}
+    assert short["allowed"] == {"direct": 0, "store": 0}
+    assert short["verdict"] == "FAIL"
+    lines = counted.out.splitlines()
+    assert lines[-1] == "OVERALL FAIL"
+    assert f"FAIL {_SHORT_INTEREST} (3 calls)" in lines
+
+
+def test_a_probed_loader_with_no_real_answer_still_fails(
+    ab: ModuleType, ab_lake: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert ab.main(_probe_args("--counts-only", ticker="ZZZ")) == 1
+    payload, _ = json.JSONDecoder().raw_decode(capsys.readouterr().out)
+    assert {(s["loader"], s["reference_answers"], s["verdict"]) for s in payload["loaders"]} == {
+        (_EARNINGS, 0, "FAIL"),
+        (_SHORT_INTEREST, 0, "FAIL"),
+    }
+
+
+def test_a_day_from_the_holdout_start_is_refused_before_any_query(
+    ab: ModuleType, ab_lake: Any
+) -> None:
+    holdout = settings.stage_a.data_end + timedelta(days=1)
+    assert ab.holdout_start() == holdout
+    ab.refuse_holdout_days([settings.stage_a.data_end])
+    sent = len(ab_lake.calls)
+    with pytest.raises(ab.HoldoutDayError, match="holdout"):
+        ab.main(["loaders", "--day", "2019-03-15", "--day", "2025-01-02", "--ticker", "AAA",
+                 "--counts-only"])  # fmt: skip
+    with pytest.raises(ab.HoldoutDayError):
+        ab.main(["loaders", "--start", "2024-12-02", "--end", holdout.isoformat(),
+                 "--ticker", "AAA"])  # fmt: skip
+    # The session after the last day is refused too, against data_end read at call time.
+    with temporary_overrides({"stage_a.data_end": date(2019, 4, 16)}):
+        with pytest.raises(ab.HoldoutDayError, match="2019-04-17"):
+            ab.main(_probe_args())
+        with pytest.raises(ab.HoldoutDayError):
+            ab.run_loaders_ab(_plan(ab))
+    assert len(ab_lake.calls) == sent
+
+
+def test_an_unknown_loader_name_is_refused(ab: ModuleType, ab_lake: Any) -> None:
+    with pytest.raises(SystemExit, match="load_nothing_from_lakehouse"):
+        ab.main(_probe_args("--only-loader", "load_nothing_from_lakehouse"))
+    assert ab.select_loaders([]) is None
+    assert ab.select_loaders([_SHORT_INTEREST, _EARNINGS]) == _PROBED
+    assert ab_lake.calls == []

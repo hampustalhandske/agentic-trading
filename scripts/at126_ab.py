@@ -11,9 +11,12 @@ the current loaders with no window declared ("direct") and the current
 loaders with the window store declared as the CLI declares it for the run
 (`declare_run_window`: the first day minus the warm-up to the run's last
 day; "store"). The decision days are the XNYS sessions from `--start` to
-`--end` (every `--every`th) plus the session after, or with `--firm-v1`
-the preset's days (`firm_v1_days`); the last day lies past the run's
-window, so the store pass also runs the direct fallback. A direct or
+`--end` (every `--every`th) or the sessions given with `--day`, plus the
+session after, or with `--firm-v1` the preset's days (`firm_v1_days`);
+the last day lies past the run's window, so the store pass also runs the
+direct fallback. A day on or after the holdout start (the day after
+`settings.stage_a.data_end`, read at call time) is refused with
+`HoldoutDayError` before any lake query. A direct or
 store answer matches when it equals the reference exactly: frames and
 series by `assert_frame_equal`/`assert_series_equal` with
 `check_exact=True`, `check_index_type=True` and `check_column_type=True`,
@@ -38,6 +41,25 @@ their count; the store pass's memory (`LoaderStoreUsage`); and the first
 mismatches in full. Then prints `PASS` or `FAIL` per loader (with its
 call count), the coverage verdict with `--firm-v1`, and
 `OVERALL PASS|FAIL`; exits 1 on an overall FAIL.
+
+`--only-loader NAME` (repeatable, each a name in `STORED_LOADERS`) builds
+the calls of the named loaders only and judges only those; the event
+coverage is then skipped (the JSON's `coverage` and the coverage line say
+so), and the lake reads that only other loaders need (the S&P 500
+members for the security ids, the option snapshots for the contracts)
+are not made.
+
+`--counts-only` keeps every answer inside the process. The JSON (printed
+and written to `--out`) holds only the lake time, the overall verdict,
+the days, the ticker list, the coverage status (`PASS`, `FAIL`,
+`skipped` or `not checked`), and per loader its calls, reference answers,
+reference errors, legacy self-mismatches, mismatches and allowed ones
+per path, queries and seconds per path, and verdict
+(`COUNT_ONLY_FIELDS`); no answer value, mismatch, key, tie or store
+usage. The lines after the JSON are the same verdict lines. Every log
+record and Python warning is blocked for the run, an error outside a
+loader call exits with its type name only, and `--firm-v1` needs
+`--firm-equities` (the selection script is not run).
 
 `--firm-v1` reads the registered firm's universe: the 30 equities that
 `scripts/select_firm_v1_equities.py` selects (from `--firm-equities`, the
@@ -81,6 +103,8 @@ Usage:
   uv run python scripts/at126_ab.py loaders --firm-v1 [--firm-equities PATH] [--lake-time T]
   uv run python scripts/at126_ab.py loaders --start 2019-01-02 --end 2019-06-28 \\
       --ticker AAPL --ticker SPY [--cot-ticker GC=F] [--lake-time T] [--every 5] [--out PATH]
+  uv run python scripts/at126_ab.py loaders --day 2021-03-15 --day 2021-06-15 --ticker AAPL \\
+      --only-loader load_short_interest_from_lakehouse --counts-only [--out PATH]
   uv run python scripts/at126_ab.py backtest --firm-v1 --start-date 2010-01-04 \\
       --end-date 2017-12-29 [--lake-time T] [--out PATH] [<extra CLI options, e.g. --set g.f=v>]
   uv run python scripts/at126_ab.py backtest --firm-record --start-date 2010-01-04 \\
@@ -88,13 +112,16 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
+import logging
 import math
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+import warnings
+from collections.abc import Callable, Iterator, Sequence
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -114,7 +141,7 @@ from agentic_trading.config import settings
 from agentic_trading.data.instruments import currency_pair, futures_root, is_marked
 from agentic_trading.data.loader import DEFAULT_BACKTEST_WARMUP_DAYS
 from agentic_trading.data.loaders import lakehouse_loader as ll
-from agentic_trading.data.trading_calendar import next_session, sessions_between
+from agentic_trading.data.trading_calendar import is_session, next_session, sessions_between
 
 RunPath = Literal["legacy", "legacy_repeat", "direct", "store"]
 PATHS: tuple[RunPath, ...] = ("legacy", "legacy_repeat", "direct", "store")
@@ -339,6 +366,81 @@ def trace_tie(expected: Any, actual: Any, tie_columns: tuple[str, ...] | None) -
             if not equal[column][position]:
                 return f"row {position} differs on ORDER BY column {column!r}"
     return None
+
+
+# ---------------------------------------------------------------- probe guards
+
+# The `LoaderSummary` fields a `--counts-only` report keeps per loader:
+# counts, seconds and the verdict, never an answer.
+COUNT_ONLY_FIELDS: tuple[str, ...] = (
+    "loader", "calls", "reference_answers", "reference_errors", "legacy_self_mismatches",
+    "mismatches", "allowed", "queries", "seconds", "verdict",
+)  # fmt: skip
+
+
+class HoldoutDayError(ValueError):
+    """A loaders A/B was asked about a day on or after the holdout start."""
+
+
+def holdout_start() -> date:
+    """The first day of the holdout: the day after `settings.stage_a.data_end`
+    (read at call time)."""
+    data_end: date = settings.stage_a.data_end
+    return data_end + timedelta(days=1)
+
+
+def refuse_holdout_days(days: Sequence[date]) -> None:
+    """Raises `HoldoutDayError` when any of `days` is on or after
+    `holdout_start()`; called before any lake query."""
+    start = holdout_start()
+    refused = sorted(day for day in days if day >= start)
+    if refused:
+        listed = ", ".join(day.isoformat() for day in refused)
+        raise HoldoutDayError(
+            f"day(s) {listed} on or after the holdout start {start.isoformat()} "
+            "(the day after stage_a.data_end); the holdout stays locked"
+        )
+
+
+def select_loaders(names: Sequence[str]) -> tuple[str, ...] | None:
+    """The stored loaders `--only-loader` names, in `STORED_LOADERS` order,
+    or `None` (every stored loader) when it names none. Raises
+    `SystemExit` naming any name that is not a stored loader."""
+    if not names:
+        return None
+    unknown = sorted(set(names) - set(STORED_LOADERS))
+    if unknown:
+        raise SystemExit(
+            f"--only-loader {', '.join(unknown)}: not a stored loader; "
+            f"choose from {', '.join(STORED_LOADERS)}"
+        )
+    return tuple(name for name in STORED_LOADERS if name in names)
+
+
+# The loaders whose calls need a lake read while the plan is built: the
+# option quote (its contracts come from a snapshot) and the security-id
+# loaders (their ids come from the S&P 500 members).
+_QUOTE_LOADER = "load_option_quote_from_lakehouse"
+_SECURITY_LOADERS = ("load_security_log_returns", "load_security_daily_bars")
+
+
+def _wants(only: Sequence[str] | None, *loaders: str) -> bool:
+    """Whether a run limited to `only` (`None`: every loader) calls any of `loaders`."""
+    return only is None or any(loader in only for loader in loaders)
+
+
+@contextlib.contextmanager
+def silenced() -> Iterator[None]:
+    """Blocks every log record (of every logger, at every level) and every
+    Python warning for the block, then restores the previous logging cut."""
+    previous = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            yield
+    finally:
+        logging.disable(previous)
 
 
 # ---------------------------------------------------------------- loaders mode
@@ -657,9 +759,18 @@ class CallPlan(BaseModel):
     days_past_window: int = 1
 
 
-def build_calls(plan: CallPlan) -> list[LoaderCall]:
+def build_calls(plan: CallPlan, only: Sequence[str] | None = None) -> list[LoaderCall]:
     """Every call of `plan`, day by day in a fixed loader order, and the
-    SIC reads (no knowledge time) on the first day."""
+    SIC reads (no knowledge time) on the first day; with `only`, just the
+    calls of those loaders."""
+    calls = _all_calls(plan)
+    if only is None:
+        return calls
+    wanted = set(only)
+    return [call for call in calls if call.loader in wanted]
+
+
+def _all_calls(plan: CallPlan) -> list[LoaderCall]:
     calls: list[LoaderCall] = []
     first = plan.days[0]
     price_tickers = plan.tickers if plan.price_tickers is None else plan.price_tickers
@@ -814,13 +925,23 @@ def coverage(calls: Sequence[LoaderCall], outputs: Sequence[Any]) -> dict[str, b
     return found
 
 
-def run_loaders_ab(plan: CallPlan) -> tuple[LoadersReport, dict[str, bool]]:
+def run_loaders_ab(
+    plan: CallPlan, only: Sequence[str] | None = None
+) -> tuple[LoadersReport, dict[str, bool] | None]:
     """Runs the four passes of `plan` inside the open session, judges
-    them, and reports the events the reference answers cover."""
-    calls = sorted(build_calls(plan), key=lambda call: call.day)
+    them, and reports the events the reference answers cover. With
+    `only`, runs and requires those loaders' calls alone and skips the
+    coverage (`None`). Refuses a plan with a holdout day
+    (`refuse_holdout_days`) before running any call."""
+    refuse_holdout_days(plan.days)
+    calls = sorted(build_calls(plan, only), key=lambda call: call.day)
     window = plan_window(plan)
     passes = {path: run_pass(path, calls, window) for path in PATHS}
-    return compare_passes(calls, passes, window), coverage(calls, passes["legacy"].outputs)
+    required = STORED_LOADERS if only is None else only
+    report = compare_passes(calls, passes, window, required)
+    if only is not None:
+        return report, None
+    return report, coverage(calls, passes["legacy"].outputs)
 
 
 def _member_ids(tickers: Sequence[str], day: date) -> list[int]:
@@ -894,9 +1015,12 @@ def cot_tickers_for(tickers: Sequence[str]) -> list[str]:
     ]
 
 
-def firm_v1_plan(equities: Sequence[dict[str, Any]], days: Sequence[date]) -> CallPlan:
+def firm_v1_plan(
+    equities: Sequence[dict[str, Any]], days: Sequence[date], only: Sequence[str] | None = None
+) -> CallPlan:
     """The plan of the firm-v1 preset over `days`, its SPY contracts found
-    on those days. The equities' prices are read as the firm record reads
+    on those days (none, with no snapshot read, when `only` leaves out the
+    quote loader). The equities' prices are read as the firm record reads
     them, by security id (`load_security_daily_bars`), so the price-history
     tickers are the universe's other non-futures instruments."""
     universe = firm_v1_universe(equities)
@@ -915,7 +1039,7 @@ def firm_v1_plan(equities: Sequence[dict[str, Any]], days: Sequence[date]) -> Ca
         fama_french_models=["3factor", "5factor"],
         cot_tickers=cot_tickers_for(universe),
         option_underlyings=["SPY"],
-        contracts=discover_contracts(["SPY"], days),
+        contracts=discover_contracts(["SPY"], days) if _wants(only, _QUOTE_LOADER) else [],
         futures_tickers=list(FIRM_V1_FUTURES),
         currencies=sorted(
             {
@@ -928,51 +1052,70 @@ def firm_v1_plan(equities: Sequence[dict[str, Any]], days: Sequence[date]) -> Ca
     )
 
 
-def _loaders_main(args: argparse.Namespace) -> int:
-    lake_time = None if args.lake_time is None else datetime.fromisoformat(args.lake_time)
-    if args.firm_v1:
-        equities = firm_v1_equities(args.firm_equities)
-        days = firm_v1_days()
+def probe_days(args: argparse.Namespace) -> list[date]:
+    """The decision days of a run without `--firm-v1`: the sessions given
+    with `--day` (sorted, each an XNYS session) or the XNYS sessions from
+    `--start` to `--end` (every `--every`th), plus the session after the
+    last. Refuses a holdout day (`refuse_holdout_days`) before looking up
+    any session."""
+    if args.day:
+        if args.start is not None or args.end is not None:
+            raise SystemExit("give --day or --start and --end, not both")
+        days = sorted({date.fromisoformat(day) for day in args.day})
+        refuse_holdout_days(days)
+        not_sessions = [day.isoformat() for day in days if not is_session(day)]
+        if not_sessions:
+            raise SystemExit(f"--day {', '.join(not_sessions)}: not an XNYS session")
     else:
-        if args.start is None or args.end is None or not args.ticker:
-            raise SystemExit("give --firm-v1, or --start, --end and at least one --ticker")
-        days = sessions_between(date.fromisoformat(args.start), date.fromisoformat(args.end))
-        days = days[:: args.every]
-        if days:
-            days.append(next_session(days[-1]))
-    if len(days) < 2:
-        raise SystemExit("no XNYS sessions in the range")
-    with ll.lake_session(lake_time) as session:
-        if args.firm_v1:
-            plan = firm_v1_plan(equities, days)
-        else:
-            tickers = list(dict.fromkeys(args.ticker))
-            pairs = [pair for t in tickers if (pair := currency_pair(t)) is not None]
-            underlyings = args.option_underlying or [t for t in tickers if not is_marked(t)]
-            plan = CallPlan(
-                days=days,
-                tickers=[t for t in tickers if not is_marked(t)],
-                price_tickers=[t for t in tickers if futures_root(t) is None],
-                security_ids=args.security_id or _member_ids(tickers, days[0]),
-                fred_series=args.fred_series or list(DEFAULT_FRED_SERIES),
-                fama_french_models=["3factor", "5factor"],
-                cot_tickers=args.cot_ticker or cot_tickers_for(tickers),
-                option_underlyings=underlyings,
-                contracts=discover_contracts(underlyings, days),
-                futures_tickers=[t for t in tickers if futures_root(t)],
-                currencies=sorted({c for pair in pairs for c in (pair.base, pair.quote)}),
-                price_lookback_days=args.price_lookback_days,
-            )
-        report, covered = run_loaders_ab(plan)
-        lake_time_used = session.lake_time.isoformat()
-    covered_ok = all(covered.values()) or not args.firm_v1
-    verdict = "PASS" if report.ok and covered_ok else "FAIL"
-    payload = {
-        "lake_time": lake_time_used,
+        if args.start is None or args.end is None:
+            raise SystemExit("give --firm-v1, or --day, or --start and --end")
+        start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
+        refuse_holdout_days([start, end])
+        days = sessions_between(start, end)[:: args.every]
+    if days:
+        days.append(next_session(days[-1]))
+    return days
+
+
+def counts_only_payload(
+    report: LoadersReport,
+    lake_time: str,
+    verdict: str,
+    days: Sequence[date],
+    tickers: Sequence[str],
+    coverage_status: str,
+) -> dict[str, Any]:
+    """The `--counts-only` JSON: the lake time, the overall verdict, the
+    days, the ticker list, the coverage status and per loader only its
+    `COUNT_ONLY_FIELDS`."""
+    fields = set(COUNT_ONLY_FIELDS)
+    return {
+        "lake_time": lake_time,
         "verdict": verdict,
-        "days": [day.isoformat() for day in plan.days],
+        "days": [day.isoformat() for day in days],
+        "tickers": list(tickers),
+        "coverage": coverage_status,
+        "loaders": [summary.model_dump(include=fields) for summary in report.loaders],
+    }
+
+
+def full_payload(
+    report: LoadersReport,
+    lake_time: str,
+    verdict: str,
+    days: Sequence[date],
+    covered: dict[str, bool] | None,
+) -> dict[str, Any]:
+    """The full loaders JSON: the days, the window, the coverage (or that
+    it was skipped), every summary, the allowed ties, the float-only
+    loaders, the registry differences, the store usage and the first
+    mismatches."""
+    return {
+        "lake_time": lake_time,
+        "verdict": verdict,
+        "days": [day.isoformat() for day in days],
         "window": report.window.model_dump(mode="json"),
-        "coverage": covered,
+        "coverage": "skipped: --only-loader given" if covered is None else covered,
         "loaders": [summary.model_dump() for summary in report.loaders],
         "allowed_ties": [tie.model_dump() for tie in report.allowed_ties],
         "float_only_loaders": [s.loader for s in report.loaders if s.float_only],
@@ -984,14 +1127,84 @@ def _loaders_main(args: argparse.Namespace) -> int:
             for item in report.mismatches[:MISMATCHES_SHOWN]
         ],
     }
+
+
+def _loaders_main(args: argparse.Namespace) -> int:
+    only = select_loaders(args.only_loader)
+    if not args.firm_v1 and not args.ticker:
+        raise SystemExit("give --firm-v1, or at least one --ticker")
+    if args.counts_only and args.firm_v1 and args.firm_equities is None:
+        raise SystemExit("--counts-only with --firm-v1 needs --firm-equities")
+    days = firm_v1_days() if args.firm_v1 else probe_days(args)
+    if len(days) < 2:
+        raise SystemExit("no XNYS sessions in the range")
+    refuse_holdout_days(days)
+    if not args.counts_only:
+        return _run_loaders(args, only, days)
+    with silenced():
+        try:
+            return _run_loaders(args, only, days)
+        except Exception as error:
+            raise SystemExit(
+                f"counts-only run failed with {type(error).__name__} (message withheld)"
+            ) from None
+
+
+def _run_loaders(args: argparse.Namespace, only: Sequence[str] | None, days: list[date]) -> int:
+    lake_time = None if args.lake_time is None else datetime.fromisoformat(args.lake_time)
+    if args.firm_v1:
+        equities = firm_v1_equities(args.firm_equities)
+    with ll.lake_session(lake_time) as session:
+        if args.firm_v1:
+            plan = firm_v1_plan(equities, days, only)
+        else:
+            tickers = list(dict.fromkeys(args.ticker))
+            pairs = [pair for t in tickers if (pair := currency_pair(t)) is not None]
+            underlyings = args.option_underlying or [t for t in tickers if not is_marked(t)]
+            security_ids = args.security_id
+            if not security_ids and _wants(only, *_SECURITY_LOADERS):
+                security_ids = _member_ids(tickers, days[0])
+            plan = CallPlan(
+                days=days,
+                tickers=[t for t in tickers if not is_marked(t)],
+                price_tickers=[t for t in tickers if futures_root(t) is None],
+                security_ids=security_ids,
+                fred_series=args.fred_series or list(DEFAULT_FRED_SERIES),
+                fama_french_models=["3factor", "5factor"],
+                cot_tickers=args.cot_ticker or cot_tickers_for(tickers),
+                option_underlyings=underlyings,
+                contracts=(
+                    discover_contracts(underlyings, days) if _wants(only, _QUOTE_LOADER) else []
+                ),
+                futures_tickers=[t for t in tickers if futures_root(t)],
+                currencies=sorted({c for pair in pairs for c in (pair.base, pair.quote)}),
+                price_lookback_days=args.price_lookback_days,
+            )
+        report, covered = run_loaders_ab(plan, only)
+        lake_time_used = session.lake_time.isoformat()
+    covered_ok = covered is None or not args.firm_v1 or all(covered.values())
+    verdict = "PASS" if report.ok and covered_ok else "FAIL"
+    if covered is None:
+        coverage_status = "skipped"
+    elif args.firm_v1:
+        coverage_status = "PASS" if covered_ok else "FAIL"
+    else:
+        coverage_status = "not checked"
+    if args.counts_only:
+        payload = counts_only_payload(
+            report, lake_time_used, verdict, plan.days, plan.tickers, coverage_status
+        )
+    else:
+        payload = full_payload(report, lake_time_used, verdict, plan.days, covered)
     _emit(payload, args.out)
     for summary in report.loaders:
         print(f"{summary.verdict} {summary.loader} ({summary.calls} calls)")
-    if args.firm_v1:
+    if covered is None:
+        print("SKIPPED coverage (--only-loader given)")
+    elif args.firm_v1:
         missing = [event for event, seen in covered.items() if not seen]
-        print(
-            f"{'PASS' if covered_ok else 'FAIL'} coverage" + (f" missing {missing}" * bool(missing))
-        )
+        listed = f" missing {missing}" if missing and not args.counts_only else ""
+        print(f"{coverage_status} coverage{listed}")
     print(f"OVERALL {verdict}")
     return 0 if verdict == "PASS" else 1
 
@@ -1429,6 +1642,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     loaders.add_argument("--firm-equities", type=Path, default=None)
     loaders.add_argument("--start", default=None)
     loaders.add_argument("--end", default=None)
+    loaders.add_argument("--day", action="append", default=[])
+    loaders.add_argument("--only-loader", action="append", default=[])
+    loaders.add_argument("--counts-only", action="store_true")
     loaders.add_argument("--ticker", action="append", default=[])
     loaders.add_argument("--cot-ticker", action="append", default=[])
     loaders.add_argument("--security-id", action="append", type=int, default=[])
