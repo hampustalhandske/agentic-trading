@@ -5,14 +5,9 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import Field, PrivateAttr
+from pydantic import PrivateAttr
 
-from agentic_trading.agents._market_math import (
-    RefitCache,
-    balanced_panel,
-    clamp,
-    load_fixed_universe_returns,
-)
+from agentic_trading.agents._market_math import RefitCache, balanced_panel, clamp
 from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import (
@@ -23,18 +18,12 @@ from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Emergency fallback only — used when the lakehouse (real, point-in-time
-# S&P 500 membership, hundreds of names) isn't reachable. A 5-name graph
-# is not a real cross-section for a network-centrality read and should
-# never be what actually runs once the lakehouse is available — see
-# `fama_macbeth_analyst.py`'s identical fallback for the same reasoning.
-DEFAULT_UNIVERSE: tuple[str, ...] = ("AAPL", "MSFT", "GOOGL", "AMZN", "JPM")
 WINDOW = 60
 LAG = 1
 RETURN_CAP = 0.05
 # A broad universe will always have some tickers fail to load on any
 # given day; below this many usable names the cross-section isn't broad
-# enough to be worth preferring over the fixed fallback.
+# enough for a network-centrality read.
 _MIN_UNIVERSE_SIZE = 30
 _UNIVERSE_HISTORY_DAYS = 250
 
@@ -62,17 +51,11 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
     The universe is resolved fresh each call (refit at
     `_universe_refit_cache.refit_interval_days`) as the real, point-in-time
     S&P 500 membership, each member priced by its lake `security_id`
-    (`_load_broad_lakehouse_universe`) — the same "real membership, fixed
-    list as an emergency fallback only" pattern `fama_macbeth_analyst.py`
-    uses, and for the same reason: a 5-name graph is not a real
-    cross-section. Falls back to the fixed `universe` field (via
-    `load_fixed_universe_returns()`, independent of whatever assets the
-    current backtest's own `market_data` happens to include) only when
-    the lakehouse has no membership for the date or too few names have
-    usable history. A broad fetch that raises is an error, with no
-    fallback, as is a fixed-universe load that raises; a fixed universe
-    missing a name, or too little history to build the graph, is
-    unavailable.
+    (`_load_broad_lakehouse_universe`), the same cross-section
+    `fama_macbeth_analyst.py` uses. A day with no membership in the lake,
+    or fewer than `_MIN_UNIVERSE_SIZE` members with usable history, is
+    unavailable, as is an `asset` outside that membership or too little
+    history to build the graph. A fetch that raises is an error.
 
     An active signal's `source_as_of` is the latest reference date: S&P
     500 membership changes are announced before they take effect, so the
@@ -89,7 +72,6 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
         ),
     )
 
-    universe: tuple[str, ...] = Field(default=DEFAULT_UNIVERSE)
     _universe_refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)
 
     def _load_broad_lakehouse_universe(
@@ -107,12 +89,12 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
         A member needs at least `WINDOW + LAG` returns; members left out,
         including those with no returns at all, are counted in one INFO
         line. Returns `None` when the lake has no membership for the date
-        or fewer than `_MIN_UNIVERSE_SIZE` members qualify, so the caller
-        uses the fixed-universe fallback for `refit_interval_days`. A
-        failed lake request propagates to `generate_signal`, which
-        returns an error signal for it. Never adds
-        `asset` to the membership: an asset outside it is scored on the
-        fixed universe instead, leaving the shared cached fetch intact."""
+        or fewer than `_MIN_UNIVERSE_SIZE` members qualify, which the
+        caller reports as unavailable for `refit_interval_days`. A failed
+        lake request propagates to `generate_signal`, which returns an
+        error signal for it. Never adds `asset` to the membership: an
+        asset outside it is unavailable, leaving the shared cached fetch
+        intact."""
         members = load_sp500_member_securities_asof(as_of_date.date())
         if members is None:
             return None
@@ -164,25 +146,21 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
             )
             return self.error_signal(asset, as_of_date, "broad S&P 500 universe lookup failed")
 
-        if broad is not None and asset in broad:
-            universe = tuple(broad)
-            returns = broad
-        else:
-            universe = self.universe if asset in self.universe else (*self.universe, asset)
-            try:
-                returns = load_fixed_universe_returns(universe, as_of_date)
-            except Exception as exc:
-                logger.debug(
-                    "%s: universe price history download failed (%s) — holding.",
-                    self.agent_id,
-                    exc,
-                )
-                return self.error_signal(asset, as_of_date, "universe price history lookup failed")
-
-            if len(returns) < len(universe):
-                return self.unavailable_signal(
-                    asset, as_of_date, f"insufficient price history for part of universe {universe}"
-                )
+        if broad is None:
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"no point-in-time S&P 500 cross-section of at least {_MIN_UNIVERSE_SIZE} "
+                "members with enough history",
+            )
+        if asset not in broad:
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"{asset} is not an S&P 500 member with enough history on {as_of_date.date()}",
+            )
+        universe = tuple(broad)
+        returns = broad
 
         asset_returns = returns[asset].dropna() if asset in returns else pd.Series(dtype=float)
         reference_dates = asset_returns.index[-(WINDOW + LAG) :]

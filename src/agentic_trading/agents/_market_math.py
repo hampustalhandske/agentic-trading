@@ -11,15 +11,9 @@ import numpy as np
 import pandas as pd
 
 from agentic_trading.config import settings
-from agentic_trading.data.loaders.lakehouse_loader import load_price_history_from_lakehouse
-from agentic_trading.data.point_in_time import get_point_in_time_data
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
-
-# A fixed, far-past start so the universe price query returns full
-# history; safely predates any realistic backtest start date.
-_UNIVERSE_HISTORY_START = date(2000, 1, 1)
 
 
 @dataclass(frozen=True)
@@ -110,41 +104,6 @@ def derived_seed(analyst_id: str, asset: str, as_of: date) -> int:
     day = as_of.date() if isinstance(as_of, datetime) else as_of
     key = f"{settings.analysts.mc_seed}|{analyst_id}|{asset}|{day.isoformat()}"
     return int(hashlib.sha256(key.encode()).hexdigest()[:16], 16) % 2**32
-
-
-def load_fixed_universe_returns(
-    universe: tuple[str, ...], as_of_date: pd.Timestamp
-) -> dict[str, pd.Series]:
-    """Point-in-time-safe, date-indexed log returns (NaNs dropped) for a
-    fixed cross-sectional `universe` a few analysts need for their own
-    methodology (e.g. a Fama-MacBeth cross-sectional regression, a
-    lead-lag correlation graph) — fetched
-    independently of whatever assets the current backtest's own
-    `market_data` happens to include, via the lakehouse, not
-    `market_slice()`.
-
-    Using `market_data` instead would silently fail for any universe ticker
-    not in the backtest's own asset list: `market_slice()` returns an empty
-    series rather than raising when a ticker isn't a `market_data` column,
-    which would read as "insufficient history" regardless of how much real
-    history the other universe tickers had.
-
-    Lakehouse-only, like every other price read in this project — a
-    universe ticker the lakehouse doesn't cover is simply omitted from
-    the result, the same shape a genuine data gap already produces for
-    callers, rather than falling back to a live price API."""
-    raw = load_price_history_from_lakehouse(
-        list(universe), _UNIVERSE_HISTORY_START, as_of_date.date()
-    )
-    if raw is None:
-        return {}
-    filtered = get_point_in_time_data(raw, as_of_date)
-    tickers_present = set(filtered.columns.get_level_values(0))
-    return {
-        ticker: filtered[ticker]["log_return"].dropna().astype(np.float64)
-        for ticker in universe
-        if ticker in tickers_present
-    }
 
 
 def balanced_panel(

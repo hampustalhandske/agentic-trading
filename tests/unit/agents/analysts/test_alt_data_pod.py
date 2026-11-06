@@ -7,7 +7,6 @@ from agentic_trading.agents.analysts.alt_data_pod.calendar_seasonality_analyst i
     CalendarSeasonalityAnalyst,
 )
 from agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst import (
-    DEFAULT_UNIVERSE,
     LeadLagNetworkCentralityAnalyst,
 )
 from agentic_trading.data.loaders.lakehouse_loader import IndexMember
@@ -45,65 +44,74 @@ def test_calendar_seasonality_analyst_flat_with_insufficient_history() -> None:
     assert signal.confidence == 0.0
 
 
-def _lead_lag_universe_returns(n: int = 71) -> dict[str, pd.Series]:
-    """Dated returns, the shape `load_fixed_universe_returns` gives: AAPL
-    repeats MSFT's return one day later, every other name is flat."""
+_LEAD_LAG_TICKERS = ("AAPL", "MSFT", *(f"TCK{i}" for i in range(33)))
+_LEAD_LAG_MEMBERS = [
+    IndexMember(security_id=i, ticker=ticker) for i, ticker in enumerate(_LEAD_LAG_TICKERS)
+]
+
+
+def _lead_lag_security_returns(n: int = 71) -> dict[int, pd.Series]:
+    """Dated returns by security, the shape `load_security_log_returns`
+    gives: AAPL repeats MSFT's return one day later, every other member is
+    flat."""
     dates = pd.bdate_range(end="2024-06-19", periods=n)
     msft_returns = np.array([0.01 if i % 2 == 0 else -0.01 for i in range(n)])
     aapl_returns = np.zeros(n)
     aapl_returns[1:] = msft_returns[:-1]
 
     returns = {}
-    for ticker in DEFAULT_UNIVERSE:
-        if ticker == "MSFT":
-            returns[ticker] = msft_returns
-        elif ticker == "AAPL":
-            returns[ticker] = aapl_returns
+    for member in _LEAD_LAG_MEMBERS:
+        if member.ticker == "MSFT":
+            values = msft_returns
+        elif member.ticker == "AAPL":
+            values = aapl_returns
         else:
-            returns[ticker] = np.zeros(n)
-    return {ticker: pd.Series(values, index=dates) for ticker, values in returns.items()}
+            values = np.zeros(n)
+        returns[member.security_id] = pd.Series(values, index=dates)
+    return returns
 
 
+@patch(
+    "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
+    "load_security_log_returns"
+)
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
     "load_sp500_member_securities_asof"
 )
-@patch(
-    "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
-    "load_fixed_universe_returns"
-)
-def test_lead_lag_network_centrality_analyst_follows_its_leader(mock_load, mock_members) -> None:
-    """No real S&P membership available — falls back to the fixed
-    DEFAULT_UNIVERSE, the same behaviour this test has always exercised."""
-    mock_members.return_value = None
-    mock_load.return_value = _lead_lag_universe_returns()
+def test_lead_lag_network_centrality_analyst_follows_its_leader(mock_members, mock_load) -> None:
+    mock_members.return_value = _LEAD_LAG_MEMBERS
+    mock_load.return_value = _lead_lag_security_returns()
 
     signal = LeadLagNetworkCentralityAnalyst().generate_signal(
         "AAPL", pd.DataFrame(), pd.Timestamp("2024-06-19")
     )
 
+    assert signal.status == "active"
     assert signal.direction == "long"
     assert signal.confidence > 0.0
 
 
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
-    "load_sp500_member_securities_asof"
+    "load_security_log_returns"
 )
 @patch(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
-    "load_fixed_universe_returns"
+    "load_sp500_member_securities_asof"
 )
-def test_lead_lag_network_centrality_analyst_flat_with_insufficient_history(
-    mock_load, mock_members
+def test_lead_lag_network_centrality_analyst_unavailable_with_insufficient_history(
+    mock_members, mock_load
 ) -> None:
-    mock_members.return_value = None
-    mock_load.return_value = _lead_lag_universe_returns(n=10)
+    """Members with too little history leave no cross-section: unavailable."""
+    mock_members.return_value = _LEAD_LAG_MEMBERS
+    mock_load.return_value = _lead_lag_security_returns(n=10)
 
     signal = LeadLagNetworkCentralityAnalyst().generate_signal(
         "AAPL", pd.DataFrame(), pd.Timestamp("2024-06-19")
     )
 
+    assert signal.status == "unavailable"
     assert signal.direction == "flat"
     assert signal.confidence == 0.0
 
@@ -112,20 +120,63 @@ def test_lead_lag_network_centrality_analyst_flat_with_insufficient_history(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
     "load_sp500_member_securities_asof"
 )
-@patch(
-    "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
-    "load_fixed_universe_returns"
-)
-def test_lead_lag_network_centrality_analyst_flat_when_universe_download_fails(
-    mock_load, mock_members
+def test_lead_lag_network_centrality_analyst_unavailable_without_membership(
+    mock_members,
 ) -> None:
     mock_members.return_value = None
+
+    signal = LeadLagNetworkCentralityAnalyst().generate_signal(
+        "AAPL", pd.DataFrame(), pd.Timestamp("2024-06-19")
+    )
+
+    assert signal.status == "unavailable"
+    assert signal.direction == "flat"
+    assert signal.confidence == 0.0
+
+
+@patch(
+    "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
+    "load_security_log_returns"
+)
+@patch(
+    "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
+    "load_sp500_member_securities_asof"
+)
+def test_lead_lag_network_centrality_analyst_unavailable_for_a_non_member(
+    mock_members, mock_load
+) -> None:
+    """An asset outside the day's S&P 500 membership has no place in the graph."""
+    mock_members.return_value = _LEAD_LAG_MEMBERS
+    mock_load.return_value = _lead_lag_security_returns()
+
+    signal = LeadLagNetworkCentralityAnalyst().generate_signal(
+        "SPY", pd.DataFrame(), pd.Timestamp("2024-06-19")
+    )
+
+    assert signal.status == "unavailable"
+    assert signal.direction == "flat"
+    assert signal.confidence == 0.0
+
+
+@patch(
+    "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
+    "load_security_log_returns"
+)
+@patch(
+    "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
+    "load_sp500_member_securities_asof"
+)
+def test_lead_lag_network_centrality_analyst_errors_when_returns_download_fails(
+    mock_members, mock_load
+) -> None:
+    mock_members.return_value = _LEAD_LAG_MEMBERS
     mock_load.side_effect = RuntimeError("network down")
 
     signal = LeadLagNetworkCentralityAnalyst().generate_signal(
         "AAPL", pd.DataFrame(), pd.Timestamp("2024-06-19")
     )
 
+    assert signal.status == "error"
     assert signal.direction == "flat"
     assert signal.confidence == 0.0
     assert "lookup failed" in signal.rationale
@@ -139,12 +190,11 @@ def test_lead_lag_network_centrality_analyst_flat_when_universe_download_fails(
     "agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst."
     "load_sp500_member_securities_asof"
 )
-def test_lead_lag_network_centrality_analyst_prefers_real_sp500_membership(
+def test_lead_lag_network_centrality_analyst_builds_on_sp500_membership(
     mock_members, mock_prices
 ) -> None:
-    """When the lakehouse resolves real, point-in-time S&P 500 membership
-    with enough usable names, that broad universe is used instead of the
-    5-name DEFAULT_UNIVERSE fallback."""
+    """The graph is built across the point-in-time S&P 500 membership
+    priced by security."""
     broad_universe = [f"TCK{i}" for i in range(35)]
     members = [
         IndexMember(security_id=i, ticker=ticker)
@@ -162,14 +212,10 @@ def test_lead_lag_network_centrality_analyst_prefers_real_sp500_membership(
         "AAPL", pd.DataFrame(), pd.Timestamp("2024-01-15")
     )
 
-    # The real 36-name broad universe was fetched (proving the broad path
-    # ran, not the 5-name DEFAULT_UNIVERSE fallback) and the signal
-    # completed against it.
+    # The 36-name membership was fetched once and the signal completed
+    # against it.
     mock_prices.assert_called_once()
     assert mock_members.call_count == 1
     assert signal.status == "active"
-    # A broad-universe ticker (never part of DEFAULT_UNIVERSE) shows up in
-    # the rationale's printed universe — proof the real 36-name fetch was
-    # used, not the 5-name fixed fallback.
+    # A member ticker shows up in the rationale's printed universe.
     assert "TCK0" in signal.rationale
-    assert not set(DEFAULT_UNIVERSE) - {"AAPL"} & set(broad_universe)

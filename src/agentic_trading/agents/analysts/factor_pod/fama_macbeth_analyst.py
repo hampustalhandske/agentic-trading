@@ -8,12 +8,7 @@ import pandas as pd
 from pydantic import Field, PrivateAttr
 from quantcore.statistics.regression import factor_loadings, fama_macbeth_regression
 
-from agentic_trading.agents._market_math import (
-    RefitCache,
-    balanced_panel,
-    clamp,
-    load_fixed_universe_returns,
-)
+from agentic_trading.agents._market_math import RefitCache, balanced_panel, clamp
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, calendar_days_for_sessions
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import (
@@ -27,12 +22,6 @@ from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Emergency fallback only — used when the lakehouse (real, point-in-time
-# S&P 500 membership, hundreds of names) isn't reachable. Fama-MacBeth's
-# statistical power depends on cross-sectional breadth; this 5-name list
-# is not a real cross-section and should never be what actually runs
-# once the lakehouse is available.
-DEFAULT_UNIVERSE: tuple[str, ...] = ("AAPL", "MSFT", "GOOGL", "AMZN", "JPM")
 _RISK_WINDOW = 120
 # A broad universe will always have some tickers fail to load on any
 # given day (thin history, a real gap) — requiring every single one to
@@ -49,7 +38,7 @@ _MIN_JOINED_OBSERVATIONS = 30
 class FamaMacbethAnalyst(AnalystAgent):
     """The one analyst whose signal legitimately needs more than one
     ticker's data: estimates per-asset factor loadings across a
-    cross-sectional `universe`, runs a Fama-MacBeth cross-sectional
+    cross-sectional universe, runs a Fama-MacBeth cross-sectional
     regression for the estimated risk premia, and predicts `asset`'s
     expected return from its own loadings times those premia.
 
@@ -60,18 +49,16 @@ class FamaMacbethAnalyst(AnalystAgent):
     date is dropped, never the date. `sample_count` is the number of
     reference dates; the rationale reports how many tickers were kept.
 
-    `universe` is resolved fresh each call as the real, point-in-time
+    The universe is resolved fresh each call as the real, point-in-time
     S&P 500 membership as of `as_of_date`, each member priced by its
-    lake `security_id` (`_load_broad_lakehouse_universe`), not a fixed
-    list — Fama-MacBeth's statistical power comes from
-    genuine cross-sectional breadth (hundreds of names, the way the
-    original methodology and institutional usage both run it), which a
-    handful of megacaps cannot provide regardless of which five are
-    picked. Falls back to `self.universe` (a small static list) only when
-    the lake has no membership for the date or too few members qualify.
-    A lake request that raises propagates to `ManagerAgent.collect_signals`,
-    which records an error signal; a fixed-universe load that raises is an
-    error signal; missing names, factors or history are unavailable.
+    lake `security_id` (`_load_broad_lakehouse_universe`) —
+    Fama-MacBeth's statistical power comes from genuine cross-sectional
+    breadth (hundreds of names, the way the original methodology and
+    institutional usage both run it). A day with no membership in the
+    lake, or fewer than `_MIN_UNIVERSE_SIZE` members with enough
+    history, is unavailable. A lake request that raises propagates to
+    `ManagerAgent.collect_signals`, which records an error signal;
+    missing names, factors or history are unavailable.
 
     An active signal's `source_as_of` is the public date
     (`ken_french_public_date`) of the newest factor row the regression
@@ -80,7 +67,6 @@ class FamaMacbethAnalyst(AnalystAgent):
 
     agent_id: str = "fama_macbeth_analyst"
 
-    universe: tuple[str, ...] = Field(default=DEFAULT_UNIVERSE)
     model: str = "3factor"
     # The broad S&P 500 universe and its trailing returns barely change
     # day to day — re-querying the lakehouse for ~500 names on every
@@ -123,14 +109,14 @@ class FamaMacbethAnalyst(AnalystAgent):
         broad_universe_result = self._universe_refit_cache.get_or_refit(
             "broad_universe", as_of_date, lambda: self._load_broad_lakehouse_universe(as_of_date)
         )
-        if broad_universe_result is not None:
-            resolution = self._resolve_with_broad_universe(broad_universe_result, asset, as_of_date)
-        else:
-            candidate_universe = (
-                self.universe if asset in self.universe else (*self.universe, asset)
+        if broad_universe_result is None:
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"no point-in-time S&P 500 cross-section of at least {_MIN_UNIVERSE_SIZE} "
+                "members with enough history",
             )
-            resolution = self._fixed_universe_returns(candidate_universe, asset, as_of_date)
-
+        resolution = self._resolve_with_broad_universe(broad_universe_result, asset, as_of_date)
         if isinstance(resolution, AgentSignal):
             return resolution
 
@@ -223,9 +209,9 @@ class FamaMacbethAnalyst(AnalystAgent):
         day, not just its own. Members left out, including those with no
         returns at all, are counted in one INFO line. Returns `None` when
         the lake has no membership for the date or fewer than
-        `_MIN_UNIVERSE_SIZE` members qualify, so the caller uses the
-        fixed-universe fallback for `refit_interval_days`. A failed lake
-        request propagates."""
+        `_MIN_UNIVERSE_SIZE` members qualify, which the caller reports as
+        unavailable for `refit_interval_days`. A failed lake request
+        propagates."""
         members = load_sp500_member_securities_asof(as_of_date.date())
         if members is None:
             return None
@@ -279,26 +265,3 @@ class FamaMacbethAnalyst(AnalystAgent):
         merged_returns = dict(universe_returns)
         merged_returns[asset] = asset_frame[(asset, "log_return")].dropna()
         return (*resolved_tickers, asset), merged_returns
-
-    def _fixed_universe_returns(
-        self, universe: tuple[str, ...], asset: str, as_of_date: pd.Timestamp
-    ) -> AgentSignal | tuple[tuple[str, ...], dict[str, pd.Series]]:
-        """Fallback used only when the broad lakehouse S&P 500 universe
-        itself is unreachable that day: `load_fixed_universe_returns`
-        over a small fixed list, only usable at that scale — every
-        ticker must succeed, since this path is never handed hundreds of
-        names where partial failure is expected."""
-        try:
-            universe_returns = load_fixed_universe_returns(universe, as_of_date)
-        except Exception as exc:
-            logger.debug(
-                "%s: universe price history download failed (%s) — returning flat.",
-                self.agent_id,
-                exc,
-            )
-            return self.error_signal(asset, as_of_date, "universe price history lookup failed")
-        if len(universe_returns) < len(universe):
-            return self.unavailable_signal(
-                asset, as_of_date, f"insufficient price history for part of universe {universe}"
-            )
-        return universe, universe_returns

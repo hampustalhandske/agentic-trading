@@ -210,51 +210,67 @@ def test_insider_cluster_buying(
 
 
 _LEAD_LAG_DATES = pd.bdate_range(end=AS_OF, periods=71)
+_LEAD_LAG_MEMBERS = [
+    IndexMember(security_id=n, ticker=t)
+    for n, t in enumerate(["AAPL", *(f"T{n:03d}" for n in range(34))])
+]
 
 
-# Kinds of fixed-universe returns: "full" (every name on the same 71 days), "partial" (JPM
-# missing), "short" (10 days each), "disjoint" (the other names only on days AAPL never trades)
-# and "zero_others" (the other names flat at zero).
-def _lead_lag_universe(kind: str) -> dict[str, pd.Series]:
-    """Fixed-universe returns for the lead-lag fallback of the given `kind`."""
+# Kinds of member returns: "full" (every member on the same 71 days), "short" (10 days each),
+# "thin" (too few members with enough history), "disjoint" (the other members only on days
+# AAPL never trades) and "zero_others" (the other members flat at zero).
+def _lead_lag_universe(kind: str) -> dict[int, pd.Series]:
+    """Member returns by `security_id` for the lead-lag cross-section of the given `kind`."""
     old_dates = pd.bdate_range(end="2023-06-30", periods=71)
     returns = {}
-    for seed, ticker in enumerate(network_centrality_analyst.DEFAULT_UNIVERSE):
-        other = ticker != "AAPL"
+    for member in _LEAD_LAG_MEMBERS:
+        other = member.ticker != "AAPL"
+        seed = member.security_id
         values = np.zeros(71) if kind == "zero_others" and other else _noise(71, seed)
         dates = old_dates if kind == "disjoint" and other else _LEAD_LAG_DATES
-        returns[ticker] = pd.Series(values, index=dates)
-    if kind == "partial":
-        returns.pop("JPM")
+        returns[member.security_id] = pd.Series(values, index=dates)
     if kind == "short":
-        returns = {ticker: series.iloc[-10:] for ticker, series in returns.items()}
+        returns = {security: series.iloc[-10:] for security, series in returns.items()}
+    if kind == "thin":
+        returns = dict(list(returns.items())[: network_centrality_analyst._MIN_UNIVERSE_SIZE - 1])
     return returns
 
 
 @pytest.mark.parametrize(
-    ("fixed", "status", "source_as_of"),
+    ("asset", "members", "kind", "status", "source_as_of"),
     [
-        (RuntimeError("lake down"), "error", None),
-        ("partial", "unavailable", None),
-        ("short", "unavailable", None),
-        ("disjoint", "unavailable", None),
-        ("zero_others", "active", AS_OF.date()),
+        ("AAPL", None, "full", "unavailable", None),
+        ("AAPL", _LEAD_LAG_MEMBERS, "short", "unavailable", None),
+        ("AAPL", _LEAD_LAG_MEMBERS, "thin", "unavailable", None),
+        ("SPY", _LEAD_LAG_MEMBERS, "full", "unavailable", None),
+        ("AAPL", _LEAD_LAG_MEMBERS, "disjoint", "unavailable", None),
+        ("AAPL", _LEAD_LAG_MEMBERS, "zero_others", "active", AS_OF.date()),
     ],
-    ids=["loader_raises", "missing_name", "short_history", "no_other_names", "zero_forecast"],
+    ids=[
+        "no_membership",
+        "short_history",
+        "too_few_members",
+        "not_a_member",
+        "no_other_names",
+        "zero_forecast",
+    ],
 )
-def test_lead_lag_fixed_universe(
-    monkeypatch: pytest.MonkeyPatch, fixed: Any, status: str, source_as_of: date | None
+def test_lead_lag_cross_section(
+    monkeypatch: pytest.MonkeyPatch,
+    asset: str,
+    members: list[IndexMember] | None,
+    kind: str,
+    status: str,
+    source_as_of: date | None,
 ) -> None:
-    """A `None` broad universe uses the fixed one: a raise errors, gaps are unavailable."""
+    """No membership, too few usable members, a non-member or no overlap is unavailable."""
     module = network_centrality_analyst
-    loader = _stub(fixed if isinstance(fixed, BaseException) else _lead_lag_universe(fixed))
-    monkeypatch.setattr(module, "load_sp500_member_securities_asof", _Recorder(None))
-    monkeypatch.setattr(module, "load_fixed_universe_returns", loader)
+    monkeypatch.setattr(module, "load_sp500_member_securities_asof", _Recorder(members))
+    monkeypatch.setattr(module, "load_security_log_returns", _Recorder(_lead_lag_universe(kind)))
 
-    signal = _recorded(module.LeadLagNetworkCentralityAnalyst(), "AAPL", pd.DataFrame())
+    signal = _recorded(module.LeadLagNetworkCentralityAnalyst(), asset, pd.DataFrame())
 
     _assert_flat(signal, status, source_as_of)
-    assert len(loader.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -269,18 +285,15 @@ def test_lead_lag_fixed_universe(
 def test_lead_lag_broad_fetch_failure(
     monkeypatch: pytest.MonkeyPatch, failing: str, error: Exception
 ) -> None:
-    """A broad-universe fetch that raises is an error, with no fallback to the fixed universe."""
+    """A membership or returns fetch that raises is an error."""
     module = network_centrality_analyst
-    members = [IndexMember(security_id=n, ticker=f"T{n:03d}") for n in range(35)]
-    fixed = _Recorder(_lead_lag_universe("full"))
-    monkeypatch.setattr(module, "load_sp500_member_securities_asof", _Recorder(members))
+    monkeypatch.setattr(module, "load_sp500_member_securities_asof", _Recorder(_LEAD_LAG_MEMBERS))
+    monkeypatch.setattr(module, "load_security_log_returns", _Recorder(_lead_lag_universe("full")))
     monkeypatch.setattr(module, failing, _Recorder(error=error))
-    monkeypatch.setattr(module, "load_fixed_universe_returns", fixed)
 
     signal = _recorded(module.LeadLagNetworkCentralityAnalyst(), "AAPL", pd.DataFrame())
 
     _assert_flat(signal, "error")
-    assert fixed.calls == []
 
 
 # stat_arb_pod
@@ -999,21 +1012,15 @@ _FM_DEFAULTS: dict[str, Any] = {
     "load_sp500_member_securities_asof": _FM_MEMBERS,
     "load_security_log_returns": {m.security_id: _FM_RETURNS[m.ticker] for m in _FM_MEMBERS},
     "load_price_history_from_lakehouse": None,
-    "load_fixed_universe_returns": {},
     "load_fama_french_factors_from_lakehouse": _FM_FACTORS,
 }
 _NO_BROAD = {"load_sp500_member_securities_asof": None}
-
-
-def _fm_fixed(disjoint: bool) -> dict[str, pd.Series]:
-    """Fixed-universe returns: AAPL alone, or AAPL plus the other names on days AAPL lacks."""
-    returns = {"AAPL": pd.Series(_noise(250, 17), index=_FM_DATES)}
-    if disjoint:
-        old_dates = pd.bdate_range(end="2023-01-31", periods=250)
-        for seed, ticker in enumerate(fama_macbeth_analyst.DEFAULT_UNIVERSE):
-            if ticker != "AAPL":
-                returns[ticker] = pd.Series(_noise(250, seed), index=old_dates)
-    return returns
+_THIN_BROAD = {
+    "load_security_log_returns": {
+        m.security_id: _FM_RETURNS[m.ticker]
+        for m in _FM_MEMBERS[: fama_macbeth_analyst._MIN_UNIVERSE_SIZE - 1]
+    }
+}
 
 
 @pytest.mark.parametrize(
@@ -1023,9 +1030,8 @@ def _fm_fixed(disjoint: bool) -> dict[str, pd.Series]:
         ("T000", {"load_security_log_returns": ValueError("bad response")}, "error"),
         ("ZZZ", {}, "unavailable"),
         ("ZZZ", {"load_price_history_from_lakehouse": RuntimeError("lake down")}, "error"),
-        ("AAPL", {**_NO_BROAD, "load_fixed_universe_returns": RuntimeError("down")}, "error"),
-        ("AAPL", {**_NO_BROAD, "load_fixed_universe_returns": _fm_fixed(False)}, "unavailable"),
-        ("AAPL", {**_NO_BROAD, "load_fixed_universe_returns": _fm_fixed(True)}, "unavailable"),
+        ("T000", _NO_BROAD, "unavailable"),
+        ("T000", _THIN_BROAD, "unavailable"),
         ("T000", {"load_fama_french_factors_from_lakehouse": None}, "unavailable"),
         (
             "T000",
@@ -1038,9 +1044,8 @@ def _fm_fixed(disjoint: bool) -> dict[str, pd.Series]:
         "security_returns_raise",
         "asset_not_in_lake",
         "asset_lookup_raises",
-        "fixed_universe_raises",
-        "fixed_universe_missing_names",
-        "cross_section_too_thin",
+        "no_membership",
+        "too_few_members",
         "no_factor_coverage",
         "short_factor_overlap",
     ],

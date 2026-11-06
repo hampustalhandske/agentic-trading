@@ -269,7 +269,6 @@ def test_lead_lag_network_centrality(monkeypatch: pytest.MonkeyPatch) -> None:
     assert signal.source_as_of == date(2022, 7, 15)
 
     monkeypatch.setattr(module, "load_sp500_member_securities_asof", _returning(None))
-    monkeypatch.setattr(module, "load_fixed_universe_returns", _returning({}))
     missing = module.LeadLagNetworkCentralityAnalyst().generate_signal("T000", market, as_of)
     assert missing.status == "unavailable"
     assert missing.source_as_of is None

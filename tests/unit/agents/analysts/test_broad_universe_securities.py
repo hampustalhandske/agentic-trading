@@ -125,3 +125,21 @@ def test_network_universe_none_when_membership_missing_or_too_thin(
 
     monkeypatch.setattr(network, "load_sp500_member_securities_asof", lambda d: None)
     assert LeadLagNetworkCentralityAnalyst()._load_broad_lakehouse_universe(_AS_OF) is None
+
+
+@pytest.mark.parametrize("module", [fama, network], ids=["fama_macbeth", "lead_lag"])
+def test_no_cross_section_is_unavailable_without_a_ticker_universe(
+    monkeypatch: pytest.MonkeyPatch, module: Any
+) -> None:
+    """No membership, or too few qualifying members, is unavailable and reads no ticker prices."""
+    analyst_class = FamaMacbethAnalyst if module is fama else LeadLagNetworkCentralityAnalyst
+    min_size = fama._RISK_WINDOW // 2 if module is fama else network.WINDOW + network.LAG
+    assert not hasattr(module, "load_fixed_universe_returns")
+
+    _install(monkeypatch, module, min_size, min_size, module._MIN_UNIVERSE_SIZE - 1)
+    thin = analyst_class().generate_signal("T000", pd.DataFrame(), _AS_OF)
+    assert (thin.status, thin.direction, thin.confidence) == ("unavailable", "flat", 0.0)
+
+    monkeypatch.setattr(module, "load_sp500_member_securities_asof", lambda d: None)
+    missing = analyst_class().generate_signal("T000", pd.DataFrame(), _AS_OF)
+    assert (missing.status, missing.direction, missing.confidence) == ("unavailable", "flat", 0.0)
