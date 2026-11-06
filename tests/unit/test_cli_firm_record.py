@@ -21,12 +21,16 @@ from click.testing import Result
 from typer.testing import CliRunner
 
 from agentic_trading.agents.roster import (
-    FIRM_V1_EQUITIES,
     FIRM_V1_EQUITY_SECURITY_IDS,
     FIRM_V1_EXCLUDED_ANALYST_IDS,
     FIRM_V1_UNIVERSE,
 )
-from agentic_trading.backtest.preflight import PriceCoverageError, check_price_coverage
+from agentic_trading.agents.schemas import ShortWarmup
+from agentic_trading.backtest.preflight import (
+    PriceCoverage,
+    PriceCoverageError,
+    check_price_coverage,
+)
 from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.cli import firm_record_app
 from agentic_trading.config import settings
@@ -144,21 +148,43 @@ def test_usage_errors(tmp_path: Path, start: str, end: str, store_dir: Path | No
 
 
 def test_price_coverage_preflight_runs_before_the_record(tmp_path: Path) -> None:
-    """The firm equities' price coverage is checked on the loaded frame from the first warm-up
-    day to --end; a failure stops the command before run_firm_record writes anything."""
+    """The universe's price coverage is checked on the loaded frame over the warm-up and the
+    window, every firm equity on every session bar the known lake gaps and crypto exempt at
+    the start; a short warm-up reaches run_firm_record, and a failure stops the command before
+    run_firm_record writes anything."""
     args = ["--start", "2010-01-04", "--end", "2010-01-05", "--store-dir", str(tmp_path)]
-    passing = MagicMock()
+    short = ShortWarmup(instrument="V", first_bar=date(2008, 3, 19), warmup_sessions=450)
+    entries = [
+        PriceCoverage(
+            ticker=ticker,
+            first_bar=date(2007, 1, 3),
+            last_bar=date(2010, 1, 5),
+            longest_gap_sessions=0,
+            short_warmup=short if ticker == "V" else None,
+            covers_run=True,
+        )
+        for ticker in FIRM_V1_UNIVERSE
+    ]
+    passing = MagicMock(return_value=entries)
     result, _, _, record = _invoke(args, passing)
     checked = _bound(check_price_coverage, passing)
 
     assert result.exit_code == 0, result.output
     assert checked["market_data"] is _MARKET
-    assert list(checked["members"]) == list(FIRM_V1_EQUITIES)
+    assert list(checked["members"]) == list(FIRM_V1_UNIVERSE)
     warmup_start = date(2010, 1, 4) - timedelta(days=settings.stage_a.warmup_days)
-    assert (checked["from_date"], checked["to_date"]) == (warmup_start, date(2010, 1, 5))
+    assert (checked["warmup_start"], checked["window_start"], checked["window_end"]) == (
+        warmup_start,
+        date(2010, 1, 4),
+        date(2010, 1, 5),
+    )
     assert checked["calendar"] == settings.stage_a.session_calendar
+    assert checked["complete"] is FIRM_V1_EQUITY_SECURITY_IDS
+    assert checked["known_gaps"] == settings.firm.known_price_gaps == []
+    assert list(checked["start_exempt"]) == ["BTC-USD", "ETH-USD"]
+    assert _bound(run_firm_record, record)["short_warmup"] == [short]
 
-    failing = MagicMock(side_effect=PriceCoverageError("MON first bar none, last bar none"))
+    failing = MagicMock(side_effect=PriceCoverageError("MON missing 2 session(s)"))
     result, _, _, record = _invoke(args, failing)
 
     assert isinstance(result.exception, PriceCoverageError)

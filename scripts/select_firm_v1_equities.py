@@ -4,9 +4,10 @@
 the S&P 500 members on 2009-12-31 with the highest average daily dollar
 volume over the 2009 XNYS sessions, using only data known by 2009-12-31.
 
-Dollar volume on a session is the bar's raw (unadjusted) close times its
-raw volume, from `equity_daily_from_bars`; a session with no bar or no
-volume is left out of that member's average. Members are ranked by that
+Dollar volume on a session is the bar's traded price times its traded
+volume, from `equity_daily_from_bars`: `load_security_daily_bars`' `close`
+times its `volume`, which one factor back-adjusts in opposite directions.
+A session with no bar or no volume is left out of that member's average. Members are ranked by that
 average, ties broken by ticker, and the first `--count` are printed as JSON
 (security_id, ticker on 2009-12-31, average dollar volume, sessions used),
 with the lake time the reads were pinned to.
@@ -45,7 +46,7 @@ def main() -> None:
             if member.security_id not in bars.columns.get_level_values("security_id"):
                 continue
             frame = bars[member.security_id]
-            dollar_volume = (frame["raw_close"] * frame["volume"]).dropna()
+            dollar_volume = (frame["close"] * frame["volume"]).dropna()
             if dollar_volume.empty:
                 continue
             ranked.append(

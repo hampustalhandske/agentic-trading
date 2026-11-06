@@ -14,6 +14,7 @@ import pytest
 
 from agentic_trading.data.loaders.lakehouse_loader import (
     READ_TABLES,
+    SECURITY_RAW_PRICE_SQL,
     EmptyAdjustmentTableError,
     load_security_daily_bars,
     load_security_log_returns,
@@ -105,7 +106,8 @@ def lake(fake_lake: Any) -> Any:
 
 
 def test_daily_bars_layout_and_split_adjustment(lake: Any) -> None:
-    """A 2:1 split keeps close and open continuous, halves raw_close and leaves volume raw."""
+    """A 2:1 split keeps close and open continuous, halves raw_close and divides volume by the
+    same factor."""
     _bar(lake, 1, _TUE, 200.0, open_=196.0, volume=1000.0)
     _bar(lake, 1, _WED, 101.0, open_=100.0, volume=2400.0)
     _bar(lake, 1, _THU, 102.0, open_=101.0, volume=2000.0)
@@ -122,7 +124,7 @@ def test_daily_bars_layout_and_split_adjustment(lake: Any) -> None:
     assert frame[(1, "close")].tolist() == pytest.approx([100.0, 101.0, 102.0])
     assert frame[(1, "raw_close")].tolist() == pytest.approx([200.0, 101.0, 102.0])
     assert frame[(1, "open")].tolist() == pytest.approx([98.0, 100.0, 101.0])
-    assert frame[(1, "volume")].tolist() == pytest.approx([1000.0, 2400.0, 2000.0])
+    assert frame[(1, "volume")].tolist() == pytest.approx([2000.0, 2400.0, 2000.0])
     log_return = frame[(1, "log_return")]
     assert math.isnan(log_return.iloc[0])
     assert log_return.iloc[1:].tolist() == pytest.approx([math.log(1.01), math.log(102 / 101)])
@@ -130,10 +132,10 @@ def test_daily_bars_layout_and_split_adjustment(lake: Any) -> None:
 
 def test_daily_bars_dividend_factor_and_factor_row_rule(lake: Any) -> None:
     """Each bar takes the cum_factor of the first factor row strictly after it; a dividend
-    factor lowers earlier levels; the bar's close is read and its official_close never."""
+    factor lowers earlier levels; official_close wins over close."""
     _bar(lake, 1, _TUE, 100.0)
     _bar(lake, 1, _WED, 99.0)
-    _bar(lake, 1, _THU, 99.5, official=999.0)
+    _bar(lake, 1, _THU, 999.0, official=99.5)
     _bar(lake, 1, _FRI, 50.0)
     _factor(lake, 1, _MON, 0.245, split=2.0)
     _factor(lake, 1, _WED, 0.49)
@@ -143,7 +145,7 @@ def test_daily_bars_dividend_factor_and_factor_row_rule(lake: Any) -> None:
 
     assert frame[(1, "close")].tolist() == pytest.approx([49.0, 49.5, 49.75, 50.0])
     assert frame[(1, "raw_close")].tolist() == pytest.approx([100.0, 99.0, 99.5, 50.0])
-    assert frame[(1, "open")].tolist() == pytest.approx([49.0, 49.5, 49.75, 50.0])
+    assert frame[(1, "open")].tolist() == pytest.approx([49.0, 49.5, 499.5, 50.0])
     assert frame[(1, "log_return")].iloc[1:].tolist() == pytest.approx(
         [math.log(99 / 98), math.log(99.5 / 99), math.log(50 / 49.75)]
     )
@@ -224,7 +226,7 @@ def test_daily_bars_missing_prices_and_non_positive_open_and_volume(lake: Any) -
     _bar(lake, 1, _WED, 101.0, open_=-1.0, volume=-5.0)
     _bar(lake, 1, _THU, None, open_=100.0)
     _bar(lake, 1, _FRI, 0.0, open_=100.0)
-    _bar(lake, 1, _NEXT_MON, -2.0, official=100.0, open_=100.0)
+    _bar(lake, 1, _NEXT_MON, 100.0, official=0.0, open_=100.0)
     for day in (_TUE, _WED, _THU, _FRI, _NEXT_MON):
         _bar(lake, 2, day, 50.0, ticker="BBB")
 
@@ -288,9 +290,30 @@ def test_member_count_table_is_a_read_table() -> None:
     assert "sp500_member_count" in READ_TABLES
 
 
-def test_security_bar_queries_read_close_and_never_official_close(lake: Any) -> None:
+def test_daily_bars_volume_is_continuous_across_a_split_and_participation_is_as_traded(
+    lake: Any,
+) -> None:
+    """Across a 2:1 split the adjusted volume is continuous, close times volume is the traded
+    dollar volume, and an order's share of volume at the adjusted close is its share of the
+    traded volume at the traded price."""
+    _bar(lake, 1, _TUE, 200.0, volume=1000.0)
+    _bar(lake, 1, _WED, 100.0, volume=2000.0)
+    _factor(lake, 1, _WED, 0.5, split=2.0)
+
+    frame = load_security_daily_bars([1], _TUE, _WED)[1]
+    notional = 50_000.0
+
+    assert frame["volume"].tolist() == pytest.approx([2000.0, 2000.0])
+    assert (frame["close"] * frame["volume"]).tolist() == pytest.approx([200_000.0, 200_000.0])
+    adjusted = (notional / frame["close"]) / frame["volume"]
+    traded = notional / pd.Series([200.0 * 1000.0, 100.0 * 2000.0], index=frame.index)
+    assert adjusted.tolist() == pytest.approx(traded.tolist())
+
+
+def test_security_bar_queries_price_bars_with_the_one_raw_price_expression(lake: Any) -> None:
     """Both stored security-bar sources and the frozen reference copy in
-    `scripts/at126_legacy.py` price a bar at its `close` and never name `official_close`."""
+    `scripts/at126_legacy.py` select and filter a bar's raw price with `SECURITY_RAW_PRICE_SQL`,
+    which the reference copy holds unchanged, and divide volume by the price factor."""
     _bar(lake, 1, _TUE, 100.0, official=50.0)
     _bar(lake, 1, _WED, 110.0, official=60.0)
     sys.path.insert(0, str(_SCRIPTS))
@@ -304,9 +327,11 @@ def test_security_bar_queries_read_close_and_never_official_close(lake: Any) -> 
     legacy.legacy_security_log_returns([1], _TUE, _WED)
     legacy.legacy_security_daily_bars([1], _TUE, _WED)
 
+    assert legacy.SECURITY_RAW_PRICE_SQL == SECURITY_RAW_PRICE_SQL
     queries = [query for query, _ in lake.calls if "equity_daily_from_bars" in query]
     assert len(queries) == 4
     for query in queries:
-        assert "official_close" not in query
-        assert "close AS raw_close" in query
-        assert "AND close > 0" in query
+        assert f"{SECURITY_RAW_PRICE_SQL} AS raw_close" in query
+        assert f"AND {SECURITY_RAW_PRICE_SQL} > 0" in query
+    for query in (queries[1], queries[3]):
+        assert "bars.volume / COALESCE(factors.cum_factor, 1.0)" in query

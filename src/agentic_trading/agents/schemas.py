@@ -437,6 +437,20 @@ class UnfactoredSplitMove(BaseModel):
     ratio: float
 
 
+class ShortWarmup(BaseModel):
+    """An instrument of a run whose first kept bar (`first_bar`) comes
+    after the first session of the run's warm-up, so it enters the run's
+    first decision day with only `warmup_sessions` sessions of history:
+    the calendar's sessions from its first bar up to, not including, the
+    run's first session."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    instrument: str
+    first_bar: date
+    warmup_sessions: int = Field(ge=0)
+
+
 class UnfilledOrder(BaseModel):
     """A decision the backtest engine could not execute on `as_of_date`, the
     day the order failed to fill.

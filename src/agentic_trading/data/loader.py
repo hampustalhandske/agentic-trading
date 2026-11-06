@@ -157,8 +157,10 @@ def _security_price_history(
     columns; `None` when none has one.
 
     The values are the bar loader's: `close` and `open` back-adjusted with
-    `cum_factor`, `raw_close` the price as traded, `volume` as traded, and
-    `log_return` NaN on a bar whose previous NYSE session has no kept bar."""
+    `cum_factor`, `volume` divided by it (so shares at `close` take the
+    same share of `volume` as traded shares of the traded volume),
+    `raw_close` the price as traded, and `log_return` NaN on a bar whose
+    previous NYSE session has no kept bar."""
     bars = load_security_daily_bars(sorted(set(security_ids.values())), start, end)
     if bars is None:
         return None

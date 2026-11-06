@@ -60,7 +60,7 @@ from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.managers.cvar_manager import ConditionalValueAtRiskManager
 from agentic_trading.agents.managers.tail_hedge_manager import TailHedgeManager
-from agentic_trading.agents.schemas import UnfilledOrder
+from agentic_trading.agents.schemas import ShortWarmup, UnfilledOrder
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
@@ -210,6 +210,7 @@ def run_firm_record(
     max_days: int | None = None,
     ledger: TrialLedger | None = None,
     repo_root: Path | None = None,
+    short_warmup: Sequence[ShortWarmup] = (),
 ) -> FirmRecordResult:
     """Record `commander` over `universe` on the sessions of
     `settings.stage_a.session_calendar` (read at call time) from
@@ -224,6 +225,8 @@ def run_firm_record(
     `risk_free_rate_series` on cash. The spec is recorded with `lake_time`
     (aware), `lake_version` and `quantcore_version`. With a `ledger`,
     `repo_root` is the repository root its registry files live under.
+    `short_warmup` lists the instruments whose bars start inside the
+    warm-up, recorded in agentic_meta.json.
 
     Raises `ValueError`, before writing anything, when the window is
     reversed, holds no session, or ends after `settings.stage_a.data_end`,
@@ -294,6 +297,7 @@ def run_firm_record(
         src_tree_clean=not dirty,
         counted=will_count,
         registered_trials=registered_trials,
+        short_warmup=short_warmup,
     )
     store_dir = Path(store_dir)
     store = FirmDecisionStore(store_dir, record, sources=sources)

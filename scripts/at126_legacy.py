@@ -59,6 +59,13 @@ def legacy_sp500_member_securities_asof(as_of_date: date) -> list[ll.IndexMember
     return members or None
 
 
+# A bar's raw price: the exchange's official close where the lake keeps
+# one, else the close of the session's last bar, the basis the grader
+# (edgelab) settles on; the same expression as
+# `lakehouse_loader.SECURITY_RAW_PRICE_SQL`, held here as its own copy.
+SECURITY_RAW_PRICE_SQL = "COALESCE(official_close, close)"
+
+
 def _legacy_adjusted_security_bars(
     security_ids: list[int], start: date, end: date, with_open_and_volume: bool
 ) -> pd.DataFrame:
@@ -69,7 +76,8 @@ def _legacy_adjusted_security_bars(
         """
                CASE WHEN bars.open > 0
                     THEN bars.open * COALESCE(factors.cum_factor, 1.0) END AS open,
-               CASE WHEN bars.volume > 0 THEN bars.volume END AS volume,"""
+               CASE WHEN bars.volume > 0
+                    THEN bars.volume / COALESCE(factors.cum_factor, 1.0) END AS volume,"""
         if with_open_and_volume
         else ""
     )
@@ -79,11 +87,11 @@ def _legacy_adjusted_security_bars(
                bars.raw_close,{open_and_volume}
                factors.effective_date AS factor_date
         FROM (
-            SELECT security_id, date, close AS raw_close{bar_columns}
+            SELECT security_id, date, {SECURITY_RAW_PRICE_SQL} AS raw_close{bar_columns}
             FROM {ll._table_sql("equity_daily_from_bars")}
             WHERE security_id IN ({placeholders})
               AND date BETWEEN ? AND ?
-              AND close > 0
+              AND {SECURITY_RAW_PRICE_SQL} > 0
         ) AS bars
         ASOF LEFT JOIN (
             SELECT security_id, effective_date, cum_factor

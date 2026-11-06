@@ -26,7 +26,7 @@ from pydantic import PrivateAttr
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, ManagerAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.portfolio_construction import PortfolioConstructor
-from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.agents.schemas import AgentSignal, ShortWarmup
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.config import settings
 from agentic_trading.data.loaders import lakehouse_loader
@@ -534,6 +534,7 @@ def test_uncounted_record_writes_a_valid_submission_folder(
         "src_tree_clean": False,
         "declared_n_from": "uncounted_default",
         "unfilled_orders": len(json.loads((trial / "unfilled_orders.json").read_text())["orders"]),
+        "short_warmup": [],
     }
     strategy = yaml.safe_load((trial / "strategy" / "strategy.yaml").read_text())
     assert strategy["strategy"] == "strategy.py:Replay"
@@ -601,6 +602,20 @@ def test_counted_record_declares_its_registration(
     meta = json.loads((trial / "agentic_meta.json").read_text())
     assert meta["counted"] and meta["src_tree_clean"]
     assert meta["declared_n_from"] == "registration"
+
+
+def test_short_warmup_is_recorded_in_agentic_meta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The instruments whose bars start inside the warm-up are listed in agentic_meta.json."""
+    monkeypatch.setattr(runner_module, "source_tree_state", lambda: ("a" * 40, True))
+    short = ShortWarmup(instrument=_UNIVERSE[0], first_bar=date(2008, 3, 19), warmup_sessions=450)
+    result = _run(tmp_path, short_warmup=[short])
+
+    meta = json.loads((tmp_path / result.spec_hash / "agentic_meta.json").read_text())
+    assert meta["short_warmup"] == [
+        {"instrument": _UNIVERSE[0], "first_bar": "2008-03-19", "warmup_sessions": 450}
+    ]
 
 
 def test_submission_seed_is_constant(tmp_path: Path) -> None:

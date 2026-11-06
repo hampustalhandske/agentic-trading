@@ -2,8 +2,9 @@
 
 """`load_price_history_with_fallback(security_ids=...)` reads the listed tickers by lake
 `security_id` from `equity_daily_from_bars` and every other ticker as before, giving each routed
-ticker the frame layout a ticker read gives; and `check_price_coverage` refuses a universe member
-whose bars start late or end early, listing every such member."""
+ticker the frame layout a ticker read gives; and `check_price_coverage` refuses a firm equity
+missing a window session that is not a known lake gap and a fixed instrument starting late or
+ending early, and reports a short warm-up without failing it."""
 
 from datetime import date
 from typing import Any
@@ -32,12 +33,12 @@ def _yahoo_row(lake: Any, ticker: str, day: date, close: float, volume: int) -> 
 
 
 def _bar(lake: Any, security_id: int, ticker: str, day: date, close: float, volume: float) -> None:
-    """One `equity_daily_from_bars` bar; its official_close is never read."""
+    """One `equity_daily_from_bars` bar whose official close is its close."""
     lake._connection.execute(
         "INSERT INTO equity_daily_from_bars "
         "(ticker, date, open, high, low, close, official_close, volume, security_id) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [ticker, day, close - 1.0, close + 1.0, close - 2.0, close, 1.0, volume, security_id],
+        [ticker, day, close - 1.0, close + 1.0, close - 2.0, close, close, volume, security_id],
     )
 
 
@@ -92,9 +93,14 @@ def test_a_ticker_absent_from_instrument_prices_loads_by_security_id(lake: Any) 
     assert mon["volume"].dropna().tolist() == [300.0] * 4
 
 
+_YEAR = sessions_between(date(2022, 1, 3), date(2023, 12, 29))
+_WINDOW = [day for day in _YEAR if day.year == 2023]
+
+
 def _coverage_frame(bars: dict[str, list[date]]) -> pd.DataFrame:
-    """A `(ticker, close)` frame on every XNYS session of 2023, each ticker closed on `bars`."""
-    index = pd.DatetimeIndex(sessions_between(date(2023, 1, 3), date(2023, 12, 29)))
+    """A `(ticker, close)` frame on every XNYS session of 2022-2023, each ticker closed on its
+    `bars`."""
+    index = pd.DatetimeIndex(_YEAR)
     return pd.concat(
         {
             ticker: pd.DataFrame(
@@ -107,37 +113,98 @@ def _coverage_frame(bars: dict[str, list[date]]) -> pd.DataFrame:
     )
 
 
-def test_price_coverage_lists_every_member_starting_late_or_ending_early() -> None:
-    """A first bar more than five sessions after the first session, a last bar more than five
-    before the last, or no bar at all fails, all members listed in one error; an interior gap
-    and bars within the slack pass."""
-    sessions = sessions_between(date(2023, 1, 3), date(2023, 12, 29))
-    gap = set(sessions[100:150])
+def _check(frame: pd.DataFrame, members: list[str], **options: Any) -> Any:
+    """`check_price_coverage` over a 2022 warm-up and a 2023 window."""
+    return check_price_coverage(
+        frame, members, date(2022, 1, 1), date(2023, 1, 1), date(2023, 12, 31), **options
+    )
+
+
+def test_a_firm_equity_missing_one_window_session_fails_unless_it_is_a_known_gap() -> None:
+    """A complete member with an interior one-day gap fails, the error naming the day; the same
+    gap listed as a known lake gap of its security passes."""
+    hole = _WINDOW[100]
+    frame = _coverage_frame({"AAA": [day for day in _YEAR if day != hole]})
+
+    with pytest.raises(PriceCoverageError, match=f"AAA missing 1 session\\(s\\): {hole}"):
+        _check(frame, ["AAA"], complete={"AAA": 7})
+
+    passing = _check(frame, ["AAA"], complete={"AAA": 7}, known_gaps=[(7, hole)])
+    assert passing[0].covers_run and passing[0].missing_sessions == []
+    assert passing[0].longest_gap_sessions == 1
+    with pytest.raises(PriceCoverageError):
+        _check(frame, ["AAA"], complete={"AAA": 7}, known_gaps=[(8, hole)])
+
+
+def test_missing_sessions_listed_up_to_ten_with_their_count() -> None:
+    """An equity missing many sessions is listed with its first ten and the count of the rest,
+    and every failing member appears in the one error."""
+    frame = _coverage_frame({"AAA": _YEAR[:-30], "BBB": _YEAR[:-1]})
+
+    with pytest.raises(PriceCoverageError) as raised:
+        _check(frame, ["AAA", "BBB"], complete={"AAA": 7, "BBB": 8})
+
+    message = str(raised.value)
+    assert "AAA missing 30 session(s): " + ", ".join(d.isoformat() for d in _YEAR[-30:-20]) in (
+        message
+    )
+    assert "and 20 more" in message
+    assert f"BBB missing 1 session(s): {_YEAR[-1].isoformat()}" in message
+
+
+def test_a_short_warmup_passes_and_is_reported() -> None:
+    """A member listing inside the warm-up (as V did in 2008) passes with its first bar and
+    the warm-up sessions it has; a crypto pair starting inside the window is exempt at the
+    start, not at the end."""
+    listing = _YEAR[120]
     frame = _coverage_frame(
         {
-            "FULL": [day for day in sessions if day not in gap],
-            "SLACK": sessions[5:-5],
-            "LATE": sessions[6:],
-            "EARLY": sessions[:-6],
+            "VVV": [day for day in _YEAR if day >= listing],
+            "FIX": _YEAR,
+            "BTC-USD": _WINDOW[200:],
+        }
+    )
+
+    coverage = _check(
+        frame, ["VVV", "FIX", "BTC-USD"], complete={"VVV": 9}, start_exempt=["BTC-USD"]
+    )
+
+    short = coverage[0].short_warmup
+    assert all(entry.covers_run for entry in coverage)
+    assert short is not None and short.instrument == "VVV" and short.first_bar == listing
+    assert short.warmup_sessions == len(_YEAR) - len(_WINDOW) - 120
+    assert coverage[1].short_warmup is None and coverage[2].short_warmup is None
+
+    ended = _coverage_frame({"BTC-USD": _WINDOW[200:-6]})
+    with pytest.raises(PriceCoverageError, match="BTC-USD first bar"):
+        _check(ended, ["BTC-USD"], start_exempt=["BTC-USD"])
+
+
+def test_a_fixed_instrument_fails_when_it_starts_late_or_ends_early() -> None:
+    """A fixed instrument needs a bar within five sessions of the window's first and last
+    sessions; an interior gap never fails it, and every failing member is listed."""
+    gap = set(_WINDOW[50:120])
+    frame = _coverage_frame(
+        {
+            "GAPPY": [day for day in _YEAR if day not in gap],
+            "SLACK": [day for day in _YEAR if _WINDOW[5] <= day <= _WINDOW[-6]],
+            "LATE": [day for day in _YEAR if day >= _WINDOW[6]],
+            "EARLY": [day for day in _YEAR if day <= _WINDOW[-7]],
         }
     )
 
     with pytest.raises(PriceCoverageError) as raised:
-        check_price_coverage(
-            frame, ["FULL", "SLACK", "LATE", "EARLY", "GONE"], date(2023, 1, 1), date(2023, 12, 31)
-        )
+        _check(frame, ["GAPPY", "SLACK", "LATE", "EARLY", "GONE"])
 
     message = str(raised.value)
-    assert f"LATE first bar {sessions[6].isoformat()}, last bar {sessions[-1].isoformat()}" in (
+    assert f"LATE first bar {_WINDOW[6].isoformat()}, last bar {_WINDOW[-1].isoformat()}" in (
         message
     )
-    assert f"EARLY first bar {sessions[0].isoformat()}, last bar {sessions[-7].isoformat()}" in (
+    assert f"EARLY first bar {_YEAR[0].isoformat()}, last bar {_WINDOW[-7].isoformat()}" in (
         message
     )
     assert "GONE first bar none, last bar none" in message
-    assert "FULL" not in message and "SLACK" not in message
-
-    passing = check_price_coverage(frame, ["FULL", "SLACK"], date(2023, 1, 1), date(2023, 12, 31))
-    assert [entry.covers_run for entry in passing] == [True, True]
-    assert passing[0].longest_gap_sessions == 50
-    assert (passing[1].first_bar, passing[1].last_bar) == (sessions[5], sessions[-6])
+    assert "GAPPY" not in message and "SLACK" not in message
+    passing = _check(frame, ["GAPPY", "SLACK"])
+    assert passing[0].longest_gap_sessions == 70
+    assert passing[1].short_warmup is not None

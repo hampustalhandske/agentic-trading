@@ -68,7 +68,7 @@ def _bar(
     lake: Any,
     security_id: int,
     day: date,
-    close: float | None,
+    close: float,
     official: float | None = None,
     ticker="AAA",
 ) -> None:
@@ -178,21 +178,17 @@ def test_log_returns_split_adjusted_across_the_effective_date(lake: Any) -> None
     assert series.iloc[0] == pytest.approx(math.log(101 / 100))
 
 
-def test_log_returns_read_close_and_never_official_close(lake: Any) -> None:
-    """The bar's close is the price whether or not an official_close is present, and a bar
-    with a null close is missing even when its official_close is positive."""
+def test_log_returns_prefer_official_close_and_fall_back_to_close(lake: Any) -> None:
+    """official_close is used when present and close when it is null."""
     _bar(lake, 1, _TUE, 100.0, official=50.0)
-    _bar(lake, 1, _WED, 110.0, official=55.0)
+    _bar(lake, 1, _WED, 999.0, official=55.0)
     _bar(lake, 2, _TUE, 100.0)
     _bar(lake, 2, _WED, 110.0)
-    _bar(lake, 3, _TUE, 100.0)
-    _bar(lake, 3, _WED, None, official=110.0)
 
-    result = load_security_log_returns([1, 2, 3], _TUE, _WED)
+    result = load_security_log_returns([1, 2], _TUE, _WED)
 
-    assert result[1].iloc[0] == pytest.approx(math.log(110 / 100))
+    assert result[1].iloc[0] == pytest.approx(math.log(55 / 50))
     assert result[2].iloc[0] == pytest.approx(math.log(110 / 100))
-    assert 3 not in result
 
 
 def test_log_returns_never_span_a_missing_session(lake: Any) -> None:

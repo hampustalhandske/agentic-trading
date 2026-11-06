@@ -11,8 +11,8 @@ import typer
 from agentic_trading import provenance
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
+from agentic_trading.agents.managers.cross_asset_manager import CRYPTO_ASSETS
 from agentic_trading.agents.roster import (
-    FIRM_V1_EQUITIES,
     FIRM_V1_EQUITY_SECURITY_IDS,
     FIRM_V1_EXCLUDED_ANALYST_IDS,
     FIRM_V1_UNIVERSE,
@@ -1161,12 +1161,16 @@ def firm_record(
     minus `stage_a.warmup_days` calendar days to --end, each of
     `roster.FIRM_V1_EQUITIES` by its `roster.FIRM_V1_EQUITY_SECURITY_IDS`
     id from `equity_daily_from_bars` and every other instrument by ticker.
-    Before anything is written, checks that every firm equity has bars
-    from the first session of that span to its last
-    (`backtest.preflight.check_price_coverage`, which raises
-    `PriceCoverageError` listing each failing equity). Then loads the
-    risk-free rate and runs `firm_record.runner.run_firm_record`, all
-    inside one lake session cut at `stage_a.data_end`. With --loader-store (the
+    Before anything is written, checks the universe's price coverage
+    (`backtest.preflight.check_price_coverage`): each firm equity needs a
+    bar on every session from --start to --end bar the
+    `firm.known_price_gaps`, and every other instrument a bar near both
+    ends of the window, the crypto pairs near its end only. It raises
+    `PriceCoverageError` listing each failing instrument. An instrument
+    whose bars start inside the warm-up passes, and its `ShortWarmup` goes
+    to agentic_meta.json. Then loads the risk-free rate and runs
+    `firm_record.runner.run_firm_record`, all inside one lake session cut
+    at `stage_a.data_end`. With --loader-store (the
     default) the session's loader window store is declared over the same
     span, --start minus `stage_a.warmup_days` to --end
     (`declare_run_window`); --no-loader-store leaves every loader call
@@ -1229,12 +1233,16 @@ def firm_record(
             security_ids=FIRM_V1_EQUITY_SECURITY_IDS,
         )
         typer.echo(f"Market data ready: {source_label}; {len(market_data)} rows.", err=True)
-        check_price_coverage(
+        coverage = check_price_coverage(
             market_data,
-            FIRM_V1_EQUITIES,
+            tickers,
             window_start - timedelta(days=settings.stage_a.warmup_days),
+            window_start,
             window_end,
-            settings.stage_a.session_calendar,
+            calendar=settings.stage_a.session_calendar,
+            complete=FIRM_V1_EQUITY_SECURITY_IDS,
+            known_gaps=settings.firm.known_price_gaps,
+            start_exempt=CRYPTO_ASSETS,
         )
         risk_free_rate_series = load_risk_free_rate_series(window_start, window_end)
         lake_version = (
@@ -1256,6 +1264,7 @@ def firm_record(
             max_days=max_days,
             ledger=TrialLedger(_REPO_ROOT / settings.trials.ledger_path, _REPO_ROOT),
             repo_root=_REPO_ROOT,
+            short_warmup=[entry.short_warmup for entry in coverage if entry.short_warmup],
         )
         echo_loader_query_counts()
         echo_loader_store_usage()

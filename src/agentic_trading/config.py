@@ -125,6 +125,13 @@ class FirmConfig(BaseModel):
     # (bootstraps, noise draws) from it, so one fixed value grades every
     # rerun of a record on the same draws. The value itself is arbitrary.
     edgelab_seed: int = Field(default=20100104, ge=0)
+    # (security_id, session) pairs the lake is known to lack a bar for at
+    # its source, which the firm record's price coverage preflight
+    # (`backtest.preflight.check_price_coverage`) accepts as missing inside
+    # its window: a firm equity on such a session holds under rule (c)
+    # instead of stopping the record. Each entry is a reviewed data fact;
+    # none is known, so it is empty.
+    known_price_gaps: list[tuple[int, date]] = Field(default_factory=list)
 
 
 class OptionsConfig(BaseModel):

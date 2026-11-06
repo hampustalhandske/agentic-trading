@@ -34,7 +34,7 @@ from typing import Any, Literal, Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
 
-from agentic_trading.agents.schemas import UnfilledOrder
+from agentic_trading.agents.schemas import ShortWarmup, UnfilledOrder
 from agentic_trading.config import settings
 from agentic_trading.firm_record.edgelab_strategy import REPLAY_STRATEGY_PY, REPLAY_STRATEGY_YAML
 from agentic_trading.firm_record.rows import row_instrument_id
@@ -221,9 +221,10 @@ class AgenticMeta(BaseModel):
     (`git_sha`), whether its `src/` tree had no changes
     (`src_tree_clean`), and whether its `declared_n` comes from the
     registry file (`"registration"`) or is the uncounted default of 1
-    (`"uncounted_default"`), and how many of the engine's orders went
+    (`"uncounted_default"`), how many of the engine's orders went
     unfilled over the days its checkpoint holds (`unfilled_orders`, listed
-    in unfilled_orders.json)."""
+    in unfilled_orders.json), and the instruments whose bars start inside
+    the warm-up (`short_warmup`, in universe order)."""
 
     model_config = _SPEC
 
@@ -232,6 +233,7 @@ class AgenticMeta(BaseModel):
     src_tree_clean: bool
     declared_n_from: Literal["registration", "uncounted_default"]
     unfilled_orders: int = Field(default=0, ge=0)
+    short_warmup: tuple[ShortWarmup, ...] = ()
 
 
 class UnfilledOrdersRecord(BaseModel):
@@ -266,10 +268,11 @@ def submission_for(
     src_tree_clean: bool,
     counted: bool,
     registered_trials: Mapping[str, Any] | None,
+    short_warmup: Sequence[ShortWarmup] = (),
 ) -> tuple[Submission, AgenticMeta]:
     """The `Submission` of the firm record `record` whose sources.json
     holds `sources`, run from `git_sha` with a clean `src/` tree or not
-    (`src_tree_clean`), and its `AgenticMeta`.
+    (`src_tree_clean`), and its `AgenticMeta`, which lists `short_warmup`.
 
     `client` is `CLIENT_PROJECT` at `git_sha` under `FIRM_HYPOTHESIS_ID`;
     the family, ledger reference and hypothesis are `FIRM_HYPOTHESIS_ID`;
@@ -316,6 +319,7 @@ def submission_for(
         git_sha=git_sha,
         src_tree_clean=src_tree_clean,
         declared_n_from="registration" if from_registration else "uncounted_default",
+        short_warmup=tuple(short_warmup),
     )
     return submission, meta
 

@@ -1377,11 +1377,12 @@ def _adjusted_security_bars(
     `_select_security_bars` slice of `_fetch_security_bars` rows, from
     the window store or fetched for this call in one query for every id.
 
-    A bar's raw price is its `close` (`official_close` is never read); a
-    bar whose raw price is null or not positive is left out. Each bar
-    takes the `cum_factor` of the security's factor row with the smallest
-    `effective_date` strictly after the bar's date (1.0 when there is
-    none); bars and factors are joined on `security_id`, never on ticker.
+    A bar's raw price is `SECURITY_RAW_PRICE_SQL`: `official_close`, or
+    `close` when that is null; a bar whose raw price is null or not
+    positive is left out. Each bar takes the `cum_factor` of the
+    security's factor row with the smallest `effective_date` strictly
+    after the bar's date (1.0 when there is none); bars and factors are
+    joined on `security_id`, never on ticker.
     Columns:
 
     - `security_id`, `date` (a `Timestamp`);
@@ -1390,7 +1391,10 @@ def _adjusted_security_bars(
     - `open` (only with `with_open_and_volume`): the bar's `open` times
       the factor, NaN when that is null or not positive;
     - `volume` (only with `with_open_and_volume`): the bar's `volume`
-      unadjusted, NaN when null or not positive;
+      divided by the factor, so `close` times `volume` is the traded
+      dollar volume and a number of shares at `close` is the same share
+      of `volume` as it is of the traded volume at the traded price; NaN
+      when null or not positive;
     - `factor_date`: the `effective_date` of the factor row joined (null
       when none);
     - `log_return`: the log of the bar's `close` over the previous kept
@@ -1425,6 +1429,15 @@ def _split_by_key[K: Hashable](
     }
 
 
+# The SQL expression, over an `equity_daily_from_bars` row, of a bar's raw
+# price: the exchange's official close where the lake keeps one, else the
+# close of the session's last bar. It is the basis the grader (edgelab)
+# settles on. Every security-bar read (`_fetch_security_bars`, both
+# `_SECURITY_CLOSES` and `_SECURITY_BARS`) prices a bar with it, and
+# scripts/at126_legacy.py's reference copy holds the same expression.
+SECURITY_RAW_PRICE_SQL = "COALESCE(official_close, close)"
+
+
 def _fetch_security_bars(
     security_ids: list[int], start: date, end: date, with_open_and_volume: bool
 ) -> dict[int, pd.DataFrame]:
@@ -1445,7 +1458,8 @@ def _fetch_security_bars(
         """
                CASE WHEN bars.open > 0
                     THEN bars.open * COALESCE(factors.cum_factor, 1.0) END AS open,
-               CASE WHEN bars.volume > 0 THEN bars.volume END AS volume,"""
+               CASE WHEN bars.volume > 0
+                    THEN bars.volume / COALESCE(factors.cum_factor, 1.0) END AS volume,"""
         if with_open_and_volume
         else ""
     )
@@ -1456,11 +1470,11 @@ def _fetch_security_bars(
                bars.raw_close,{open_and_volume}
                factors.effective_date AS factor_date
         FROM (
-            SELECT security_id, date, close AS raw_close{bar_columns}
+            SELECT security_id, date, {SECURITY_RAW_PRICE_SQL} AS raw_close{bar_columns}
             FROM {_table_sql("equity_daily_from_bars")}
             WHERE security_id IN ({placeholders})
               AND date BETWEEN ? AND ?
-              AND close > 0
+              AND {SECURITY_RAW_PRICE_SQL} > 0
         ) AS bars
         ASOF LEFT JOIN (
             SELECT security_id, effective_date, cum_factor
@@ -1543,12 +1557,12 @@ def load_security_log_returns(
     `start` to `end` inclusive. One query serves every id in
     `security_ids`.
 
-    A bar's price is its `close` (never `official_close`) times the
-    `cum_factor` of the security's `equity_adjustment_factors` row with
-    the smallest `effective_date` strictly after the bar's date (1.0 when
-    there is none); bars and factors are joined on
-    `security_id`, never on ticker. A bar whose price is null or not
-    positive counts as missing. The return on day d is the log of d's
+    A bar's price is `SECURITY_RAW_PRICE_SQL` (`official_close`, or
+    `close` when that is null) times the `cum_factor` of the security's
+    `equity_adjustment_factors` row with the smallest `effective_date`
+    strictly after the bar's date (1.0 when there is none); bars and
+    factors are joined on `security_id`, never on ticker. A bar whose
+    price is null or not positive counts as missing. The return on day d is the log of d's
     price over the previous bar's price, and exists only when the
     security has bars on d and on the NYSE session immediately before d,
     both inside the range; a gap never yields a multi-day return, and the
@@ -1597,15 +1611,17 @@ def load_security_daily_bars(
     `MultiIndex` columns named `security_id` and `field`, with one group
     per security that has a kept bar in the range and these fields:
 
-    - `close`: the bar's `close` (never its `official_close`) times the
+    - `close`: the bar's raw price (`SECURITY_RAW_PRICE_SQL`:
+      `official_close`, or `close` when that is null) times the
       `cum_factor` of the security's first `equity_adjustment_factors`
       row with an `effective_date` strictly after the bar's date (1.0
       when there is none), joined on `security_id`;
     - `raw_close`: the same price before the factor;
     - `open`: the bar's `open` times the same factor, NaN when the open
       is null or not positive;
-    - `volume`: the bar's volume, unadjusted, NaN when null or not
-      positive;
+    - `volume`: the bar's volume divided by the same factor, so
+      `close` times `volume` is the traded dollar volume; NaN when null
+      or not positive;
     - `log_return`: the value `load_security_log_returns` gives for that
       security and day, NaN on every day it gives none.
 
@@ -1617,7 +1633,7 @@ def load_security_daily_bars(
     earlier `close` and `open` levels, so those levels are not the prices
     that traded. Returns and ratios therefore use `close` and
     `log_return`; any level-based rule (a price filter, a round-number
-    level) uses `raw_close`. `volume` is raw.
+    level) uses `raw_close`.
 
     Returns `None` when `security_ids` is empty or no security has a kept
     bar in the range. Raises `EmptyAdjustmentTableError` when

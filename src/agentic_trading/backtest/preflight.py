@@ -6,8 +6,8 @@ simulated day. For every analyst's declared `DataRequirement`s
 (`agents/base.py`), checks whether the lakehouse actually covers the
 run's tickers and its date range, warm-up included, and reports the
 result. `check_price_coverage` checks, on a run's loaded price frame,
-that each member of a universe has bars from the run's first session to
-its last.
+that each member of a universe has bars over the run's window and
+reports any member whose warm-up is short.
 
 This project never calls a live external API during a run (prices,
 FRED, Ken French, SEC EDGAR, FINRA, option chains, CFTC positioning,
@@ -21,7 +21,7 @@ there is no look-ahead concern here, since this check happens once,
 before the simulated run starts, and wants the lakehouse's true real
 coverage range, not a point-in-time-gated slice of it."""
 
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import date, timedelta
 
 import numpy as np
@@ -29,6 +29,7 @@ import pandas as pd
 from pydantic import BaseModel
 
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, is_likely_equity
+from agentic_trading.agents.schemas import ShortWarmup
 from agentic_trading.data.loaders.lakehouse_loader import (
     load_company_facts_from_lakehouse,
     load_fama_french_factors_from_lakehouse,
@@ -275,106 +276,170 @@ def check_data_availability(
     return PreflightReport(checked_at=date.today(), results=results)
 
 
-# Sessions a member's first bar may come after the first session it is
-# needed on, and its last bar before the last: room for a listing that
-# starts a few days in, or a bar the lake is missing at either end,
-# without calling that a coverage hole. Policy choice.
+# Sessions a fixed instrument's first bar may come after the run's first
+# session, and its last bar before the run's last: room for a bar the lake
+# lacks at either end (futures and FX have holiday and source gaps, held
+# under rule (c)) without calling that a coverage hole. Policy choice.
 PRICE_COVERAGE_SLACK_SESSIONS = 5
+# Missing sessions an error names per member; the count names the rest.
+_MISSING_SESSIONS_LISTED = 10
 
 
 class PriceCoverage(BaseModel):
-    """One member's kept bars in a run's price frame: its `first_bar` and
-    `last_bar` (both `None` without any), the most sessions in a row
-    without a bar between them (`longest_gap_sessions`), and whether the
-    first and last bar fall within the slack of the run's first and last
-    sessions (`covers_run`)."""
+    """One member's kept bars (a non-NaN close) in a run's price frame:
+    its `first_bar` and `last_bar` (both `None` without any), the most
+    sessions in a row without a bar between them (`longest_gap_sessions`),
+    the sessions of the run's window it has no bar on that are not known
+    lake gaps (`missing_sessions`, checked only for a complete member),
+    its `short_warmup` when its first bar comes after the warm-up's first
+    session, and whether it passes (`covers_run`)."""
 
     ticker: str
     first_bar: date | None
     last_bar: date | None
     longest_gap_sessions: int
+    missing_sessions: list[date] = []
+    short_warmup: ShortWarmup | None = None
     covers_run: bool
 
 
 class PriceCoverageError(ValueError):
-    """Some members of a run's universe have no price coverage over the
-    run; the message lists each with its first and last bar."""
+    """Some members of a run's universe lack price coverage over the run;
+    the message lists each with its missing sessions or its first and
+    last bar."""
 
 
 def check_price_coverage(
     market_data: pd.DataFrame,
     members: Sequence[str],
-    from_date: date,
-    to_date: date,
+    warmup_start: date,
+    window_start: date,
+    window_end: date,
+    *,
     calendar: str = "XNYS",
+    complete: Mapping[str, int] | None = None,
+    known_gaps: Collection[tuple[int, date]] = (),
+    start_exempt: Collection[str] = (),
     slack_sessions: int = PRICE_COVERAGE_SLACK_SESSIONS,
 ) -> list[PriceCoverage]:
-    """Checks that every one of `members` has kept bars (a non-NaN
+    """Checks each of `members` for kept bars (a non-NaN
     `(member, "close")` in `market_data`, a `(ticker, field)` frame on a
-    `DatetimeIndex`) across the `calendar` sessions from `from_date` to
-    `to_date`: its first bar on or before the session `slack_sessions`
-    after the first of those sessions, and its last bar on or after the
-    session `slack_sessions` before the last. Logs one INFO line per
-    member with its first and last bar and its longest interior gap, in
-    sessions of `calendar` between two consecutive bars; a gap never fails
-    the check. Returns each member's `PriceCoverage`, in `members` order.
+    `DatetimeIndex`; a bar whose price is null or not positive is NaN
+    there, so missing) over the `calendar` sessions of the run's window,
+    `window_start` to `window_end`.
 
-    Raises `PriceCoverageError` listing every member that fails, with its
-    first and last bar ("none" without a bar), and `ValueError` when no
-    session lies between `from_date` and `to_date`."""
-    sessions = sessions_between(from_date, to_date, calendar)
-    if not sessions:
+    - A member in `complete` (ticker to `security_id`) needs a bar on
+      every session of the window, except a session `(security_id, day)`
+      listed in `known_gaps`.
+    - Any other member needs a bar on or before the session
+      `slack_sessions` after the window's first session (unless it is in
+      `start_exempt`, an instrument never decided before its first bar)
+      and one on or after the session `slack_sessions` before its last.
+
+    A member, `start_exempt` aside, whose first bar is after the first
+    session from `warmup_start` has a short warm-up: it passes, and is
+    logged at WARNING and returned as its `ShortWarmup`. Logs one INFO line
+    per member with its first and last bar and its longest interior gap.
+    Returns each member's `PriceCoverage`, in `members` order.
+
+    Raises `PriceCoverageError` listing every failing member, a complete
+    one with its first `_MISSING_SESSIONS_LISTED` missing sessions and
+    their count, any other with its first and last bar ("none" without a
+    bar); `ValueError` when the window holds no session."""
+    complete = complete or {}
+    known = {(int(security_id), day) for security_id, day in known_gaps}
+    window = sessions_between(window_start, window_end, calendar)
+    if not window:
         raise ValueError(
-            f"no {calendar} session from {from_date.isoformat()} to {to_date.isoformat()}"
+            f"no {calendar} session from {window_start.isoformat()} to {window_end.isoformat()}"
         )
-    latest_first = sessions[min(slack_sessions, len(sessions) - 1)]
-    earliest_last = sessions[max(len(sessions) - 1 - slack_sessions, 0)]
-    session_index = pd.DatetimeIndex(sessions)
+    warmup = sessions_between(warmup_start, window_end, calendar)
+    latest_first = window[min(slack_sessions, len(window) - 1)]
+    earliest_last = window[max(len(window) - 1 - slack_sessions, 0)]
+    session_index = pd.DatetimeIndex(warmup)
     coverage: list[PriceCoverage] = []
     for member in members:
         if (member, "close") in market_data.columns:
-            kept = pd.DatetimeIndex(market_data[(member, "close")].dropna().index)
+            kept = pd.DatetimeIndex(market_data[(member, "close")].dropna().index).sort_values()
         else:
             kept = pd.DatetimeIndex([])
-        if kept.empty:
-            first_bar, last_bar, longest_gap = None, None, 0
+        first_bar = None if kept.empty else kept[0].date()
+        last_bar = None if kept.empty else kept[-1].date()
+        positions = np.unique(session_index.searchsorted(kept))
+        longest_gap = int((np.diff(positions) - 1).max()) if positions.size > 1 else 0
+        short_warmup = None
+        if member not in start_exempt and first_bar is not None and first_bar > warmup[0]:
+            short_warmup = ShortWarmup(
+                instrument=member,
+                first_bar=first_bar,
+                warmup_sessions=sum(1 for day in warmup if first_bar <= day < window[0]),
+            )
+        missing: list[date] = []
+        if member in complete:
+            kept_days = {stamp.date() for stamp in kept}
+            security_id = int(complete[member])
+            missing = [
+                day for day in window if day not in kept_days and (security_id, day) not in known
+            ]
+            covers_run = not missing
         else:
-            first_bar, last_bar = kept.min().date(), kept.max().date()
-            positions = np.unique(session_index.searchsorted(kept.sort_values()))
-            longest_gap = int((np.diff(positions) - 1).max()) if positions.size > 1 else 0
-        covers_run = (
-            first_bar is not None
-            and last_bar is not None
-            and first_bar <= latest_first
-            and last_bar >= earliest_last
-        )
+            covers_run = (
+                first_bar is not None
+                and last_bar is not None
+                and (member in start_exempt or first_bar <= latest_first)
+                and last_bar >= earliest_last
+            )
         logger.info(
             "Price coverage %s: first bar %s, last bar %s, longest interior gap %d session(s)",
             member,
-            "none" if first_bar is None else first_bar.isoformat(),
-            "none" if last_bar is None else last_bar.isoformat(),
+            _day_text(first_bar),
+            _day_text(last_bar),
             longest_gap,
         )
+        if short_warmup is not None:
+            logger.warning(
+                "Short warm-up for %s: first bar %s, %d warm-up session(s) before %s",
+                member,
+                short_warmup.first_bar.isoformat(),
+                short_warmup.warmup_sessions,
+                window[0].isoformat(),
+            )
         coverage.append(
             PriceCoverage(
                 ticker=member,
                 first_bar=first_bar,
                 last_bar=last_bar,
                 longest_gap_sessions=longest_gap,
+                missing_sessions=missing,
+                short_warmup=short_warmup,
                 covers_run=covers_run,
             )
         )
     failing = [entry for entry in coverage if not entry.covers_run]
     if failing:
-        listed = "; ".join(
-            f"{entry.ticker} first bar "
-            f"{'none' if entry.first_bar is None else entry.first_bar.isoformat()}, last bar "
-            f"{'none' if entry.last_bar is None else entry.last_bar.isoformat()}"
-            for entry in failing
-        )
+        listed = "; ".join(_failure_text(entry, entry.ticker in complete) for entry in failing)
         raise PriceCoverageError(
-            f"{len(failing)} member(s) lack price coverage from {sessions[0].isoformat()} "
-            f"to {sessions[-1].isoformat()} (first bar by {latest_first.isoformat()}, last bar "
-            f"from {earliest_last.isoformat()}): {listed}"
+            f"{len(failing)} member(s) lack price coverage over {window[0].isoformat()} to "
+            f"{window[-1].isoformat()} (a fixed instrument's first bar by "
+            f"{latest_first.isoformat()} and last bar from {earliest_last.isoformat()}): "
+            f"{listed}"
         )
     return coverage
+
+
+def _day_text(day: date | None) -> str:
+    return "none" if day is None else day.isoformat()
+
+
+def _failure_text(entry: PriceCoverage, complete: bool) -> str:
+    """One failing member as the coverage error lists it."""
+    if not complete:
+        return (
+            f"{entry.ticker} first bar {_day_text(entry.first_bar)}, "
+            f"last bar {_day_text(entry.last_bar)}"
+        )
+    shown = ", ".join(day.isoformat() for day in entry.missing_sessions[:_MISSING_SESSIONS_LISTED])
+    more = len(entry.missing_sessions) - _MISSING_SESSIONS_LISTED
+    return f"{entry.ticker} missing {len(entry.missing_sessions)} session(s): {shown}" + (
+        f" and {more} more" if more > 0 else ""
+    )
