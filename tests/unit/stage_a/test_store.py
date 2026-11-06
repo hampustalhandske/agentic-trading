@@ -43,7 +43,8 @@ _SIGNAL_COLUMNS = [
     "sample_count",
 ]
 _DECISION_COLUMNS = [*_REQUIRED, "status", "source", "source_as_of"]
-_SCHEMA = Path(__file__).resolve().parents[5] / "edgelab/docs/schema/decision_file.v1.json"
+# edgelab's decision_file.v1 schema, vendored (source in test_decision_schema_fixture.py).
+_SCHEMA = Path(__file__).resolve().parents[2] / "fixtures" / "edgelab_decision_file_v1.json"
 _PACKAGE = "agentic_trading.stage_a"
 
 
@@ -328,8 +329,6 @@ def test_decisions_conform_to_decision_file_v1(tmp_path: Path) -> None:
         assert row["status"] == "active" or weight == 0.0
         assert row["instrument_kind"] in _INSTRUMENT_KINDS and row["instrument_id"]
 
-    if not _SCHEMA.exists():
-        pytest.skip(f"edgelab decision-file schema not reachable at {_SCHEMA}")
     schema = json.loads(_SCHEMA.read_text())
     properties = schema["properties"]
     min_id_length = properties["instrument_id"]["minLength"]

@@ -1,0 +1,41 @@
+# test_decision_schema_fixture.py
+
+"""`tests/fixtures/edgelab_decision_file_v1.json` is a byte copy of edgelab's
+`docs/schema/decision_file.v1.json` at edgelab commit 5b3ac5c, the interface schema a stage (a)
+decision file must satisfy (checked in `test_store.py`). The copy is pinned by sha256, and when
+an edgelab checkout is reachable the copy must equal edgelab's current file, so a schema change
+on either side fails here until the copy is refreshed from edgelab."""
+
+import hashlib
+import os
+from pathlib import Path
+
+import pytest
+
+_FIXTURE = Path(__file__).resolve().parents[2] / "fixtures" / "edgelab_decision_file_v1.json"
+_FIXTURE_SHA256 = "4ca13257363da95efd8e8061b01191564e9765c1eda94f4c90294d151a3c7a5b"
+_EDGELAB_SCHEMA = Path("docs") / "schema" / "decision_file.v1.json"
+
+
+def _edgelab_dir() -> Path:
+    """The edgelab checkout: `EDGELAB_DIR` when set, else `edgelab` beside this repo's
+    parent directory."""
+    configured = os.environ.get("EDGELAB_DIR")
+    if configured:
+        return Path(configured)
+    return Path(__file__).resolve().parents[5] / "edgelab"
+
+
+def test_vendored_schema_is_the_pinned_copy() -> None:
+    """The vendored schema's bytes hash to the pinned sha256."""
+    assert hashlib.sha256(_FIXTURE.read_bytes()).hexdigest() == _FIXTURE_SHA256
+
+
+def test_vendored_schema_matches_edgelab() -> None:
+    """When an edgelab checkout is reachable, its schema is byte-identical to the copy."""
+    source = _edgelab_dir() / _EDGELAB_SCHEMA
+    if not source.exists():
+        pytest.skip(f"no edgelab checkout with {_EDGELAB_SCHEMA}; set EDGELAB_DIR to check drift")
+    assert source.read_bytes() == _FIXTURE.read_bytes(), (
+        f"edgelab's {_EDGELAB_SCHEMA} changed; refresh {_FIXTURE.name} from it"
+    )
