@@ -239,7 +239,6 @@ def run_batch(
     lake_time: datetime,
     lake_version: str,
     quantcore_version: str,
-    quantcore_sha: str | None,
     resources_ok: Callable[[Path], bool] = system_resources_ok,
     ledger: TrialLedger | None = None,
     repo_root: Path | None = None,
@@ -255,7 +254,7 @@ def run_batch(
     asset as instrument id and written as `instrument_kind`. Each trial's
     spec is built from the analyst, `universe` and the window when the
     batch starts, and recorded with `lake_time` (aware), `lake_version`,
-    `quantcore_version` and `quantcore_sha`. Every read happens inside
+    and `quantcore_version`. Every read happens inside
     `lake_session(lake_time, data_end=settings.stage_a.data_end)`, which
     joins a session already open at the same T and data_end. counts.json
     is written for each analyst that wrote a day, or has none yet.
@@ -320,7 +319,6 @@ def run_batch(
                 lake_time=lake_time,
                 lake_version=lake_version,
                 quantcore_version=quantcore_version,
-                quantcore_sha=quantcore_sha,
             )
         )
     store_dir = Path(store_dir)

@@ -45,7 +45,6 @@ def _store(store_dir: Path, analyst: AnalystAgent) -> tuple[SignalStore, Path]:
         lake_time=datetime(2026, 11, 5, tzinfo=UTC),
         lake_version="v",
         quantcore_version="0",
-        quantcore_sha=None,
     )
     store = SignalStore(store_dir, record)
     store.open()

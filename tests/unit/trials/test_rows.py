@@ -52,6 +52,7 @@ _SPEC = StageASpec(
     window_start=date(2010, 1, 4),
     window_end=date(2024, 12, 31),
     decision_rule=DECISION_RULE,
+    quantcore_sha="e" * 40,
 )
 _RECORD = SpecRecord(
     spec=_SPEC,
@@ -59,7 +60,6 @@ _RECORD = SpecRecord(
     lake_time=datetime(2026, 10, 29, 12, 0, tzinfo=UTC),
     lake_version="f89aef2f428a",
     quantcore_version="0.3.0",
-    quantcore_sha=None,
 )
 _PROVENANCE = TrialProvenance(agentic_sha="a" * 40, agentic_dirty=True, quantcore_sha="b" * 40)
 

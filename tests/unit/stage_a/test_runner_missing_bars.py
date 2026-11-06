@@ -124,7 +124,6 @@ def _batch(
         lake_time=_T,
         lake_version="f89aef2f428a",
         quantcore_version="0.4.0",
-        quantcore_sha=None,
         resources_ok=lambda _store_dir: True,
     )
 

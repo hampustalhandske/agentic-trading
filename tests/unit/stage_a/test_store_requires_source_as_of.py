@@ -39,7 +39,6 @@ def _record(analyst: AnalystAgent, universe: list[str]) -> SpecRecord:
         lake_time=datetime(2026, 10, 29, tzinfo=UTC),
         lake_version="f89aef2f428a",
         quantcore_version="0.4.0",
-        quantcore_sha=None,
     )
 
 

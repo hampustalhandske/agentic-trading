@@ -54,7 +54,6 @@ def _record(analyst: AnalystAgent, universe: list[str], **overrides: Any) -> Spe
         "lake_time": datetime(2026, 10, 29, tzinfo=UTC),
         "lake_version": "f89aef2f428a",
         "quantcore_version": "0.4.0",
-        "quantcore_sha": None,
     }
     return SpecRecord(spec=spec, spec_hash=spec_hash(spec), **(fields | overrides))
 
@@ -153,14 +152,13 @@ def test_open_writes_spec_and_sources(tmp_path: Path) -> None:
 
 
 def test_open_refuses_a_changed_record(tmp_path: Path) -> None:
-    """A same-hash record with another lake time, lake version or quantcore field is refused."""
+    """A same-hash record with another lake time, lake version or quantcore version is refused."""
     _, trial = _open(tmp_path)
     original = (trial / "spec.json").read_text()
     changes: list[dict[str, Any]] = [
         {"lake_time": datetime(2026, 11, 5, 12, tzinfo=UTC)},
         {"lake_version": "c69d5dd"},
         {"quantcore_version": "0.5.0"},
-        {"quantcore_sha": "0123456789abcdef"},
     ]
     for change in changes:
         record = _record(CIRRateRegimeAnalyst(), list(_RATE_IDS), **change)

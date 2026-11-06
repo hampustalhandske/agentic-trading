@@ -41,7 +41,6 @@ _META: dict[str, Any] = {
     "lake_time": _T,
     "lake_version": "f89aef2f428a",
     "quantcore_version": "0.4.0",
-    "quantcore_sha": None,
 }
 _RUNTIME_FIELDS = {
     "stage_a.min_free_memory_pct",

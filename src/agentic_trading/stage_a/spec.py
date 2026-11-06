@@ -7,12 +7,13 @@
 minus `RUNTIME_SETTINGS_FIELDS`, the sha256 of the analyst's own module
 and of every `agentic_trading.agents` and `agentic_trading.data` module
 reachable through imports from it, the universe, the window and the
-decision rule. `spec_hash` is the sha256 of the spec's canonical JSON,
-so two specs hash alike exactly when they define the same trial.
+decision rule, and the installed quantcore commit. `spec_hash` is the
+sha256 of the spec's canonical JSON, so two specs hash alike exactly
+when they define the same trial.
 
 `SpecRecord` is what spec.json holds: the spec and its hash, plus the
-lake time T, the lake version and the quantcore version and sha, which
-are recorded beside the hash and never enter it. No field holds a
+lake time T, the lake version and the quantcore version, which are
+recorded beside the hash and never enter it. No field holds a
 machine path: modules are named by their dotted import name, never by
 file location."""
 
@@ -26,6 +27,7 @@ from typing import Any, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, model_validator
 
+from agentic_trading import provenance
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.config import settings
 
@@ -72,7 +74,10 @@ class StageASpec(BaseModel):
     - `universe`: the instrument ids the analyst runs over;
     - `window_start`, `window_end`: the trial's first and last date,
       inclusive;
-    - `decision_rule`: the rule turning signals into weights.
+    - `decision_rule`: the rule turning signals into weights;
+    - `quantcore_sha`: the commit the installed quantcore was built from,
+      `None` when quantcore was not installed from a VCS URL, so a re-pin
+      is another trial.
 
     Raises `ValueError` when `window_start` is after `window_end`."""
 
@@ -87,6 +92,7 @@ class StageASpec(BaseModel):
     window_start: date
     window_end: date
     decision_rule: str
+    quantcore_sha: str | None
 
     @model_validator(mode="after")
     def _window_is_ordered(self) -> Self:
@@ -116,8 +122,7 @@ class SpecRecord(BaseModel):
     """The contents of one trial's spec.json: `spec` and its `spec_hash`,
     plus what the trial ran against, recorded outside the hash:
     `lake_time` (T, timezone-aware), `lake_version` (the lake service's
-    git commit), `quantcore_version` and `quantcore_sha` (the pinned
-    quantcore commit, `None` when unknown). Raises `ValueError` when
+    git commit) and `quantcore_version`. Raises `ValueError` when
     `spec_hash` is not the hash of `spec`."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -127,7 +132,6 @@ class SpecRecord(BaseModel):
     lake_time: AwareDatetime
     lake_version: str
     quantcore_version: str
-    quantcore_sha: str | None
 
     @model_validator(mode="after")
     def _hash_matches_spec(self) -> Self:
@@ -156,6 +160,7 @@ def build_spec(
         window_start=window_start,
         window_end=window_end,
         decision_rule=DECISION_RULE,
+        quantcore_sha=provenance.quantcore_sha(),
     )
 
 

@@ -1015,7 +1015,6 @@ def stage_a(
             lake_time=session.lake_time,
             lake_version=lake_version,
             quantcore_version=metadata.version("quantcore"),
-            quantcore_sha=provenance.quantcore_sha(),
             ledger=TrialLedger(_REPO_ROOT / settings.trials.ledger_path, _REPO_ROOT),
             repo_root=_REPO_ROOT,
         )

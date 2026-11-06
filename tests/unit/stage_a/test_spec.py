@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from agentic_trading import provenance
 from agentic_trading.agents.analysts import CIRRateRegimeAnalyst
 from agentic_trading.config import settings, temporary_overrides
 from agentic_trading.stage_a import spec as spec_module
@@ -26,7 +27,7 @@ _DECISION_RULE = (
     "w_i = s_i / sum_j |s_j| over active instruments; s_i = sign(direction_i) * confidence_i; "
     "non-active and zero-sum days weight 0"
 )
-_RECORD_FIELDS = {"lake_time", "lake_version", "quantcore_version", "quantcore_sha"}
+_RECORD_FIELDS = {"lake_time", "lake_version", "quantcore_version"}
 # The agentic_trading.agents modules cir_rate_regime_analyst.py imports directly.
 _CIR_AGENT_IMPORTS = {
     "agentic_trading.agents._market_math",
@@ -53,7 +54,6 @@ def _record(spec: StageASpec, **overrides: Any) -> SpecRecord:
         "lake_time": datetime(2026, 10, 29, tzinfo=UTC),
         "lake_version": "f89aef2f428a",
         "quantcore_version": "0.4.0",
-        "quantcore_sha": None,
     }
     return SpecRecord(spec=spec, spec_hash=spec_hash(spec), **(fields | overrides))
 
@@ -131,7 +131,7 @@ def test_spec_hash_changes_with_each_hashed_input() -> None:
 
 
 def test_record_fields_stay_outside_the_hash() -> None:
-    """Lake time, lake version and quantcore fields live on SpecRecord only and leave the hash."""
+    """Lake time, lake version and quantcore version live on SpecRecord only and leave the hash."""
     spec = _build()
     records = [
         _record(spec),
@@ -140,7 +140,6 @@ def test_record_fields_stay_outside_the_hash() -> None:
             lake_time=datetime(2026, 11, 5, 12, tzinfo=UTC),
             lake_version="c69d5dd",
             quantcore_version="0.5.0",
-            quantcore_sha="0123456789abcdef",
         ),
     ]
 
@@ -202,3 +201,16 @@ def test_spec_record_json_has_no_machine_path() -> None:
 
     assert texts
     assert [text for text in texts if any(part in text for part in forbidden)] == []
+
+
+def test_spec_hashes_the_installed_quantcore_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The spec carries the installed quantcore commit, and another commit is another hash."""
+    installed = provenance.quantcore_sha()
+    spec = _build()
+    other = "f" * 40
+    monkeypatch.setattr(provenance, "quantcore_sha", lambda: other)
+    repinned = _build()
+
+    assert spec.quantcore_sha == installed
+    assert repinned.quantcore_sha == other
+    assert spec_hash(repinned) != spec_hash(spec)

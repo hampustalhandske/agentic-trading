@@ -36,7 +36,6 @@ _META: dict[str, Any] = {
     "lake_time": datetime(2026, 10, 29, tzinfo=UTC),
     "lake_version": "f89aef2f428a",
     "quantcore_version": "0.4.0",
-    "quantcore_sha": None,
 }
 _PROVENANCE = TrialProvenance(agentic_sha="c" * 40, agentic_dirty=False, quantcore_sha="d" * 40)
 
