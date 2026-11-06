@@ -17,15 +17,28 @@ from datetime import date, timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 import pytest
+from pydantic import BaseModel
+from typer.testing import CliRunner
 
+import agentic_trading.cli as cli
+from agentic_trading.agents.roster import FIRM_V1_EQUITIES, FIRM_V1_UNIVERSE
 from agentic_trading.agents.schemas import OptionContract, UnfactoredSplitMove
+from agentic_trading.backtest.engine import BacktestEngine
+from agentic_trading.cli import (
+    LOADER_QUERY_COUNTS_PREFIX,
+    LOADER_STORE_USAGE_PREFIX,
+    firm_record_app,
+)
+from agentic_trading.config import settings
 from agentic_trading.data.loaders import lakehouse_loader as ll
 from agentic_trading.data.loaders import option_marks
 from agentic_trading.data.trading_calendar import sessions_between
+from agentic_trading.firm_record.runner import FirmRecordResult
 
 _SCRIPTS = Path(__file__).resolve().parents[4] / "scripts"
 _SCRAPED_AT = pd.Timestamp("2020-01-01T00:00:00Z")
@@ -1393,3 +1406,170 @@ def test_backtest_comparison_reads_the_result_and_counts(ab: ModuleType) -> None
     command = ab.backtest_command(["SPY"], "2019-01-02", "2019-02-01", "T", True, ["--set", "a=b"])
     assert command[-3:] == ["--loader-store", "--set", "a=b"]
     assert "--lake-time" in command and "--yes" in command
+
+
+# ---------------------------------------------------------------- the firm-record path
+
+
+@pytest.mark.parametrize("store", [True, False])
+def test_firm_record_declares_the_run_window(
+    preflight_lake: Any, tmp_path: Path, store: bool
+) -> None:
+    """The firm-record command declares the window store from --start minus
+    stage_a.warmup_days to --end unless --no-loader-store is given, and
+    writes the query counts and the store's usage to stderr."""
+    market = pd.DataFrame(
+        {("SPY", "close"): [100.0, 101.0]}, index=pd.DatetimeIndex(["2010-01-04", "2010-01-05"])
+    )
+    seen: list[ll.LoaderWindow | None] = []
+
+    def record(*_args: Any, **_kwargs: Any) -> FirmRecordResult:
+        seen.append(ll.loader_window())
+        return FirmRecordResult(
+            spec_hash="0" * 64,
+            days_written=2,
+            last_completed=date(2010, 1, 5),
+            complete=True,
+            counted=False,
+        )
+
+    args = ["--start", "2010-01-04", "--end", "2010-01-05", "--store-dir", str(tmp_path)]
+    with (
+        patch(
+            "agentic_trading.cli.load_price_history_with_fallback",
+            return_value=(market, "lakehouse data"),
+        ),
+        patch("agentic_trading.cli.load_risk_free_rate_series", return_value=None),
+        patch("agentic_trading.cli.run_firm_record", side_effect=record),
+    ):
+        result = CliRunner().invoke(
+            firm_record_app, [*args, "--loader-store" if store else "--no-loader-store"]
+        )
+
+    assert result.exit_code == 0, result.output
+    expected = ll.LoaderWindow(
+        start=date(2010, 1, 4) - timedelta(days=settings.stage_a.warmup_days),
+        end=date(2010, 1, 5),
+    )
+    assert seen == [expected if store else None]
+    stderr = result.stderr.splitlines()
+    assert any(line.startswith(LOADER_QUERY_COUNTS_PREFIX) for line in stderr)
+    usage = [line for line in stderr if line.startswith(LOADER_STORE_USAGE_PREFIX)]
+    assert len(usage) == 1 and usage[0].endswith("null") != store
+    assert ll.loader_window() is None
+
+
+def test_the_firm_v1_preset_is_the_registered_universe(ab: ModuleType) -> None:
+    equities = [{"security_id": n, "ticker": t} for n, t in enumerate(FIRM_V1_EQUITIES)]
+    assert ab.firm_v1_universe(equities) == list(FIRM_V1_UNIVERSE)
+
+
+def test_the_firm_record_driver_writes_the_engine_result(
+    ab: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The driver runs firm_record_main on its options and writes what
+    BacktestEngine.run returns to its result path."""
+
+    class Result(BaseModel):
+        x: float = 1.5
+
+    calls: list[tuple[list[str], Any]] = []
+    monkeypatch.setattr(BacktestEngine, "run", lambda _self, *_a, **_k: Result())
+    monkeypatch.setattr(
+        cli, "firm_record_main", lambda args: calls.append((args, BacktestEngine.run(None)))
+    )
+    path = tmp_path / ab.FIRM_RECORD_RESULT_FILE
+    monkeypatch.setattr(sys, "argv", ["-c", str(path), "--start", "2010-01-04"])
+    exec(ab.FIRM_RECORD_DRIVER, {"__name__": "__main__"})
+
+    assert calls == [(["--start", "2010-01-04"], Result())]
+    assert path.read_text() == Result().model_dump_json(indent=2)
+
+
+def _firm_record_run(
+    ab: ModuleType,
+    run_dir: Path,
+    store: bool,
+    *,
+    weight: float = 0.25,
+    sharpe: float = 0.5,
+    complete: bool = True,
+    code: int = 0,
+) -> Any:
+    """A firm-record run directory holding a one-trial store and a
+    BacktestResult, and the CliRun that printed its FirmRecordResult."""
+    spec_hash = "a" * 64
+    trial = run_dir / "store" / spec_hash
+    trial.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "decision_date": pd.to_datetime(["2010-01-04", "2010-01-04"]),
+            "instrument_id": ["SPY", "TLT"],
+            "pod_id": ["risk_manager", "rates_manager"],
+            "target_weight": [weight, 0.1],
+        }
+    ).to_parquet(trial / "decisions.parquet")
+    (trial / "progress.json").write_text('{"last_completed": "2010-01-04"}\n')
+    (run_dir / ab.FIRM_RECORD_RESULT_FILE).write_text(
+        f'{{\n  "start_date": "2010-01-04",\n  "final_sharpe_ratio": {sharpe}\n}}'
+    )
+    payload = (
+        f'{{\n  "spec_hash": "{spec_hash}",\n  "days_written": 1,\n'
+        f'  "last_completed": "2010-01-04",\n  "complete": {str(complete).lower()},\n'
+        '  "counted": false\n}'
+    )
+    stderr = ab.LOADER_QUERY_COUNTS_PREFIX + '[{"loader": "x", "path": "store", "queries": 2}]'
+    run = ab.CliRun(
+        store=store, returncode=code, stdout="Reading\n" + payload + "\n", stderr=stderr, seconds=1
+    )
+    return ab.FirmRecordRun(run=run, run_dir=run_dir)
+
+
+def test_firm_record_comparison_needs_identical_files_and_result(
+    ab: ModuleType, tmp_path: Path
+) -> None:
+    direct = _firm_record_run(ab, tmp_path / "direct", False)
+    same = ab.compare_firm_records(direct, _firm_record_run(ab, tmp_path / "same", True))
+    assert same["identical"] and same["store"]["queries"] == 2
+    assert same["direct"]["firm_record"]["spec_hash"] == "a" * 64
+    assert set(same["trial_dir"]["files"]) == {"decisions.parquet", "progress.json"}
+
+    weights = ab.compare_firm_records(
+        direct, _firm_record_run(ab, tmp_path / "weights", True, weight=0.3)
+    )
+    assert not weights["identical"] and weights["backtest_result"]["identical"]
+    assert weights["trial_dir"]["files"]["decisions.parquet"]["difference"] == (
+        "row 0 {'decision_date': '2010-01-04 00:00:00', 'instrument_id': 'SPY', "
+        "'pod_id': 'risk_manager'}: columns ['target_weight'] differ"
+    )
+
+    sharpe = ab.compare_firm_records(
+        direct, _firm_record_run(ab, tmp_path / "sharpe", True, sharpe=0.75)
+    )
+    assert not sharpe["identical"] and sharpe["trial_dir"]["identical"]
+    difference = sharpe["backtest_result"]["difference"]
+    assert difference == 'line 3 (key "final_sharpe_ratio")'
+    assert "0.5" not in difference and "0.75" not in difference
+
+    incomplete = ab.compare_firm_records(
+        direct, _firm_record_run(ab, tmp_path / "incomplete", True, complete=False)
+    )
+    assert not incomplete["identical"]
+    failed = ab.compare_firm_records(
+        direct, _firm_record_run(ab, tmp_path / "failed", True, code=1)
+    )
+    assert not failed["identical"] and "stderr_tail" in failed["store"]
+
+
+def test_the_firm_record_command_is_uncounted_and_switches_the_store(
+    ab: ModuleType, tmp_path: Path
+) -> None:
+    command = ab.firm_record_command(
+        "2010-01-04", "2017-12-29", "T", False, tmp_path, ["--set", "a=b"]
+    )
+    assert command[1:4] == ["-c", ab.FIRM_RECORD_DRIVER, str(tmp_path / "backtest_result.json")]
+    assert "--no-loader-store" in command and command[-2:] == ["--set", "a=b"]
+    assert command[command.index("--store-dir") + 1] == str(tmp_path / "store")
+    assert f"trials.ledger_path={tmp_path / 'ledger.duckdb'}" in command
+    assert f"trials.registry_dir={tmp_path / 'registry'}" in command
+    assert "--loader-store" in ab.firm_record_command("s", "e", "T", True, tmp_path, [])

@@ -1144,6 +1144,9 @@ def firm_record(
         "for several. Hashed settings enter the firm's spec; trials.ledger_path moves the "
         "trial ledger. See agentic_trading/config.py for every key.",
     ),
+    loader_store: bool = typer.Option(
+        True, "--loader-store/--no-loader-store", help=_LOADER_STORE_HELP
+    ),
 ) -> None:
     """Record the registered firm (agentic-firm-v1) from --start to --end:
     the Commander's daily pod targets written as a `decision_file.v1` trial
@@ -1155,7 +1158,13 @@ def firm_record(
     universe's prices aligned on `stage_a.session_calendar`, from --start
     minus `stage_a.warmup_days` calendar days to --end, and the risk-free
     rate, then runs `firm_record.runner.run_firm_record`, all inside one
-    lake session cut at `stage_a.data_end`. The firm's hypothesis is
+    lake session cut at `stage_a.data_end`. With --loader-store (the
+    default) the session's loader window store is declared over the same
+    span, --start minus `stage_a.warmup_days` to --end
+    (`declare_run_window`); --no-loader-store leaves every loader call
+    fetching for itself. Before the session closes, the loader query
+    counts and the store's usage are written to stderr
+    (`echo_loader_query_counts`, `echo_loader_store_usage`). The firm's hypothesis is
     registered in the trial ledger at `trials.ledger_path` from its
     registry file before the first day; without that file the record is
     uncounted. Prints the result as JSON, which holds no performance
@@ -1201,6 +1210,7 @@ def firm_record(
     )
     with lake_session(requested_lake_time, data_end=data_end) as session:
         typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
+        declare_run_window(loader_store, window_start, window_end, settings.stage_a.warmup_days)
         market_data, source_label = load_price_history_with_fallback(
             tickers,
             window_start,
@@ -1231,6 +1241,8 @@ def firm_record(
             ledger=TrialLedger(_REPO_ROOT / settings.trials.ledger_path, _REPO_ROOT),
             repo_root=_REPO_ROOT,
         )
+        echo_loader_query_counts()
+        echo_loader_store_usage()
     typer.echo(result.model_dump_json(indent=2))
 
 

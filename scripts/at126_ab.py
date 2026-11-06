@@ -46,13 +46,36 @@ JSON its `--out` writes, or by running it), `FIRM_V1_ETFS`,
 
 `backtest` mode: runs the single-phase CLI backtest twice at one lake
 time (the given `--lake-time`, or the default T of a session opened now),
-on the given assets (with `--firm-v1`, the firm's universe first), once
-with `--no-loader-store` and once with `--loader-store`, and compares the
-two runs' `result` (the BacktestResult JSON) byte for byte. Prints JSON
-with each run's wall seconds, total queries, per-loader query counts and
-window-store memory, and the first differing line, then the store run's
-memory per source and its peak, and `OVERALL PASS|FAIL`; exits 1 when
-the results differ.
+on the given assets (with `--firm-v1`, `roster.FIRM_V1_UNIVERSE` first),
+once with `--no-loader-store` and once with `--loader-store`, and
+compares the two runs' `result` (the BacktestResult JSON) byte for byte.
+Prints JSON with each run's wall seconds, total queries, per-loader query
+counts and window-store memory, and the first differing line, then the
+store run's memory per source and its peak, and `OVERALL PASS|FAIL`;
+exits 1 when the results differ.
+
+`backtest --firm-record` runs the firm-record path instead: the
+`agentic-trading-firm-record` command (the registered firm over
+`roster.FIRM_V1_UNIVERSE`) from `--start-date` to `--end-date`, twice at
+one lake time, store off then on, each into its own fresh directory
+under `--work-dir` (a new temporary directory by default; it must lie
+outside the repository). Each run moves the trial ledger and the
+registry directory into its own directory (`--set trials.ledger_path`,
+`--set trials.registry_dir`), so the runs are uncounted and leave the
+repository's ledger untouched; both settings are outside the spec hash,
+so the trial is the registered record's. The command runs under
+`FIRM_RECORD_DRIVER`, which writes the engine's BacktestResult to the
+run's directory as the engine returns it, since the command itself
+prints no performance figure. The two runs match when both exit 0 and
+complete the window under one spec hash, every file of their trial
+directories (the decision file decisions.parquet, spec.json,
+sources.json, progress.json) is byte-identical, and their BacktestResult
+JSON is byte-identical. The JSON printed names each differing file, the
+first differing row and column of a differing decisions.parquet, and the
+line (with its key, never its value) where the BacktestResult texts
+first differ, so no performance figure is printed. An extra
+`--max-days` pauses the record before the engine returns, so the runs
+have no BacktestResult and fail.
 
 Usage:
   uv run python scripts/at126_ab.py loaders --firm-v1 [--firm-equities PATH] [--lake-time T]
@@ -60,6 +83,8 @@ Usage:
       --ticker AAPL --ticker SPY [--cot-ticker GC=F] [--lake-time T] [--every 5] [--out PATH]
   uv run python scripts/at126_ab.py backtest --firm-v1 --start-date 2010-01-04 \\
       --end-date 2017-12-29 [--lake-time T] [--out PATH] [<extra CLI options, e.g. --set g.f=v>]
+  uv run python scripts/at126_ab.py backtest --firm-record --start-date 2010-01-04 \\
+      --end-date 2017-12-29 [--lake-time T] [--work-dir DIR] [--out PATH] [<extra options>]
 """
 
 import argparse
@@ -79,6 +104,7 @@ import pandas as pd
 from at126_legacy import LEGACY_LOADERS
 from pydantic import BaseModel, ConfigDict
 
+from agentic_trading.agents.roster import FIRM_V1_UNIVERSE
 from agentic_trading.cli import (
     LOADER_QUERY_COUNTS_PREFIX,
     LOADER_STORE_USAGE_PREFIX,
@@ -1103,7 +1129,7 @@ def _backtest_main(args: argparse.Namespace, extra: list[str]) -> int:
             lake_time = session.lake_time.isoformat()
     assets = list(args.assets)
     if args.firm_v1:
-        assets = [*firm_v1_universe(firm_v1_equities(args.firm_equities)), *assets]
+        assets = [*FIRM_V1_UNIVERSE, *assets]
     if not assets:
         raise SystemExit("give --firm-v1 or at least one asset")
     runs = [
@@ -1115,12 +1141,263 @@ def _backtest_main(args: argparse.Namespace, extra: list[str]) -> int:
     ]
     summary = {"lake_time": lake_time, **compare_backtests(runs[0], runs[1])}
     _emit(summary, args.out)
-    usage = summary["store"]["store_usage"]
-    if usage is not None:
-        for source in usage["sources"]:
-            print(f"store {source['source']}: {source['keys']} keys, {source['rows']} rows, "
-                  f"~{source['bytes']} bytes")  # fmt: skip
-        print(f"store held ~{usage['held_bytes']} bytes, peak ~{usage['peak_bytes']} bytes")
+    _print_store_usage(summary["store"]["store_usage"])
+    print(f"OVERALL {'PASS' if summary['identical'] else 'FAIL'}")
+    return 0 if summary["identical"] else 1
+
+
+def _print_store_usage(usage: dict[str, Any] | None) -> None:
+    """Prints the store run's memory per source and its peak, when it
+    declared a store."""
+    if usage is None:
+        return
+    for source in usage["sources"]:
+        print(f"store {source['source']}: {source['keys']} keys, {source['rows']} rows, "
+              f"~{source['bytes']} bytes")  # fmt: skip
+    print(f"store held ~{usage['held_bytes']} bytes, peak ~{usage['peak_bytes']} bytes")
+
+
+# ---------------------------------------------------------------- the firm-record path
+
+# Run as `python -c FIRM_RECORD_DRIVER <result path> <firm-record options>`:
+# the `agentic-trading-firm-record` command, with the engine's
+# BacktestResult written to <result path> (indent=2) as `BacktestEngine.run`
+# returns it.
+FIRM_RECORD_DRIVER = """\
+import sys
+from pathlib import Path
+
+from agentic_trading.backtest.engine import BacktestEngine
+from agentic_trading.cli import firm_record_main
+
+result_path = Path(sys.argv[1])
+engine_run = BacktestEngine.run
+
+
+def run_and_keep(self, *args, **kwargs):
+    result = engine_run(self, *args, **kwargs)
+    result_path.write_text(result.model_dump_json(indent=2))
+    return result
+
+
+BacktestEngine.run = run_and_keep
+firm_record_main(sys.argv[2:])
+"""
+# The file each firm-record run's BacktestResult is written to, in its run directory.
+FIRM_RECORD_RESULT_FILE = "backtest_result.json"
+
+
+class FirmRecordRun(BaseModel):
+    """One firm-record subprocess: the CLI run and the directory it wrote
+    its store, ledger and BacktestResult under."""
+
+    run: CliRun
+    run_dir: Path
+
+
+def firm_record_command(
+    start: str, end: str, lake_time: str, store: bool, run_dir: Path, extra: Sequence[str]
+) -> list[str]:
+    """The subprocess command running the firm record from `start` to
+    `end` at `lake_time` with the window store on or off, its trial store
+    under `run_dir / "store"`, its trial ledger and registry directory
+    moved into `run_dir` (so the run is uncounted) and its BacktestResult
+    written to `run_dir / FIRM_RECORD_RESULT_FILE`."""
+    return [
+        sys.executable,
+        "-c",
+        FIRM_RECORD_DRIVER,
+        str(run_dir / FIRM_RECORD_RESULT_FILE),
+        "--start",
+        start,
+        "--end",
+        end,
+        "--store-dir",
+        str(run_dir / "store"),
+        "--lake-time",
+        lake_time,
+        "--loader-store" if store else "--no-loader-store",
+        "--set",
+        f"trials.ledger_path={run_dir / 'ledger.duckdb'}",
+        "--set",
+        f"trials.registry_dir={run_dir / 'registry'}",
+        *extra,
+    ]
+
+
+def firm_record_result(stdout: str) -> dict[str, Any]:
+    """The `FirmRecordResult` JSON the firm-record command printed last
+    (from a line holding only `{`). Raises `ValueError` when stdout holds
+    none."""
+    lines = stdout.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index] != "{":
+            continue
+        try:
+            payload = json.loads("\n".join(lines[index:]))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and "spec_hash" in payload:
+            return payload
+    raise ValueError("no FirmRecordResult JSON in the firm-record output")
+
+
+def difference_location(expected: str, actual: str) -> str | None:
+    """`None` when the two texts are byte-identical, else the number of
+    the first line where they differ, with the JSON key that line holds
+    when it holds one; never a value."""
+    if expected == actual:
+        return None
+    left, right = expected.splitlines(), actual.splitlines()
+    for number, (one, other) in enumerate(zip(left, right, strict=False), start=1):
+        if one != other:
+            key, colon, _ = one.strip().partition('":')
+            return f"line {number}" + (f' (key {key}")' if colon and key.startswith('"') else "")
+    return f"line {min(len(left), len(right)) + 1}: one text ends ({len(left)} vs {len(right)})"
+
+
+def first_frame_difference(expected: pd.DataFrame, actual: pd.DataFrame) -> str:
+    """Where two decision files first differ: their columns or dtypes,
+    their row counts, or the first differing row (its position and
+    `decision_date`, `instrument_id` and `pod_id` when it has them) and
+    the columns differing on it."""
+    if list(expected.columns) != list(actual.columns):
+        return f"columns {list(expected.columns)} != {list(actual.columns)}"
+    if list(expected.dtypes.astype(str)) != list(actual.dtypes.astype(str)):
+        return f"dtypes {list(expected.dtypes.astype(str))} != {list(actual.dtypes.astype(str))}"
+    if len(expected) != len(actual):
+        return f"{len(expected)} rows != {len(actual)} rows"
+    left = expected.reset_index(drop=True)
+    right = actual.reset_index(drop=True)
+    for position in range(len(left)):
+        columns = [
+            column
+            for column in left.columns
+            if not (
+                (pd.isna(left.at[position, column]) and pd.isna(right.at[position, column]))
+                or left.at[position, column] == right.at[position, column]
+            )
+        ]
+        if columns:
+            where = {
+                name: str(left.at[position, name])
+                for name in ("decision_date", "instrument_id", "pod_id")
+                if name in left.columns
+            }
+            return f"row {position} {where}: columns {columns} differ"
+    return "the files differ in bytes but not in their rows"
+
+
+def compare_trial_dirs(expected: Path, actual: Path) -> dict[str, Any]:
+    """Each file of two trial directories, byte for byte: `identical` when
+    both hold the same file names with the same bytes, and per file
+    whether it matches, with where a differing Parquet or text file first
+    differs (`first_frame_difference`, `first_difference`)."""
+    names = sorted({path.name for path in (*expected.iterdir(), *actual.iterdir())})
+    files: dict[str, Any] = {}
+    for name in names:
+        left, right = expected / name, actual / name
+        if not (left.exists() and right.exists()):
+            files[name] = {"identical": False, "difference": "present in one run only"}
+            continue
+        if left.read_bytes() == right.read_bytes():
+            files[name] = {"identical": True}
+            continue
+        if name.endswith(".parquet"):
+            difference = first_frame_difference(pd.read_parquet(left), pd.read_parquet(right))
+        else:
+            difference = first_difference(left.read_text(), right.read_text()) or ""
+        files[name] = {"identical": False, "difference": difference}
+    return {
+        "identical": bool(names) and all(entry["identical"] for entry in files.values()),
+        "files": files,
+    }
+
+
+def compare_firm_records(direct: FirmRecordRun, stored: FirmRecordRun) -> dict[str, Any]:
+    """The comparison of a `--no-loader-store` and a `--loader-store` firm
+    record: `identical` when both exited 0 and completed the window under
+    one spec hash, their trial directories match file for file
+    (`compare_trial_dirs`) and their BacktestResult JSON is byte-identical
+    (its difference located by `difference_location`); with each run's
+    seconds, query counts, window-store memory and FirmRecordResult."""
+    summary: dict[str, Any] = {}
+    results: dict[str, dict[str, Any] | None] = {}
+    for label, record in (("direct", direct), ("store", stored)):
+        run = record.run
+        counts = query_counts(run.stderr)
+        summary[label] = {
+            "returncode": run.returncode,
+            "seconds": run.seconds,
+            "queries": sum(int(count["queries"]) for count in counts),
+            "counts": counts,
+            "store_usage": store_usage(run.stderr),
+        }
+        try:
+            results[label] = firm_record_result(run.stdout) if run.returncode == 0 else None
+        except ValueError:
+            results[label] = None
+        summary[label]["firm_record"] = results[label]
+        if results[label] is None:
+            summary[label]["stderr_tail"] = run.stderr[-2000:]
+    direct_result, store_result = results["direct"], results["store"]
+    if direct_result is None or store_result is None:
+        summary["identical"] = False
+        summary["difference"] = "a run failed or printed no FirmRecordResult"
+        return summary
+    if direct_result["spec_hash"] != store_result["spec_hash"]:
+        summary["identical"] = False
+        summary["difference"] = "the runs recorded different spec hashes"
+        return summary
+    if not (direct_result["complete"] and store_result["complete"]):
+        summary["identical"] = False
+        summary["difference"] = "a run did not complete the window"
+        return summary
+    spec_hash = direct_result["spec_hash"]
+    trial = compare_trial_dirs(
+        direct.run_dir / "store" / spec_hash, stored.run_dir / "store" / spec_hash
+    )
+    direct_path = direct.run_dir / FIRM_RECORD_RESULT_FILE
+    store_path = stored.run_dir / FIRM_RECORD_RESULT_FILE
+    if direct_path.exists() and store_path.exists():
+        result_difference = difference_location(direct_path.read_text(), store_path.read_text())
+        backtest = {"identical": result_difference is None, "difference": result_difference}
+    else:
+        backtest = {"identical": False, "difference": "a run wrote no BacktestResult"}
+    summary["trial_dir"] = trial
+    summary["backtest_result"] = backtest
+    summary["identical"] = trial["identical"] and backtest["identical"]
+    summary["difference"] = None if summary["identical"] else "see trial_dir and backtest_result"
+    return summary
+
+
+def _firm_record_main(args: argparse.Namespace, extra: list[str]) -> int:
+    if args.assets or args.firm_v1:
+        raise SystemExit("--firm-record runs the registered firm's universe; give no assets")
+    lake_time = args.lake_time
+    if lake_time is None:
+        with ll.lake_session() as session:
+            lake_time = session.lake_time.isoformat()
+    work_dir = (
+        Path(tempfile.mkdtemp(prefix="at126-firm-record-"))
+        if args.work_dir is None
+        else args.work_dir
+    )
+    records = []
+    for store in (False, True):
+        run_dir = work_dir / ("store" if store else "direct")
+        run_dir.mkdir(parents=True, exist_ok=False)
+        command = firm_record_command(
+            args.start_date, args.end_date, lake_time, store, run_dir, extra
+        )
+        records.append(FirmRecordRun(run=_run_cli(command, store), run_dir=run_dir))
+    summary = {
+        "lake_time": lake_time,
+        "work_dir": str(work_dir),
+        **compare_firm_records(records[0], records[1]),
+    }
+    _emit(summary, args.out)
+    _print_store_usage(summary["store"]["store_usage"])
     print(f"OVERALL {'PASS' if summary['identical'] else 'FAIL'}")
     return 0 if summary["identical"] else 1
 
@@ -1158,7 +1435,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     backtest = modes.add_parser("backtest", help="diff a backtest with and without the store")
     backtest.add_argument("assets", nargs="*")
     backtest.add_argument("--firm-v1", action="store_true")
-    backtest.add_argument("--firm-equities", type=Path, default=None)
+    backtest.add_argument("--firm-record", action="store_true")
+    backtest.add_argument("--work-dir", type=Path, default=None)
     backtest.add_argument("--start-date", required=True)
     backtest.add_argument("--end-date", required=True)
     backtest.add_argument("--lake-time", default=None)
@@ -1169,7 +1447,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if extra:
             parser.error(f"unrecognized arguments: {' '.join(extra)}")
         return _loaders_main(args)
-    return _backtest_main(args, [item for item in extra if item != "--"])
+    passed = [item for item in extra if item != "--"]
+    if args.firm_record:
+        return _firm_record_main(args, passed)
+    return _backtest_main(args, passed)
 
 
 if __name__ == "__main__":
