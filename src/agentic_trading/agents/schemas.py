@@ -201,7 +201,9 @@ class PodTarget(BaseModel):
 
     `held` is `True` when the pod keeps a target it set on an earlier day
     rather than setting one: on a day its instrument has no bar
-    (`carried`), when its own sized weight is unchanged from the day
+    (`carried`) while its weight is the carried target (a firm limit that
+    scales it makes it a new decision), when its own sized weight is
+    unchanged from the day
     before (its no-trade band held it), and on a held option row whose
     contract count is kept (`hold_contracts`). `carried` is `True` on a
     day the instrument (or an option's underlying) has no bar: the pod's

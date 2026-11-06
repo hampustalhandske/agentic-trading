@@ -629,3 +629,25 @@ def test_all_finite_decisions_are_pinned(monkeypatch: pytest.MonkeyPatch) -> Non
         assert [weight for _, weight in day] == pytest.approx(
             [weight for _, weight in golden], rel=1e-12, abs=1e-15
         )
+
+
+def test_a_carried_target_is_held_only_while_no_limit_scales_it() -> None:
+    """On GLD's missing day its carried row is held at the carried weight; when the gross limit
+    scales it, the row is the scaled weight the book holds and is no longer held."""
+    gapped = _frame(("SPY", "AAPL", "GLD"))
+    gapped.loc[_DAY, ("GLD", ["close", "open", "log_return"])] = np.nan
+
+    def gld_on_gap_day(overrides: dict[str, object]) -> tuple[float, float, bool]:
+        commander = _normalising_commander()
+        _run_days(commander, gapped.loc[: _INDEX[-2]], 2)
+        (before,) = [t for t in commander.pod_targets() if t.asset == "GLD"]
+        with temporary_overrides(overrides):
+            commander.decide(gapped, _DAY, _scoreboard())
+        (after,) = [t for t in commander.pod_targets() if t.asset == "GLD"]
+        assert after.carried
+        return before.target_weight, after.target_weight, after.held
+
+    before, unscaled, held = gld_on_gap_day({})
+    assert unscaled == before and held
+    before, scaled, held = gld_on_gap_day({"firm.max_gross_exposure": 0.2})
+    assert 0.0 < scaled < before and not held

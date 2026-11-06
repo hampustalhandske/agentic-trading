@@ -379,3 +379,33 @@ def test_every_futures_row_is_keyed_by_its_root() -> None:
         ("CL", "future"),
         ("GC", "future"),
     ]
+
+
+def test_carried_row_provenance_depends_on_whether_a_limit_scaled_it() -> None:
+    """A carried row at its carried weight keeps the setting decision's provenance; a carried
+    row a firm limit scaled takes the latest of the day's inputs, other instruments' included."""
+    previous = {("SPY", "a_pod"): ("fred", date(2015, 12, 28))}
+    old_signal = _signal("fred_analyst", source_as_of=date(2015, 12, 28))
+    today = _signal("fred_analyst", source_as_of=date(2016, 1, 5), pod="b_pod")
+    other = _target(0.1, today, pod="b_pod", asset="CL=F")
+
+    def spy_row(held: bool) -> Any:
+        rows = firm_day_rows(
+            _DAY,
+            [_target(0.2, old_signal, held=held, carried=True), other],
+            absent={"SPY": ["a_pod"]},
+            analyst_sources=_SOURCES,
+            instrument_kinds=_KINDS,
+            calendar="XNYS",
+            previous=previous,
+        )
+        return next(row for row in rows if row.instrument_id == "SPY")
+
+    kept, scaled = spy_row(held=True), spy_row(held=False)
+
+    assert (kept.source, kept.source_as_of, kept.status) == ("fred", date(2015, 12, 28), "active")
+    assert (scaled.source, scaled.source_as_of, scaled.status) == (
+        "fred",
+        date(2016, 1, 5),
+        "active",
+    )

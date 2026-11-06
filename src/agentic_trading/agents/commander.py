@@ -1195,6 +1195,9 @@ class Commander:
                 delta_mark = delta_marks.get(asset) if instrument is not None else None
                 underlying = instrument.underlying if instrument is not None else asset
                 is_carried = underlying in carried_assets
+                last = carried_targets.get(manager_id, {}).get(asset)
+                # A carried target a firm limit scaled is a new decision.
+                kept_carried = is_carried and last is not None and weight == last.target_weight
                 hold_contracts = is_hedge and hedge_holds.get(asset, False)
                 self._pod_targets.append(
                     PodTarget(
@@ -1210,7 +1213,11 @@ class Commander:
                             else weight * delta_mark[0] * delta_mark[1] / delta_mark[2]
                         ),
                         mark_as_of=None if delta_mark is None else delta_mark[3],
-                        held=is_carried or hold_contracts or (manager_id, asset) in held_rows,
+                        held=(
+                            kept_carried
+                            if is_carried
+                            else hold_contracts or (manager_id, asset) in held_rows
+                        ),
                         carried=is_carried,
                         hold_contracts=hold_contracts,
                     )

@@ -20,9 +20,12 @@ session of the decision calendar, any other from its own day; on an equal
 effective day the after-close source wins, then the later date, then the
 alphabetically first source. Every input passes the stage (a) audit on its
 own. A target the pod holds rather than sets (`PodTarget.held`: carried
-over a day without a bar, kept by the no-trade band, a held put) keeps the
-source and source_as_of of the row that set it, the pod's row on the
-previous day.
+over a day without a bar at its carried weight, kept by the no-trade band,
+a held put) keeps the source and source_as_of of the row that set it, the
+pod's row on the previous day. A carried target a firm limit scaled is a
+new decision resting on that day's inputs: its own and those of every
+target of the day not carried, since the firm limits act on the whole
+book.
 
 An instrument held over a day without its bar is written at each pod's
 carried target (see `Commander.decide`); one without a bar and without a
@@ -205,6 +208,9 @@ def firm_day_rows(
     provenance fails `decisions.check_source_as_of`."""
     previous = previous or {}
     held_premium = held_premium or {}
+    day_signals = [
+        signal for target in targets if not target.carried for signal in target.contributing_signals
+    ]
     rows: list[DecisionRow] = []
     targeted: set[str] = set()
     for target in targets:
@@ -226,7 +232,12 @@ def firm_day_rows(
             )
         if not target.contributing_signals and weight == 0.0:
             continue
-        source, source_as_of = _row_source(day, target, analyst_sources, calendar)
+        inputs = target
+        if target.carried and not target.held:
+            inputs = target.model_copy(
+                update={"contributing_signals": [*target.contributing_signals, *day_signals]}
+            )
+        source, source_as_of = _row_source(day, inputs, analyst_sources, calendar)
         kept = previous.get((row_instrument_id(target.asset), target.pod_id))
         if target.held and kept is not None:
             source, source_as_of = kept
