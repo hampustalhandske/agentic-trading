@@ -14,14 +14,19 @@ progress.json, the trial directory holds:
 - data/: the Parquet bundle folder, holding only a README line;
 - agentic_meta.json: an `AgenticMeta`, what edgelab's model has no field
   for: whether the record is counted in the trial ledger, whether its
-  `src/` tree was clean, and how many orders went unfilled;
+  `src/` tree was clean, how many orders went unfilled, and which analysts
+  had too few available signals;
 - unfilled_orders.json: an `UnfilledOrdersRecord`, the orders the engine
-  could not fill and their count per reason.
+  could not fill and their count per reason;
+- analyst_availability.json: an `AnalystAvailability`, each analyst's
+  signals by status per year and over the record
+  (`firm_record.availability`).
 
 `submission_for` builds the `Submission` of a record,
-`write_submission_folder` writes these files but the last, and
-`write_unfilled_orders` writes it and the count. Nothing here imports
-edgelab."""
+`write_submission_folder` writes these files but the last two,
+`write_unfilled_orders` writes unfilled_orders.json and the count, and
+`write_analyst_availability` writes analyst_availability.json and the
+analysts under the threshold. Nothing here imports edgelab."""
 
 import json
 import math
@@ -36,6 +41,11 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_
 
 from agentic_trading.agents.schemas import ShortWarmup, UnfilledOrder
 from agentic_trading.config import settings
+from agentic_trading.firm_record.availability import (
+    AnalystAvailability,
+    LowAvailability,
+    low_availability,
+)
 from agentic_trading.firm_record.edgelab_strategy import REPLAY_STRATEGY_PY, REPLAY_STRATEGY_YAML
 from agentic_trading.firm_record.rows import row_instrument_id
 from agentic_trading.stage_a.spec import FirmSpecRecord
@@ -45,6 +55,7 @@ from agentic_trading.trials.rows import FIRM_HYPOTHESIS_ID
 SUBMISSION_FILE = "submission.json"
 META_FILE = "agentic_meta.json"
 UNFILLED_ORDERS_FILE = "unfilled_orders.json"
+ANALYST_AVAILABILITY_FILE = "analyst_availability.json"
 STRATEGY_DIR = "strategy"
 DATA_DIR = "data"
 DECISIONS_FILE = "decisions.parquet"
@@ -223,8 +234,13 @@ class AgenticMeta(BaseModel):
     registry file (`"registration"`) or is the uncounted default of 1
     (`"uncounted_default"`), how many of the engine's orders went
     unfilled over the days its checkpoint holds (`unfilled_orders`, listed
-    in unfilled_orders.json), and the instruments whose bars start inside
-    the warm-up (`short_warmup`, in universe order)."""
+    in unfilled_orders.json), the instruments whose bars start inside
+    the warm-up (`short_warmup`, in universe order), the analysts whose
+    share of available signals over those days is below
+    `settings.firm.low_availability_threshold` (`low_availability`, in
+    analyst order; analyst_availability.json holds every analyst's counts),
+    and the registry file's `expected_availability` as it states it, empty
+    without one."""
 
     model_config = _SPEC
 
@@ -234,6 +250,8 @@ class AgenticMeta(BaseModel):
     declared_n_from: Literal["registration", "uncounted_default"]
     unfilled_orders: int = Field(default=0, ge=0)
     short_warmup: tuple[ShortWarmup, ...] = ()
+    low_availability: tuple[LowAvailability, ...] = ()
+    expected_availability: dict[str, str] = Field(default_factory=dict)
 
 
 class UnfilledOrdersRecord(BaseModel):
@@ -269,10 +287,12 @@ def submission_for(
     counted: bool,
     registered_trials: Mapping[str, Any] | None,
     short_warmup: Sequence[ShortWarmup] = (),
+    expected_availability: Mapping[str, str] | None = None,
 ) -> tuple[Submission, AgenticMeta]:
     """The `Submission` of the firm record `record` whose sources.json
     holds `sources`, run from `git_sha` with a clean `src/` tree or not
-    (`src_tree_clean`), and its `AgenticMeta`, which lists `short_warmup`.
+    (`src_tree_clean`), and its `AgenticMeta`, which lists `short_warmup`
+    and `expected_availability` (the registry file's, `None` without one).
 
     `client` is `CLIENT_PROJECT` at `git_sha` under `FIRM_HYPOTHESIS_ID`;
     the family, ledger reference and hypothesis are `FIRM_HYPOTHESIS_ID`;
@@ -320,6 +340,7 @@ def submission_for(
         src_tree_clean=src_tree_clean,
         declared_n_from="registration" if from_registration else "uncounted_default",
         short_warmup=tuple(short_warmup),
+        expected_availability=dict(expected_availability or {}),
     )
     return submission, meta
 
@@ -416,5 +437,26 @@ def write_unfilled_orders(
     )
     _write_text(trial_dir / UNFILLED_ORDERS_FILE, record.model_dump_json(indent=2) + "\n")
     updated = meta.model_copy(update={"unfilled_orders": len(written)})
+    _write_text(trial_dir / META_FILE, updated.model_dump_json(indent=2) + "\n")
+    return updated
+
+
+def write_analyst_availability(
+    trial_dir: Path, availability: AnalystAvailability, meta: AgenticMeta
+) -> AgenticMeta:
+    """Write `availability` to `trial_dir`'s analyst_availability.json, then
+    `meta` with `low_availability` set to its analysts under
+    `settings.firm.low_availability_threshold` (read at call time), each
+    `undeclared` when `meta.expected_availability` does not name it, as its
+    agentic_meta.json, each atomically and replacing what is there; return
+    that `meta`."""
+    trial_dir = Path(trial_dir)
+    _write_text(
+        trial_dir / ANALYST_AVAILABILITY_FILE, availability.model_dump_json(indent=2) + "\n"
+    )
+    flagged = low_availability(
+        availability, settings.firm.low_availability_threshold, meta.expected_availability
+    )
+    updated = meta.model_copy(update={"low_availability": tuple(flagged)})
     _write_text(trial_dir / META_FILE, updated.model_dump_json(indent=2) + "\n")
     return updated

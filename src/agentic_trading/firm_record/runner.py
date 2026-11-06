@@ -30,9 +30,16 @@ sources.json, decisions.parquet and progress.json, and the edgelab replay
 folder around them (`firm_record.submission`: submission.json, strategy/,
 data/ and agentic_meta.json), written at each start of the pass for the
 commit it runs from. unfilled_orders.json lists the orders the engine
-could not fill, and agentic_meta.json their number; both are derived from
-the engine checkpoint at the start and at the end of each pass, so a
-resumed pass reports the orders of every day its checkpoint holds.
+could not fill, and agentic_meta.json their number; analyst_availability.json
+counts each analyst's signals by status per year and over the record
+(`firm_record.availability`), and agentic_meta.json lists the analysts whose
+share of available signals is below `settings.firm.low_availability_threshold`
+(`low_availability`), each marked `undeclared` when the registry file's
+`expected_availability` does not name it, a mapping agentic_meta.json
+copies. All of these are derived from the engine checkpoint at the start
+and at the end of each pass, so a resumed pass reports the days its
+checkpoint holds as an unbroken one does; at the end of each pass every
+analyst under the threshold is logged as a warning.
 
 No performance figure leaves the pass: the result reports only what was
 written, and the engine's value and ratio log lines are held back while it
@@ -60,7 +67,7 @@ from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.managers.cvar_manager import ConditionalValueAtRiskManager
 from agentic_trading.agents.managers.tail_hedge_manager import TailHedgeManager
-from agentic_trading.agents.schemas import ShortWarmup, UnfilledOrder
+from agentic_trading.agents.schemas import PortfolioDecision, ShortWarmup, UnfilledOrder
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
@@ -68,6 +75,7 @@ from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import HoldoutReadError, lake_session
 from agentic_trading.data.trading_calendar import sessions_between
+from agentic_trading.firm_record.availability import analyst_availability
 from agentic_trading.firm_record.rows import (
     analyst_sources,
     firm_day_rows,
@@ -77,7 +85,9 @@ from agentic_trading.firm_record.rows import (
 )
 from agentic_trading.firm_record.spec import build_firm_spec
 from agentic_trading.firm_record.submission import (
+    AgenticMeta,
     submission_for,
+    write_analyst_availability,
     write_submission_folder,
     write_unfilled_orders,
 )
@@ -90,6 +100,7 @@ from agentic_trading.trials.ledger import TrialLedger
 from agentic_trading.trials.rows import (
     current_trial_provenance,
     ensure_firm_registration,
+    firm_expected_availability,
     firm_registered_trials,
     firm_trial_row,
 )
@@ -168,13 +179,33 @@ def _checkpoint_last_day(path: Path) -> date | None:
     return date.fromisoformat(payload["portfolio_value_history"][-1][0])
 
 
-def _checkpoint_unfilled_orders(path: Path) -> list[UnfilledOrder]:
-    """Every order the engine checkpoint at `path` records as unfilled, in
-    day order; empty when the file is absent or holds no state."""
-    payload = _checkpoint_payload(path)
-    if payload is None:
-        return []
-    return [UnfilledOrder.model_validate(order) for order in payload["unfilled_orders"]]
+def _write_checkpoint_reports(
+    trial_dir: Path, checkpoint_path: Path, meta: AgenticMeta
+) -> AgenticMeta:
+    """Write `trial_dir`'s unfilled_orders.json and analyst_availability.json
+    from the engine checkpoint at `checkpoint_path` (every unfilled order it
+    records, in day order, and the analysts' signals in the decisions of
+    every day it holds; neither has any when the file is absent or holds no
+    state), with `meta` updated to match as agentic_meta.json; return that
+    `meta`."""
+    payload = _checkpoint_payload(checkpoint_path)
+    orders = (
+        []
+        if payload is None
+        else [UnfilledOrder.model_validate(order) for order in payload["unfilled_orders"]]
+    )
+    decisions_by_day = (
+        {}
+        if payload is None
+        else {
+            date.fromisoformat(day): [
+                PortfolioDecision.model_validate(decision) for decision in decisions
+            ]
+            for day, decisions in payload["decisions_by_day"].items()
+        }
+    )
+    meta = write_unfilled_orders(trial_dir, orders, meta)
+    return write_analyst_availability(trial_dir, analyst_availability(decisions_by_day), meta)
 
 
 def _held_contracts(portfolio: Portfolio) -> dict[str, float]:
@@ -226,7 +257,9 @@ def run_firm_record(
     (aware), `lake_version` and `quantcore_version`. With a `ledger`,
     `repo_root` is the repository root its registry files live under.
     `short_warmup` lists the instruments whose bars start inside the
-    warm-up, recorded in agentic_meta.json.
+    warm-up, recorded in agentic_meta.json. With a `repo_root`, the firm's
+    registry file's `expected_availability`, when it has one, is copied
+    into agentic_meta.json.
 
     Raises `ValueError`, before writing anything, when the window is
     reversed, holds no session, or ends after `settings.stage_a.data_end`,
@@ -237,7 +270,8 @@ def run_firm_record(
     breaks edgelab's model (`pydantic.ValidationError`, a one-day window
     among them); `ValueError` when the engine checkpoint is ahead of the
     store, so the pass cannot resume. A registry file that is not a YAML
-    mapping raises `LedgerError` before anything is written.
+    mapping, or whose `expected_availability` is malformed, raises
+    `LedgerError` before anything is written.
     `HoldoutReadError` and the store's refusals propagate with the day
     unwritten; a `LedgerError` from registering or recording propagates."""
     data_end = settings.stage_a.data_end
@@ -264,6 +298,7 @@ def run_firm_record(
     tickers = list(universe)
     family = settings.trials.firm_family
     registered_trials = None if repo_root is None else firm_registered_trials(repo_root)
+    expected_availability = {} if repo_root is None else firm_expected_availability(repo_root)
     will_count = ledger is not None and registered_trials is not None
     head_sha, dirty = source_tree_state()
     if will_count and (head_sha is None or dirty is not False):
@@ -298,6 +333,7 @@ def run_firm_record(
         counted=will_count,
         registered_trials=registered_trials,
         short_warmup=short_warmup,
+        expected_availability=expected_availability,
     )
     store_dir = Path(store_dir)
     store = FirmDecisionStore(store_dir, record, sources=sources)
@@ -339,9 +375,7 @@ def run_firm_record(
                 is not None
             )
         write_submission_folder(store.trial_dir, record, submission, meta)
-        meta = write_unfilled_orders(
-            store.trial_dir, _checkpoint_unfilled_orders(checkpoint_path), meta
-        )
+        meta = _write_checkpoint_reports(store.trial_dir, checkpoint_path, meta)
         pending = [day for day in sessions if last is None or day > last]
         logger.info(
             "Firm record (trial %s, %s): %d of %d sessions to compute",
@@ -406,8 +440,18 @@ def run_firm_record(
             except _RecordPausedError:
                 commander.close()
                 logger.info("Firm record paused after %d day(s)", written)
-            write_unfilled_orders(
-                store.trial_dir, _checkpoint_unfilled_orders(checkpoint_path), meta
+            meta = _write_checkpoint_reports(store.trial_dir, checkpoint_path, meta)
+        for flagged in meta.low_availability:
+            logger.warning(
+                "Firm record (trial %s): analyst %s had an available signal in %.1f%% of its "
+                "signals, below the %.1f%% threshold (%s)",
+                record.spec_hash,
+                flagged.analyst_id,
+                100.0 * flagged.available_share,
+                100.0 * settings.firm.low_availability_threshold,
+                "undeclared in the registration"
+                if flagged.undeclared
+                else f"declared {meta.expected_availability[flagged.analyst_id]!r}",
             )
         last_completed = store.last_completed()
         if counted and written and ledger is not None and last_completed is not None:

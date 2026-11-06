@@ -56,6 +56,9 @@ _IMPORTED_METRIC = "firm_sharpe_diagnostic"
 _DIRECTION = "two-sided"
 # `git_sha` or `data_snapshot` when it is not known.
 _UNKNOWN = "unknown"
+# The forms an `expected_availability` entry of the firm's registry file
+# takes (`firm_expected_availability`).
+_EXPECTED_AVAILABILITY_FORMS = ("from YYYY-MM-DD", "none in window", "full")
 
 
 class TrialProvenance(BaseModel):
@@ -310,12 +313,10 @@ def firm_registry_path(repo_root: Path) -> Path:
     return Path(repo_root) / settings.trials.registry_dir / f"{FIRM_HYPOTHESIS_ID}.yaml"
 
 
-def firm_registered_trials(repo_root: Path) -> dict[str, Any] | None:
-    """The `trials` mapping of the firm's registry file (`firm_registry_path`)
-    as the file states it, `{}` when the file has no `trials` key, and
-    `None` when the file does not exist. The file is read as YAML. Raises
-    `LedgerError` when it is not valid YAML, is not a mapping, or its
-    `trials` is not a mapping."""
+def _firm_registry_content(repo_root: Path) -> dict[str, Any] | None:
+    """The firm's registry file (`firm_registry_path`) read as YAML, `None`
+    when the file does not exist. Raises `LedgerError` when it is not valid
+    YAML or not a mapping."""
     path = firm_registry_path(repo_root)
     if not path.exists():
         return None
@@ -325,10 +326,68 @@ def firm_registered_trials(repo_root: Path) -> dict[str, Any] | None:
         raise LedgerError(f"{path} is not valid YAML: {exc}") from None
     if not isinstance(content, dict):
         raise LedgerError(f"{path} does not hold a YAML mapping")
+    return content
+
+
+def firm_registered_trials(repo_root: Path) -> dict[str, Any] | None:
+    """The `trials` mapping of the firm's registry file (`firm_registry_path`)
+    as the file states it, `{}` when the file has no `trials` key, and
+    `None` when the file does not exist. The file is read as YAML. Raises
+    `LedgerError` when it is not valid YAML, is not a mapping, or its
+    `trials` is not a mapping."""
+    content = _firm_registry_content(repo_root)
+    if content is None:
+        return None
     trials = content.get("trials", {})
     if not isinstance(trials, dict):
-        raise LedgerError(f"{path} has a trials entry that is not a mapping")
+        raise LedgerError(
+            f"{firm_registry_path(repo_root)} has a trials entry that is not a mapping"
+        )
     return trials
+
+
+def firm_expected_availability(repo_root: Path) -> dict[str, str]:
+    """The `expected_availability` mapping of the firm's registry file
+    (`firm_registry_path`), the sibling of its `trials` key: each analyst id
+    to when the registration expects the analyst to have data in the
+    record's window, `"from YYYY-MM-DD"` (from that day on), `"none in
+    window"` or `"full"`, in the file's order. Empty when the file does not
+    exist or has no such key. Raises `LedgerError` when the file is not
+    valid YAML or not a mapping, or the entry is not a mapping of analyst
+    ids to one of those three forms."""
+    content = _firm_registry_content(repo_root)
+    if content is None:
+        return {}
+    path = firm_registry_path(repo_root)
+    declared = content.get("expected_availability", {})
+    if not isinstance(declared, dict):
+        raise LedgerError(f"{path} has an expected_availability entry that is not a mapping")
+    expected: dict[str, str] = {}
+    for analyst_id, availability in declared.items():
+        if not isinstance(analyst_id, str) or not _is_expected_availability(availability):
+            raise LedgerError(
+                f"{path} declares expected availability {availability!r} for {analyst_id!r}; "
+                f"expected {' or '.join(repr(form) for form in _EXPECTED_AVAILABILITY_FORMS)}"
+            )
+        expected[analyst_id] = availability
+    return expected
+
+
+def _is_expected_availability(value: object) -> bool:
+    """Whether `value` is `"full"`, `"none in window"` or `"from "` followed
+    by an ISO date."""
+    if not isinstance(value, str):
+        return False
+    if value in ("full", "none in window"):
+        return True
+    prefix, _, day = value.partition(" ")
+    if prefix != "from" or len(day) != len("YYYY-MM-DD"):
+        return False
+    try:
+        date.fromisoformat(day)
+    except ValueError:
+        return False
+    return True
 
 
 def firm_trial_row(

@@ -141,6 +141,12 @@ class FirmConfig(BaseModel):
     # instead of stopping the record. Each entry is a reviewed data fact;
     # none is known, so it is empty.
     known_price_gaps: list[tuple[int, date]] = Field(default_factory=list)
+    # A firm record flags an analyst whose share of available signals
+    # (active, flat at confidence 0 included, over all its signals) across
+    # the record falls below this: at under half, the analyst sat out most
+    # of the window on missing data or errors, so the record's evidence for
+    # its pod rests on far less of the window than it appears to.
+    low_availability_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class OptionsConfig(BaseModel):

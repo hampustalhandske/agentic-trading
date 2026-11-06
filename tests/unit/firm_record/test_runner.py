@@ -6,7 +6,9 @@ stage (a) store, with the firm spec beside it. An instrument without a bar on a 
 unavailable, weight-0 row per pod in its scope; a run stopped after `max_days` resumes from its
 engine checkpoint and ends with the rows of an unbroken run; with the agentic-firm-v1 registry
 file present the run is registered before its first day and records one trial row; no
-performance figure leaves the run."""
+performance figure leaves the run. AT-130: each analyst's signals are counted by status into
+analyst_availability.json, an analyst under the availability threshold is listed in
+agentic_meta.json and warned about, and the counts survive a resume without moving a decision."""
 
 import json
 import logging
@@ -26,7 +28,7 @@ from pydantic import PrivateAttr
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, ManagerAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.portfolio_construction import PortfolioConstructor
-from agentic_trading.agents.schemas import AgentSignal, ShortWarmup
+from agentic_trading.agents.schemas import AgentSignal, ShortWarmup, UnfilledOrder
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.config import settings
 from agentic_trading.data.loaders import lakehouse_loader
@@ -37,7 +39,7 @@ from agentic_trading.firm_record.runner import FirmRecordResult, run_firm_record
 from agentic_trading.scoring.weighting import EqualWeight
 from agentic_trading.stage_a.decisions import check_source_as_of
 from agentic_trading.stage_a.store import DecisionRow
-from agentic_trading.trials.ledger import TrialLedger
+from agentic_trading.trials.ledger import LedgerError, TrialLedger
 from agentic_trading.trials.rows import FIRM_HYPOTHESIS_ID
 
 _T = datetime(2026, 11, 6, tzinfo=UTC)
@@ -294,6 +296,7 @@ def test_trial_dir_holds_the_submission_only(tmp_path: Path) -> None:
 
     assert sorted(path.name for path in trial.iterdir()) == [
         "agentic_meta.json",
+        "analyst_availability.json",
         "data",
         "decisions.parquet",
         "progress.json",
@@ -535,6 +538,8 @@ def test_uncounted_record_writes_a_valid_submission_folder(
         "declared_n_from": "uncounted_default",
         "unfilled_orders": len(json.loads((trial / "unfilled_orders.json").read_text())["orders"]),
         "short_warmup": [],
+        "low_availability": [],
+        "expected_availability": {},
     }
     strategy = yaml.safe_load((trial / "strategy" / "strategy.yaml").read_text())
     assert strategy["strategy"] == "strategy.py:Replay"
@@ -677,3 +682,139 @@ def test_unfilled_orders_are_written_and_survive_a_resume(tmp_path: Path) -> Non
 
     assert resumed.complete
     assert _unfilled(tmp_path / "paused", resumed) == record
+
+
+class _DarkAnalyst(AnalystAgent):
+    """Has no data on any day: every signal is unavailable."""
+
+    agent_id: str = "dark_stub_analyst"
+
+    def generate_signal(
+        self, asset: str, market_data: pd.DataFrame, as_of_date: pd.Timestamp
+    ) -> AgentSignal:
+        return self.unavailable_signal(asset, as_of_date, "no data")
+
+
+def _dark_commander() -> Commander:
+    """`_commander()`'s two pods and a third whose only analyst is `_DarkAnalyst`."""
+    commander = _commander()
+    dark = _PassThroughManager(
+        agent_id="dark_manager",
+        managed_analysts=[_DarkAnalyst()],
+        weighting_strategy=EqualWeight(),
+        portfolio_constructor=_ViewConstructor(),
+    )
+    return Commander(
+        managers=[*commander.managers, dark], weighting_strategy=commander.weighting_strategy
+    )
+
+
+def _availability(store_dir: Path, result: FirmRecordResult) -> dict[str, Any]:
+    return json.loads((store_dir / result.spec_hash / "analyst_availability.json").read_text())
+
+
+def _meta(store_dir: Path, result: FirmRecordResult) -> dict[str, Any]:
+    return json.loads((store_dir / result.spec_hash / "agentic_meta.json").read_text())
+
+
+def _priced_signals() -> int:
+    """The (session, instrument) pairs of the window with a bar: one signal of an analyst
+    whose pod covers the whole universe on each."""
+    closes = _frame().xs("close", axis=1, level=1).reindex(_SESSIONS)
+    return int(closes.notna().to_numpy().sum())
+
+
+def test_unavailable_analyst_is_flagged_undeclared(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An analyst unavailable on every day has available_share 0 in every year and over the
+    record, counted once per instrument with a bar on each session; agentic_meta.json lists it
+    as low availability and undeclared, and the pass warns about it. The available analysts
+    have share 1 and are not listed."""
+    with caplog.at_level(logging.WARNING, logger="agentic_trading.firm_record.runner"):
+        result = _run(tmp_path, commander=_dark_commander())
+    availability = _availability(tmp_path, result)
+    meta = _meta(tmp_path, result)
+
+    assert sorted(availability) == ["dark_stub_analyst", "fred_stub_analyst", "price_stub_analyst"]
+    dark = availability["dark_stub_analyst"]
+    assert list(dark) == ["2016", "total"]
+    assert dark["total"] == {
+        "active": 0,
+        "unavailable": _priced_signals(),
+        "error": 0,
+        "available_share": 0.0,
+    }
+    assert dark["2016"] == dark["total"]
+    assert availability["fred_stub_analyst"]["total"]["available_share"] == 1.0
+    assert availability["price_stub_analyst"]["total"]["available_share"] == 1.0
+    assert meta["low_availability"] == [
+        {"analyst_id": "dark_stub_analyst", "available_share": 0.0, "undeclared": True}
+    ]
+    assert meta["expected_availability"] == {}
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert [r for r in warnings if "dark_stub_analyst" in r.getMessage()]
+    assert not [r for r in warnings if "fred_stub_analyst" in r.getMessage()]
+
+
+def test_declared_availability_is_copied_and_marks_the_analyst_declared(tmp_path: Path) -> None:
+    """With the registry file's expected_availability naming the dark analyst, agentic_meta.json
+    copies the declaration and lists the analyst as declared."""
+    declared = "expected_availability:\n  dark_stub_analyst: none in window\n"
+    _, repo = _ledger(tmp_path, registered=True, registration=_REGISTRATION + declared)
+    result = _run(tmp_path / "store", commander=_dark_commander(), repo_root=repo)
+    meta = _meta(tmp_path / "store", result)
+
+    assert meta["expected_availability"] == {"dark_stub_analyst": "none in window"}
+    assert meta["low_availability"] == [
+        {"analyst_id": "dark_stub_analyst", "available_share": 0.0, "undeclared": False}
+    ]
+
+
+def test_malformed_expected_availability_refuses_the_record(tmp_path: Path) -> None:
+    """A registry file whose expected_availability is malformed is refused before anything is
+    written."""
+    broken = "expected_availability:\n  dark_stub_analyst: mostly\n"
+    _, repo = _ledger(tmp_path, registered=True, registration=_REGISTRATION + broken)
+
+    with pytest.raises(LedgerError, match="expected availability"):
+        _run(tmp_path / "store", commander=_dark_commander(), repo_root=repo)
+    assert not (tmp_path / "store").exists()
+
+
+def test_availability_survives_a_resume(tmp_path: Path) -> None:
+    """A record paused after 3 days and resumed by a fresh firm ends with the same
+    analyst_availability.json and agentic_meta.json as an unbroken record."""
+    paused = _run(tmp_path / "paused", commander=_dark_commander(), max_days=3)
+    partial = _availability(tmp_path / "paused", paused)
+    assert 0 < partial["dark_stub_analyst"]["total"]["unavailable"] < _priced_signals()
+    resumed = _run(tmp_path / "paused", commander=_dark_commander())
+    unbroken = _run(tmp_path / "unbroken", commander=_dark_commander())
+
+    assert resumed.complete
+    for name in ("analyst_availability.json", "agentic_meta.json"):
+        assert (tmp_path / "paused" / resumed.spec_hash / name).read_bytes() == (
+            tmp_path / "unbroken" / unbroken.spec_hash / name
+        ).read_bytes()
+
+
+def test_availability_leaves_the_decisions_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """decisions.parquet holds the same bytes whether or not the pass counts availability."""
+    counted = _run(tmp_path / "counted", commander=_dark_commander())
+
+    def unfilled_only(trial_dir: Path, checkpoint_path: Path, meta: Any) -> Any:
+        payload = runner_module._checkpoint_payload(checkpoint_path)
+        orders = [] if payload is None else payload["unfilled_orders"]
+        return runner_module.write_unfilled_orders(
+            trial_dir, [UnfilledOrder.model_validate(order) for order in orders], meta
+        )
+
+    monkeypatch.setattr(runner_module, "_write_checkpoint_reports", unfilled_only)
+    plain = _run(tmp_path / "plain", commander=_dark_commander())
+
+    assert not (tmp_path / "plain" / plain.spec_hash / "analyst_availability.json").exists()
+    assert (tmp_path / "plain" / plain.spec_hash / "decisions.parquet").read_bytes() == (
+        tmp_path / "counted" / counted.spec_hash / "decisions.parquet"
+    ).read_bytes()
