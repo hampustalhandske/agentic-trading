@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+from quantcore.core.stochastic import CIRNoMeanReversionError
 from quantcore.risk import ConvergenceError
 from quantcore.risk.egarch import EGARCHParams, GJRGARCHParams
 
@@ -748,8 +749,8 @@ def test_macro_var_spillover(
 
 _WINDOW = settings.analysts.risk_window_long
 _CIR_FIT = SimpleNamespace(kappa=1.0, theta=0.03, sigma=0.05)
-# The three RuntimeError messages quantcore's `cir_fit` raises for a fit outside the CIR
-# parameter space. Only kappa <= 0 (no mean reversion in the data) is an abstention.
+# The messages quantcore's `cir_fit` raises for a fit outside the CIR parameter space. Only
+# kappa <= 0 (no mean reversion in the data, `CIRNoMeanReversionError`) is an abstention.
 _CIR_KAPPA = (
     "cir_fit: estimated kappa <= 0 -- input series shows no discernible "
     "mean reversion, so no admissible CIR fit exists for this data"
@@ -774,7 +775,7 @@ def _rates(size: int = 300, at: int | None = None, value: float = 0.0) -> np.nda
         (_vintages(_rates(at=-1)), _CIR_FIT, "active", PUBLISHED, False),
         (_vintages(_rates(at=-_WINDOW)), _CIR_FIT, "active", PUBLISHED, False),
         (_vintages(_rates(at=-100, value=-0.01)), _CIR_FIT, "active", PUBLISHED, False),
-        (_vintages(_rates()), RuntimeError(_CIR_KAPPA), "active", PUBLISHED, True),
+        (_vintages(_rates()), CIRNoMeanReversionError(_CIR_KAPPA), "active", PUBLISHED, True),
         (_vintages(_rates()), RuntimeError(_CIR_THETA), "error", None, True),
         (_vintages(_rates()), RuntimeError(_CIR_SIGMA), "error", None, True),
         (_vintages(_rates()), RuntimeError("cir_fit: unexpected"), "error", None, True),
@@ -1134,14 +1135,15 @@ def test_round_one_modules_build_status_signals_through_the_helpers() -> None:
 
 
 def test_cir_no_mean_reversion_matches_quantcore() -> None:
-    """quantcore's real `cir_fit` on a steadily rising rate series raises the kappa <= 0 error, and
-    the analyst classifies that message as no mean reversion, so a quantcore wording change fails
-    here rather than turning abstentions into errors."""
+    """quantcore's real `cir_fit` on a steadily rising rate series raises
+    `CIRNoMeanReversionError`, which the analyst classifies as no mean reversion; a plain
+    `RuntimeError` is not, whatever its message."""
     from quantcore.core.stochastic import cir_fit
 
     rising = np.linspace(0.01, 0.05, 250) * np.exp(_noise(250, 3, 0.001))
-    with pytest.raises(RuntimeError) as raised:
+    with pytest.raises(CIRNoMeanReversionError) as raised:
         cir_fit(rising, 1.0 / 365.0)
     assert cir_rate_regime_analyst.is_no_mean_reversion(raised.value)
     assert not cir_rate_regime_analyst.is_no_mean_reversion(RuntimeError(_CIR_THETA))
     assert not cir_rate_regime_analyst.is_no_mean_reversion(RuntimeError(_CIR_SIGMA))
+    assert not cir_rate_regime_analyst.is_no_mean_reversion(RuntimeError(_CIR_KAPPA))

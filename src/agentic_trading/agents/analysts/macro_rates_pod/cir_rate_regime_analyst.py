@@ -5,7 +5,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from pydantic import Field, PrivateAttr
-from quantcore.core.stochastic import cir_fit, simulate_cir_paths
+from quantcore.core.stochastic import CIRNoMeanReversionError, cir_fit, simulate_cir_paths
 
 from agentic_trading.agents._market_math import RefitCache, clamp, derived_seed
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, calendar_days_for_sessions
@@ -21,19 +21,14 @@ SIMULATION_HORIZON_DAYS = 30
 # Daily FRED observations -> annualized CIR time unit, matching
 # simulate_cir_paths' own t=SIMULATION_HORIZON_DAYS/365.0 convention below.
 _DAILY_DT_YEARS = 1.0 / 365.0
-# quantcore's `cir_fit` raises one RuntimeError type for three fits outside
-# the CIR parameter space (kappa, theta or sigma^2 at or below zero); only
-# the kappa case, no mean reversion in the data, is an abstention, and its
-# message carries this marker. `test_cir_no_mean_reversion_matches_quantcore`
-# pins the wording against the installed quantcore.
-NO_MEAN_REVERSION_MARKER = "kappa <= 0"
 
 
 def is_no_mean_reversion(error: RuntimeError) -> bool:
     """Whether a `RuntimeError` from `cir_fit` reports an estimated
-    kappa <= 0, a rate series with no mean reversion, rather than an
-    inadmissible theta or sigma^2 or any other failure."""
-    return NO_MEAN_REVERSION_MARKER in str(error)
+    kappa <= 0, a rate series with no mean reversion
+    (`CIRNoMeanReversionError`), rather than an inadmissible theta or
+    sigma^2 or any other failure."""
+    return isinstance(error, CIRNoMeanReversionError)
 
 
 class CIRRateRegimeAnalyst(AnalystAgent):

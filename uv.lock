@@ -56,7 +56,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "pyyaml", specifier = ">=6.0.3" },
-    { name = "quantcore", git = "https://github.com/hampustalhandske/quantcore.git?rev=31a75997753179c8e9cf8342de29ae68218a2d8b" },
+    { name = "quantcore", git = "https://github.com/hampustalhandske/quantcore.git?rev=599b8bd339898cbbafd07c128b36791d4072d811" },
     { name = "scipy", specifier = ">=1.18.1" },
     { name = "streamlit", specifier = ">=1.62.0" },
     { name = "typer", specifier = ">=0.27.1" },
@@ -1809,8 +1809,8 @@ wheels = [
 
 [[package]]
 name = "quantcore"
-version = "0.3.0"
-source = { git = "https://github.com/hampustalhandske/quantcore.git?rev=31a75997753179c8e9cf8342de29ae68218a2d8b#31a75997753179c8e9cf8342de29ae68218a2d8b" }
+version = "0.3.1"
+source = { git = "https://github.com/hampustalhandske/quantcore.git?rev=599b8bd339898cbbafd07c128b36791d4072d811#599b8bd339898cbbafd07c128b36791d4072d811" }
 dependencies = [
     { name = "arch" },
     { name = "numba" },
