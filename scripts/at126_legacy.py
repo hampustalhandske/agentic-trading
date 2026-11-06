@@ -79,11 +79,11 @@ def _legacy_adjusted_security_bars(
                bars.raw_close,{open_and_volume}
                factors.effective_date AS factor_date
         FROM (
-            SELECT security_id, date, COALESCE(official_close, close) AS raw_close{bar_columns}
+            SELECT security_id, date, close AS raw_close{bar_columns}
             FROM {ll._table_sql("equity_daily_from_bars")}
             WHERE security_id IN ({placeholders})
               AND date BETWEEN ? AND ?
-              AND COALESCE(official_close, close) > 0
+              AND close > 0
         ) AS bars
         ASOF LEFT JOIN (
             SELECT security_id, effective_date, cum_factor

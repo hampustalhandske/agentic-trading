@@ -896,13 +896,20 @@ def cot_tickers_for(tickers: Sequence[str]) -> list[str]:
 
 def firm_v1_plan(equities: Sequence[dict[str, Any]], days: Sequence[date]) -> CallPlan:
     """The plan of the firm-v1 preset over `days`, its SPY contracts found
-    on those days."""
+    on those days. The equities' prices are read as the firm record reads
+    them, by security id (`load_security_daily_bars`), so the price-history
+    tickers are the universe's other non-futures instruments."""
     universe = firm_v1_universe(equities)
+    equity_tickers = {row["ticker"] for row in equities}
     stocks = [*(row["ticker"] for row in equities), *FIRM_V1_ETFS]
     return CallPlan(
         days=list(days),
         tickers=stocks,
-        price_tickers=[ticker for ticker in universe if futures_root(ticker) is None],
+        price_tickers=[
+            ticker
+            for ticker in universe
+            if futures_root(ticker) is None and ticker not in equity_tickers
+        ],
         security_ids=[row["security_id"] for row in equities],
         fred_series=list(DEFAULT_FRED_SERIES),
         fama_french_models=["3factor", "5factor"],

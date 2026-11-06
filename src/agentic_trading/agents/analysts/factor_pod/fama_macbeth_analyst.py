@@ -248,20 +248,38 @@ class FamaMacbethAnalyst(AnalystAgent):
         as_of_date: pd.Timestamp,
     ) -> AgentSignal | tuple[tuple[str, ...], dict[str, pd.Series]]:
         """Per-call, cheap: reuses the cached broad-universe returns as
-        they stand, only doing a fresh (single-ticker, fast) lakehouse
+        they stand, only doing a fresh (single-asset, fast) lakehouse
         lookup if `asset` itself isn't already in the cached set — most
         of this project's traded assets are themselves S&P 500 members,
-        so this extra lookup is the exception, not the common path."""
+        so this extra lookup is the exception, not the common path. The
+        lookup reads a registered-firm equity
+        (`roster.FIRM_V1_EQUITY_SECURITY_IDS`) by its `security_id`
+        (`load_security_log_returns`, the universe's own basis) and any
+        other asset by ticker (`load_price_history_from_lakehouse`)."""
+        # roster imports this module, so its constants are read at call time.
+        from agentic_trading.agents.roster import FIRM_V1_EQUITY_SECURITY_IDS
+
         resolved_tickers, universe_returns = broad_universe_result
         if asset in universe_returns:
             return resolved_tickers, universe_returns
 
         window_start = (as_of_date - timedelta(days=250)).date()
-        asset_frame = load_price_history_from_lakehouse([asset], window_start, as_of_date.date())
-        if asset_frame is None or asset not in asset_frame.columns.get_level_values(0):
+        security_id = FIRM_V1_EQUITY_SECURITY_IDS.get(asset)
+        asset_returns: pd.Series | None = None
+        if security_id is not None:
+            asset_returns = load_security_log_returns(
+                [security_id], window_start, as_of_date.date()
+            ).get(security_id)
+        else:
+            asset_frame = load_price_history_from_lakehouse(
+                [asset], window_start, as_of_date.date()
+            )
+            if asset_frame is not None and asset in asset_frame.columns.get_level_values(0):
+                asset_returns = asset_frame[(asset, "log_return")].dropna()
+        if asset_returns is None:
             return self.unavailable_signal(
                 asset, as_of_date, f"{asset} not resolvable in the lakehouse cross-section"
             )
         merged_returns = dict(universe_returns)
-        merged_returns[asset] = asset_frame[(asset, "log_return")].dropna()
+        merged_returns[asset] = asset_returns
         return (*resolved_tickers, asset), merged_returns

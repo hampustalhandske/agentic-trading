@@ -5,6 +5,7 @@ the lakehouse (`data/loaders/lakehouse_loader.py`) and nowhere else. The
 frame this module returns still has to pass through the point-in-time
 boundary (`data/point_in_time.py`) before any agent sees it."""
 
+from collections.abc import Mapping
 from datetime import date, timedelta
 from typing import Literal
 
@@ -16,6 +17,7 @@ from agentic_trading.data.loaders.lakehouse_loader import (
     _guard_data_end,
     load_futures_price_history_from_lakehouse,
     load_price_history_from_lakehouse,
+    load_security_daily_bars,
 )
 from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.logging_config import get_logger
@@ -38,6 +40,7 @@ def load_price_history_with_fallback(
     *,
     align: Literal["sessions", "intersection"] = "sessions",
     calendar: str = "XNYS",
+    security_ids: Mapping[str, int] | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """The shared entry point the CLI uses to load market data — always
     returns MultiIndex (ticker, field) columns, even for a single-ticker
@@ -62,7 +65,11 @@ def load_price_history_with_fallback(
       backtest engine's callers pass this, because the engine fills and
       marks every ticker on every bar and so needs a close for each.
 
-    A futures ticker (`data/instruments.futures_root`) is read from the
+    A ticker in `security_ids` (ticker to lake `security_id`) is read by
+    its id from `equity_daily_from_bars`
+    (`lakehouse_loader.load_security_daily_bars`, see
+    `_security_price_history`), under its ticker in the returned frame. A
+    futures ticker (`data/instruments.futures_root`) is read from the
     continuous futures series
     (`lakehouse_loader.load_futures_price_history_from_lakehouse`), whose
     level is both what the analysts read and what the book earns; every
@@ -91,11 +98,20 @@ def load_price_history_with_fallback(
         raise ValueError("warmup_days must be non-negative")
     data_start = start - timedelta(days=warmup_days)
 
-    futures = [ticker for ticker in tickers if futures_root(ticker) is not None]
-    others = [ticker for ticker in tickers if futures_root(ticker) is None]
+    by_id = security_ids or {}
+    securities = [ticker for ticker in tickers if ticker in by_id]
+    by_ticker = [ticker for ticker in tickers if ticker not in by_id]
+    futures = [ticker for ticker in by_ticker if futures_root(ticker) is not None]
+    others = [ticker for ticker in by_ticker if futures_root(ticker) is None]
     parts = []
     if others:
         parts.append(load_price_history_from_lakehouse(others, data_start, end))
+    if securities:
+        parts.append(
+            _security_price_history(
+                {ticker: by_id[ticker] for ticker in securities}, data_start, end
+            )
+        )
     if futures:
         parts.append(load_futures_price_history_from_lakehouse(futures, data_start, end))
     priced = [part for part in parts if part is not None]
@@ -123,6 +139,39 @@ def load_price_history_with_fallback(
             f"{data_start.isoformat()} to {end.isoformat()}"
         )
     return _with_rolls_since_previous_row(frame, lake_frame, futures), "lakehouse data"
+
+
+# The fields of a `load_price_history_from_lakehouse` ticker, in its column order.
+_PRICE_FIELDS = ["open", "close", "raw_close", "volume", "log_return"]
+
+
+def _security_price_history(
+    security_ids: Mapping[str, int], start: date, end: date
+) -> pd.DataFrame | None:
+    """The `load_security_daily_bars` bars of each ticker's security in
+    `security_ids` from `start` to `end`, as a `(ticker, field)` frame in
+    the layout `load_price_history_from_lakehouse` gives a ticker: the
+    fields `open`, `close`, `raw_close`, `volume` and `log_return` in that
+    order, float64, on a `DatetimeIndex` named `date`, with unnamed column
+    levels. A ticker whose security has no kept bar in the range has no
+    columns; `None` when none has one.
+
+    The values are the bar loader's: `close` and `open` back-adjusted with
+    `cum_factor`, `raw_close` the price as traded, `volume` as traded, and
+    `log_return` NaN on a bar whose previous NYSE session has no kept bar."""
+    bars = load_security_daily_bars(sorted(set(security_ids.values())), start, end)
+    if bars is None:
+        return None
+    present = set(bars.columns.get_level_values("security_id"))
+    per_ticker: dict[str, pd.DataFrame] = {}
+    for ticker, security_id in security_ids.items():
+        if security_id in present:
+            fields = pd.DataFrame(bars[security_id][_PRICE_FIELDS])
+            fields.columns = pd.Index(_PRICE_FIELDS)
+            per_ticker[ticker] = fields
+    if not per_ticker:
+        return None
+    return pd.concat(per_ticker, axis=1)
 
 
 def _with_rolls_since_previous_row(

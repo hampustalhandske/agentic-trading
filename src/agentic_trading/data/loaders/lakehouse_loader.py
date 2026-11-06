@@ -1377,8 +1377,8 @@ def _adjusted_security_bars(
     `_select_security_bars` slice of `_fetch_security_bars` rows, from
     the window store or fetched for this call in one query for every id.
 
-    A bar's raw price is `official_close`, or `close` when that is null;
-    a bar whose raw price is null or not positive is left out. Each bar
+    A bar's raw price is its `close` (`official_close` is never read); a
+    bar whose raw price is null or not positive is left out. Each bar
     takes the `cum_factor` of the security's factor row with the smallest
     `effective_date` strictly after the bar's date (1.0 when there is
     none); bars and factors are joined on `security_id`, never on ticker.
@@ -1456,11 +1456,11 @@ def _fetch_security_bars(
                bars.raw_close,{open_and_volume}
                factors.effective_date AS factor_date
         FROM (
-            SELECT security_id, date, COALESCE(official_close, close) AS raw_close{bar_columns}
+            SELECT security_id, date, close AS raw_close{bar_columns}
             FROM {_table_sql("equity_daily_from_bars")}
             WHERE security_id IN ({placeholders})
               AND date BETWEEN ? AND ?
-              AND COALESCE(official_close, close) > 0
+              AND close > 0
         ) AS bars
         ASOF LEFT JOIN (
             SELECT security_id, effective_date, cum_factor
@@ -1543,10 +1543,10 @@ def load_security_log_returns(
     `start` to `end` inclusive. One query serves every id in
     `security_ids`.
 
-    A bar's price is `official_close`, or `close` when that is null,
-    times the `cum_factor` of the security's `equity_adjustment_factors`
-    row with the smallest `effective_date` strictly after the bar's date
-    (1.0 when there is none); bars and factors are joined on
+    A bar's price is its `close` (never `official_close`) times the
+    `cum_factor` of the security's `equity_adjustment_factors` row with
+    the smallest `effective_date` strictly after the bar's date (1.0 when
+    there is none); bars and factors are joined on
     `security_id`, never on ticker. A bar whose price is null or not
     positive counts as missing. The return on day d is the log of d's
     price over the previous bar's price, and exists only when the
@@ -1597,11 +1597,10 @@ def load_security_daily_bars(
     `MultiIndex` columns named `security_id` and `field`, with one group
     per security that has a kept bar in the range and these fields:
 
-    - `close`: the bar's `official_close` (or `close` when that is null)
-      times the `cum_factor` of the security's first
-      `equity_adjustment_factors` row with an `effective_date` strictly
-      after the bar's date (1.0 when there is none), joined on
-      `security_id`;
+    - `close`: the bar's `close` (never its `official_close`) times the
+      `cum_factor` of the security's first `equity_adjustment_factors`
+      row with an `effective_date` strictly after the bar's date (1.0
+      when there is none), joined on `security_id`;
     - `raw_close`: the same price before the factor;
     - `open`: the bar's `open` times the same factor, NaN when the open
       is null or not positive;

@@ -3,7 +3,11 @@
 """The registered firm's universe (agentic-firm-v1) is named once, in `roster.py`: the 30
 equities `scripts/select_firm_v1_equities.py` selected, then the 17 fixed instruments."""
 
-from agentic_trading.agents.roster import FIRM_V1_EQUITIES, FIRM_V1_UNIVERSE
+from agentic_trading.agents.roster import (
+    FIRM_V1_EQUITIES,
+    FIRM_V1_EQUITY_SECURITY_IDS,
+    FIRM_V1_UNIVERSE,
+)
 
 _EQUITIES = (
     "BAC AAPL GS JPM WFC XOM C GOOGL GE MSFT INTC CSCO WMT FCX PFE IBM CVX MS AMZN QCOM JNJ T PG "
@@ -35,3 +39,11 @@ def test_firm_v1_universe_is_the_registered_one() -> None:
     assert list(FIRM_V1_EQUITIES) == _EQUITIES
     assert list(FIRM_V1_UNIVERSE) == _EQUITIES + _FIXED
     assert len(set(FIRM_V1_UNIVERSE)) == len(FIRM_V1_UNIVERSE) == 47
+
+
+def test_firm_v1_equity_security_ids_follow_the_equities() -> None:
+    """One distinct security id per firm equity, keyed in the equities' order."""
+    assert list(FIRM_V1_EQUITY_SECURITY_IDS) == list(FIRM_V1_EQUITIES)
+    assert len(set(FIRM_V1_EQUITY_SECURITY_IDS.values())) == len(FIRM_V1_EQUITIES)
+    assert FIRM_V1_EQUITY_SECURITY_IDS["MON"] == 38786
+    assert FIRM_V1_EQUITY_SECURITY_IDS["GOOGL"] == 25819

@@ -1441,6 +1441,7 @@ def test_firm_record_declares_the_run_window(
         ),
         patch("agentic_trading.cli.load_risk_free_rate_series", return_value=None),
         patch("agentic_trading.cli.run_firm_record", side_effect=record),
+        patch("agentic_trading.cli.check_price_coverage"),
     ):
         result = CliRunner().invoke(
             firm_record_app, [*args, "--loader-store" if store else "--no-loader-store"]

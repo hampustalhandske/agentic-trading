@@ -5,7 +5,9 @@ analyst roster and ticker list are both final, and before the first
 simulated day. For every analyst's declared `DataRequirement`s
 (`agents/base.py`), checks whether the lakehouse actually covers the
 run's tickers and its date range, warm-up included, and reports the
-result.
+result. `check_price_coverage` checks, on a run's loaded price frame,
+that each member of a universe has bars from the run's first session to
+its last.
 
 This project never calls a live external API during a run (prices,
 FRED, Ken French, SEC EDGAR, FINRA, option chains, CFTC positioning,
@@ -19,8 +21,11 @@ there is no look-ahead concern here, since this check happens once,
 before the simulated run starts, and wants the lakehouse's true real
 coverage range, not a point-in-time-gated slice of it."""
 
+from collections.abc import Sequence
 from datetime import date, timedelta
 
+import numpy as np
+import pandas as pd
 from pydantic import BaseModel
 
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, is_likely_equity
@@ -33,6 +38,7 @@ from agentic_trading.data.loaders.lakehouse_loader import (
     load_sic_code_from_lakehouse,
     source_coverage,
 )
+from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -267,3 +273,108 @@ def check_data_availability(
             AnalystPreflightResult(analyst_id=analyst.agent_id, passed=passed, checks=checks)
         )
     return PreflightReport(checked_at=date.today(), results=results)
+
+
+# Sessions a member's first bar may come after the first session it is
+# needed on, and its last bar before the last: room for a listing that
+# starts a few days in, or a bar the lake is missing at either end,
+# without calling that a coverage hole. Policy choice.
+PRICE_COVERAGE_SLACK_SESSIONS = 5
+
+
+class PriceCoverage(BaseModel):
+    """One member's kept bars in a run's price frame: its `first_bar` and
+    `last_bar` (both `None` without any), the most sessions in a row
+    without a bar between them (`longest_gap_sessions`), and whether the
+    first and last bar fall within the slack of the run's first and last
+    sessions (`covers_run`)."""
+
+    ticker: str
+    first_bar: date | None
+    last_bar: date | None
+    longest_gap_sessions: int
+    covers_run: bool
+
+
+class PriceCoverageError(ValueError):
+    """Some members of a run's universe have no price coverage over the
+    run; the message lists each with its first and last bar."""
+
+
+def check_price_coverage(
+    market_data: pd.DataFrame,
+    members: Sequence[str],
+    from_date: date,
+    to_date: date,
+    calendar: str = "XNYS",
+    slack_sessions: int = PRICE_COVERAGE_SLACK_SESSIONS,
+) -> list[PriceCoverage]:
+    """Checks that every one of `members` has kept bars (a non-NaN
+    `(member, "close")` in `market_data`, a `(ticker, field)` frame on a
+    `DatetimeIndex`) across the `calendar` sessions from `from_date` to
+    `to_date`: its first bar on or before the session `slack_sessions`
+    after the first of those sessions, and its last bar on or after the
+    session `slack_sessions` before the last. Logs one INFO line per
+    member with its first and last bar and its longest interior gap, in
+    sessions of `calendar` between two consecutive bars; a gap never fails
+    the check. Returns each member's `PriceCoverage`, in `members` order.
+
+    Raises `PriceCoverageError` listing every member that fails, with its
+    first and last bar ("none" without a bar), and `ValueError` when no
+    session lies between `from_date` and `to_date`."""
+    sessions = sessions_between(from_date, to_date, calendar)
+    if not sessions:
+        raise ValueError(
+            f"no {calendar} session from {from_date.isoformat()} to {to_date.isoformat()}"
+        )
+    latest_first = sessions[min(slack_sessions, len(sessions) - 1)]
+    earliest_last = sessions[max(len(sessions) - 1 - slack_sessions, 0)]
+    session_index = pd.DatetimeIndex(sessions)
+    coverage: list[PriceCoverage] = []
+    for member in members:
+        if (member, "close") in market_data.columns:
+            kept = pd.DatetimeIndex(market_data[(member, "close")].dropna().index)
+        else:
+            kept = pd.DatetimeIndex([])
+        if kept.empty:
+            first_bar, last_bar, longest_gap = None, None, 0
+        else:
+            first_bar, last_bar = kept.min().date(), kept.max().date()
+            positions = np.unique(session_index.searchsorted(kept.sort_values()))
+            longest_gap = int((np.diff(positions) - 1).max()) if positions.size > 1 else 0
+        covers_run = (
+            first_bar is not None
+            and last_bar is not None
+            and first_bar <= latest_first
+            and last_bar >= earliest_last
+        )
+        logger.info(
+            "Price coverage %s: first bar %s, last bar %s, longest interior gap %d session(s)",
+            member,
+            "none" if first_bar is None else first_bar.isoformat(),
+            "none" if last_bar is None else last_bar.isoformat(),
+            longest_gap,
+        )
+        coverage.append(
+            PriceCoverage(
+                ticker=member,
+                first_bar=first_bar,
+                last_bar=last_bar,
+                longest_gap_sessions=longest_gap,
+                covers_run=covers_run,
+            )
+        )
+    failing = [entry for entry in coverage if not entry.covers_run]
+    if failing:
+        listed = "; ".join(
+            f"{entry.ticker} first bar "
+            f"{'none' if entry.first_bar is None else entry.first_bar.isoformat()}, last bar "
+            f"{'none' if entry.last_bar is None else entry.last_bar.isoformat()}"
+            for entry in failing
+        )
+        raise PriceCoverageError(
+            f"{len(failing)} member(s) lack price coverage from {sessions[0].isoformat()} "
+            f"to {sessions[-1].isoformat()} (first bar by {latest_first.isoformat()}, last bar "
+            f"from {earliest_last.isoformat()}): {listed}"
+        )
+    return coverage

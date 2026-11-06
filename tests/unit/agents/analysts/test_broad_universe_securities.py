@@ -16,6 +16,7 @@ from agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst imp
 )
 from agentic_trading.agents.analysts.factor_pod import fama_macbeth_analyst as fama
 from agentic_trading.agents.analysts.factor_pod.fama_macbeth_analyst import FamaMacbethAnalyst
+from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import IndexMember
 
 _AS_OF = pd.Timestamp("2024-03-08")
@@ -143,3 +144,48 @@ def test_no_cross_section_is_unavailable_without_a_ticker_universe(
     monkeypatch.setattr(module, "load_sp500_member_securities_asof", lambda d: None)
     missing = analyst_class().generate_signal("T000", pd.DataFrame(), _AS_OF)
     assert (missing.status, missing.direction, missing.confidence) == ("unavailable", "flat", 0.0)
+
+
+def test_fama_macbeth_reads_a_firm_equity_outside_the_universe_by_security_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registered-firm equity missing from the cached cross-section (here MON, whose ticker
+    has no instrument_prices rows) is read by its security id, never by ticker."""
+    universe = {"T000": _series(80, 0)}
+    calls: list[tuple[list[int], date, date]] = []
+    own = _series(80, 1)
+
+    def returns(ids: list[int], start: date, end: date) -> dict[int, pd.Series]:
+        calls.append((list(ids), start, end))
+        return {38786: own}
+
+    monkeypatch.setattr(fama, "load_security_log_returns", returns)
+    monkeypatch.setattr(fama, "load_price_history_from_lakehouse", _forbidden)
+
+    result = FamaMacbethAnalyst()._resolve_with_broad_universe((("T000",), universe), "MON", _AS_OF)
+
+    assert not isinstance(result, AgentSignal)
+    tickers, merged = result
+    assert tickers == ("T000", "MON")
+    assert merged["MON"] is own
+    assert calls == [([38786], (_AS_OF - timedelta(days=250)).date(), _AS_OF.date())]
+
+
+def test_fama_macbeth_reads_any_other_asset_by_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An asset that is not a registered-firm equity keeps the ticker read, and a firm equity
+    whose security has no returns is unavailable."""
+    universe = {"T000": _series(80, 0)}
+    index = pd.bdate_range(end=_AS_OF, periods=3)
+    frame = pd.concat(
+        {"ZZZ": pd.DataFrame({"log_return": [np.nan, 0.01, -0.02]}, index=index)}, axis=1
+    )
+    monkeypatch.setattr(fama, "load_security_log_returns", lambda ids, start, end: {})
+    monkeypatch.setattr(fama, "load_price_history_from_lakehouse", lambda tickers, s, e: frame)
+    analyst = FamaMacbethAnalyst()
+
+    result = analyst._resolve_with_broad_universe((("T000",), universe), "ZZZ", _AS_OF)
+    missing = analyst._resolve_with_broad_universe((("T000",), universe), "MON", _AS_OF)
+
+    assert not isinstance(result, AgentSignal)
+    assert result[1]["ZZZ"].tolist() == [0.01, -0.02]
+    assert isinstance(missing, AgentSignal) and missing.status == "unavailable"

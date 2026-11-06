@@ -2,8 +2,11 @@
 
 """Adjusted and raw daily bars by security id, and the daily S&P 500 member count."""
 
+import importlib
 import math
+import sys
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -40,6 +43,7 @@ _MEMBER_COUNT = {
     "shortfall": "INTEGER",
 }
 _FIELDS = {"close", "raw_close", "open", "volume", "log_return"}
+_SCRIPTS = Path(__file__).resolve().parents[4] / "scripts"
 
 _MON, _TUE, _WED, _THU, _FRI = (date(2024, 3, d) for d in (4, 5, 6, 7, 8))
 _NEXT_MON, _NEXT_TUE = date(2024, 3, 11), date(2024, 3, 12)
@@ -126,10 +130,10 @@ def test_daily_bars_layout_and_split_adjustment(lake: Any) -> None:
 
 def test_daily_bars_dividend_factor_and_factor_row_rule(lake: Any) -> None:
     """Each bar takes the cum_factor of the first factor row strictly after it; a dividend
-    factor lowers earlier levels; official_close wins over close."""
+    factor lowers earlier levels; the bar's close is read and its official_close never."""
     _bar(lake, 1, _TUE, 100.0)
     _bar(lake, 1, _WED, 99.0)
-    _bar(lake, 1, _THU, 999.0, official=99.5)
+    _bar(lake, 1, _THU, 99.5, official=999.0)
     _bar(lake, 1, _FRI, 50.0)
     _factor(lake, 1, _MON, 0.245, split=2.0)
     _factor(lake, 1, _WED, 0.49)
@@ -139,7 +143,7 @@ def test_daily_bars_dividend_factor_and_factor_row_rule(lake: Any) -> None:
 
     assert frame[(1, "close")].tolist() == pytest.approx([49.0, 49.5, 49.75, 50.0])
     assert frame[(1, "raw_close")].tolist() == pytest.approx([100.0, 99.0, 99.5, 50.0])
-    assert frame[(1, "open")].tolist() == pytest.approx([49.0, 49.5, 499.5, 50.0])
+    assert frame[(1, "open")].tolist() == pytest.approx([49.0, 49.5, 49.75, 50.0])
     assert frame[(1, "log_return")].iloc[1:].tolist() == pytest.approx(
         [math.log(99 / 98), math.log(99.5 / 99), math.log(50 / 49.75)]
     )
@@ -220,7 +224,7 @@ def test_daily_bars_missing_prices_and_non_positive_open_and_volume(lake: Any) -
     _bar(lake, 1, _WED, 101.0, open_=-1.0, volume=-5.0)
     _bar(lake, 1, _THU, None, open_=100.0)
     _bar(lake, 1, _FRI, 0.0, open_=100.0)
-    _bar(lake, 1, _NEXT_MON, 100.0, official=0.0, open_=100.0)
+    _bar(lake, 1, _NEXT_MON, -2.0, official=100.0, open_=100.0)
     for day in (_TUE, _WED, _THU, _FRI, _NEXT_MON):
         _bar(lake, 2, day, 50.0, ticker="BBB")
 
@@ -282,3 +286,27 @@ def test_member_count_none_when_no_rows_match(lake: Any) -> None:
 def test_member_count_table_is_a_read_table() -> None:
     """`sp500_member_count` is one of the tables the loader reads."""
     assert "sp500_member_count" in READ_TABLES
+
+
+def test_security_bar_queries_read_close_and_never_official_close(lake: Any) -> None:
+    """Both stored security-bar sources and the frozen reference copy in
+    `scripts/at126_legacy.py` price a bar at its `close` and never name `official_close`."""
+    _bar(lake, 1, _TUE, 100.0, official=50.0)
+    _bar(lake, 1, _WED, 110.0, official=60.0)
+    sys.path.insert(0, str(_SCRIPTS))
+    try:
+        legacy = importlib.import_module("at126_legacy")
+    finally:
+        sys.path.remove(str(_SCRIPTS))
+
+    load_security_log_returns([1], _TUE, _WED)
+    load_security_daily_bars([1], _TUE, _WED)
+    legacy.legacy_security_log_returns([1], _TUE, _WED)
+    legacy.legacy_security_daily_bars([1], _TUE, _WED)
+
+    queries = [query for query, _ in lake.calls if "equity_daily_from_bars" in query]
+    assert len(queries) == 4
+    for query in queries:
+        assert "official_close" not in query
+        assert "close AS raw_close" in query
+        assert "AND close > 0" in query

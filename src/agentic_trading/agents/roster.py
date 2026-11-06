@@ -108,7 +108,9 @@ carries the reasoning for that pod's row.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import date
+from types import MappingProxyType
 
 from agentic_trading.agents.analysts import (
     ARIMAForecastAnalyst,
@@ -251,6 +253,45 @@ FIRM_V1_EQUITIES: tuple[str, ...] = (
     "MON",
     "V",
     "FSLR",
+)
+# The lake `security_id` of each of `FIRM_V1_EQUITIES`, in the same order: the
+# ids scripts/select_firm_v1_equities.py selected from the S&P 500 membership
+# on 2009-12-31. The firm record prices these equities from
+# `equity_daily_from_bars` by these ids, never by ticker. 25819 is Alphabet
+# class A, named GOOGL in the rows.
+FIRM_V1_EQUITY_SECURITY_IDS: Mapping[str, int] = MappingProxyType(
+    {
+        "BAC": 5797,
+        "AAPL": 147,
+        "GS": 26556,
+        "JPM": 32841,
+        "WFC": 64020,
+        "XOM": 65558,
+        "C": 15348,
+        "GOOGL": 25819,
+        "GE": 24532,
+        "MSFT": 39307,
+        "INTC": 30948,
+        "CSCO": 14140,
+        "WMT": 64494,
+        "FCX": 21280,
+        "PFE": 45694,
+        "IBM": 29477,
+        "CVX": 14919,
+        "MS": 39946,
+        "AMZN": 3103,
+        "QCOM": 48703,
+        "JNJ": 32693,
+        "T": 51927,
+        "PG": 45937,
+        "HPQ": 28491,
+        "ORCL": 44165,
+        "AIG": 1969,
+        "COP": 13266,
+        "MON": 38786,
+        "V": 63531,
+        "FSLR": 23082,
+    }
 )
 # The registered firm's whole universe: `FIRM_V1_EQUITIES`, then the fixed
 # instruments the registration names (index, bond and credit ETFs, futures,

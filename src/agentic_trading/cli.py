@@ -12,6 +12,8 @@ from agentic_trading import provenance
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.roster import (
+    FIRM_V1_EQUITIES,
+    FIRM_V1_EQUITY_SECURITY_IDS,
     FIRM_V1_EXCLUDED_ANALYST_IDS,
     FIRM_V1_UNIVERSE,
     FIRM_V1_WINDOW_END,
@@ -24,7 +26,7 @@ from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystCommander
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
-from agentic_trading.backtest.preflight import check_data_availability
+from agentic_trading.backtest.preflight import check_data_availability, check_price_coverage
 from agentic_trading.config import apply_overrides, parse_override, settings
 from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
@@ -1156,9 +1158,15 @@ def firm_record(
     and the default managers under a Commander weighting pods by
     `ShrinkageWeight(Hedge())`, over `roster.FIRM_V1_UNIVERSE`. Loads the
     universe's prices aligned on `stage_a.session_calendar`, from --start
-    minus `stage_a.warmup_days` calendar days to --end, and the risk-free
-    rate, then runs `firm_record.runner.run_firm_record`, all inside one
-    lake session cut at `stage_a.data_end`. With --loader-store (the
+    minus `stage_a.warmup_days` calendar days to --end, each of
+    `roster.FIRM_V1_EQUITIES` by its `roster.FIRM_V1_EQUITY_SECURITY_IDS`
+    id from `equity_daily_from_bars` and every other instrument by ticker.
+    Before anything is written, checks that every firm equity has bars
+    from the first session of that span to its last
+    (`backtest.preflight.check_price_coverage`, which raises
+    `PriceCoverageError` listing each failing equity). Then loads the
+    risk-free rate and runs `firm_record.runner.run_firm_record`, all
+    inside one lake session cut at `stage_a.data_end`. With --loader-store (the
     default) the session's loader window store is declared over the same
     span, --start minus `stage_a.warmup_days` to --end
     (`declare_run_window`); --no-loader-store leaves every loader call
@@ -1218,8 +1226,16 @@ def firm_record(
             warmup_days=settings.stage_a.warmup_days,
             align="sessions",
             calendar=settings.stage_a.session_calendar,
+            security_ids=FIRM_V1_EQUITY_SECURITY_IDS,
         )
         typer.echo(f"Market data ready: {source_label}; {len(market_data)} rows.", err=True)
+        check_price_coverage(
+            market_data,
+            FIRM_V1_EQUITIES,
+            window_start - timedelta(days=settings.stage_a.warmup_days),
+            window_end,
+            settings.stage_a.session_calendar,
+        )
         risk_free_rate_series = load_risk_free_rate_series(window_start, window_end)
         lake_version = (
             session.lake_version
