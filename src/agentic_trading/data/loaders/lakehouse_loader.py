@@ -2569,6 +2569,7 @@ def load_price_history_from_lakehouse(
     return combined
 
 
+@_counted("load_futures_price_history_from_lakehouse")
 def load_futures_price_history_from_lakehouse(
     tickers: list[str], start: date, end: date
 ) -> pd.DataFrame | None:
@@ -2602,7 +2603,12 @@ def load_futures_price_history_from_lakehouse(
 
     Point-in-time on the bar date, as prices are: only bars dated on or
     before `end` are read. Self-asserts point-in-time on the frame's date
-    index against `end` before returning."""
+    index against `end` before returning.
+
+    Inside a window store each root's rows come from the store, and
+    `_select_futures_rows` cuts out the rows this call's own query reads
+    (from the last kept bar before `start`), so the first-bar roll, the
+    zeroed first return and the level's base are computed per call."""
     _guard_data_end(end, "load_futures_price_history_from_lakehouse")
     ticker_by_root: dict[str, str] = {}
     for ticker in tickers:
@@ -2610,7 +2616,30 @@ def load_futures_price_history_from_lakehouse(
         if root is None:
             raise ValueError(f"{ticker} is not a futures ticker")
         ticker_by_root[root] = ticker
-    placeholders = ", ".join("?" for _ in ticker_by_root)
+    roots = sorted(ticker_by_root)
+    stored = _FUTURES_DAILY.read(roots, start, end)
+    per_ticker: dict[str, pd.DataFrame] = {}
+    for root in roots:
+        rows = _select_futures_rows(stored[root], start, end)
+        if rows.empty:
+            continue
+        bars = _futures_bars(rows, start)
+        if bars is not None:
+            per_ticker[ticker_by_root[root]] = bars
+    if not per_ticker:
+        return None
+    combined = pd.concat(per_ticker, axis=1)
+    assert_point_in_time(combined, end)
+    return combined
+
+
+def _fetch_futures_daily(roots: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each of `roots`' `futures_continuous_daily` rows dated from its
+    last kept bar (positive `ratio_adjusted_close`) before `start` (from
+    `start` when there is none) to `end`, in one query: `root`, `date`,
+    `front_contract`, `unadjusted_close`, `ratio_adjusted_close`,
+    `is_roll_day` and `roll_gap_known`, sorted by date."""
+    placeholders = ", ".join("?" for _ in roots)
     query = f"""
         SELECT root, date, front_contract, unadjusted_close, ratio_adjusted_close,
                is_roll_day, roll_gap_known
@@ -2626,59 +2655,73 @@ def load_futures_price_history_from_lakehouse(
         WHERE date >= COALESCE(previous_kept, ?)
         ORDER BY root, date
     """
-    frame = _query(query, [start.isoformat(), *ticker_by_root, end.isoformat(), start.isoformat()])
-    if frame.empty:
+    frame = _query(query, [start.isoformat(), *roots, end.isoformat(), start.isoformat()])
+    return _split_by_key(_gated(frame, end, "date"), "root", roots)
+
+
+_FUTURES_DAILY: StoreSource[str, pd.DataFrame] = StoreSource(
+    "futures_continuous_daily", _fetch_futures_daily, ranged=True
+)
+
+
+def _select_futures_rows(rows: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    """The rows of one root's `_fetch_futures_daily` frame that the
+    loader's query reads for `start` to `end`: dated on or before `end`
+    and on or after the last kept bar before `start` among them (`start`
+    when there is none). `rows` must start at or before that bar, as a
+    fetch from `start` or earlier does."""
+    first, last = pd.Timestamp(start), pd.Timestamp(end)
+    up_to_end = (rows["date"] <= last).to_numpy(dtype=bool)
+    kept = rows["ratio_adjusted_close"].gt(0.0).fillna(False).to_numpy(dtype=bool)
+    before = rows["date"].to_numpy()[up_to_end & kept & (rows["date"] < first).to_numpy(dtype=bool)]
+    lower = pd.Timestamp(before.max()) if len(before) else first
+    return _rows_where(rows, up_to_end & (rows["date"] >= lower).to_numpy(dtype=bool))
+
+
+def _futures_bars(group: pd.DataFrame, start: date) -> pd.DataFrame | None:
+    """One root's `load_futures_price_history_from_lakehouse` fields from
+    the rows `_select_futures_rows` gives for `start`, or `None` when no
+    kept bar is dated on or after `start`."""
+    adjusted_all = group["ratio_adjusted_close"].astype(float)
+    kept = (adjusted_all > 0.0).to_numpy(dtype=bool)
+    unknown_gap = group["is_roll_day"].eq(True).to_numpy(dtype=bool) & group["roll_gap_known"].eq(
+        False
+    ).fillna(False).to_numpy(dtype=bool)
+    # Unknown-gap rows up to each kept bar; a rise between two kept bars
+    # means the span into the later one holds an unknown gap.
+    unknown_gaps_so_far = np.cumsum(unknown_gap)[kept]
+    bars = group.loc[kept]
+    adjusted = adjusted_all.to_numpy(dtype=np.float64)[kept]
+    daily = np.zeros(len(adjusted))
+    daily[1:] = adjusted[1:] / adjusted[:-1] - 1.0
+    daily[1:][np.diff(unknown_gaps_so_far) > 0] = 0.0
+    fronts = bars["front_contract"]
+    previous_fronts = fronts.shift(1)
+    roll = fronts.ne(previous_fronts) & fronts.notna() & previous_fronts.notna()
+
+    in_range = (bars["date"] >= pd.Timestamp(start)).to_numpy(dtype=bool)
+    if not in_range.any():
         return None
-    frame["date"] = pd.to_datetime(frame["date"])
-
-    per_ticker: dict[str, pd.DataFrame] = {}
-    for lake_root, group in frame.groupby("root", sort=True):
-        adjusted_all = group["ratio_adjusted_close"].astype(float)
-        kept = (adjusted_all > 0.0).to_numpy(dtype=bool)
-        unknown_gap = group["is_roll_day"].eq(True).to_numpy(dtype=bool) & group[
-            "roll_gap_known"
-        ].eq(False).fillna(False).to_numpy(dtype=bool)
-        # Unknown-gap rows up to each kept bar; a rise between two kept bars
-        # means the span into the later one holds an unknown gap.
-        unknown_gaps_so_far = np.cumsum(unknown_gap)[kept]
-        bars = group.loc[kept]
-        adjusted = adjusted_all.to_numpy(dtype=np.float64)[kept]
-        daily = np.zeros(len(adjusted))
-        daily[1:] = adjusted[1:] / adjusted[:-1] - 1.0
-        daily[1:][np.diff(unknown_gaps_so_far) > 0] = 0.0
-        fronts = bars["front_contract"]
-        previous_fronts = fronts.shift(1)
-        roll = fronts.ne(previous_fronts) & fronts.notna() & previous_fronts.notna()
-
-        in_range = (bars["date"] >= pd.Timestamp(start)).to_numpy(dtype=bool)
-        if not in_range.any():
-            continue
-        bars = bars.loc[in_range]
-        daily = daily[in_range]
-        daily[0] = 0.0
-        index = pd.DatetimeIndex(bars["date"])
-        unadjusted = bars["unadjusted_close"].astype(float)
-        unadjusted = unadjusted.where(unadjusted > 0.0)
-        first_adjusted = float(adjusted[in_range][0])
-        base = float(unadjusted.iloc[0]) if pd.notna(unadjusted.iloc[0]) else first_adjusted
-        close = pd.Series(base * np.cumprod(1.0 + daily), index=index)
-        per_ticker[ticker_by_root[str(lake_root)]] = pd.DataFrame(
-            {
-                "open": close,
-                "close": close,
-                "raw_close": unadjusted.to_numpy(),
-                "volume": np.nan,
-                "log_return": np.log(close / close.shift(1)),
-                "roll": roll.loc[in_range].astype(float).to_numpy(),
-            },
-            index=index,
-        )
-
-    if not per_ticker:
-        return None
-    combined = pd.concat(per_ticker, axis=1)
-    assert_point_in_time(combined, end)
-    return combined
+    bars = bars.loc[in_range]
+    daily = daily[in_range]
+    daily[0] = 0.0
+    index = pd.DatetimeIndex(bars["date"])
+    unadjusted = bars["unadjusted_close"].astype(float)
+    unadjusted = unadjusted.where(unadjusted > 0.0)
+    first_adjusted = float(adjusted[in_range][0])
+    base = float(unadjusted.iloc[0]) if pd.notna(unadjusted.iloc[0]) else first_adjusted
+    close = pd.Series(base * np.cumprod(1.0 + daily), index=index)
+    return pd.DataFrame(
+        {
+            "open": close,
+            "close": close,
+            "raw_close": unadjusted.to_numpy(),
+            "volume": np.nan,
+            "log_return": np.log(close / close.shift(1)),
+            "roll": roll.loc[in_range].astype(float).to_numpy(),
+        },
+        index=index,
+    )
 
 
 @_counted("load_raw_close_from_lakehouse")
@@ -2874,6 +2917,7 @@ _BIS_DAILY = "D"
 POLICY_RATE_LOOKBACK_DAYS = 14
 
 
+@_counted("load_policy_rates_from_lakehouse")
 def load_policy_rates_from_lakehouse(
     currencies: list[str], start: date, end: date
 ) -> pd.DataFrame | None:
@@ -2893,7 +2937,10 @@ def load_policy_rates_from_lakehouse(
     dated on or before `end` is read as known on its date; inside a
     `lake_session` the value is the one the lake held at its lake time
     (BIS revisions are kept as later versions). Self-asserts
-    point-in-time on the index against `end` before returning."""
+    point-in-time on the index against `end` before returning.
+
+    Inside a window store each reference area's observations come from
+    the store, sliced to this call's dates."""
     _guard_data_end(end, "load_policy_rates_from_lakehouse")
     wanted = list(dict.fromkeys(currencies))
     currency_by_area: dict[str, str] = {}
@@ -2902,7 +2949,17 @@ def load_policy_rates_from_lakehouse(
         if area is None:
             raise ValueError(f"no BIS policy-rate reference area for currency {currency}")
         currency_by_area[area] = currency
-    placeholders = ", ".join("?" for _ in currency_by_area)
+    window_start = start - timedelta(days=POLICY_RATE_LOOKBACK_DAYS)
+    areas = list(currency_by_area)
+    stored = _POLICY_RATES.read(areas, window_start, end)
+    return _select_policy_rates(stored, currency_by_area, wanted, window_start, end)
+
+
+def _fetch_policy_rates(areas: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each of `areas`' daily `WS_CBPOL` observations with a value, dated
+    `start` to `end` inclusive, in one query: `ref_area`, `date` and
+    `value` (per cent), sorted by date."""
+    placeholders = ", ".join("?" for _ in areas)
     query = f"""
         SELECT ref_area, date, value
         FROM {_table_sql("bis_observations")}
@@ -2913,20 +2970,33 @@ def load_policy_rates_from_lakehouse(
           AND value IS NOT NULL
         ORDER BY date, ref_area
     """
-    window_start = start - timedelta(days=POLICY_RATE_LOOKBACK_DAYS)
     frame = _query(
         query,
-        [
-            _BIS_POLICY_RATE_DATAFLOW,
-            _BIS_DAILY,
-            *currency_by_area,
-            window_start.isoformat(),
-            end.isoformat(),
-        ],
+        [_BIS_POLICY_RATE_DATAFLOW, _BIS_DAILY, *areas, start.isoformat(), end.isoformat()],
     )
+    return _split_by_key(_gated(frame, end, "date"), "ref_area", areas)
+
+
+_POLICY_RATES: StoreSource[str, pd.DataFrame] = StoreSource(
+    "bis_observations", _fetch_policy_rates, ranged=True
+)
+
+
+def _select_policy_rates(
+    observations: dict[str, pd.DataFrame],
+    currency_by_area: dict[str, str],
+    wanted: list[str],
+    start: date,
+    end: date,
+) -> pd.DataFrame | None:
+    """The `load_policy_rates_from_lakehouse` frame from each area's
+    `_fetch_policy_rates` rows dated `start` (the lookback start) to
+    `end`, stacked in the query's order (date, then area), or `None`
+    when there are none."""
+    frame = _rows_in_range(observations, list(currency_by_area), start, end)
     if frame.empty:
         return None
-    frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame.sort_values(["date", "ref_area"], kind="stable").reset_index(drop=True)
     frame["currency"] = frame["ref_area"].map(currency_by_area)
     rates = frame.pivot(index="date", columns="currency", values="value").astype(float) / 100.0
     rates = rates.reindex(columns=wanted).sort_index()

@@ -486,6 +486,62 @@ def _kline_rows() -> list[dict[str, Any]]:
     return rows
 
 
+_CL_ROLL_BEFORE_START = date(2019, 3, 1)
+
+
+def _futures_rows() -> list[dict[str, Any]]:
+    """CL and NG continuous rows. CL rolls on 2019-03-01 (the first bar of
+    a read starting there compares against the last kept bar before it,
+    on 2019-02-27, because the bar of 2019-02-28 has no adjusted close),
+    rolls with an unknown gap on 2019-04-10, and rolls with a known gap on
+    2019-05-15."""
+    rows = []
+    for n, day in enumerate(_sessions(date(2018, 11, 1), date(2019, 6, 28))):
+        if day < _CL_ROLL_BEFORE_START:
+            front = "CLH19"
+        elif day < date(2019, 4, 10):
+            front = "CLK19"
+        elif day < date(2019, 5, 15):
+            front = "CLN19"
+        else:
+            front = "CLQ19"
+        adjusted = None if day == date(2019, 2, 28) else 60.0 + 0.1 * n
+        rows.append({
+            "root": "CL", "date": day, "front_contract": front,
+            "unadjusted_close": None if n % 19 == 0 else 55.0 + 0.1 * n,
+            "ratio_adjusted_close": adjusted, "diff_adjusted_close": 0.0,
+            "is_roll_day": day in (_CL_ROLL_BEFORE_START, date(2019, 4, 10), date(2019, 5, 15)),
+            "roll_return": None,
+            "roll_gap_known": False if day == date(2019, 4, 10)
+            else True if day == date(2019, 5, 15) else None,
+        })  # fmt: skip
+        rows.append({
+            "root": "NG", "date": day, "front_contract": "NGK19" if n < 80 else "NGM19",
+            "unadjusted_close": 2.5 + 0.01 * n, "ratio_adjusted_close": 2.6 + 0.01 * n,
+            "diff_adjusted_close": 0.0, "is_roll_day": n == 80, "roll_return": None,
+            "roll_gap_known": True if n == 80 else None,
+        })  # fmt: skip
+    return rows
+
+
+def _bis_rows() -> list[dict[str, Any]]:
+    """Daily WS_CBPOL rates for the US and the euro area on sessions only
+    (no weekend rows), a monthly row that is not read, a null value, and
+    another dataflow's row."""
+    rows = []
+    for n, day in enumerate(_sessions(date(2018, 11, 1), date(2019, 6, 28))):
+        rows.append({"dataflow": "WS_CBPOL", "freq": "D", "ref_area": "US", "date": day,
+                     "value": 2.25 if day < date(2018, 12, 20) else 2.5})  # fmt: skip
+        if n % 2 == 0:
+            rows.append({"dataflow": "WS_CBPOL", "freq": "D", "ref_area": "XM", "date": day,
+                         "value": None if n == 40 else 0.0})  # fmt: skip
+    rows.append({"dataflow": "WS_CBPOL", "freq": "M", "ref_area": "US",
+                 "date": date(2019, 3, 1), "value": 9.0})  # fmt: skip
+    rows.append({"dataflow": "WS_OTHER", "freq": "D", "ref_area": "US",
+                 "date": date(2019, 3, 4), "value": 7.0})  # fmt: skip
+    return rows
+
+
 @pytest.fixture
 def ab_lake(preflight_lake: Any) -> Any:
     """`preflight_lake` filled with every stored loader's synthetic source rows."""
@@ -517,6 +573,8 @@ def ab_lake(preflight_lake: Any) -> Any:
     _put(lake, "sec_filings", filings)
     _put(lake, "finra_short_interest", _short_interest_rows())
     _put(lake, "sec_insider_transactions_log", _insider_rows())
+    _put(lake, "futures_continuous_daily", _futures_rows())
+    _put(lake, "bis_observations", _bis_rows())
     return lake
 
 
@@ -543,6 +601,8 @@ def _plan(ab: ModuleType, days: list[date] = _DAYS) -> Any:
             ("SPY", _E1, "put", 150.0),
             ("AAA", _E1, "put", 100.0),
         ],
+        futures_tickers=["CL=F", "NG=F"],
+        currencies=["EUR", "USD", "JPY"],
         price_lookback_days=_PRICE_LOOKBACK,
         quote_lookback_days=_QUOTE_LOOKBACK,
     )
@@ -558,7 +618,7 @@ def _three_ways(ab: ModuleType, loader: str, *args: Any) -> tuple[Any, Any, Any]
     session must be open."""
     window = _window(ab)
     call = ab.LoaderCall(loader=loader, args=args, day=_DAYS[0])
-    passes = [ab.run_pass(path, [call], window) for path in ab.PATHS]
+    passes = [ab.run_pass(path, [call], window) for path in ("legacy", "direct", "store")]
     return passes[0].outputs[0], passes[1].outputs[0], passes[2].outputs[0]
 
 
@@ -596,9 +656,11 @@ def test_every_stored_loader_answers_exactly_as_the_reference_on_both_paths(
     report = ab.compare_passes(calls, passes, window)
 
     assert not report.mismatches, "\n\n".join(
-        f"{m.loader}{m.args} on {m.path}:\n{m.difference}" for m in report.mismatches
+        f"{m.loader}{m.key} on {m.day} {m.path}:\n{m.difference}" for m in report.mismatches
     )
-    assert report.registry_differences == {"direct": None, "store": None}
+    assert report.verdict == "PASS"
+    assert all(summary.legacy_self_mismatches == 0 for summary in report.loaders)
+    assert report.registry_differences == {"legacy_repeat": None, "direct": None, "store": None}
     assert passes["legacy"].registry, "the plan should flag an unfactored split move"
     answered = {
         call.loader
@@ -609,6 +671,10 @@ def test_every_stored_loader_answers_exactly_as_the_reference_on_both_paths(
     assert not any(isinstance(output, ab.RaisedError) for output in passes["legacy"].outputs)
     totals = {path: sum(summary.queries[path] for summary in report.loaders) for path in ab.PATHS}
     assert totals["store"] * 5 < totals["direct"]
+    assert {
+        "load_futures_price_history_from_lakehouse",
+        "load_policy_rates_from_lakehouse",
+    } <= answered
 
 
 # ---------------------------------------------------------------- per trap
@@ -822,6 +888,50 @@ def test_dividends_raw_close_and_members(ab: ModuleType, ab_lake: Any) -> None:
     assert [(m.security_id, m.ticker) for m in after] == [(1, "AAA2"), (3, "BBB"), (5, "DDA")]
 
 
+def test_futures_first_bar_and_level_are_computed_per_request_window(
+    ab: ModuleType, ab_lake: Any
+) -> None:
+    """The store holds CL from long before each start, yet each call's
+    first bar compares fronts against the last kept bar before its own
+    start (skipping the bar with no adjusted close), its first return is
+    zero, and its level starts from its own first unadjusted close; an
+    unknown-gap roll's return is zeroed and a known-gap one kept."""
+    end = date(2019, 6, 3)
+    with ll.lake_session():
+        rolled = _agree(ab, "load_futures_price_history_from_lakehouse", ["CL=F", "NG=F"],
+                        _CL_ROLL_BEFORE_START, end)  # fmt: skip
+        later = _agree(ab, "load_futures_price_history_from_lakehouse", ["CL=F"],
+                       date(2019, 3, 4), end)  # fmt: skip
+        assert _agree(ab, "load_futures_price_history_from_lakehouse", ["ZZ=F"],
+                      _CL_ROLL_BEFORE_START, end) is None  # fmt: skip
+    first = rolled["CL=F"].iloc[0]
+    assert first["roll"] == 1.0
+    assert later["CL=F"]["roll"].iloc[0] == 0.0
+    assert rolled["CL=F"]["log_return"].isna().iloc[0]
+    assert first["close"] == first["raw_close"]
+    assert later["CL=F"]["close"].iloc[0] == later["CL=F"]["raw_close"].iloc[0]
+    unknown_gap = rolled["CL=F"].loc[pd.Timestamp(2019, 4, 10)]
+    known_gap = rolled["CL=F"].loc[pd.Timestamp(2019, 5, 15)]
+    assert unknown_gap["log_return"] == 0.0 and unknown_gap["roll"] == 1.0
+    assert known_gap["log_return"] > 0.0 and known_gap["roll"] == 1.0
+    assert list(rolled.columns.get_level_values(0).unique()) == ["CL=F", "NG=F"]
+
+
+def test_policy_rates_read_the_lookback_before_start(ab: ModuleType, ab_lake: Any) -> None:
+    """A Saturday start still sees the rate observed on the Friday before
+    it; a currency with no observations is an all-NaN column; monthly and
+    other-dataflow rows are never read."""
+    with ll.lake_session():
+        rates = _agree(ab, "load_policy_rates_from_lakehouse", ["USD", "EUR", "JPY"],
+                       date(2019, 3, 2), date(2019, 3, 8))  # fmt: skip
+        assert _agree(ab, "load_policy_rates_from_lakehouse", ["JPY"], date(2019, 3, 2),
+                      date(2019, 3, 8)) is None  # fmt: skip
+    assert list(rates.columns) == ["USD", "EUR", "JPY"]
+    assert rates.index[0] < pd.Timestamp(2019, 3, 2)
+    assert rates["JPY"].isna().all()
+    assert (rates["USD"] == 0.025).all()
+
+
 def test_no_rows_is_none_on_every_path(ab: ModuleType, ab_lake: Any) -> None:
     with ll.lake_session():
         for loader, args in (
@@ -1032,35 +1142,112 @@ def test_compare_is_exact(ab: ModuleType) -> None:
     )
 
 
-def test_compare_passes_counts_mismatches_per_path(ab: ModuleType) -> None:
-    window = ll.LoaderWindow(start=date(2019, 1, 1), end=date(2019, 2, 1))
-    calls = [
-        ab.LoaderCall(loader="load_x", args=("A",), day=date(2019, 1, 2)),
-        ab.LoaderCall(loader="load_x", args=("B",), day=date(2019, 1, 3)),
+def _short_interest(*rows: tuple[str, int]) -> pd.DataFrame:
+    """A short-interest answer, one row per `(settlement_date, shares)`."""
+    return pd.DataFrame(
+        {
+            "settlement_date": pd.to_datetime([day for day, _ in rows]),
+            "short_interest_shares": [shares for _, shares in rows],
+        }
+    )
+
+
+_SHORT_INTEREST = "load_short_interest_from_lakehouse"
+
+
+def test_trace_tie_accepts_rows_reordered_or_picked_within_a_tie(ab: ModuleType) -> None:
+    columns = ab.TIE_COLUMNS[_SHORT_INTEREST]
+    legacy = _short_interest(("2019-01-15", 1), ("2019-01-15", 2), ("2019-01-31", 3))
+    swapped = _short_interest(("2019-01-15", 2), ("2019-01-15", 1), ("2019-01-31", 3))
+    assert ab.trace_tie(legacy, swapped, columns) is None
+    # No ORDER BY at all: every row ties, so any equal-shaped difference traces.
+    assert ab.trace_tie(0.5, 0.5000000000000001, ()) is None
+
+
+def test_trace_tie_rejects_a_difference_outside_a_tie(ab: ModuleType) -> None:
+    columns = ab.TIE_COLUMNS[_SHORT_INTEREST]
+    legacy = _short_interest(("2019-01-15", 1), ("2019-01-31", 3))
+    changed = _short_interest(("2019-01-15", 1), ("2019-01-31", 4))
+    reordered = _short_interest(("2019-01-31", 3), ("2019-01-15", 1))
+    assert ab.trace_tie(legacy, legacy, columns) is None
+    assert ab.trace_tie(legacy, changed, columns) is None  # same key: a picked tie
+    assert "ORDER BY column 'settlement_date'" in ab.trace_tie(legacy, reordered, columns)
+    assert "row count" in ab.trace_tie(legacy, legacy.iloc[:1], columns)
+    assert ab.trace_tie(legacy, None, columns) is not None
+    assert ab.trace_tie(1.0, 2.0, None) is not None
+    dividends = pd.Series([0.2, 0.3], index=pd.to_datetime(["2019-02-08", "2019-05-08"]))
+    shifted = pd.Series([0.2, 0.3], index=pd.to_datetime(["2019-02-08", "2019-05-09"]))
+    assert ab.trace_tie(dividends, shifted, ab.TIE_COLUMNS["load_dividends_from_lakehouse"])
+
+
+def _pass(ab: ModuleType, path: str, outputs: list[Any]) -> Any:
+    counted = "store" if path == "store" else "direct"
+    return ab.PassResult(
+        path=path,
+        outputs=outputs,
+        registry=[],
+        counts=[ll.LoaderQueryCount(loader=_SHORT_INTEREST, path=counted, calls=len(outputs),
+                                    queries=len(outputs))],
+        seconds={_SHORT_INTEREST: 0.1},
+    )  # fmt: skip
+
+
+def test_a_tie_difference_passes_only_where_the_reference_varies_too(ab: ModuleType) -> None:
+    window = ll.LoaderWindow(start=date(2019, 1, 1), end=date(2019, 2, 28))
+    days = [date(2019, 2, 1), date(2019, 2, 4)]
+    calls = [ab.LoaderCall(loader=_SHORT_INTEREST, args=("AAA", day), day=day) for day in days]
+    tied = _short_interest(("2019-01-15", 1), ("2019-01-15", 2))
+    swapped = _short_interest(("2019-01-15", 2), ("2019-01-15", 1))
+
+    varies = {
+        "legacy": _pass(ab, "legacy", [tied, tied]),
+        "legacy_repeat": _pass(ab, "legacy_repeat", [swapped, swapped]),
+        "direct": _pass(ab, "direct", [tied, swapped]),
+        "store": _pass(ab, "store", [swapped, swapped]),
+    }
+    report = ab.compare_passes(calls, varies, window)
+    (summary,) = report.loaders
+    assert summary.verdict == "PASS" and report.verdict == "PASS"
+    assert summary.legacy_self_mismatches == 2
+    assert summary.mismatches == {"direct": 1, "store": 2}
+    assert summary.allowed == {"direct": 1, "store": 2}
+    assert [(tie.path, tie.key, tie.count) for tie in report.allowed_ties] == [
+        ("direct", "('AAA',)", 1),
+        ("store", "('AAA',)", 2),
     ]
 
-    def result(path: str, outputs: list[Any], queries: int) -> Any:
-        return ab.PassResult(
-            path=path,
-            outputs=outputs,
-            registry=[],
-            counts=[ll.LoaderQueryCount(loader="load_x", path="direct" if path != "store"
-                                        else "store", calls=2, queries=queries)],
-            seconds={"load_x": 0.5},
-        )  # fmt: skip
+    stable = {**varies, "legacy_repeat": _pass(ab, "legacy_repeat", [tied, tied])}
+    report = ab.compare_passes(calls, stable, window)
+    assert report.loaders[0].verdict == "FAIL" and report.verdict == "FAIL"
+    assert report.allowed_ties == []
+    assert all(not m.legacy_varies and m.tie is None for m in report.mismatches)
 
+
+def test_a_difference_that_is_not_a_tie_fails_even_where_the_reference_varies(
+    ab: ModuleType,
+) -> None:
+    window = ll.LoaderWindow(start=date(2019, 1, 1), end=date(2019, 2, 28))
+    calls = [ab.LoaderCall(loader=_SHORT_INTEREST, args=("AAA", _DAYS[0]), day=_DAYS[0])]
+    legacy = _short_interest(("2019-01-15", 1), ("2019-01-31", 3))
     passes = {
-        "legacy": result("legacy", [1.0, None], 2),
-        "direct": result("direct", [1.0, None], 2),
-        "store": result("store", [1.0, 2.0], 1),
+        "legacy": _pass(ab, "legacy", [legacy]),
+        "legacy_repeat": _pass(ab, "legacy_repeat", [legacy.iloc[::-1].reset_index(drop=True)]),
+        "direct": _pass(ab, "direct", [legacy]),
+        "store": _pass(ab, "store", [_short_interest(("2019-01-15", 1), ("2019-02-15", 3))]),
     }
     report = ab.compare_passes(calls, passes, window)
-    assert not report.ok
-    (summary,) = report.loaders
-    assert summary.calls == 2
-    assert summary.mismatches == {"direct": 0, "store": 1}
-    assert summary.queries == {"legacy": 2, "direct": 2, "store": 1}
-    assert [m.path for m in report.mismatches] == ["store"]
+    (mismatch,) = report.mismatches
+    assert mismatch.legacy_varies and mismatch.tie is not None and not mismatch.allowed
+    assert report.verdict == "FAIL"
+    assert report.loaders[0].queries == {"legacy": 1, "legacy_repeat": 1, "direct": 1, "store": 1}
+
+
+def test_a_float_only_difference_is_flagged(ab: ModuleType) -> None:
+    call = ab.LoaderCall(loader="split_adjustment_factor", args=("SPY", _DAYS[0]), day=_DAYS[0])
+    mismatch = ab.judge(call, "store", 1.0 / 3.0, 1.0 / 3.0, (1.0 / 1.5) / 2.0 + 1e-16)
+    assert mismatch is not None and mismatch.float_only
+    assert not mismatch.legacy_varies and not mismatch.allowed
+    assert ab.judge(call, "store", 0.5, 0.5, 0.5) is None
 
 
 def test_backtest_comparison_reads_the_result_and_counts(ab: ModuleType) -> None:

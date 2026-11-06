@@ -211,7 +211,7 @@ _LOADER_STORE_HELP = (
 LOADER_QUERY_COUNTS_PREFIX = "loader-query-counts "
 
 
-def _declare_run_window(enabled: bool, start: date, end: date) -> None:
+def declare_run_window(enabled: bool, start: date, end: date) -> None:
     """Resets the loader query counts and, when `enabled`, declares the
     open session's window store from `start` (the first day minus the
     warm-up) to `end` (the last day)."""
@@ -220,7 +220,7 @@ def _declare_run_window(enabled: bool, start: date, end: date) -> None:
         declare_loader_window(start, end)
 
 
-def _echo_loader_query_counts() -> None:
+def echo_loader_query_counts() -> None:
     """Writes one stderr line: `LOADER_QUERY_COUNTS_PREFIX` and the JSON
     list of `loader_query_counts()`."""
     counts = [count.model_dump() for count in loader_query_counts()]
@@ -464,7 +464,7 @@ def run(
     )
     with lake_session(requested_lake_time) as session:
         logger.info("Reading the lake at lake time %s", session.lake_time.isoformat())
-        _declare_run_window(
+        declare_run_window(
             loader_store,
             parsed_start_date - timedelta(days=DEFAULT_BACKTEST_WARMUP_DAYS),
             parsed_end_date,
@@ -535,7 +535,7 @@ def run(
             )
             raise
         verify_rebuilt_whole_builds()
-        _echo_loader_query_counts()
+        echo_loader_query_counts()
         typer.echo(
             json.dumps(
                 {
@@ -691,7 +691,7 @@ def experiment(
     )
     with lake_session(requested_lake_time) as session:
         typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
-        _declare_run_window(
+        declare_run_window(
             loader_store, parsed_train_start - timedelta(days=warmup_days), parsed_test_end
         )
         analysts = resolve_roster_after_preflight(
@@ -887,7 +887,7 @@ def experiment(
                     mode="json"
                 )
         verify_rebuilt_whole_builds()
-        _echo_loader_query_counts()
+        echo_loader_query_counts()
         typer.echo(
             json.dumps(
                 {

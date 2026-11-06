@@ -1,7 +1,7 @@
 # at126_legacy.py
 
 """The per-call loaders as they stood before the window store (dev at
-fda9a5e), kept as the reference `at126_ab.py` compares the new paths
+c6b479a), kept as the reference `at126_ab.py` compares the new paths
 against: every function here sends its own query for each call, with
 the SQL, post-query steps and return shapes of that commit. They call the
 loader module's shared internals (`_table_sql`, `_query`, the guards and
@@ -13,13 +13,14 @@ this module with `at126_ab.py` once the A/B has passed on the live lake.
 
 Each `legacy_<loader>` takes the arguments of the public loader of the
 same name (without `load_` and `_from_lakehouse`) and returns what that
-loader returned at fda9a5e."""
+loader returned at c6b479a."""
 
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 
+from agentic_trading.data.instruments import futures_root
 from agentic_trading.data.loaders import lakehouse_loader as ll
 from agentic_trading.data.point_in_time import assert_point_in_time
 from agentic_trading.data.trading_calendar import is_session, next_session
@@ -662,8 +663,132 @@ def legacy_insider_transactions(ticker: str, as_of_date: date) -> pd.DataFrame |
     return frame
 
 
+def legacy_futures_price_history(tickers: list[str], start: date, end: date) -> pd.DataFrame | None:
+    ll._guard_data_end(end, "load_futures_price_history_from_lakehouse")
+    ticker_by_root: dict[str, str] = {}
+    for ticker in tickers:
+        root = futures_root(ticker)
+        if root is None:
+            raise ValueError(f"{ticker} is not a futures ticker")
+        ticker_by_root[root] = ticker
+    placeholders = ", ".join("?" for _ in ticker_by_root)
+    query = f"""
+        SELECT root, date, front_contract, unadjusted_close, ratio_adjusted_close,
+               is_roll_day, roll_gap_known
+        FROM (
+            SELECT root, date, front_contract, unadjusted_close, ratio_adjusted_close,
+                   is_roll_day, roll_gap_known,
+                   max(CASE WHEN date < ? AND ratio_adjusted_close > 0 THEN date END)
+                       OVER (PARTITION BY root) AS previous_kept
+            FROM {ll._table_sql("futures_continuous_daily")}
+            WHERE root IN ({placeholders})
+              AND date <= ?
+        ) AS daily
+        WHERE date >= COALESCE(previous_kept, ?)
+        ORDER BY root, date
+    """
+    frame = ll._query(
+        query, [start.isoformat(), *ticker_by_root, end.isoformat(), start.isoformat()]
+    )
+    if frame.empty:
+        return None
+    frame["date"] = pd.to_datetime(frame["date"])
+
+    per_ticker: dict[str, pd.DataFrame] = {}
+    for lake_root, group in frame.groupby("root", sort=True):
+        adjusted_all = group["ratio_adjusted_close"].astype(float)
+        kept = (adjusted_all > 0.0).to_numpy(dtype=bool)
+        unknown_gap = group["is_roll_day"].eq(True).to_numpy(dtype=bool) & group[
+            "roll_gap_known"
+        ].eq(False).fillna(False).to_numpy(dtype=bool)
+        unknown_gaps_so_far = np.cumsum(unknown_gap)[kept]
+        bars = group.loc[kept]
+        adjusted = adjusted_all.to_numpy(dtype=np.float64)[kept]
+        daily = np.zeros(len(adjusted))
+        daily[1:] = adjusted[1:] / adjusted[:-1] - 1.0
+        daily[1:][np.diff(unknown_gaps_so_far) > 0] = 0.0
+        fronts = bars["front_contract"]
+        previous_fronts = fronts.shift(1)
+        roll = fronts.ne(previous_fronts) & fronts.notna() & previous_fronts.notna()
+
+        in_range = (bars["date"] >= pd.Timestamp(start)).to_numpy(dtype=bool)
+        if not in_range.any():
+            continue
+        bars = bars.loc[in_range]
+        daily = daily[in_range]
+        daily[0] = 0.0
+        index = pd.DatetimeIndex(bars["date"])
+        unadjusted = bars["unadjusted_close"].astype(float)
+        unadjusted = unadjusted.where(unadjusted > 0.0)
+        first_adjusted = float(adjusted[in_range][0])
+        base = float(unadjusted.iloc[0]) if pd.notna(unadjusted.iloc[0]) else first_adjusted
+        close = pd.Series(base * np.cumprod(1.0 + daily), index=index)
+        per_ticker[ticker_by_root[str(lake_root)]] = pd.DataFrame(
+            {
+                "open": close,
+                "close": close,
+                "raw_close": unadjusted.to_numpy(),
+                "volume": np.nan,
+                "log_return": np.log(close / close.shift(1)),
+                "roll": roll.loc[in_range].astype(float).to_numpy(),
+            },
+            index=index,
+        )
+
+    if not per_ticker:
+        return None
+    combined = pd.concat(per_ticker, axis=1)
+    assert_point_in_time(combined, end)
+    return combined
+
+
+def legacy_policy_rates(currencies: list[str], start: date, end: date) -> pd.DataFrame | None:
+    ll._guard_data_end(end, "load_policy_rates_from_lakehouse")
+    wanted = list(dict.fromkeys(currencies))
+    currency_by_area: dict[str, str] = {}
+    for currency in wanted:
+        area = ll._BIS_POLICY_RATE_AREAS.get(currency)
+        if area is None:
+            raise ValueError(f"no BIS policy-rate reference area for currency {currency}")
+        currency_by_area[area] = currency
+    placeholders = ", ".join("?" for _ in currency_by_area)
+    query = f"""
+        SELECT ref_area, date, value
+        FROM {ll._table_sql("bis_observations")}
+        WHERE dataflow = ?
+          AND freq = ?
+          AND ref_area IN ({placeholders})
+          AND date BETWEEN ? AND ?
+          AND value IS NOT NULL
+        ORDER BY date, ref_area
+    """
+    window_start = start - timedelta(days=ll.POLICY_RATE_LOOKBACK_DAYS)
+    frame = ll._query(
+        query,
+        [
+            ll._BIS_POLICY_RATE_DATAFLOW,
+            ll._BIS_DAILY,
+            *currency_by_area,
+            window_start.isoformat(),
+            end.isoformat(),
+        ],
+    )
+    if frame.empty:
+        return None
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame["currency"] = frame["ref_area"].map(currency_by_area)
+    rates = frame.pivot(index="date", columns="currency", values="value").astype(float) / 100.0
+    rates = rates.reindex(columns=wanted).sort_index()
+    rates.index.name = "date"
+    rates.columns.name = None
+    assert_point_in_time(rates, end)
+    return rates
+
+
 # Each public loader's name and its frozen per-call reference.
 LEGACY_LOADERS = {
+    "load_futures_price_history_from_lakehouse": legacy_futures_price_history,
+    "load_policy_rates_from_lakehouse": legacy_policy_rates,
     "load_sp500_member_securities_asof": legacy_sp500_member_securities_asof,
     "load_security_log_returns": legacy_security_log_returns,
     "load_security_daily_bars": legacy_security_daily_bars,
