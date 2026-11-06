@@ -427,7 +427,8 @@ class AnalystConfig(BaseModel):
     vol_jump_threshold: float = Field(default=1.5, gt=1.0)
     # VIX z-score that maps to full hedge confidence (policy choice).
     vix_zscore_full_confidence: float = Field(default=3.0, gt=0.0)
-    # One trading year of VIX history for its own z-score baseline.
+    # One trading year of VIX history, counted in NYSE sessions, for its own
+    # z-score baseline.
     vix_lookback_days: int = Field(default=252, ge=2)
     # Below this much VIX history the hedge stays flat rather than guessing.
     min_vix_observations: int = Field(default=30, ge=2)
