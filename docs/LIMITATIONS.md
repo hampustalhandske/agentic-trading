@@ -74,7 +74,10 @@ Per source, as coded:
 - **SEC company facts and Form 4 insider transactions**: usable from the
   next NYSE session after the later of the filed date and the ET date of
   EDGAR's acceptance time (after the filed date when there is no
-  acceptance time), so a filing accepted before the close loses a day
+  acceptance time). A filing usable at the close of the session it
+  became public in therefore costs one session: one accepted before the
+  close loses its acceptance day, and a 10-Q or 10-K accepted after
+  17:30 ET, which EDGAR dates to the next business day, loses that day
   (AT-9, AT-133). Both read
   the lake's `_log` views with a local de-duplication (AT-10, AT-11). A
   fiscal Q4 is derived as the annual value minus three discrete quarters,

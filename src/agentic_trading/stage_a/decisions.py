@@ -47,9 +47,12 @@ SOURCES: dict[str, bool] = {
     "ken_french_factors": False,
     # Option chains: end-of-day snapshots taken at the 16:00 ET close of their session.
     "options_chain": False,
-    # SEC EDGAR company facts: filings are accepted until 22:00 ET on their filed date.
+    # SEC EDGAR company facts: EDGAR accepts filings after the 16:00 ET close (Forms
+    # 3/4/5 until 22:00 ET on their filed date; other forms accepted after 17:30 ET are
+    # dated the next business day).
     "sec_edgar_facts": True,
-    # SEC Form 4 insider transactions: accepted until 22:00 ET on their filed date.
+    # SEC Form 4 insider transactions: EDGAR accepts Forms 3/4/5 after the 16:00 ET close,
+    # until 22:00 ET on their filed date.
     "sec_insider_transactions": True,
     # S&P 500 membership: changes are announced days before their effective date.
     "sp500_membership": False,

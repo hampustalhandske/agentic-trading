@@ -13,10 +13,16 @@ this module with `at126_ab.py` once the A/B has passed on the live lake.
 
 Each `legacy_<loader>` takes the arguments of the public loader of the
 same name (without `load_` and `_from_lakehouse`) and returns what that
-loader returned at c6b479a, with two exceptions in the security-bar
-references (`_legacy_adjusted_security_bars`), which match the loaders:
-a bar's raw price is this module's `SECURITY_RAW_PRICE_SQL`, and its
-`volume` is divided by the bar's `cum_factor`."""
+loader returned at c6b479a, with these exceptions, which match the
+loaders: in the security-bar references (`_legacy_adjusted_security_bars`)
+a bar's raw price is this module's `SECURITY_RAW_PRICE_SQL` and its
+`volume` is divided by the bar's `cum_factor`; the SEC references
+(`legacy_company_facts`, `legacy_insider_transactions`) set
+`available_date` with the loader module's shared `_sec_available_dates`
+(the next NYSE session after the later of the filed date and the New
+York date of the EDGAR acceptance), and `legacy_company_facts` keeps,
+per period, the latest filed row known by the decision day (ties: the
+latest `available_date`, then the latest acceptance)."""
 
 from datetime import date, timedelta
 
@@ -586,12 +592,14 @@ def legacy_company_facts(ticker: str, as_of_date: date) -> pd.DataFrame | None:
     frame["period_start"] = pd.to_datetime(frame["period_start"])
     frame["period_end"] = pd.to_datetime(frame["period_end"])
     frame["available_date"] = ll._sec_available_dates(frame["filed"], frame["accepted_at"])
-    frame = frame[frame["available_date"] <= pd.Timestamp(as_of_date)].drop(columns="accepted_at")
+    frame = frame[frame["available_date"] <= pd.Timestamp(as_of_date)]
     if frame.empty:
         return None
     frame = (
-        frame.sort_values(["available_date", "filed"], kind="stable")
+        frame.assign(accepted_at=pd.to_datetime(frame["accepted_at"], utc=True))
+        .sort_values(["filed", "available_date", "accepted_at"], kind="stable")
         .drop_duplicates(subset=ll._COMPANY_FACT_PERIOD_KEY, keep="last")
+        .drop(columns="accepted_at")
         .sort_values(["filed", "period_end"], kind="stable")
         .reset_index(drop=True)
     )

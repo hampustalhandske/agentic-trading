@@ -3230,12 +3230,12 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     acceptance time in `sec_filings` (`_sec_acceptance_query`), as
     `_sec_available_dates` sets it, so a filing is never usable on the
     day it is filed; only rows with `available_date <= as_of_date` are
-    kept. Of
-    those, each (`concept`, `unit`, `period_start`, `period_end`) keeps
-    the row with the latest `available_date`, ties broken by the latest
-    `filed`, then the latest EDGAR acceptance; the query sorts on every
-    column it returns, so which of two tied rows is kept never depends on
-    the order the lake stores them in.
+    kept. Of those, each (`concept`, `unit`, `period_start`,
+    `period_end`) keeps the latest filing known by `as_of_date`: the row
+    with the latest `filed`, ties broken by the latest `available_date`,
+    then the latest EDGAR acceptance; the query sorts on every column it
+    returns, so which of two tied rows is kept never depends on the order
+    the lake stores them in.
     Returns `None` if no rows remain. Self-asserts point-in-time on
     `filed` (the SQL gate) and on `available_date` before returning."""
     _guard_data_end(as_of_date, "load_company_facts_from_lakehouse")
@@ -3287,12 +3287,14 @@ def _select_company_facts(facts: pd.DataFrame, as_of_date: date) -> pd.DataFrame
     frame["period_start"] = pd.to_datetime(frame["period_start"])
     frame["period_end"] = pd.to_datetime(frame["period_end"])
     frame["available_date"] = _sec_available_dates(frame["filed"], frame["accepted_at"])
-    frame = frame[frame["available_date"] <= pd.Timestamp(as_of_date)].drop(columns="accepted_at")
+    frame = frame[frame["available_date"] <= pd.Timestamp(as_of_date)]
     if frame.empty:
         return None
     frame = (
-        frame.sort_values(["available_date", "filed"], kind="stable")
+        frame.assign(accepted_at=pd.to_datetime(frame["accepted_at"], utc=True))
+        .sort_values(["filed", "available_date", "accepted_at"], kind="stable")
         .drop_duplicates(subset=_COMPANY_FACT_PERIOD_KEY, keep="last")
+        .drop(columns="accepted_at")
         .sort_values(["filed", "period_end"], kind="stable")
         .reset_index(drop=True)
     )
@@ -3325,7 +3327,7 @@ def _sec_available_dates(filed: pd.Series, accepted_at: pd.Series) -> pd.Series:
     the filed date when `accepted_at` is missing. A filing is therefore
     never known on the day it is filed, as for every source that can
     publish after the close. Returns a datetime64 series aligned with
-    `filed`."""
+    `filed`, at the resolution of `filed`."""
     filed_days = pd.to_datetime(filed).dt.normalize()
     accepted_days = (
         pd.to_datetime(accepted_at, utc=True)
@@ -3334,7 +3336,11 @@ def _sec_available_dates(filed: pd.Series, accepted_at: pd.Series) -> pd.Series:
         .dt.normalize()
     )
     known_from = filed_days.where(~(accepted_days > filed_days), accepted_days)
-    return pd.to_datetime(known_from.map(lambda day: pd.Timestamp(next_session(day.date()))))
+    available = pd.to_datetime(
+        known_from.map(lambda day: pd.Timestamp(next_session(day.date())))
+    ).astype(filed_days.dtype)
+    assert available.dtype == filed_days.dtype
+    return available
 
 
 # FINRA publishes short interest about seven business days after the

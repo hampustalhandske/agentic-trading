@@ -869,8 +869,11 @@ def coverage(calls: Sequence[LoaderCall], outputs: Sequence[Any]) -> dict[str, b
       previous call day;
     - `fred_revision`: a FRED vintage released more than 7 days after
       its observation date;
-    - `sec_filing_after_close`: a company fact or insider filing known
-      only after its filed date;
+    - `sec_filing_after_close`: a ticker with a company-facts or
+      insider-transactions reference answer that has a row known by its
+      last such call day whose EDGAR acceptance, read in New York, is at
+      or after the 16:00 close on its filed date or on a later date
+      (`sec_accepted_after_close`, one lake read per ticker and loader);
     - `spy_option_quote`: a quote of a SPY contract;
     - `missing_bar`: a price history, futures or bar answer in which a
       requested instrument has no close on the answer's last date."""
@@ -880,6 +883,7 @@ def coverage(calls: Sequence[LoaderCall], outputs: Sequence[Any]) -> dict[str, b
         False,
     )  # fmt: skip
     cot_rows: dict[str, int] = {}
+    sec_last_day: dict[tuple[str, str], date] = {}
     for call, output in zip(calls, outputs, strict=True):
         if output is None or isinstance(output, RaisedError):
             continue
@@ -913,16 +917,52 @@ def coverage(calls: Sequence[LoaderCall], outputs: Sequence[Any]) -> dict[str, b
         if name == "load_fred_vintages_from_lakehouse":
             lag = output["realtime_start"] - output.index.to_series()
             found["fred_revision"] |= bool((lag > pd.Timedelta(days=7)).any())
-        if name == "load_company_facts_from_lakehouse":
-            found["sec_filing_after_close"] |= bool(
-                (output["available_date"] > output["filed"]).any()
-            )
-        if name == "load_insider_transactions_from_lakehouse":
-            later = output["available_date"] > output["filed_date"]
-            found["sec_filing_after_close"] |= bool(later.any())
+        if name in _SEC_FILED_COLUMNS:
+            key = (name, str(call.args[0]))
+            sec_last_day[key] = max(call.day, sec_last_day.get(key, call.day))
         if name == "load_option_quote_from_lakehouse" and call.args[0] == "SPY":
             found["spy_option_quote"] = True
+    found["sec_filing_after_close"] = any(
+        sec_accepted_after_close(loader, ticker, day)
+        for (loader, ticker), day in sec_last_day.items()
+    )
     return found
+
+
+# The filed-date column of each SEC loader's fetched rows.
+_SEC_FILED_COLUMNS = {
+    "load_company_facts_from_lakehouse": "filed",
+    "load_insider_transactions_from_lakehouse": "filed_date",
+}
+# The NYSE close, as a time after midnight in New York.
+_NYSE_CLOSE = pd.Timedelta(hours=16)
+
+
+def sec_accepted_after_close(loader: str, ticker: str, day: date) -> bool:
+    """Whether `ticker` has an SEC row of `loader` (a key of
+    `_SEC_FILED_COLUMNS`) known by `day` whose EDGAR `accepted_at`, read
+    in New York, is at or after the 16:00 close on its filed date or on a
+    later date. Reads the rows with the loader's own fetch
+    (`_fetch_company_facts` or `_fetch_insider_transactions`, which keep
+    `accepted_at`) and gates them with `_sec_available_dates`; a missing
+    acceptance never counts."""
+    fetch = (
+        ll._fetch_company_facts
+        if loader == "load_company_facts_from_lakehouse"
+        else ll._fetch_insider_transactions
+    )
+    rows = fetch([ticker], day, day)[ticker]
+    if rows.empty:
+        return False
+    filed = pd.to_datetime(rows[_SEC_FILED_COLUMNS[loader]])
+    known = ll._sec_available_dates(filed, rows["accepted_at"]) <= pd.Timestamp(day)
+    accepted = (
+        pd.to_datetime(rows["accepted_at"], utc=True)
+        .dt.tz_convert(ll._DECISION_TIMEZONE)
+        .dt.tz_localize(None)
+    )
+    after_close = accepted >= filed.dt.normalize() + _NYSE_CLOSE
+    return bool((known & after_close).any())
 
 
 def run_loaders_ab(

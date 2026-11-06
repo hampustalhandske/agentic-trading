@@ -1290,7 +1290,21 @@ def test_an_unexercised_stored_loader_fails_the_verdict(ab: ModuleType) -> None:
     assert set(ab.STORED_LOADERS) == set(ab.TIE_COLUMNS)
 
 
-def test_coverage_finds_each_firm_v1_event(ab: ModuleType) -> None:
+def _sec_fetch(filed: str, accepted_ny: str | None, filed_column: str = "filed") -> Any:
+    """A stand-in for an SEC `_fetch_*` function returning one row filed on `filed` and
+    accepted at `accepted_ny` (America/New_York, or missing)."""
+    accepted = None if accepted_ny is None else pd.Timestamp(accepted_ny, tz="America/New_York")
+    frame = pd.DataFrame(
+        {
+            filed_column: [pd.Timestamp(filed)],
+            "accepted_at": pd.Series([accepted], dtype="datetime64[ns, UTC]"),
+        }
+    )
+    return lambda tickers, _start, _end: {ticker: frame for ticker in tickers}
+
+
+def test_coverage_finds_each_firm_v1_event(ab: ModuleType, monkeypatch) -> None:
+    monkeypatch.setattr(ll, "_fetch_company_facts", _sec_fetch("2017-07-27", "2017-07-27 16:05"))
     day = date(2017, 8, 1)
     index = pd.DatetimeIndex([pd.Timestamp(2017, 7, 31), pd.Timestamp(day)], name="date")
     futures = pd.concat(
@@ -1332,6 +1346,43 @@ def test_coverage_finds_each_firm_v1_event(ab: ModuleType) -> None:
         True,
     )  # fmt: skip
     assert not any(ab.coverage(calls, [None] * len(calls)).values())
+
+
+@pytest.mark.parametrize(
+    ("filed", "accepted_ny", "day", "expected"),
+    [
+        ("2017-07-27", "2017-07-27 15:59", date(2017, 8, 1), False),
+        ("2017-07-27", "2017-07-27 16:00", date(2017, 8, 1), True),
+        ("2017-07-27", "2017-07-28 09:00", date(2017, 8, 1), True),
+        ("2017-07-27", None, date(2017, 8, 1), False),
+        ("2017-07-27", "2017-07-27 18:00", date(2017, 7, 27), False),
+    ],
+    ids=["pre-close", "at-close", "later-date", "missing", "not-yet-known"],
+)
+@pytest.mark.parametrize(
+    ("loader", "fetch", "filed_column"),
+    [
+        ("load_company_facts_from_lakehouse", "_fetch_company_facts", "filed"),
+        ("load_insider_transactions_from_lakehouse", "_fetch_insider_transactions", "filed_date"),
+    ],
+    ids=["facts", "insiders"],
+)
+def test_sec_accepted_after_close_reads_ny_acceptance_against_the_close(
+    ab: ModuleType,
+    monkeypatch,
+    loader: str,
+    fetch: str,
+    filed_column: str,
+    filed: str,
+    accepted_ny: str | None,
+    day: date,
+    expected: bool,
+) -> None:
+    """A row counts when it is known by the day and EDGAR accepted it at or after 16:00 New
+    York time on its filed date or on a later date."""
+    monkeypatch.setattr(ll, fetch, _sec_fetch(filed, accepted_ny, filed_column))
+
+    assert ab.sec_accepted_after_close(loader, "AAA", day) is expected
 
 
 def test_firm_v1_days_lie_in_2010_to_2017_and_end_past_the_window(ab: ModuleType) -> None:

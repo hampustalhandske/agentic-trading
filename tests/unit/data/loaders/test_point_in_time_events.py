@@ -416,6 +416,10 @@ _NY = "America/New_York"
         ("2024-03-15", None, "2024-03-18"),
         ("2024-03-12", pd.Timestamp("2024-03-13 02:00", tz=_UTC), "2024-03-13"),
         ("2024-03-12", pd.Timestamp("2024-03-13 05:00", tz=_UTC), "2024-03-14"),
+        ("2024-01-16", pd.Timestamp("2024-01-17 04:30", tz=_UTC), "2024-01-17"),
+        ("2024-03-08", pd.Timestamp("2024-03-10 06:30", tz=_UTC), "2024-03-11"),
+        ("2024-11-01", pd.Timestamp("2024-11-03 05:30", tz=_UTC), "2024-11-04"),
+        ("2024-11-01", pd.Timestamp("2024-11-04 04:30", tz=_UTC), "2024-11-04"),
     ],
     ids=[
         "pre-close-on-filed-date",
@@ -429,6 +433,10 @@ _NY = "America/New_York"
         "missing-acceptance-friday",
         "utc-next-day-is-ny-filed-date",
         "utc-next-day-is-ny-next-day",
+        "winter-utc-next-day-is-est-filed-date",
+        "dst-start-day",
+        "dst-end-day",
+        "first-est-night-after-dst-end",
     ],
 )
 def test_sec_available_dates_is_session_after_later_of_filed_and_ny_acceptance(
@@ -453,6 +461,18 @@ def test_sec_available_dates_keeps_filed_index_and_mixes_missing_acceptance() ->
     result = lakehouse_loader._sec_available_dates(filed, accepted)
 
     assert list(result.index) == [7, 3]
+    assert list(result) == [pd.Timestamp("2024-03-13"), pd.Timestamp("2024-03-18")]
+
+
+@pytest.mark.parametrize("unit", ["ns", "us", "s"])
+def test_sec_available_dates_keeps_the_resolution_of_filed(unit: str) -> None:
+    """The result has the datetime64 resolution of `filed`."""
+    filed = pd.Series(pd.to_datetime(["2024-03-12", "2024-03-15"]).as_unit(unit))
+    accepted = pd.Series([pd.Timestamp("2024-03-12 21:30", tz=_UTC), None])
+
+    result = lakehouse_loader._sec_available_dates(filed, accepted)
+
+    assert result.dtype == filed.dtype
     assert list(result) == [pd.Timestamp("2024-03-13"), pd.Timestamp("2024-03-18")]
 
 
@@ -527,3 +547,42 @@ def test_select_company_facts_excludes_filed_date_includes_next_session(
     assert result is not None
     assert list(result["available_date"]) == [pd.Timestamp("2024-03-13")]
     assert "accepted_at" not in result.columns
+
+
+def _restated_fact_frame() -> pd.DataFrame:
+    """Two `_fetch_company_facts` rows of one period, in fetch order (`filed` first): Y, filed
+    2024-03-12 but accepted 2024-03-20 10:00 ET (value 100), and X, filed and accepted
+    2024-03-15 10:00 ET (value 200)."""
+    y = _fetched_fact_frame(pd.Timestamp("2024-03-20 10:00", tz=_NY).tz_convert(_UTC))
+    x = _fetched_fact_frame(pd.Timestamp("2024-03-15 10:00", tz=_NY).tz_convert(_UTC))
+    y["value"] = 100.0
+    x["value"] = 200.0
+    x["filed"] = pd.Timestamp("2024-03-15")
+    return pd.concat([y, x], ignore_index=True)
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["fetch-order", "reversed"])
+def test_select_company_facts_keeps_latest_filed_known_row_per_period(reverse: bool) -> None:
+    """At 2024-03-22 both rows are known (Y from 2024-03-21, X from 2024-03-18); X, the later
+    filing, is kept although Y became available later."""
+    frame = _restated_fact_frame()
+    if reverse:
+        frame = frame.iloc[::-1].reset_index(drop=True)
+
+    result = lakehouse_loader._select_company_facts(frame, date(2024, 3, 22))
+
+    assert result is not None
+    assert list(result["value"]) == [200.0]
+    assert list(result["filed"]) == [pd.Timestamp("2024-03-15")]
+    assert list(result["available_date"]) == [pd.Timestamp("2024-03-18")]
+
+
+def test_select_company_facts_keeps_known_row_before_restatement_is_available() -> None:
+    """At 2024-03-20 only X is known; at 2024-03-15 neither is."""
+    frame = _restated_fact_frame()
+
+    assert lakehouse_loader._select_company_facts(frame, date(2024, 3, 15)) is None
+    result = lakehouse_loader._select_company_facts(frame, date(2024, 3, 20))
+
+    assert result is not None
+    assert list(result["value"]) == [200.0]

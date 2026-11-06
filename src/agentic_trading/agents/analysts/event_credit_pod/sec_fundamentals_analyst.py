@@ -43,12 +43,13 @@ def discrete_quarters(facts: pd.DataFrame, concept: str) -> pd.DataFrame:
     minus the three discrete quarters lying inside the annual period —
     only when exactly three do. A derived row takes the annual fact's
     `period_end` and `filed`. When several facts of one kind end on the
-    same day, the latest available one (ties: latest filed) is used.
+    same day, the latest filed one (ties: latest available) is used, so
+    the latest filing known at the decision date wins.
 
     Returns columns `period_end`, `value`, `filed`, sorted by
     `period_end`; empty when `concept` has no quarters."""
     rows = facts.loc[facts["concept"] == concept]
-    rows = rows.sort_values(["available_date", "filed"], kind="stable")
+    rows = rows.sort_values(["filed", "available_date"], kind="stable")
     span_days = (rows["period_end"] - rows["period_start"]).dt.days
     quarters = rows.loc[span_days.between(_QUARTER_MIN_DAYS, _QUARTER_MAX_DAYS)]
     quarters = quarters.drop_duplicates(subset="period_end", keep="last")
