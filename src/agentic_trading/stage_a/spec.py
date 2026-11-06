@@ -104,13 +104,19 @@ class StageASpec(BaseModel):
         return self
 
 
+def canonical_json(payload: Any) -> str:
+    """`payload` serialized with sorted keys and no whitespace, non-JSON
+    values written through `str`, so dict key order never changes it."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def canonical_spec_json(spec: StageASpec) -> str:
     """`spec`'s canonical JSON: its JSON-mode dump with `universe` sorted,
-    serialized with sorted keys and no whitespace, non-JSON values written
-    through `str`. Dict key order and instrument order never change it."""
+    through `canonical_json`. Dict key order and instrument order never
+    change it."""
     payload = spec.model_dump(mode="json")
     payload["universe"] = sorted(payload["universe"])
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return canonical_json(payload)
 
 
 def spec_hash(spec: StageASpec) -> str:
@@ -154,7 +160,7 @@ def build_spec(
         agent_id=analyst.agent_id,
         analyst_class=f"{cls.__module__}.{cls.__qualname__}",
         analyst_params=analyst.model_dump(mode="json"),
-        settings=_hashed_settings(RUNTIME_SETTINGS_FIELDS),
+        settings=hashed_settings(RUNTIME_SETTINGS_FIELDS),
         module_hashes=_module_hashes(cls.__module__),
         universe=list(universe),
         window_start=window_start,
@@ -164,7 +170,7 @@ def build_spec(
     )
 
 
-def _hashed_settings(runtime_fields: tuple[str, ...]) -> dict[str, Any]:
+def hashed_settings(runtime_fields: tuple[str, ...]) -> dict[str, Any]:
     """`settings` as JSON values with every dotted path in `runtime_fields`
     removed, and every group (or pod) left empty by the removal dropped
     too, so a group made only of runtime fields leaves no trace in the

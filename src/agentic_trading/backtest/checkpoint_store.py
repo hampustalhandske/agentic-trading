@@ -5,13 +5,18 @@
 Each simulated day appends exactly that day's new rows to eight tables
 (`track_record`, `decisions`, `trades`, `unfilled_orders`, `capital_usage`,
 `sizing_diagnostics`, `pod_returns`, `pod_cost_days`) via `INSERT` — O(1) per day, O(n)
-total for a run of length n — and keeps a single small `cursor` row (next
-day index, portfolio state, signal health, pending decisions, the
-Commander's serialized risk state, the lake time the run reads at, and
-the run's own config for `_restore_checkpoint`'s match-check) as the only
-thing overwritten each day, since that piece stays small regardless of
-run length. Mirrors the append-only idiom `data/db.py` uses for the fetch
-log."""
+total for a run of length n — and overwrites two things each day: a single
+small `cursor` row (next day index, portfolio state, signal health, pending
+decisions, the Commander's serialized risk state, the lake time the run
+reads at, and the run's own config for `_restore_checkpoint`'s
+match-check: dates, assets, settings fingerprint and roster fingerprint),
+and the `carried_state` table, one row per agent holding its
+`carried_state()` snapshot. Both hold one day's state, so their size does
+not grow with run length. Mirrors the append-only idiom `data/db.py` uses
+for the fetch log.
+
+A `carried_state` blob is a pickle: open with `connect` only checkpoint
+files this program wrote, never one from an untrusted source."""
 
 import json
 import sqlite3
@@ -105,7 +110,17 @@ CREATE TABLE IF NOT EXISTS cursor (
     commander_risk_state TEXT,
     total_financing_cost REAL NOT NULL DEFAULT 0.0,
     total_option_premium_paid REAL NOT NULL DEFAULT 0.0,
-    lake_time TEXT
+    lake_time TEXT,
+    settings_fingerprint TEXT,
+    roster_fingerprint TEXT
+)
+"""
+# One row per agent, rewritten each day: the agent's `carried_state()`
+# snapshot (a pickle) keyed by its agent_id.
+_CREATE_CARRIED_STATE = """
+CREATE TABLE IF NOT EXISTS carried_state (
+    agent_id TEXT PRIMARY KEY,
+    state BLOB NOT NULL
 )
 """
 # Columns added to a table after its first release, applied with `ALTER
@@ -118,6 +133,8 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("cursor", "total_financing_cost", "REAL NOT NULL DEFAULT 0.0"),
     ("cursor", "total_option_premium_paid", "REAL NOT NULL DEFAULT 0.0"),
     ("cursor", "lake_time", "TEXT"),
+    ("cursor", "settings_fingerprint", "TEXT"),
+    ("cursor", "roster_fingerprint", "TEXT"),
 )
 
 
@@ -147,6 +164,7 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
     connection.execute(_CREATE_POD_COST_DAYS)
     connection.execute(_CREATE_PORTFOLIO_VALUE)
     connection.execute(_CREATE_CURSOR)
+    connection.execute(_CREATE_CARRIED_STATE)
     _add_missing_columns(connection)
     if not resume:
         with connection:
@@ -160,6 +178,7 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
             connection.execute("DELETE FROM pod_cost_days")
             connection.execute("DELETE FROM portfolio_value")
             connection.execute("DELETE FROM cursor")
+            connection.execute("DELETE FROM carried_state")
     return connection
 
 
@@ -186,6 +205,9 @@ def append_day(
     new_pod_returns: list[tuple[str, date, float]] | None = None,
     pod_cost_day: PodCostDay | None = None,
     lake_time: datetime | None = None,
+    settings_fingerprint: str | None = None,
+    roster_fingerprint: str | None = None,
+    carried_states: dict[str, bytes] | None = None,
 ) -> None:
     """Appends exactly this simulated day's new rows — never touches a
     prior day's already-written rows — plus overwrites the single small
@@ -197,7 +219,11 @@ def append_day(
     `sizing_diagnostics` are the day's per-pod sizing diagnostics, in pod
     order. `new_pod_returns` are the (pod id, date, return) entries first seen
     this day. `pod_cost_day` is the day's pod contributions and the fill
-    costs charged to each pod."""
+    costs charged to each pod. `settings_fingerprint` and `roster_fingerprint`
+    are recorded with the dates and assets as the run's config, on the day
+    the cursor row is first written. `carried_states` is each agent's
+    `carried_state()` keyed by agent_id; when given it replaces every stored
+    snapshot, and when `None` the stored snapshots are left as they are."""
     with connection:
         connection.execute(
             "INSERT INTO portfolio_value (as_of_date, value) VALUES (?, ?)",
@@ -271,8 +297,9 @@ def append_day(
             INSERT INTO cursor
                 (id, next_day_index, start_date, end_date, assets, portfolio,
                  signal_health, pending_decisions, commander_risk_state,
-                 total_financing_cost, total_option_premium_paid, lake_time)
-            VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 total_financing_cost, total_option_premium_paid, lake_time,
+                 settings_fingerprint, roster_fingerprint)
+            VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 next_day_index = excluded.next_day_index,
                 portfolio = excluded.portfolio,
@@ -295,8 +322,16 @@ def append_day(
                 total_financing_cost,
                 total_option_premium_paid,
                 None if lake_time is None else lake_time.isoformat(),
+                settings_fingerprint,
+                roster_fingerprint,
             ),
         )
+        if carried_states is not None:
+            connection.execute("DELETE FROM carried_state")
+            connection.executemany(
+                "INSERT INTO carried_state (agent_id, state) VALUES (?, ?)",
+                sorted(carried_states.items()),
+            )
 
 
 def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
@@ -305,11 +340,15 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
     GUI's saved-run browser) needs — one read at startup, not per-day.
     Returns `None` if there's no cursor row yet (a fresh, never-checkpointed
     run). `lake_time` is the stored lake time as an aware `datetime`, or
-    `None` when the run read outside a lake session."""
+    `None` when the run read outside a lake session. `config` holds the
+    dates, the assets and the two fingerprints (`None` in a checkpoint
+    written without them). `carried_states` is each agent's stored
+    `carried_state()` snapshot keyed by agent_id, still pickled."""
     cursor_row = connection.execute(
         "SELECT next_day_index, start_date, end_date, assets, portfolio, "
         "signal_health, pending_decisions, commander_risk_state, total_financing_cost, "
-        "total_option_premium_paid, lake_time FROM cursor WHERE id = 0"
+        "total_option_premium_paid, lake_time, settings_fingerprint, roster_fingerprint "
+        "FROM cursor WHERE id = 0"
     ).fetchone()
     if cursor_row is None:
         return None
@@ -325,6 +364,8 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         total_financing_cost,
         total_option_premium_paid,
         lake_time,
+        settings_fingerprint,
+        roster_fingerprint,
     ) = cursor_row
 
     portfolio_value_history = [
@@ -391,12 +432,20 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         "SELECT pod_id, as_of_date, value FROM pod_returns ORDER BY as_of_date, rowid"
     ):
         pod_return_history.setdefault(pod_id, []).append((return_date, value))
+    carried_states = {
+        agent_id: bytes(state)
+        for agent_id, state in connection.execute(
+            "SELECT agent_id, state FROM carried_state ORDER BY agent_id"
+        )
+    }
     return {
         "next_day_index": next_day_index,
         "config": {
             "start_date": start_date,
             "end_date": end_date,
             "assets": json.loads(assets_json),
+            "settings_fingerprint": settings_fingerprint,
+            "roster_fingerprint": roster_fingerprint,
         },
         "portfolio": json.loads(portfolio_json),
         "signal_health": json.loads(signal_health_json),
@@ -416,6 +465,7 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         "pod_return_history": pod_return_history,
         "pod_cost_days": pod_cost_days,
         "portfolio_value_history": portfolio_value_history,
+        "carried_states": carried_states,
     }
 
 

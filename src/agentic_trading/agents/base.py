@@ -4,16 +4,20 @@
 Contains the abstract base classes for all agents in the system, both analysts and managers.
 """
 
+import copy
+import io
 import math
+import pickle
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from datetime import date
-from typing import Literal
+from typing import Any, Literal
 
 import pandas as pd
 from pydantic import BaseModel, Field, PrivateAttr
 
 from agentic_trading.agents._market_math import wide_log_returns
+from agentic_trading.agents._stable_value import qualified_name, stable_value
 from agentic_trading.agents.portfolio_construction import PodView, PortfolioConstructor
 from agentic_trading.agents.schemas import (
     AgentSignal,
@@ -55,6 +59,27 @@ def _pod_information_coefficient(
     return max(0.0, sum(shrunk_ic(signal.source_agent_id) for signal in active) / len(active))
 
 
+def _rebuilt_exception(cls: type[BaseException], args: tuple[Any, ...]) -> BaseException:
+    """An instance of exception class `cls` with `args`, made without
+    calling `cls.__init__`; its other attributes are set by unpickling."""
+    exception = cls.__new__(cls, *args)
+    exception.args = args
+    return exception
+
+
+class _CarriedStatePickler(pickle.Pickler):
+    """Pickles exceptions by class, `args` and attributes rather than by
+    calling the class with `args`, so an exception whose `__init__` takes
+    more than its message (quantcore's `ConvergenceError`, which a
+    `RefitCache` holds as a non-converged fit) unpickles. Quantcore gap:
+    `ConvergenceError` defines no `__reduce__` of its own."""
+
+    def reducer_override(self, obj: Any) -> Any:
+        if isinstance(obj, BaseException):
+            return _rebuilt_exception, (type(obj), obj.args), obj.__dict__ or None
+        return NotImplemented
+
+
 class Agent(BaseModel, ABC):
     """Shared base for every agent in the system — analysts and managers alike"""
 
@@ -62,6 +87,54 @@ class Agent(BaseModel, ABC):
 
     model_config = {"arbitrary_types_allowed": True}
     # Needed for concrete subclasses that will eventually hold non-Pydantic
+
+    # `built_parameters()`, recorded once the instance is built.
+    _built_parameters: dict[str, Any] = PrivateAttr(default_factory=dict)
+
+    def model_post_init(self, context: Any, /) -> None:
+        cls = type(self)
+        self._built_parameters = {
+            "agent_id": self.agent_id,
+            "class": qualified_name(cls),
+            "parameters": {name: stable_value(getattr(self, name)) for name in cls.model_fields},
+        }
+
+    def built_parameters(self) -> dict[str, Any]:
+        """This agent as it was built, as JSON values: its `agent_id`, its
+        class as `<module>.<qualname>` and every field (`stable_value`), a
+        non-pydantic value such as a `PortfolioConstructor` by its class and
+        public attributes. Read at construction, so later changes to the
+        instance's fields or their contents do not reach it. A copy."""
+        return copy.deepcopy(self._built_parameters)
+
+    def carried_state(self) -> bytes:
+        """An opaque snapshot of every pydantic private attribute this
+        instance holds (`__pydantic_private__`, `None` for a class with
+        none), as it stands now; later changes to the instance do not
+        reach it. The bytes are a pickle: pass them only to
+        `restore_carried_state`, and only from a checkpoint this program
+        wrote, never from untrusted input."""
+        buffer = io.BytesIO()
+        _CarriedStatePickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(
+            self.__pydantic_private__
+        )
+        return buffer.getvalue()
+
+    def restore_carried_state(self, state: bytes) -> None:
+        """Replaces this instance's private attributes with a fresh copy of
+        those in `state`, a `carried_state()` snapshot of an instance of
+        the same class. `state` is unpickled: it must come from a
+        checkpoint this program wrote, never from untrusted input. Raises
+        `ValueError` when the snapshot names other private attributes than
+        this instance has."""
+        private = pickle.loads(state)
+        expected = set(self.__pydantic_private__ or {})
+        if set(private or {}) != expected:
+            raise ValueError(
+                f"{self.agent_id}: carried state holds private attributes "
+                f"{sorted(private or {})}, this instance holds {sorted(expected)}"
+            )
+        object.__setattr__(self, "__pydantic_private__", private)
 
 
 # Bond/credit/index ETFs traded by the Rates/Credit/Tail-Hedge pods

@@ -37,6 +37,11 @@ from agentic_trading.agents.schemas import (
 )
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.portfolio import OptionPosition, Portfolio
+from agentic_trading.backtest.resume_fingerprint import (
+    agents_by_id,
+    roster_fingerprint,
+    settings_fingerprint,
+)
 from agentic_trading.config import settings
 from agentic_trading.data.loaders import lakehouse_loader
 from agentic_trading.data.loaders.option_marks import OptionMark, load_option_mark
@@ -77,10 +82,14 @@ class CommanderLike(Protocol):
     A commander may additionally expose `risk_state() -> CommanderRiskState`
     and `restore_risk_state(state)`; the engine checkpoints/restores that
     state and reports its pod return history when present, and simply
-    skips it otherwise. A commander may also expose `pod_contributions()
-    -> dict[str, dict[str, float]]` (pod id to asset to the pod's
-    contribution on the latest decision); the engine splits fill costs
-    across pods by it, and charges every fill to `"commander"` without it."""
+    skips it otherwise. A commander with a `managers` list has each
+    manager's and each managed analyst's `carried_state()` checkpointed
+    and restored as well, and their parameters recorded in the roster
+    fingerprint (see `resume_fingerprint.py`). A commander may also
+    expose `pod_contributions() -> dict[str, dict[str, float]]` (pod id
+    to asset to the pod's contribution on the latest decision); the
+    engine splits fill costs across pods by it, and charges every fill to
+    `"commander"` without it."""
 
     def decide(
         self,
@@ -202,6 +211,22 @@ class BacktestEngine:
             return
         restore(CommanderRiskState.model_validate(payload))
 
+    def _carried_states(self) -> dict[str, bytes]:
+        """Each of the commander's managers' and managed analysts'
+        `carried_state()`, keyed by agent_id; empty for a commander without
+        managers."""
+        return {
+            agent_id: agent.carried_state()
+            for agent_id, agent in agents_by_id(self.commander).items()
+        }
+
+    def _restore_carried_states(self, carried_states: dict[str, bytes]) -> None:
+        """Hands each checkpointed `carried_state()` snapshot back to the
+        commander's agent with the same agent_id."""
+        agents = agents_by_id(self.commander)
+        for agent_id, state in carried_states.items():
+            agents[agent_id].restore_carried_state(state)
+
     def _pod_contributions(self) -> dict[str, dict[str, float]] | None:
         """The commander's pod contributions on its latest decision with
         zero entries left out, or `None` for a commander that doesn't
@@ -268,13 +293,28 @@ class BacktestEngine:
             )
         return self._checkpoint_connection
 
-    def _restore_checkpoint(self) -> dict[str, Any] | None:
+    def _run_config(self) -> dict[str, Any]:
+        """This backtest's config as a checkpoint records it: its dates and
+        assets, the settings fingerprint and the roster fingerprint of its
+        commander, read now."""
+        return {
+            "start_date": self.start_date.isoformat(),
+            "end_date": self.end_date.isoformat(),
+            "assets": self.assets,
+            "settings_fingerprint": settings_fingerprint(),
+            "roster_fingerprint": roster_fingerprint(self.commander),
+        }
+
+    def _restore_checkpoint(self, run_config: dict[str, Any]) -> dict[str, Any] | None:
         """The checkpointed state to resume from, or `None` when not
         resuming or the checkpoint holds no day yet. Raises `ValueError`
-        when the checkpoint's dates or assets differ from this backtest's,
-        and `LakeTimeError` when its stored lake time differs from the open
-        lake session's (`None` on either side meaning no session), since
-        the resumed days would read another lake state."""
+        when the checkpoint's config differs from `run_config` (other
+        dates, assets, strategy settings or roster; a checkpoint written
+        without fingerprints never matches) or it carries state for an
+        agent this commander does not run, and `LakeTimeError` when its
+        stored lake time differs from the open lake session's (`None` on
+        either side meaning no session), since the resumed days would read
+        another lake state. Nothing is restored by this method."""
         if not self.resume:
             return None
         connection = self._checkpoint()
@@ -283,13 +323,11 @@ class BacktestEngine:
         payload = checkpoint_store.read_all(connection)
         if payload is None:
             return None
-        expected = {
-            "start_date": self.start_date.isoformat(),
-            "end_date": self.end_date.isoformat(),
-            "assets": self.assets,
-        }
-        if payload.get("config") != expected:
+        if payload.get("config") != run_config:
             raise ValueError("checkpoint configuration does not match this backtest")
+        unknown = sorted(set(payload.get("carried_states", {})) - set(agents_by_id(self.commander)))
+        if unknown:
+            raise ValueError(f"checkpoint carries state for unknown agents: {unknown}")
         stored_lake_time = payload.get("lake_time")
         lake_time = lakehouse_loader.current_lake_time()
         if stored_lake_time != lake_time:
@@ -469,7 +507,8 @@ class BacktestEngine:
             if self.start_date <= pd.Timestamp(day).date() <= self.end_date
         ]
 
-        checkpoint = self._restore_checkpoint()
+        run_config = self._run_config() if self.checkpoint_path is not None else {}
+        checkpoint = self._restore_checkpoint(run_config)
         start_day_index = int(checkpoint.get("next_day_index", 0)) if checkpoint else 0
 
         scoreboard = PerformanceScoreboard(self.track_record)
@@ -557,6 +596,11 @@ class BacktestEngine:
                 [PerformanceRecord.model_validate(entry) for entry in checkpoint["track_record"]]
             )
             self._restore_commander_risk_state(checkpoint.get("commander_risk_state"))
+            # After the risk state, which restores the Commander's own state
+            # and each manager's constructor state; the carried state then
+            # sets every agent's private attributes to the exact snapshot of
+            # the same day, overlapping values included.
+            self._restore_carried_states(checkpoint.get("carried_states", {}))
         total_financing_cost = (
             float(checkpoint.get("total_financing_cost", 0.0)) if checkpoint else 0.0
         )
@@ -937,6 +981,9 @@ class BacktestEngine:
                     total_financing_cost=total_financing_cost,
                     total_option_premium_paid=total_option_premium_paid,
                     lake_time=lakehouse_loader.current_lake_time(),
+                    settings_fingerprint=run_config["settings_fingerprint"],
+                    roster_fingerprint=run_config["roster_fingerprint"],
+                    carried_states=self._carried_states(),
                 )
 
             if on_day_complete is not None:
