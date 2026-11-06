@@ -44,12 +44,59 @@ without an error. Every read of such a table as a whole goes through
 `_query_table`, which sends an empty read once more after
 `EMPTY_READ_RETRY_SECONDS` and raises `EmptyTableReadError` when the
 table is empty again. A read filtered to one security, ticker or market
-that finds no rows is an answer, not a rebuild, and is never retried."""
+that finds no rows is an answer, not a rebuild, and is never retried.
 
+Window store. A run calls most loaders once per decision day, each time
+for a window ending on that day. `declare_loader_window(start, end)`,
+called once inside the session, makes the loaders serve those calls
+from data read once: each source fetches a key (a ticker, a security, a
+series, a chain month) over the declared window on its first call and
+keeps it until the session closes. Every call slices its answer out of
+the stored rows in memory. A call whose knowledge time is after the
+window's `end`, or any call with no declared window, fetches for itself
+instead. Both paths run the same `_select_*` function on the rows, so
+they return the same answer: the slice reproduces exactly the rows the
+call's own query returns, in the same order and with the same dtypes,
+and every per-call step (first-bar returns, split-move flags, the
+latest-version or latest-filing choice, availability) runs on that
+slice. `_guard_data_end` runs first in every public loader, whichever
+path it takes, and a window may not end after the session's `data_end`.
+Option chains are stored per underlying and calendar month, loaded as a
+run reaches each month and evicted once older than every chain
+lookback. `loader_query_counts` reports, per public loader and path, the
+calls made and the `/v1/sql` queries they sent.
+
+A loader joins the store with one fetch and one select:
+
+    def _fetch_thing(keys: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+        # The loader's query over `start`..`end` (or a key's full history
+        # when the per-call rule needs it), one frame per key, sorted on
+        # enough columns that ties never depend on the lake's row order;
+        # `_gated` checks the query's own date gate against `end`.
+
+    _THING = StoreSource("thing_table", _fetch_thing, ranged=True)
+
+    def _select_thing(rows: pd.DataFrame, as_of_date: date) -> pd.DataFrame | None:
+        # Slice the rows the per-call query would return (`_rows_where`,
+        # `_rows_in_range`, `_as_read` for BIGINT/BOOLEAN pass-throughs),
+        # then every post-query step; never change `rows`.
+
+    @_counted("load_thing")
+    def load_thing(key: str, as_of_date: date) -> pd.DataFrame | None:
+        _guard_data_end(as_of_date, "load_thing")
+        rows = _THING.read([key], as_of_date, as_of_date)[key]
+        return _select_thing(rows, as_of_date)
+
+`ranged=True` marks a source whose stored rows start at a date (a call
+starting earlier fetches the key again from there); a source holding a
+key's full history up to `end` passes `ranged=False`."""
+
+import functools
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, date, datetime, timedelta
 from functools import cache
 from typing import Any, Literal, cast, get_args
@@ -60,7 +107,7 @@ import pandas as pd
 from pydantic import BaseModel, PrivateAttr
 
 from agentic_trading.agents.schemas import UnfactoredSplitMove
-from agentic_trading.config import _env_value
+from agentic_trading.config import _env_value, settings
 from agentic_trading.data.instruments import futures_root
 from agentic_trading.data.lakehouse_client import Lake, LakehouseError
 from agentic_trading.data.point_in_time import assert_point_in_time
@@ -394,6 +441,7 @@ def lake_session(
             verify_rebuilt_whole_builds()
     finally:
         if opened:
+            clear_loader_window()
             with _SESSION_LOCK:
                 _SESSION = None
 
@@ -520,13 +568,15 @@ def _record_version(session: LakeSession, version: str | None) -> None:
 
 def _query(query: str, params: list[Any]) -> pd.DataFrame:
     """Runs one read-only `SELECT` with `?` placeholders bound to `params`
-    and returns every row as a DataFrame. Request failures propagate.
+    and returns every row as a DataFrame, counting the request in
+    `loader_query_counts`. Request failures propagate.
     Inside a session, the lake refusing the read with HTTP 409 raises
     `LakeTimeError` naming T and quoting the lake's detail (the read is
     never retried unpinned), and a response from a different lake version
     than the session's raises `LakeTimeError`."""
     session = _current_session()
     lake = _lake()
+    _count_query()
     try:
         frame = cast(pd.DataFrame, lake.sql(query, params))
     except LakehouseError as error:
@@ -656,6 +706,365 @@ class _LakeTimeMemo[V]:
         return entry[1]
 
 
+class LoaderWindow(BaseModel):
+    """The dates a run's loader calls ask about, declared once per run with
+    `declare_loader_window`: `start` is the run's first day minus its
+    longest lookback, the date the store's first read of a ranged source
+    starts at, and `end` the run's last day, the latest knowledge time a
+    call can be served from the store for."""
+
+    start: date
+    end: date
+
+
+class LoaderQueryCount(BaseModel):
+    """The calls of one public loader that took one path, and the queries
+    they sent, since `reset_loader_query_counts`. `path` is "store" for a
+    call served from the window store (it queries only on a miss) and
+    "direct" for a call that fetched for itself. `queries` counts every
+    `/v1/sql` request sent inside the call, including the session-memoized
+    table checks and the split-factor reads made on its behalf; a public
+    loader called by another is counted inside the outer call. Queries
+    sent outside any public loader (preflight coverage, provenance) are
+    counted under `loader` "unattributed" with `calls` 0."""
+
+    loader: str
+    path: Literal["store", "direct"]
+    calls: int
+    queries: int
+
+
+class _LoaderCall:
+    """The public loader call in progress in this context: its `loader`
+    name, the `path` its first store-source read took (`None` before one)
+    and the `queries` it has sent."""
+
+    __slots__ = ("loader", "path", "queries")
+
+    def __init__(self, loader: str) -> None:
+        self.loader = loader
+        self.path: Literal["store", "direct"] | None = None
+        self.queries = 0
+
+
+# The outermost public loader call of the current thread (worker threads
+# start with none).
+_LOADER_CALL: ContextVar[_LoaderCall | None] = ContextVar("loader_call", default=None)
+# `[calls, queries]` per (loader, path).
+_QUERY_COUNTS: dict[tuple[str, str], list[int]] = {}
+_QUERY_COUNTS_LOCK = threading.Lock()
+_UNATTRIBUTED = "unattributed"
+
+
+def _record_counts(loader: str, path: str, calls: int, queries: int) -> None:
+    with _QUERY_COUNTS_LOCK:
+        counts = _QUERY_COUNTS.setdefault((loader, path), [0, 0])
+        counts[0] += calls
+        counts[1] += queries
+
+
+def _count_query() -> None:
+    """Counts one `/v1/sql` request against the loader call in progress,
+    or as unattributed outside one."""
+    call = _LOADER_CALL.get()
+    if call is None:
+        _record_counts(_UNATTRIBUTED, "direct", 0, 1)
+    else:
+        call.queries += 1
+
+
+def _mark_path(path: Literal["store", "direct"]) -> None:
+    """Records `path` as the path of the loader call in progress, unless an
+    earlier store-source read of the call already set one."""
+    call = _LOADER_CALL.get()
+    if call is not None and call.path is None:
+        call.path = path
+
+
+def _counted[**P, R](loader: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Decorates public loader `loader` so each outermost call is counted in
+    `loader_query_counts` with the queries sent inside it. A call made
+    inside another counted call is part of the outer one."""
+
+    def decorate(function: Callable[P, R]) -> Callable[P, R]:
+        @functools.wraps(function)
+        def counted(*args: P.args, **kwargs: P.kwargs) -> R:
+            if _LOADER_CALL.get() is not None:
+                return function(*args, **kwargs)
+            call = _LoaderCall(loader)
+            token = _LOADER_CALL.set(call)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _LOADER_CALL.reset(token)
+                _record_counts(call.loader, call.path or "direct", 1, call.queries)
+
+        return counted
+
+    return decorate
+
+
+def loader_query_counts() -> list[LoaderQueryCount]:
+    """Every (loader, path) counted since the last
+    `reset_loader_query_counts`, sorted by loader then path."""
+    with _QUERY_COUNTS_LOCK:
+        entries = sorted(_QUERY_COUNTS.items())
+    return [
+        LoaderQueryCount(
+            loader=loader, path=cast(Literal["store", "direct"], path), calls=calls, queries=queries
+        )
+        for (loader, path), (calls, queries) in entries
+    ]
+
+
+def reset_loader_query_counts() -> None:
+    """Sets every count `loader_query_counts` reports back to zero."""
+    with _QUERY_COUNTS_LOCK:
+        _QUERY_COUNTS.clear()
+
+
+class _StoreEntry:
+    """One stored value and the earliest `start` it covers."""
+
+    __slots__ = ("start", "value")
+
+    def __init__(self, start: date, value: Any) -> None:
+        self.start = start
+        self.value = value
+
+
+def _approximate_size(value: Any) -> tuple[int, int]:
+    """Rows and approximate bytes held by a stored value: a DataFrame, a
+    dict of DataFrames, or anything else (one row, no bytes counted)."""
+    if isinstance(value, pd.DataFrame):
+        return len(value), int(value.memory_usage(index=True, deep=False).sum())
+    if isinstance(value, dict):
+        rows = 0
+        size = 0
+        for item in value.values():
+            item_rows, item_size = _approximate_size(item)
+            rows += item_rows
+            size += item_size
+        return rows, size
+    return 1, 0
+
+
+class _LoaderStore:
+    """The window store of one `lake_session`: the declared `window` and,
+    per source name, the value fetched for each key. Every source has its
+    own lock, held while a miss is fetched, so concurrent calls for one
+    source fetch it once."""
+
+    def __init__(self, session: LakeSession, window: LoaderWindow) -> None:
+        self.session = session
+        self.window = window
+        self._lock = threading.Lock()
+        self._entries: dict[str, dict[Hashable, _StoreEntry]] = {}
+        self._source_locks: dict[str, threading.Lock] = {}
+
+    def _source_lock(self, name: str) -> threading.Lock:
+        with self._lock:
+            return self._source_locks.setdefault(name, threading.Lock())
+
+    def read(
+        self, source: "StoreSource[Any, Any]", keys: Sequence[Hashable], start: date
+    ) -> dict[Hashable, Any]:
+        """The stored value of each of `keys` for `source`, fetching every
+        key that is missing, or (for a ranged source) whose entry starts
+        after `start`, in one `source.fetch` call from the earlier of
+        `start` and the window's start through the window's end."""
+        with self._source_lock(source.name):
+            entries = self._entries.setdefault(source.name, {})
+            missing = [
+                key
+                for key in dict.fromkeys(keys)
+                if key not in entries or (source.ranged and entries[key].start > start)
+            ]
+            if missing:
+                fetch_start = min(start, self.window.start)
+                fetched = source.fetch(missing, fetch_start, self.window.end)
+                for key in missing:
+                    entries[key] = _StoreEntry(fetch_start, fetched[key])
+                rows, size = _approximate_size({key: fetched[key] for key in missing})
+                logger.debug(
+                    "window store fetched %s for %d key(s) from %s to %s: %d rows, ~%d bytes",
+                    source.name,
+                    len(missing),
+                    fetch_start.isoformat(),
+                    self.window.end.isoformat(),
+                    rows,
+                    size,
+                )
+            return {key: entries[key].value for key in keys}
+
+    def evict(self, source: "StoreSource[Any, Any]", drop: Callable[[Any], bool]) -> None:
+        """Removes every stored key of `source` for which `drop(key)` is true."""
+        with self._source_lock(source.name):
+            entries = self._entries.get(source.name, {})
+            for key in [key for key in entries if drop(key)]:
+                del entries[key]
+
+    def keys(self, source: "StoreSource[Any, Any]") -> list[Hashable]:
+        """The keys currently stored for `source`."""
+        with self._source_lock(source.name):
+            return list(self._entries.get(source.name, {}))
+
+
+# The window store of the open session, shared by every thread.
+_STORE: _LoaderStore | None = None
+_STORE_LOCK = threading.Lock()
+
+
+def _active_store() -> _LoaderStore | None:
+    """The window store declared for the open session, or `None` when no
+    session is open or none was declared for it."""
+    session = _current_session()
+    with _STORE_LOCK:
+        store = _STORE
+    if store is None or session is None or store.session is not session:
+        return None
+    return store
+
+
+class StoreSource[K: Hashable, V]:
+    """One loader's data in the window store: `fetch(keys, start, end)`
+    runs the loader's query for every key in `keys` over `start` to `end`
+    and returns a value for each key (an empty frame for a key with no
+    rows). The value is what the loader's pure `_select_*` function slices
+    each call's answer from, on both paths. A `ranged` source's value for
+    a key covers dates from the fetch's `start` on, so a later call
+    starting earlier fetches the key again from that call's start; any
+    other source ignores `start` or reads a key's full history."""
+
+    def __init__(
+        self, name: str, fetch: Callable[[list[K], date, date], dict[K, V]], *, ranged: bool
+    ) -> None:
+        self.name = name
+        self.fetch = fetch
+        self.ranged = ranged
+
+    def stored(self, keys: Sequence[K], start: date, end: date | None) -> dict[K, V] | None:
+        """The stored value of each of `keys`, fetched over the declared
+        window on a miss, when a window store is declared for the open
+        session and `end` (the call's knowledge time; `None` for a read
+        with none) is not after the window's end; otherwise `None`. The
+        caller's `_select_*` must never change a returned value."""
+        store = _active_store()
+        if store is None or (end is not None and end > store.window.end):
+            return None
+        _mark_path("store")
+        return cast(dict[K, V], store.read(self, keys, start))
+
+    def read(
+        self, keys: Sequence[K], start: date, end: date, *, windowed: bool = True
+    ) -> dict[K, V]:
+        """The value of each of `keys` for a call covering `start` to `end`:
+        from the store when `stored` serves it (`windowed=False` for a read
+        with no knowledge time, which the store serves whatever the
+        window), else from one `fetch` over `start` to `end`."""
+        stored = self.stored(keys, start, end if windowed else None)
+        if stored is not None:
+            return stored
+        _mark_path("direct")
+        return self.fetch(list(dict.fromkeys(keys)), start, end)
+
+
+def declare_loader_window(start: date, end: date) -> LoaderWindow:
+    """Declares the window store for the open `lake_session` and returns
+    its window: from now until the session closes, a public loader call
+    whose knowledge time is on or before `end` is served from data each
+    source fetches once over the window (see the module docstring), and
+    any other call fetches for itself. A store declared earlier in the
+    session is replaced, emptied. Raises `RuntimeError` when no session is
+    open, `ValueError` when `end` precedes `start`, and `HoldoutReadError`
+    when `end` is after the session's `data_end`, so no fetch reads past
+    the cut."""
+    global _STORE
+    session = _current_session()
+    if session is None:
+        raise RuntimeError("declare_loader_window needs an open lake_session")
+    if end < start:
+        raise ValueError(
+            f"loader window end {end.isoformat()} precedes its start {start.isoformat()}"
+        )
+    _guard_data_end(end, "declare_loader_window")
+    window = LoaderWindow(start=start, end=end)
+    with _STORE_LOCK:
+        _STORE = _LoaderStore(session, window)
+    logger.info("Loader window store declared from %s to %s", start.isoformat(), end.isoformat())
+    return window
+
+
+def loader_window() -> LoaderWindow | None:
+    """The window of the store declared for the open session, or `None`."""
+    store = _active_store()
+    return None if store is None else store.window
+
+
+def clear_loader_window() -> None:
+    """Drops the window store, so every loader call fetches for itself
+    until a window is declared again. Closing the session that opened
+    it does this too."""
+    global _STORE
+    with _STORE_LOCK:
+        _STORE = None
+
+
+def _as_read(
+    rows: pd.DataFrame, int_columns: tuple[str, ...] = (), bool_columns: tuple[str, ...] = ()
+) -> pd.DataFrame:
+    """`rows`, a slice of a fetched frame, re-indexed from 0 and typed as
+    the lake client types a result holding exactly these rows: a BIGINT
+    column (`int_columns`) or BOOLEAN column (`bool_columns`) comes back
+    widened (to a float, nullable or object dtype) only when it holds a
+    null, so each listed column with no null among `rows` is narrowed to
+    `int64` or `bool`."""
+    rows = rows.reset_index(drop=True)
+    if rows.empty:
+        return rows
+    for column in int_columns:
+        if not rows[column].isna().any() and rows[column].dtype != np.int64:
+            rows[column] = rows[column].astype(np.int64)
+    for column in bool_columns:
+        if not rows[column].isna().any() and rows[column].dtype != np.bool_:
+            rows[column] = rows[column].astype(np.bool_)
+    return rows
+
+
+def _gated(
+    frame: pd.DataFrame, end: date | None, gate: str | None, dated: tuple[str, ...] = ()
+) -> pd.DataFrame:
+    """`frame`, one fetch's query result, with its `gate` column and each
+    of `dated` converted to datetime64 (a no-op for a column already of
+    that dtype), after checking with `assert_point_in_time` that no
+    `gate` date is after `end`, the fetch's own SQL gate; `None` skips
+    the check. A selection compares these columns with `pd.Timestamp`."""
+    columns = [column for column in (gate, *dated) if column is not None]
+    if gate is not None and end is not None:
+        assert_point_in_time(frame, end, date_column=gate)
+    for column in columns:
+        frame[column] = pd.to_datetime(frame[column])
+    return frame
+
+
+def _rows_where(frame: pd.DataFrame, mask: Any) -> pd.DataFrame:
+    """The rows of `frame` where boolean `mask` holds, in `frame`'s order,
+    re-indexed from 0. `frame` is never changed."""
+    return frame[np.asarray(mask, dtype=bool)].reset_index(drop=True)
+
+
+def _concat_rows(parts: list[pd.DataFrame], template: pd.DataFrame) -> pd.DataFrame:
+    """The non-empty `parts` stacked in order and re-indexed from 0, or
+    `template`'s empty slice when every part is empty. Empty parts are
+    left out so they never change a column's dtype."""
+    kept = [part for part in parts if not part.empty]
+    if not kept:
+        return template.iloc[0:0].reset_index(drop=True)
+    if len(kept) == 1:
+        return kept[0].reset_index(drop=True)
+    return pd.concat(kept, ignore_index=True)
+
+
 AdjustmentTable = Literal["equity_adjustment_factors", "yahoo_split_close_basis"]
 
 # Row count per adjustment table, for the lake client and lake time that answered.
@@ -703,6 +1112,7 @@ class IndexMember(BaseModel):
     ticker: str
 
 
+@_counted("load_sp500_member_securities_asof")
 def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | None:
     """Point-in-time S&P 500 membership on `as_of_date` as securities, one
     `IndexMember` per `security_id`, sorted by ticker.
@@ -718,33 +1128,57 @@ def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | N
     `security_id` is left out and named in one WARNING. Returns `None`
     when no row counts."""
     _guard_data_end(as_of_date, "load_sp500_member_securities_asof")
+    pieces = _SP500_COVERAGE.read([None], as_of_date, as_of_date)[None]
+    return _select_sp500_members(pieces, as_of_date)
+
+
+def _fetch_sp500_coverage(keys: list[None], start: date, end: date) -> dict[None, pd.DataFrame]:
+    """The `sp500_price_coverage` pieces that cover any date from `start`
+    to `end` (`piece_start <= end`, `piece_end` null or after `start`),
+    with the columns `_select_sp500_members` reads, sorted on every one."""
     query = f"""
-        SELECT security_id, ticker
-        FROM (
-            SELECT
-                security_id,
-                ticker,
-                ROW_NUMBER() OVER (
-                    PARTITION BY security_id,
-                        CASE WHEN security_id IS NULL THEN ticker END
-                    ORDER BY start_date DESC, ticker
-                ) AS security_rank
-            FROM {_table_sql("sp500_price_coverage")}
-            WHERE piece_start <= ?
-              AND (piece_end IS NULL OR piece_end > ?)
-        ) AS ranked
-        WHERE security_rank = 1
-        ORDER BY ticker, security_id
+        SELECT security_id, ticker, start_date, piece_start, piece_end
+        FROM {_table_sql("sp500_price_coverage")}
+        WHERE piece_start <= ?
+          AND (piece_end IS NULL OR piece_end > ?)
+        ORDER BY ticker, security_id, start_date, piece_start, piece_end
     """
-    as_of = as_of_date.isoformat()
-    result = _query(query, [as_of, as_of])
-    if result.empty:
+    frame = _query(query, [end.isoformat(), start.isoformat()])
+    return {None: _gated(frame, None, None, ("start_date", "piece_start", "piece_end"))}
+
+
+_SP500_COVERAGE: StoreSource[None, pd.DataFrame] = StoreSource(
+    "sp500_price_coverage", _fetch_sp500_coverage, ranged=True
+)
+
+
+def _select_sp500_members(pieces: pd.DataFrame, as_of_date: date) -> list[IndexMember] | None:
+    """The members on `as_of_date` from `_fetch_sp500_coverage` rows: the
+    pieces with `piece_start <= as_of_date < piece_end` (null: open), one
+    per security, or per ticker for a piece without a security, keeping
+    the latest `start_date` (null last), then the first ticker."""
+    as_of = pd.Timestamp(as_of_date)
+    counted = _rows_where(
+        pieces,
+        (pieces["piece_start"] <= as_of)
+        & (pieces["piece_end"].isna() | (pieces["piece_end"] > as_of)),
+    )
+    if counted.empty:
         return None
+    unresolved_key = counted["ticker"].astype(object).where(counted["security_id"].isna(), None)
+    ranked = counted.assign(_unresolved_ticker=unresolved_key).sort_values(
+        ["start_date", "ticker"], ascending=[False, True], na_position="last", kind="stable"
+    )
+    result = (
+        ranked.drop_duplicates(subset=["security_id", "_unresolved_ticker"], keep="first")
+        .sort_values(["ticker", "security_id"], na_position="last", kind="stable")
+        .reset_index(drop=True)
+    )
     unresolved = result["security_id"].isna()
     if unresolved.any():
         logger.warning(
             "S&P 500 members on %s without a security_id, left out: %s",
-            as_of,
+            as_of_date.isoformat(),
             sorted(result.loc[unresolved, "ticker"].tolist()),
         )
     resolved = result.loc[~unresolved]
@@ -759,6 +1193,7 @@ def load_sp500_member_securities_asof(as_of_date: date) -> list[IndexMember] | N
 _MEMBER_COUNT_COLUMNS = ("member_lines", "nominal_members", "shortfall")
 
 
+@_counted("load_sp500_member_count")
 def load_sp500_member_count(start: date, end: date) -> pd.DataFrame | None:
     """The lake's daily S&P 500 member count from `sp500_member_count`,
     one row per date from `start` to `end` inclusive, on an ascending
@@ -854,9 +1289,9 @@ def _adjusted_security_bars(
 ) -> pd.DataFrame:
     """The `equity_daily_from_bars` bars of `security_ids` dated `start`
     to `end` inclusive, adjusted with `equity_adjustment_factors`, as one
-    row per (`security_id`, `date`) sorted by security then date. One
-    query serves every id; it reads the bars' `open` and `volume` only
-    when `with_open_and_volume` is true.
+    row per (`security_id`, `date`) sorted by security then date: the
+    `_select_security_bars` slice of `_fetch_security_bars` rows, from
+    the window store or fetched for this call in one query for every id.
 
     A bar's raw price is `official_close`, or `close` when that is null;
     a bar whose raw price is null or not positive is left out. Each bar
@@ -884,6 +1319,42 @@ def _adjusted_security_bars(
     rows at all. Logs and registers split-sized moves through
     `_warn_unfactored_split_moves`; the frame is not changed by them."""
     adjustment_table_row_count("equity_adjustment_factors")
+    ids = sorted({int(security_id) for security_id in security_ids})
+    source = _SECURITY_BARS if with_open_and_volume else _SECURITY_CLOSES
+    bars = source.read(ids, start, end)
+    return _select_security_bars(bars, ids, start, end)
+
+
+def _split_by_key[K: Hashable](
+    frame: pd.DataFrame, column: str, keys: Sequence[K]
+) -> dict[K, pd.DataFrame]:
+    """`frame`'s rows per value of `column`, one frame (re-indexed from 0,
+    rows in `frame`'s order) for each of `keys`; a key with no rows maps
+    to `frame`'s empty slice."""
+    positions: dict[Any, list[int]] = {}
+    for position, value in enumerate(frame[column].tolist()):
+        positions.setdefault(value, []).append(position)
+    empty = frame.iloc[0:0].reset_index(drop=True)
+    return {
+        key: frame.iloc[positions[key]].reset_index(drop=True) if key in positions else empty
+        for key in keys
+    }
+
+
+def _fetch_security_bars(
+    security_ids: list[int], start: date, end: date, with_open_and_volume: bool
+) -> dict[int, pd.DataFrame]:
+    """The adjusted bars of each of `security_ids` dated `start` to `end`,
+    in one query, before any per-call step: columns `security_id`, `date`,
+    `close`, `raw_close`, `open` and `volume` (only with
+    `with_open_and_volume`) and `factor_date` (see
+    `_adjusted_security_bars`), sorted by security, date, raw price, then
+    (with `with_open_and_volume`) raw open and raw volume.
+
+    Only factor rows with `effective_date > start` are joined, which never
+    changes the factor a bar in the range takes: that factor's
+    `effective_date` is after the bar's date, so after `start`. A bar's
+    price levels are therefore the same whatever `start` is."""
     placeholders = ", ".join("?" for _ in security_ids)
     bar_columns = ", open, volume" if with_open_and_volume else ""
     open_and_volume = (
@@ -894,6 +1365,7 @@ def _adjusted_security_bars(
         if with_open_and_volume
         else ""
     )
+    tie_breaks = ", bars.open, bars.volume" if with_open_and_volume else ""
     query = f"""
         SELECT bars.security_id, bars.date,
                bars.raw_close * COALESCE(factors.cum_factor, 1.0) AS close,
@@ -914,11 +1386,38 @@ def _adjusted_security_bars(
         ) AS factors
           ON factors.security_id = bars.security_id
          AND bars.date < factors.effective_date
-        ORDER BY bars.security_id, bars.date
+        ORDER BY bars.security_id, bars.date, bars.raw_close{tie_breaks}
     """
     ids = [int(security_id) for security_id in security_ids]
     params = [*ids, start.isoformat(), end.isoformat(), *ids, start.isoformat()]
-    frame = _query(query, params)
+    return _split_by_key(_gated(_query(query, params), end, "date"), "security_id", ids)
+
+
+# Adjusted security bars without and with the bars' open and volume.
+_SECURITY_CLOSES: StoreSource[int, pd.DataFrame] = StoreSource(
+    "equity_daily_from_bars:close",
+    functools.partial(_fetch_security_bars, with_open_and_volume=False),
+    ranged=True,
+)
+_SECURITY_BARS: StoreSource[int, pd.DataFrame] = StoreSource(
+    "equity_daily_from_bars:bars",
+    functools.partial(_fetch_security_bars, with_open_and_volume=True),
+    ranged=True,
+)
+
+
+def _select_security_bars(
+    bars: dict[int, pd.DataFrame],
+    security_ids: list[int],
+    start: date,
+    end: date,
+) -> pd.DataFrame:
+    """The `_adjusted_security_bars` frame of `security_ids` (ascending,
+    distinct) from `start` to `end`, built from `_fetch_security_bars`
+    rows: each security's bars dated in the range, stacked in id order,
+    with `log_return` computed over the range alone (its first bar has
+    none) and split-sized moves flagged over the range alone."""
+    frame = _rows_in_range(bars, security_ids, start, end)
     if frame.empty:
         return frame
     frame["date"] = pd.to_datetime(frame["date"])
@@ -951,6 +1450,7 @@ def _log_return_series(frame: pd.DataFrame) -> dict[int, pd.Series]:
     return result
 
 
+@_counted("load_security_log_returns")
 def load_security_log_returns(
     security_ids: list[int], start: date, end: date
 ) -> dict[int, pd.Series]:
@@ -999,6 +1499,7 @@ def load_security_log_returns(
 _DAILY_BAR_FIELDS = ("close", "raw_close", "open", "volume", "log_return")
 
 
+@_counted("load_security_daily_bars")
 def load_security_daily_bars(
     security_ids: list[int], start: date, end: date
 ) -> pd.DataFrame | None:
@@ -1087,6 +1588,7 @@ def _warn_unfactored_split_moves(returns: dict[int, pd.Series], frame: pd.DataFr
         )
 
 
+@_counted("split_adjustment_factor")
 def split_adjustment_factor(ticker: str, quote_date: date) -> float:
     """Factor that moves an option-chain row quoted on `quote_date` onto
     the basis of `ticker`'s `instrument_prices` close: the product of
@@ -1108,6 +1610,11 @@ def split_adjustment_factor(ticker: str, quote_date: date) -> float:
     Raises `EmptyAdjustmentTableError` when `yahoo_split_close_basis` has
     no rows at all; a ticker with no rows of its own gets 1.0.
 
+    The ratios are applied in ascending `ex_date` order, then ascending
+    `ratio`, so the float product does not depend on the order the lake
+    returns rows in; inside a window store the ticker's rows are read once
+    for every quote date.
+
     Not subject to the session's `data_end` (`_guard_data_end`):
     `quote_date` is not a knowledge time but the date of a chain row an
     option loader already read under its guarded `as_of_date`. The split
@@ -1115,16 +1622,42 @@ def split_adjustment_factor(ticker: str, quote_date: date) -> float:
     T, and serve only to put that row on the split-adjusted close basis;
     they carry no signal value of their own."""
     adjustment_table_row_count("yahoo_split_close_basis")
+    splits = _SPLIT_RATIOS.read([ticker], quote_date, quote_date, windowed=False)[ticker]
+    return _select_split_factor(splits, quote_date)
+
+
+def _fetch_split_ratios(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each of `tickers`' `yahoo_split_close_basis` rows with an ex-date
+    after `start` that the close reflects (`in_close_basis` true or null),
+    as `ex_date`/`ratio` sorted by ex-date then ratio, one query per
+    ticker. `end` is not used: every later split counts, up to the lake
+    time."""
     query = f"""
-        SELECT ratio
+        SELECT ex_date, ratio
         FROM {_table_sql("yahoo_split_close_basis")}
         WHERE ticker = ?
           AND ex_date > ?
           AND in_close_basis IS NOT FALSE
+        ORDER BY ex_date, ratio
     """
-    frame = _query(query, [ticker, quote_date.isoformat()])
+    return {
+        ticker: _gated(_query(query, [ticker, start.isoformat()]), None, None, ("ex_date",))
+        for ticker in tickers
+    }
+
+
+_SPLIT_RATIOS: StoreSource[str, pd.DataFrame] = StoreSource(
+    "yahoo_split_close_basis", _fetch_split_ratios, ranged=True
+)
+
+
+def _select_split_factor(splits: pd.DataFrame, quote_date: date) -> float:
+    """The product of `1 / ratio` over the `_fetch_split_ratios` rows with
+    an ex-date after `quote_date`, in their order; a missing or
+    non-positive ratio contributes nothing."""
+    later = _rows_where(splits, splits["ex_date"] > pd.Timestamp(quote_date))
     factor = 1.0
-    for ratio in frame["ratio"]:
+    for ratio in later["ratio"]:
         if ratio and ratio > 0:
             factor /= float(ratio)
     return factor
@@ -1196,6 +1729,7 @@ def _option_chain_source(underlying: str, as_of_date: date) -> tuple[str, str]:
 DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS = 10
 
 
+@_counted("load_options_snapshot_from_lakehouse")
 def load_options_snapshot_from_lakehouse(
     ticker: str, as_of_date: date, lookback_days: int = DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS
 ) -> pd.DataFrame | None:
@@ -1223,29 +1757,189 @@ def load_options_snapshot_from_lakehouse(
     `_apply_split_adjustment` before returning, since the raw chain is
     archival and never itself adjusted for a later split. Rows are sorted
     on every returned column. Self-asserts point-in-time on `date` before
-    returning."""
+    returning.
+
+    Inside a window store the snapshots come from the store's chain
+    months (`_chain_snapshots`); otherwise one query reads only the latest
+    snapshot in the window. `_select_options_snapshot` picks the answer
+    from either."""
     _guard_data_end(as_of_date, "load_options_snapshot_from_lakehouse")
-    window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
-    window_end = as_of_date.isoformat()
+    first = as_of_date - timedelta(days=lookback_days)
     table, date_column = _option_chain_source(ticker, as_of_date)
-    query = f"""
-        SELECT {date_column} AS date, expiration, option_type, strike, bid, ask,
-               implied_volatility, delta, gamma, theta, vega, rho
+
+    def latest_snapshot() -> pd.DataFrame:
+        query = f"""
+            SELECT {date_column} AS date, {", ".join(_CHAIN_COLUMNS)}
+            FROM {_table_sql(table)}
+            WHERE underlying = ?
+              AND {date_column} BETWEEN ? AND ?
+              AND {date_column} = (
+                  SELECT MAX({date_column})
+                  FROM {_table_sql(table)}
+                  WHERE underlying = ?
+                    AND {date_column} BETWEEN ? AND ?
+              )
+            ORDER BY {date_column}, {", ".join(_CHAIN_COLUMNS)}
+        """
+        window = [first.isoformat(), as_of_date.isoformat()]
+        frame = _query(query, [ticker, *window, ticker, *window])
+        return _gated(frame, as_of_date, "date", ("expiration",))
+
+    snapshots = _chain_snapshots(table, date_column, ticker, first, as_of_date, latest_snapshot)
+    return _select_options_snapshot(snapshots, ticker, as_of_date, lookback_days)
+
+
+# The columns after `date` that every chain read returns, in order; chain
+# rows are sorted on `date` and then on all of them.
+_CHAIN_COLUMNS = (
+    "expiration",
+    "option_type",
+    "strike",
+    "bid",
+    "ask",
+    "implied_volatility",
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "rho",
+)
+
+# A chain month in the window store: (table, date column, underlying,
+# year, month).
+_ChainMonth = tuple[str, str, str, int, int]
+
+
+def _chain_query(table: str, date_column: str, condition: str = "") -> str:
+    """The chain rows of one underlying (`?`) with `date_column` between
+    two dates (`?`, `?`), plus SQL `condition` when given, as `date` and
+    `_CHAIN_COLUMNS`, sorted on `date` and then on every column."""
+    return f"""
+        SELECT {date_column} AS date, {", ".join(_CHAIN_COLUMNS)}
         FROM {_table_sql(table)}
         WHERE underlying = ?
           AND {date_column} BETWEEN ? AND ?
-          AND {date_column} = (
-              SELECT MAX({date_column})
-              FROM {_table_sql(table)}
-              WHERE underlying = ?
-                AND {date_column} BETWEEN ? AND ?
-          )
-        ORDER BY expiration, option_type, strike, bid, ask, implied_volatility, delta, gamma,
-                 theta, vega, rho
+          {condition}
+        ORDER BY {date_column}, {", ".join(_CHAIN_COLUMNS)}
     """
-    frame = _query(query, [ticker, window_start, window_end, ticker, window_start, window_end])
-    if frame.empty:
+
+
+def _chain_by_date(frame: pd.DataFrame) -> dict[pd.Timestamp, pd.DataFrame]:
+    """`frame`'s chain rows per snapshot `date`, each snapshot re-indexed
+    from 0 with its rows in `frame`'s order."""
+    dates = sorted({pd.Timestamp(day) for day in frame["date"]})
+    return _split_by_key(frame, "date", dates)
+
+
+def _month_end(year: int, month: int) -> date:
+    return pd.Period(year=year, month=month, freq="M").end_time.date()
+
+
+def _fetch_chain_months(
+    months: list[_ChainMonth], start: date, end: date
+) -> dict[_ChainMonth, dict[pd.Timestamp, pd.DataFrame]]:
+    """Every snapshot of each chain month, by date, one query per month,
+    read up to the earlier of the month's last day and `end`; `start` is
+    not used."""
+    fetched: dict[_ChainMonth, dict[pd.Timestamp, pd.DataFrame]] = {}
+    for month in months:
+        table, date_column, underlying, year, number = month
+        first = date(year, number, 1)
+        last = min(_month_end(year, number), end)
+        if last < first:
+            fetched[month] = {}
+            continue
+        frame = _query(
+            _chain_query(table, date_column), [underlying, first.isoformat(), last.isoformat()]
+        )
+        fetched[month] = _chain_by_date(_gated(frame, last, "date", ("expiration",)))
+    return fetched
+
+
+_CHAIN_MONTHS: StoreSource[_ChainMonth, dict[pd.Timestamp, pd.DataFrame]] = StoreSource(
+    "option_chain_months", _fetch_chain_months, ranged=False
+)
+
+
+def _chain_retention_days() -> int:
+    """Calendar days of chain months the store keeps before the earliest
+    date a chain read asks for: the longest window any option loader is
+    called with (the mark-age, snapshot-age and default snapshot
+    lookbacks), plus the publication lag a decision-time read is shifted
+    by. Read at use time from `settings.options`."""
+    options = settings.options
+    return (
+        max(
+            options.max_mark_age_days,
+            options.max_snapshot_age_days,
+            DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS,
+        )
+        + options.publication_lag_days
+    )
+
+
+def _chain_snapshots(
+    table: str,
+    date_column: str,
+    underlying: str,
+    first: date,
+    last: date,
+    direct: Callable[[], pd.DataFrame],
+) -> dict[pd.Timestamp, pd.DataFrame]:
+    """The chain snapshots of `underlying` in `table` that a read from
+    `first` to `last` selects from, by date. Inside a window store (with
+    `last` within its window) they are the stored calendar months the
+    range touches, fetched whole on a miss, and every stored month of the
+    same table and underlying ending more than `_chain_retention_days`
+    before `first` is evicted; otherwise they are the rows of one
+    `direct()` query."""
+    months = [
+        (table, date_column, underlying, period.year, period.month)
+        for period in pd.period_range(first, last, freq="M")
+    ]
+    stored = _CHAIN_MONTHS.stored(months, first, last)
+    if stored is None:
+        _mark_path("direct")
+        return _chain_by_date(direct())
+    store = _active_store()
+    if store is not None:
+        oldest_kept = first - timedelta(days=_chain_retention_days())
+        store.evict(
+            _CHAIN_MONTHS,
+            lambda key: (
+                key[0] == table
+                and key[2] == underlying
+                and _month_end(key[3], key[4]) < oldest_kept
+            ),
+        )
+    snapshots: dict[pd.Timestamp, pd.DataFrame] = {}
+    for month in months:
+        snapshots.update(stored[month])
+    return snapshots
+
+
+def _snapshot_dates_in(
+    snapshots: dict[pd.Timestamp, pd.DataFrame], first: date, last: date
+) -> list[pd.Timestamp]:
+    """The dates of `snapshots` from `first` to `last` inclusive, ascending."""
+    low, high = pd.Timestamp(first), pd.Timestamp(last)
+    return sorted(day for day in snapshots if low <= day <= high)
+
+
+def _select_options_snapshot(
+    snapshots: dict[pd.Timestamp, pd.DataFrame],
+    ticker: str,
+    as_of_date: date,
+    lookback_days: int,
+) -> pd.DataFrame | None:
+    """The `load_options_snapshot_from_lakehouse` answer from chain
+    `snapshots`: the rows of the latest snapshot dated within
+    `lookback_days` on or before `as_of_date`, split-adjusted, or `None`
+    when there is none."""
+    dates = _snapshot_dates_in(snapshots, as_of_date - timedelta(days=lookback_days), as_of_date)
+    if not dates:
         return None
+    frame = snapshots[dates[-1]].copy()
     frame["date"] = pd.to_datetime(frame["date"])
     frame["expiration"] = pd.to_datetime(frame["expiration"])
     frame = _apply_split_adjustment(frame, ticker)
@@ -1282,6 +1976,7 @@ DEFAULT_COT_TICKER_BY_ASSET: dict[str, str] = {"SHY": "ZT=F", "IEF": "ZN=F", "TL
 DEFAULT_COT_LOOKBACK_DAYS = 400
 
 
+@_counted("load_cot_positioning_from_lakehouse")
 def load_cot_positioning_from_lakehouse(
     ticker: str, as_of_date: date, lookback_days: int = DEFAULT_COT_LOOKBACK_DAYS
 ) -> pd.Series | None:
@@ -1295,6 +1990,7 @@ def load_cot_positioning_from_lakehouse(
     return None if reports is None else reports["net_positioning_ratio"]
 
 
+@_counted("load_cot_reports_from_lakehouse")
 def load_cot_reports_from_lakehouse(
     ticker: str, as_of_date: date, lookback_days: int = DEFAULT_COT_LOOKBACK_DAYS
 ) -> pd.DataFrame | None:
@@ -1333,29 +2029,48 @@ def _cot_reports(ticker: str, as_of_date: date, lookback_days: int) -> pd.DataFr
     `cftc_cot_publication` holds rows, so a read landing on its rebuild
     raises `EmptyTableReadError` instead of finding no available report;
     inside a `lake_session` that check is made once per session."""
-    window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
-    availability_cutoff = as_of_date.isoformat()
-    queries = [
-        (
-            "cftc_cot_disaggregated",
-            _COT_DISAGGREGATED_CODES,
-            "(managed_money_long - managed_money_short)",
-        ),
-        (
-            "cftc_cot_tff",
-            _COT_TFF_CODES,
-            "(leveraged_funds_long - leveraged_funds_short)",
-        ),
-    ]
-    for table, codes, net_position_expr in queries:
+    for table, codes in _COT_TABLES:
         code = codes.get(ticker)
         if code is None:
             continue
         _require_rows("cftc_cot_publication")
+        first = as_of_date - timedelta(days=lookback_days)
+        reports = _COT_REPORTS.read([(table, code)], first, as_of_date)[(table, code)]
+        selected = _select_cot_reports(reports, as_of_date, lookback_days)
+        if selected is not None:
+            return selected
+    return None
+
+
+# The two COT tables, with their tickers' contract-market codes, in the
+# order a ticker's code is looked up.
+_COT_TABLES = (
+    ("cftc_cot_disaggregated", _COT_DISAGGREGATED_CODES),
+    ("cftc_cot_tff", _COT_TFF_CODES),
+)
+# Net speculative position per COT table (see `load_cot_reports_from_lakehouse`).
+_COT_NET_POSITION = {
+    "cftc_cot_disaggregated": "(managed_money_long - managed_money_short)",
+    "cftc_cot_tff": "(leveraged_funds_long - leveraged_funds_short)",
+}
+
+
+def _fetch_cot_reports(
+    markets: list[tuple[str, str]], start: date, end: date
+) -> dict[tuple[str, str], pd.DataFrame]:
+    """Each (table, contract-market code)'s reports dated `start` to `end`
+    with positive open interest that are available by the close of `end`
+    (see `load_cot_reports_from_lakehouse`), one query per market:
+    `report_date`, `net_positioning_ratio`, `published_date` and
+    `untimed` (no `published_at`), sorted by report date, then
+    publication date, then ratio."""
+    fetched: dict[tuple[str, str], pd.DataFrame] = {}
+    for table, code in markets:
         query = f"""
             SELECT cot.report_date,
-                   {net_position_expr} / cot.open_interest_all AS net_positioning_ratio,
-                   pub.published_date
+                   {_COT_NET_POSITION[table]} / cot.open_interest_all AS net_positioning_ratio,
+                   pub.published_date,
+                   pub.published_at IS NULL AS untimed
             FROM {_table_sql(table)} AS cot
             JOIN {_table_sql("cftc_cot_publication")} AS pub ON pub.report_date = cot.report_date
             WHERE cot.cftc_contract_market_code = ?
@@ -1365,19 +2080,43 @@ def _cot_reports(ticker: str, as_of_date: date, lookback_days: int) -> pd.DataFr
                   (pub.published_at IS NOT NULL AND pub.published_date <= ?)
                   OR (pub.published_at IS NULL AND pub.published_date < ?)
               )
-            ORDER BY cot.report_date
+            ORDER BY cot.report_date, pub.published_date, net_positioning_ratio
         """
-        frame = _query(
-            query,
-            [code, window_start, availability_cutoff, availability_cutoff, availability_cutoff],
-        )
-        if not frame.empty:
-            frame["report_date"] = pd.to_datetime(frame["report_date"])
-            frame["published_date"] = pd.to_datetime(frame["published_date"])
-            reports = frame.set_index("report_date")[["net_positioning_ratio", "published_date"]]
-            assert_point_in_time(reports, as_of_date)
-            return reports
-    return None
+        cutoff = end.isoformat()
+        frame = _query(query, [code, start.isoformat(), cutoff, cutoff, cutoff])
+        fetched[(table, code)] = _gated(frame, end, "report_date", ("published_date",))
+    return fetched
+
+
+_COT_REPORTS: StoreSource[tuple[str, str], pd.DataFrame] = StoreSource(
+    "cftc_cot_reports", _fetch_cot_reports, ranged=True
+)
+
+
+def _select_cot_reports(
+    reports: pd.DataFrame, as_of_date: date, lookback_days: int
+) -> pd.DataFrame | None:
+    """The `load_cot_reports_from_lakehouse` frame from `_fetch_cot_reports`
+    rows: those dated within `lookback_days` on or before `as_of_date` and
+    available at its close (published that day with a `published_at`, or
+    before it without one), or `None` when none are."""
+    as_of = pd.Timestamp(as_of_date)
+    untimed = reports["untimed"].astype(bool).to_numpy()
+    published = reports["published_date"]
+    available = np.where(untimed, published < as_of, published <= as_of)
+    frame = _rows_where(
+        reports,
+        (reports["report_date"] >= as_of - pd.Timedelta(days=lookback_days))
+        & (reports["report_date"] <= as_of)
+        & available,
+    ).drop(columns="untimed")
+    if frame.empty:
+        return None
+    frame["report_date"] = pd.to_datetime(frame["report_date"])
+    frame["published_date"] = pd.to_datetime(frame["published_date"])
+    selected = frame.set_index("report_date")[["net_positioning_ratio", "published_date"]]
+    assert_point_in_time(selected, as_of_date)
+    return selected
 
 
 # `equity_distributions.distribution_type` of an ordinary recurring cash
@@ -1386,6 +2125,7 @@ def _cot_reports(ticker: str, as_of_date: date, lookback_days: int) -> pd.DataFr
 _REGULAR_CASH = "regular_cash"
 
 
+@_counted("load_dividends_from_lakehouse")
 def load_dividends_from_lakehouse(ticker: str, as_of_date: date) -> pd.Series | None:
     """Regular cash dividends per share for `ticker`, from the
     `equity_distributions` table: rows whose `distribution_type` is
@@ -1399,13 +2139,35 @@ def load_dividends_from_lakehouse(ticker: str, as_of_date: date) -> pd.Series | 
     public by then. Returns `None` when no rows qualify. Self-asserts
     point-in-time on the ex-date index before returning."""
     _guard_data_end(as_of_date, "load_dividends_from_lakehouse")
+    dividends = _DIVIDENDS.read([ticker], as_of_date, as_of_date)[ticker]
+    return _select_dividends(dividends, as_of_date)
+
+
+def _fetch_dividends(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each of `tickers`' regular cash dividends with `ex_date <= end`, as
+    `ex_date`/`amount_split_adjusted` sorted by ex-date then amount, one
+    query per ticker; `start` is not used."""
     query = f"""
         SELECT ex_date, amount_split_adjusted
         FROM {_table_sql("equity_distributions")}
         WHERE ticker = ? AND distribution_type = ? AND ex_date <= ?
-        ORDER BY ex_date
+        ORDER BY ex_date, amount_split_adjusted
     """
-    frame = _query(query, [ticker, _REGULAR_CASH, as_of_date.isoformat()])
+    return {
+        ticker: _gated(_query(query, [ticker, _REGULAR_CASH, end.isoformat()]), end, "ex_date")
+        for ticker in tickers
+    }
+
+
+_DIVIDENDS: StoreSource[str, pd.DataFrame] = StoreSource(
+    "equity_distributions", _fetch_dividends, ranged=False
+)
+
+
+def _select_dividends(dividends: pd.DataFrame, as_of_date: date) -> pd.Series | None:
+    """The `load_dividends_from_lakehouse` series from `_fetch_dividends`
+    rows: those with `ex_date <= as_of_date`, or `None` when none are."""
+    frame = _rows_where(dividends, dividends["ex_date"] <= pd.Timestamp(as_of_date))
     if frame.empty:
         return None
     frame["ex_date"] = pd.to_datetime(frame["ex_date"])
@@ -1414,6 +2176,7 @@ def load_dividends_from_lakehouse(ticker: str, as_of_date: date) -> pd.Series | 
     return series
 
 
+@_counted("load_earnings_surprise_from_lakehouse")
 def load_earnings_surprise_from_lakehouse(
     ticker: str, as_of_date: date
 ) -> tuple[float, float, pd.Timestamp] | None:
@@ -1435,6 +2198,16 @@ def load_earnings_surprise_from_lakehouse(
     Self-asserts point-in-time on the availability date before
     returning."""
     _guard_data_end(as_of_date, "load_earnings_surprise_from_lakehouse")
+    surprises = _EARNINGS.read([ticker], as_of_date, as_of_date)[ticker]
+    return _select_earnings_surprise(surprises, as_of_date)
+
+
+def _fetch_earnings(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each of `tickers`' EPS surprises joined to their announcement (see
+    `load_earnings_surprise_from_lakehouse`) announced before `end`, as
+    `reported`/`estimate`/`announcement_date`, latest announcement first,
+    ties broken by the latest period end, then reported, then estimate;
+    one query per ticker. `start` is not used."""
     query = f"""
         SELECT h.reported, h.estimate, c.date AS announcement_date
         FROM (
@@ -1451,9 +2224,26 @@ def load_earnings_surprise_from_lakehouse(
            AND CAST(c.date AS DATE) BETWEEN CAST(h.period_end_date AS DATE)
                AND date_add(CAST(h.period_end_date AS DATE), INTERVAL 75 DAY)
         WHERE CAST(c.date AS DATE) < ?
-        ORDER BY c.date DESC
+        ORDER BY c.date DESC, h.period_end_date DESC, h.reported, h.estimate
     """
-    frame = _query(query, [ticker, ticker, as_of_date.isoformat()])
+    return {
+        ticker: _gated(_query(query, [ticker, ticker, end.isoformat()]), end, "announcement_date")
+        for ticker in tickers
+    }
+
+
+_EARNINGS: StoreSource[str, pd.DataFrame] = StoreSource(
+    "dolthub_earnings", _fetch_earnings, ranged=False
+)
+
+
+def _select_earnings_surprise(
+    surprises: pd.DataFrame, as_of_date: date
+) -> tuple[float, float, pd.Timestamp] | None:
+    """The `load_earnings_surprise_from_lakehouse` answer from
+    `_fetch_earnings` rows: of those announced before `as_of_date`, the
+    first whose next NYSE session is on or before it, or `None`."""
+    frame = _rows_where(surprises, surprises["announcement_date"] < pd.Timestamp(as_of_date))
     if frame.empty:
         return None
     frame["announcement_date"] = pd.to_datetime(frame["announcement_date"])
@@ -1468,6 +2258,7 @@ def load_earnings_surprise_from_lakehouse(
     return float(row["reported"]), float(row["estimate"]), pd.Timestamp(row["announcement_date"])
 
 
+@_counted("load_sic_code_from_lakehouse")
 def load_sic_code_from_lakehouse(ticker: str) -> str | None:
     """SIC (Standard Industrial Classification) code for `ticker` from
     SEC EDGAR, via `sec_sic_classification`; `None` if `ticker` has no SIC
@@ -1486,14 +2277,29 @@ def load_sic_code_from_lakehouse(ticker: str) -> str | None:
     no knowledge-time argument. The read is current-state, bounded only by
     the lake time T, so inside a session with a `data_end` it can return a
     classification made after `data_end`."""
-    frame = _query(
-        f"SELECT sic FROM {_table_sql('sec_sic_classification')} WHERE ticker = ?", [ticker]
-    )
+    frame = _SIC_CODES.read([ticker], date.min, date.min, windowed=False)[ticker]
     if frame.empty or pd.isna(frame.iloc[0]["sic"]):
         return None
     return str(frame.iloc[0]["sic"])
 
 
+def _fetch_sic_codes(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each of `tickers`' `sec_sic_classification` rows as one `sic`
+    column, one query per ticker; `start` and `end` are not used."""
+    return {
+        ticker: _query(
+            f"SELECT sic FROM {_table_sql('sec_sic_classification')} WHERE ticker = ?", [ticker]
+        )
+        for ticker in tickers
+    }
+
+
+_SIC_CODES: StoreSource[str, pd.DataFrame] = StoreSource(
+    "sec_sic_classification", _fetch_sic_codes, ranged=False
+)
+
+
+@_counted("same_sic_candidate_pairs")
 def same_sic_candidate_pairs(tickers: list[str]) -> list[tuple[str, str]]:
     """Every pair within `tickers` that share a real SEC SIC code — a
     genuine industry-classification candidate list for pairs-cointegration
@@ -1534,18 +2340,11 @@ _SESSION_FIRST_MINUTE = "09:30:00"
 _SESSION_LAST_MINUTE = "15:59:00"
 
 
-def _equity_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFrame:
-    """Daily `ticker`/`date`/`open`/`close`/`raw_close`/`volume` rows from
-    `instrument_prices` for `tickers` between `start` and `end`
-    inclusive: `close` is `adj_close`, `open` is the raw open scaled by
-    `adj_close / close`, `raw_close` the unadjusted close.
-
-    A row whose raw open lies outside its raw `[low, high]` range
-    (boundaries included as valid), or whose raw low exceeds its raw
-    high, has an inconsistent bar, so its `open` is NaN; the rest of the
-    row is kept. A row with a null raw low or high keeps its open. Logs
-    one WARNING naming each ticker with masked rows and its count when
-    any row is masked."""
+def _fetch_equity_prices(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each of `tickers`' `instrument_prices` rows dated `start` to `end`,
+    in one query: `ticker`, `date`, `open` (the raw open scaled by
+    `adj_close / close`), `raw_open`, `raw_high`, `raw_low`, `close`
+    (`adj_close`), `raw_close` (`close`) and `volume`, sorted by date."""
     placeholders = ", ".join("?" for _ in tickers)
     query = f"""
         SELECT ticker, date,
@@ -1561,7 +2360,44 @@ def _equity_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFra
           AND date BETWEEN ? AND ?
         ORDER BY ticker, date
     """
-    frame = _query(query, [*tickers, start.isoformat(), end.isoformat()])
+    frame = _gated(_query(query, [*tickers, start.isoformat(), end.isoformat()]), end, "date")
+    return _split_by_key(frame, "ticker", tickers)
+
+
+_EQUITY_PRICES: StoreSource[str, pd.DataFrame] = StoreSource(
+    "instrument_prices", _fetch_equity_prices, ranged=True
+)
+
+
+def _rows_in_range(
+    rows_by_key: dict[Any, pd.DataFrame], keys: list[Any], start: date, end: date
+) -> pd.DataFrame:
+    """The rows of each of `keys` (in that order) dated `start` to `end`
+    inclusive, stacked and re-indexed from 0."""
+    first, last = pd.Timestamp(start), pd.Timestamp(end)
+    parts = [
+        _rows_where(rows, (rows["date"] >= first) & (rows["date"] <= last))
+        for rows in (rows_by_key[key] for key in keys)
+    ]
+    return _concat_rows(parts, rows_by_key[keys[0]])
+
+
+def _equity_price_rows(
+    prices: dict[str, pd.DataFrame], tickers: list[str], start: date, end: date
+) -> pd.DataFrame:
+    """Daily `ticker`/`date`/`open`/`close`/`raw_close`/`volume` rows of
+    `tickers` (sorted, distinct) between `start` and `end` inclusive,
+    from `_fetch_equity_prices` rows: `close` is `adj_close`, `open` is
+    the raw open scaled by `adj_close / close`, `raw_close` the
+    unadjusted close.
+
+    A row whose raw open lies outside its raw `[low, high]` range
+    (boundaries included as valid), or whose raw low exceeds its raw
+    high, has an inconsistent bar, so its `open` is NaN; the rest of the
+    row is kept. A row with a null raw low or high keeps its open. Logs
+    one WARNING naming each ticker with masked rows and its count when
+    any row is masked."""
+    frame = _rows_in_range(prices, tickers, start, end)
     raw_open = frame["raw_open"].astype(float)
     raw_high = frame["raw_high"].astype(float)
     raw_low = frame["raw_low"].astype(float)
@@ -1576,19 +2412,18 @@ def _equity_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFra
     return frame[["ticker", "date", "open", "close", "raw_close", "volume"]]
 
 
-def _crypto_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFrame:
-    """One `ticker`/`date`/`open`/`close`/`raw_close`/`volume` row per
-    NYSE session between `start` and `end` inclusive for each crypto
-    ticker in `tickers` (keys of `_CRYPTO_KLINE_SYMBOLS`), built from
+def _fetch_crypto_prices(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each crypto ticker's (keys of `_CRYPTO_KLINE_SYMBOLS`) daily
+    `symbol`/`date`/`open`/`close`/`volume` rows for the local dates
+    `start` to `end`, aggregated in the lake in one query from
     `crypto_klines_1m` minutes whose `open_time` (naive UTC, the minute's
-    start) falls in the session in America/New_York: `open` is the open
-    of the minute starting at `_SESSION_FIRST_MINUTE`, `close` and
-    `raw_close` the close of the minute starting at
-    `_SESSION_LAST_MINUTE`, `volume` the summed volume of the minutes
-    from `_SESSION_FIRST_MINUTE` to `_SESSION_LAST_MINUTE`. A day without
-    a `_SESSION_LAST_MINUTE` kline, or that is not an NYSE session, has
-    no row. Only minutes inside the session on days in the range are
-    read; the aggregation runs in the lake."""
+    start) falls in that date's NYSE regular session in America/New_York:
+    `open` is the open of the minute starting at `_SESSION_FIRST_MINUTE`,
+    `close` the close of the minute starting at `_SESSION_LAST_MINUTE`,
+    `volume` the summed volume of the minutes from `_SESSION_FIRST_MINUTE`
+    to `_SESSION_LAST_MINUTE`. A date without a `_SESSION_LAST_MINUTE`
+    kline has no row. Every session minute of a local date lies in the
+    same UTC date, so a date's row does not depend on the range read."""
     symbols = [_CRYPTO_KLINE_SYMBOLS[ticker] for ticker in tickers]
     placeholders = ", ".join("?" for _ in symbols)
     query = f"""
@@ -1621,7 +2456,24 @@ def _crypto_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFra
         _SESSION_LAST_MINUTE,
         _SESSION_LAST_MINUTE,
     ]
-    frame = _query(query, params)
+    by_symbol = _split_by_key(_gated(_query(query, params), end, "date"), "symbol", symbols)
+    return {ticker: by_symbol[_CRYPTO_KLINE_SYMBOLS[ticker]] for ticker in tickers}
+
+
+_CRYPTO_PRICES: StoreSource[str, pd.DataFrame] = StoreSource(
+    "crypto_klines_1m", _fetch_crypto_prices, ranged=True
+)
+
+
+def _crypto_price_rows(
+    prices: dict[str, pd.DataFrame], tickers: list[str], start: date, end: date
+) -> pd.DataFrame:
+    """One `ticker`/`date`/`open`/`close`/`raw_close`/`volume` row per
+    NYSE session between `start` and `end` inclusive for each crypto
+    ticker in `tickers` (distinct, sorted by kline symbol), from
+    `_fetch_crypto_prices` rows: `raw_close` is `close`, and a date that
+    is not an NYSE session has no row."""
+    frame = _rows_in_range(prices, tickers, start, end)
     if frame.empty:
         return frame
     ticker_by_symbol = {symbol: ticker for ticker, symbol in _CRYPTO_KLINE_SYMBOLS.items()}
@@ -1632,6 +2484,7 @@ def _crypto_price_rows(tickers: list[str], start: date, end: date) -> pd.DataFra
     return frame[["ticker", "date", "open", "close", "raw_close", "volume"]]
 
 
+@_counted("load_price_history_from_lakehouse")
 def load_price_history_from_lakehouse(
     tickers: list[str], start: date, end: date
 ) -> pd.DataFrame | None:
@@ -1668,9 +2521,13 @@ def load_price_history_from_lakehouse(
     others = [ticker for ticker in tickers if ticker not in _CRYPTO_KLINE_SYMBOLS]
     parts = []
     if others:
-        parts.append(_equity_price_rows(others, start, end))
+        equities = sorted(set(others))
+        prices = _EQUITY_PRICES.read(equities, start, end)
+        parts.append(_equity_price_rows(prices, equities, start, end))
     if crypto:
-        parts.append(_crypto_price_rows(crypto, start, end))
+        coins = sorted(set(crypto), key=lambda ticker: _CRYPTO_KLINE_SYMBOLS[ticker])
+        klines = _CRYPTO_PRICES.read(coins, start, end)
+        parts.append(_crypto_price_rows(klines, coins, start, end))
     parts = [part for part in parts if not part.empty]
     if not parts:
         return None
@@ -1824,6 +2681,7 @@ def load_futures_price_history_from_lakehouse(
     return combined
 
 
+@_counted("load_raw_close_from_lakehouse")
 def load_raw_close_from_lakehouse(
     ticker: str, as_of_date: date, lookback_days: int
 ) -> float | None:
@@ -1834,23 +2692,48 @@ def load_raw_close_from_lakehouse(
     close for `ticker` in that window. Self-asserts point-in-time on
     `date` before returning."""
     _guard_data_end(as_of_date, "load_raw_close_from_lakehouse")
-    window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
+    first = as_of_date - timedelta(days=lookback_days)
+    closes = _RAW_CLOSES.read([ticker], first, as_of_date)
+    return _select_raw_close(closes, ticker, first, as_of_date)
+
+
+def _fetch_raw_closes(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each of `tickers`' positive unadjusted `instrument_prices` closes
+    dated `start` to `end`, as `date`/`close` sorted by date, one query
+    per ticker."""
     query = f"""
         SELECT date, close
         FROM {_table_sql("instrument_prices")}
         WHERE ticker = ?
           AND date BETWEEN ? AND ?
           AND close > 0
-        ORDER BY date DESC
-        LIMIT 1
+        ORDER BY date
     """
-    frame = _query(query, [ticker, window_start, as_of_date.isoformat()])
-    if frame.empty:
+    return {
+        ticker: _gated(_query(query, [ticker, start.isoformat(), end.isoformat()]), end, "date")
+        for ticker in tickers
+    }
+
+
+_RAW_CLOSES: StoreSource[str, pd.DataFrame] = StoreSource(
+    "instrument_prices:raw_close", _fetch_raw_closes, ranged=True
+)
+
+
+def _select_raw_close(
+    closes: dict[str, pd.DataFrame], ticker: str, first: date, as_of_date: date
+) -> float | None:
+    """The `load_raw_close_from_lakehouse` answer from `_fetch_raw_closes`
+    rows: `ticker`'s last close dated `first` to `as_of_date`, or `None`."""
+    rows = _rows_in_range(closes, [ticker], first, as_of_date)
+    if rows.empty:
         return None
+    frame = rows.iloc[[-1]]
     assert_point_in_time(frame, as_of_date, date_column="date")
     return float(frame["close"].iloc[0])
 
 
+@_counted("load_fred_series_from_lakehouse")
 def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Series | None:
     """A FRED macro series (`DGS3MO`/`DGS2`/`DGS10`/`VIXCLS`/`CPIAUCSL`/
     `BAMLH0A0HYM2`/`BAMLC0A0CM` — the same series `macro_loader.
@@ -1866,6 +2749,7 @@ def load_fred_series_from_lakehouse(series_id: str, as_of_date: date) -> pd.Seri
     return None if vintages is None else vintages["value"]
 
 
+@_counted("load_fred_vintages_from_lakehouse")
 def load_fred_vintages_from_lakehouse(series_id: str, as_of_date: date) -> pd.DataFrame | None:
     """The FRED series `series_id` as it stood at the close of
     `as_of_date`, from the `fred_vintages` table (`series_id`, `date`,
@@ -1891,27 +2775,55 @@ def load_fred_vintages_from_lakehouse(series_id: str, as_of_date: date) -> pd.Da
 
 
 def _fred_vintages(series_id: str, as_of_date: date) -> pd.DataFrame | None:
-    """The query behind `load_fred_vintages_from_lakehouse`, without the
+    """The read behind `load_fred_vintages_from_lakehouse`, without the
     `data_end` guard its public callers apply first."""
+    versions = _FRED_VERSIONS.read([series_id], as_of_date, as_of_date)[series_id]
+    return _select_fred_vintages(versions, as_of_date)
+
+
+def _fetch_fred_versions(series_ids: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Every version of each of `series_ids` known strictly before `end`,
+    one query per series: `date`, `value`, `realtime_start` and
+    `known_at` (`GREATEST(realtime_start, date)`, the later of the two;
+    a null `realtime_start` gives the observation date), sorted by
+    observation date, then `realtime_start` with nulls first, then
+    `value` with nulls first, so the last row of a date is its latest
+    version. `start` is not used."""
     query = f"""
         SELECT date, value, realtime_start, known_at
         FROM (
-            SELECT date, value, realtime_start, known_at, ROW_NUMBER() OVER (
-                PARTITION BY date
-                ORDER BY realtime_start DESC
-            ) AS rn
-            FROM (
-                SELECT date, value, realtime_start,
-                    GREATEST(realtime_start, date) AS known_at
-                FROM {_table_sql("fred_vintages")}
-                WHERE series_id = ?
-            )
-            WHERE known_at < ?
+            SELECT date, value, realtime_start,
+                GREATEST(realtime_start, date) AS known_at
+            FROM {_table_sql("fred_vintages")}
+            WHERE series_id = ?
         )
-        WHERE rn = 1
-        ORDER BY date
+        WHERE known_at < ?
+        ORDER BY date, realtime_start NULLS FIRST, value NULLS FIRST
     """
-    frame = _query(query, [series_id, as_of_date.isoformat()])
+    return {
+        series_id: _gated(
+            _query(query, [series_id, end.isoformat()]),
+            end,
+            "date",
+            ("realtime_start", "known_at"),
+        )
+        for series_id in series_ids
+    }
+
+
+_FRED_VERSIONS: StoreSource[str, pd.DataFrame] = StoreSource(
+    "fred_vintages", _fetch_fred_versions, ranged=False
+)
+
+
+def _select_fred_vintages(versions: pd.DataFrame, as_of_date: date) -> pd.DataFrame | None:
+    """The `load_fred_vintages_from_lakehouse` frame from
+    `_fetch_fred_versions` rows: of the versions with `known_at` strictly
+    before `as_of_date`, each observation date's last (its latest
+    `realtime_start`; of two with the same `realtime_start`, the larger
+    `value`), or `None` when none are known."""
+    known = _rows_where(versions, versions["known_at"] < pd.Timestamp(as_of_date))
+    frame = known.drop_duplicates(subset="date", keep="last").reset_index(drop=True)
     if frame.empty:
         return None
     frame["date"] = pd.to_datetime(frame["date"])
@@ -2033,6 +2945,7 @@ def ken_french_public_date(day: date) -> date:
     return month.end_time.date()
 
 
+@_counted("load_fama_french_factors_from_lakehouse")
 def load_fama_french_factors_from_lakehouse(
     as_of_date: date, model: str = "3factor"
 ) -> pd.DataFrame | None:
@@ -2054,19 +2967,57 @@ def load_fama_french_factors_from_lakehouse(
     if dataset is None:
         return None
     factors = _KEN_FRENCH_FACTORS_BY_MODEL[model]
+    rows = _KEN_FRENCH_ROWS.read([(dataset, factors)], as_of_date, as_of_date)[(dataset, factors)]
+    return _select_fama_french(rows, factors, as_of_date)
 
-    placeholders = ", ".join("?" for _ in factors)
-    query = f"""
-        SELECT date, portfolio, value
-        FROM {_table_sql("famafrench_returns")}
-        WHERE dataset = ? AND frequency = ?
-          AND portfolio IN ({placeholders})
-          AND last_day(
-                date_add(CAST(date AS DATE), INTERVAL {_KEN_FRENCH_PUBLICATION_LAG_MONTHS} MONTH)
-              ) <= ?
-        ORDER BY date
-    """
-    long = _query(query, [dataset, _KEN_FRENCH_FREQUENCY, *factors, as_of_date.isoformat()])
+
+def _fetch_ken_french(
+    keys: list[tuple[str, tuple[str, ...]]], start: date, end: date
+) -> dict[tuple[str, tuple[str, ...]], pd.DataFrame]:
+    """For each (dataset, factor portfolios), the daily rows of those
+    portfolios public on or before `end`, one query per key: `date`,
+    `portfolio`, `value` and `public_date` (`ken_french_public_date`,
+    computed in the lake), sorted by date, portfolio, then value. `start`
+    is not used."""
+    fetched: dict[tuple[str, tuple[str, ...]], pd.DataFrame] = {}
+    for dataset, factors in keys:
+        placeholders = ", ".join("?" for _ in factors)
+        query = f"""
+            SELECT date, portfolio, value, public_date
+            FROM (
+                SELECT date, portfolio, value,
+                       last_day(
+                           date_add(
+                               CAST(date AS DATE),
+                               INTERVAL {_KEN_FRENCH_PUBLICATION_LAG_MONTHS} MONTH
+                           )
+                       ) AS public_date
+                FROM {_table_sql("famafrench_returns")}
+                WHERE dataset = ? AND frequency = ?
+                  AND portfolio IN ({placeholders})
+            )
+            WHERE public_date <= ?
+            ORDER BY date, portfolio, value
+        """
+        frame = _query(query, [dataset, _KEN_FRENCH_FREQUENCY, *factors, end.isoformat()])
+        fetched[(dataset, factors)] = _gated(frame, end, "date", ("public_date",))
+    return fetched
+
+
+_KEN_FRENCH_ROWS: StoreSource[tuple[str, tuple[str, ...]], pd.DataFrame] = StoreSource(
+    "famafrench_returns", _fetch_ken_french, ranged=False
+)
+
+
+def _select_fama_french(
+    rows: pd.DataFrame, factors: tuple[str, ...], as_of_date: date
+) -> pd.DataFrame | None:
+    """The `load_fama_french_factors_from_lakehouse` frame from
+    `_fetch_ken_french` rows: those public on or before `as_of_date`,
+    pivoted to one column per factor, or `None` when none are."""
+    long = _rows_where(rows, rows["public_date"] <= pd.Timestamp(as_of_date)).drop(
+        columns="public_date"
+    )
     if long.empty:
         return None
     long["date"] = pd.to_datetime(long["date"])
@@ -2082,6 +3033,7 @@ def load_fama_french_factors_from_lakehouse(
 _COMPANY_FACT_PERIOD_KEY = ["concept", "unit", "period_start", "period_end"]
 
 
+@_counted("load_company_facts_from_lakehouse")
 def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataFrame | None:
     """Filed SEC EDGAR company facts for `ticker` known at the close of
     `as_of_date`, one row per reported period: columns `concept`, `unit`,
@@ -2111,6 +3063,16 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
     Returns `None` if no rows remain. Self-asserts point-in-time on
     `filed` (the SQL gate) and on `available_date` before returning."""
     _guard_data_end(as_of_date, "load_company_facts_from_lakehouse")
+    facts = _COMPANY_FACTS.read([ticker], as_of_date, as_of_date)[ticker]
+    return _select_company_facts(facts, as_of_date)
+
+
+def _fetch_company_facts(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each of `tickers`' distinct company-fact rows filed on or before
+    `end`, joined to their filing's acceptance time, one query per ticker:
+    `concept`, `unit`, `period_start`, `period_end`, `value`,
+    `fiscal_year`, `fiscal_period`, `form`, `filed` and `accepted_at`,
+    sorted on every column (`filed` first). `start` is not used."""
     query = f"""
         SELECT x.concept, x.unit, x.period_start, x.period_end, x.value, x.fiscal_year,
                x.fiscal_period, x.form, x.filed_date AS filed, f.accepted_at
@@ -2123,7 +3085,25 @@ def load_company_facts_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataF
         ORDER BY filed, concept, unit, period_start, period_end, accepted_at, fiscal_year,
                  fiscal_period, form, value
     """
-    frame = _query(query, [ticker, as_of_date.isoformat()])
+    return {
+        ticker: _gated(_query(query, [ticker, end.isoformat()]), end, "filed") for ticker in tickers
+    }
+
+
+_COMPANY_FACTS: StoreSource[str, pd.DataFrame] = StoreSource(
+    "sec_company_facts", _fetch_company_facts, ranged=False
+)
+
+
+def _select_company_facts(facts: pd.DataFrame, as_of_date: date) -> pd.DataFrame | None:
+    """The `load_company_facts_from_lakehouse` frame from
+    `_fetch_company_facts` rows: those filed on or before `as_of_date`
+    (typed as a read of exactly those rows), gated on availability and
+    reduced to one row per period, or `None` when none remain."""
+    frame = _as_read(
+        facts[np.asarray(facts["filed"] <= pd.Timestamp(as_of_date), dtype=bool)],
+        int_columns=("fiscal_year",),
+    )
     if frame.empty:
         return None
     frame["filed"] = pd.to_datetime(frame["filed"])
@@ -2195,13 +3175,15 @@ def _finra_available_date(settlement: date) -> date:
     return next_session(add_sessions(settlement, _FINRA_DISSEMINATION_LAG_SESSIONS))
 
 
+@_counted("load_short_interest_from_lakehouse")
 def load_short_interest_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataFrame | None:
     """FINRA short-interest history for `ticker`, from the
     `finra_short_interest` table (`symbol`, `settlement_date`,
     `revision_flag`, `current_short_position`, `days_to_cover`,
     `average_daily_volume`, ...), as `settlement_date`/
     `dissemination_date`/`short_interest_shares`/`days_to_cover`/
-    `avg_daily_volume` rows sorted by settlement date.
+    `avg_daily_volume` rows sorted by settlement date, an unrevised row
+    before a revised one of the same settlement.
 
     `dissemination_date` holds this loader's own availability estimate,
     `_finra_available_date(settlement_date)`, not the lake's
@@ -2213,17 +3195,44 @@ def load_short_interest_from_lakehouse(ticker: str, as_of_date: date) -> pd.Data
     available on or before `as_of_date` are returned; `None` if none are.
     Self-asserts point-in-time on `dissemination_date` before returning."""
     _guard_data_end(as_of_date, "load_short_interest_from_lakehouse")
+    history = _SHORT_INTEREST.read([ticker], as_of_date, as_of_date)[ticker]
+    return _select_short_interest(history, as_of_date)
+
+
+def _fetch_short_interest(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Each of `tickers`' full `finra_short_interest` history (a revised
+    row's availability rests on the symbol's next settlement, so no date
+    cut is applied), one query per ticker: `settlement_date`,
+    `revision_flag`, `short_interest_shares`, `days_to_cover` and
+    `avg_daily_volume`, sorted by settlement date, an unrevised row before
+    a revised one of the same settlement, then on every other column, so
+    the order never depends on the lake's row order. `start` and `end`
+    are not used."""
     query = f"""
         SELECT settlement_date, revision_flag,
                current_short_position AS short_interest_shares,
                days_to_cover, average_daily_volume AS avg_daily_volume
         FROM {_table_sql("finra_short_interest")}
         WHERE symbol = ?
-        ORDER BY settlement_date
+        ORDER BY settlement_date, revision_flag NULLS FIRST, current_short_position,
+                 days_to_cover, average_daily_volume
     """
-    frame = _query(query, [ticker])
-    if frame.empty:
+    return {ticker: _query(query, [ticker]) for ticker in tickers}
+
+
+_SHORT_INTEREST: StoreSource[str, pd.DataFrame] = StoreSource(
+    "finra_short_interest", _fetch_short_interest, ranged=False
+)
+
+
+def _select_short_interest(history: pd.DataFrame, as_of_date: date) -> pd.DataFrame | None:
+    """The `load_short_interest_from_lakehouse` frame from a symbol's
+    `_fetch_short_interest` history: every row with its estimated
+    dissemination date, kept when that is on or before `as_of_date`, or
+    `None` when none are."""
+    if history.empty:
         return None
+    frame = history.copy()
     frame["settlement_date"] = pd.to_datetime(frame["settlement_date"])
     settlements = sorted({stamp.date() for stamp in frame["settlement_date"]})
     next_settlement: dict[date, date | None] = dict(
@@ -2253,6 +3262,7 @@ def load_short_interest_from_lakehouse(ticker: str, as_of_date: date) -> pd.Data
     return frame
 
 
+@_counted("load_insider_transactions_from_lakehouse")
 def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataFrame | None:
     """SEC Form 4 insider transactions for `ticker` (`owner_cik`,
     `owner_name`, `is_officer`, `is_director`, `is_ten_percent_owner`,
@@ -2277,6 +3287,18 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
     rows remain. Self-asserts point-in-time on `filed_date` (the SQL gate)
     and on `available_date` before returning."""
     _guard_data_end(as_of_date, "load_insider_transactions_from_lakehouse")
+    transactions = _INSIDER_TRANSACTIONS.read([ticker], as_of_date, as_of_date)[ticker]
+    return _select_insider_transactions(transactions, as_of_date)
+
+
+def _fetch_insider_transactions(
+    tickers: list[str], start: date, end: date
+) -> dict[str, pd.DataFrame]:
+    """Each of `tickers`' distinct Form 4 lines filed on or before `end`,
+    joined to their filing's acceptance time, one query per ticker, with
+    the columns of `load_insider_transactions_from_lakehouse` before
+    `available_date` plus `accepted_at`, sorted on every column
+    (`filed_date` first). `start` is not used."""
     query = f"""
         SELECT t.owner_cik, t.owner_name, t.is_officer, t.is_director, t.is_ten_percent_owner,
                t.transaction_date, t.transaction_code, t.shares, t.price_per_share,
@@ -2291,7 +3313,31 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
                  t.acquired_disposed, t.shares, t.price_per_share, t.is_officer, t.is_director,
                  t.is_ten_percent_owner, f.accepted_at
     """
-    frame = _query(query, [ticker, as_of_date.isoformat()])
+    return {
+        ticker: _gated(_query(query, [ticker, end.isoformat()]), end, "filed_date")
+        for ticker in tickers
+    }
+
+
+_INSIDER_TRANSACTIONS: StoreSource[str, pd.DataFrame] = StoreSource(
+    "sec_insider_transactions", _fetch_insider_transactions, ranged=False
+)
+
+
+def _select_insider_transactions(
+    transactions: pd.DataFrame, as_of_date: date
+) -> pd.DataFrame | None:
+    """The `load_insider_transactions_from_lakehouse` frame from
+    `_fetch_insider_transactions` rows: those filed on or before
+    `as_of_date` (typed as a read of exactly those rows) and available
+    by its close, or `None` when none are."""
+    frame = _as_read(
+        transactions[
+            np.asarray(transactions["filed_date"] <= pd.Timestamp(as_of_date), dtype=bool)
+        ],
+        int_columns=("owner_cik",),
+        bool_columns=("is_officer", "is_director", "is_ten_percent_owner"),
+    )
     if frame.empty:
         return None
     frame["filed_date"] = pd.to_datetime(frame["filed_date"])
@@ -2314,6 +3360,7 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
 STRIKE_MATCH_TOLERANCE = 0.005
 
 
+@_counted("load_option_quote_from_lakehouse")
 def load_option_quote_from_lakehouse(
     underlying: str,
     expiration: date,
@@ -2332,28 +3379,67 @@ def load_option_quote_from_lakehouse(
     `STRIKE_MATCH_TOLERANCE` of `strike`; the strike is compared in the
     adjusted basis rather than in SQL against the raw column, since the
     two differ for a contract quoted before a later split. Of several
-    matching rows the one with the latest `date` is returned. `None`
-    when never quoted in the window. Self-asserts point-in-time on
-    `date` before returning."""
+    matching rows the one with the latest `date` is returned; rows of one
+    date are taken in chain order (`_CHAIN_COLUMNS`), so the returned
+    row's index label is its position in that order, latest date first.
+    `None` when never quoted in the window. Self-asserts point-in-time on
+    `date` before returning.
+
+    Inside a window store the rows come from the store's chain months
+    (`_chain_snapshots`); otherwise one query reads the contract's
+    expiry and type over the window. `_select_option_quote` picks the
+    answer from either."""
     _guard_data_end(as_of_date, "load_option_quote_from_lakehouse")
-    window_start = (as_of_date - pd.Timedelta(days=lookback_days)).isoformat()
+    first = as_of_date - timedelta(days=lookback_days)
     table, date_column = _option_chain_source(underlying, as_of_date)
-    query = f"""
-        SELECT {date_column} AS date, expiration, option_type, strike, bid, ask,
-               implied_volatility, delta, gamma, theta, vega, rho
-        FROM {_table_sql(table)}
-        WHERE underlying = ?
-          AND expiration = ?
-          AND option_type = ?
-          AND {date_column} BETWEEN ? AND ?
-        ORDER BY {date_column} DESC
-    """
-    frame = _query(
-        query,
-        [underlying, expiration.isoformat(), option_type, window_start, as_of_date.isoformat()],
+
+    def contract_rows() -> pd.DataFrame:
+        query = _chain_query(table, date_column, "AND expiration = ? AND option_type = ?")
+        frame = _query(
+            query,
+            [
+                underlying,
+                first.isoformat(),
+                as_of_date.isoformat(),
+                expiration.isoformat(),
+                option_type,
+            ],
+        )
+        return _gated(frame, as_of_date, "date", ("expiration",))
+
+    snapshots = _chain_snapshots(table, date_column, underlying, first, as_of_date, contract_rows)
+    return _select_option_quote(
+        snapshots, underlying, expiration, option_type, strike, as_of_date, lookback_days
     )
-    if frame.empty:
+
+
+def _select_option_quote(
+    snapshots: dict[pd.Timestamp, pd.DataFrame],
+    underlying: str,
+    expiration: date,
+    option_type: str,
+    strike: float,
+    as_of_date: date,
+    lookback_days: int,
+) -> pd.DataFrame | None:
+    """The `load_option_quote_from_lakehouse` answer from chain
+    `snapshots`: the rows of `expiration` and `option_type` dated within
+    `lookback_days` on or before `as_of_date`, latest date first and in
+    chain order within a date, split-adjusted; then the first whose
+    strike is within `STRIKE_MATCH_TOLERANCE` of `strike`, or `None`."""
+    expiry = pd.Timestamp(expiration)
+    parts = []
+    for day in reversed(
+        _snapshot_dates_in(snapshots, as_of_date - timedelta(days=lookback_days), as_of_date)
+    ):
+        rows = snapshots[day]
+        parts.append(
+            _rows_where(rows, (rows["expiration"] == expiry) & (rows["option_type"] == option_type))
+        )
+    kept = [part for part in parts if not part.empty]
+    if not kept:
         return None
+    frame = pd.concat(kept, ignore_index=True)
     frame["date"] = pd.to_datetime(frame["date"])
     frame["expiration"] = pd.to_datetime(frame["expiration"])
     frame = _apply_split_adjustment(frame, underlying)

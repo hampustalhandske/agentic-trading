@@ -1,7 +1,7 @@
 # cli.py
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from importlib import metadata
 from pathlib import Path
 from typing import cast, get_args
@@ -31,7 +31,10 @@ from agentic_trading.data.loader import (
     load_price_history_with_fallback,
 )
 from agentic_trading.data.loaders.lakehouse_loader import (
+    declare_loader_window,
     lake_session,
+    loader_query_counts,
+    reset_loader_query_counts,
     verify_rebuilt_whole_builds,
 )
 from agentic_trading.data.loaders.macro_loader import (
@@ -198,6 +201,31 @@ _LAKE_TIME_HELP = (
     "write of the tables the run reads."
 )
 
+_LOADER_STORE_HELP = (
+    "Serve the loaders' per-day reads from data read once over the run's window "
+    "(the window store); --no-loader-store makes every read query the lake itself. "
+    "Both give the same result."
+)
+
+# Prefix of the stderr line holding the run's loader query counts as JSON.
+LOADER_QUERY_COUNTS_PREFIX = "loader-query-counts "
+
+
+def _declare_run_window(enabled: bool, start: date, end: date) -> None:
+    """Resets the loader query counts and, when `enabled`, declares the
+    open session's window store from `start` (the first day minus the
+    warm-up) to `end` (the last day)."""
+    reset_loader_query_counts()
+    if enabled:
+        declare_loader_window(start, end)
+
+
+def _echo_loader_query_counts() -> None:
+    """Writes one stderr line: `LOADER_QUERY_COUNTS_PREFIX` and the JSON
+    list of `loader_query_counts()`."""
+    counts = [count.model_dump() for count in loader_query_counts()]
+    typer.echo(LOADER_QUERY_COUNTS_PREFIX + json.dumps(counts), err=True)
+
 
 def _parse_lake_time_flag(value: str | None) -> datetime | None:
     """The `--lake-time` value as an aware `datetime`, or `None` when the
@@ -352,13 +380,19 @@ def run(
         "prompting — required for scripted/CI use.",
     ),
     lake_time: str | None = typer.Option(None, "--lake-time", help=_LAKE_TIME_HELP),
+    loader_store: bool = typer.Option(
+        True, "--loader-store/--no-loader-store", help=_LOADER_STORE_HELP
+    ),
 ) -> None:
     """Wires together Portfolio, Commander, and BacktestEngine for the
     given assets and date range, runs the backtest, and prints a summary
     of the resulting BacktestResult. Every lakehouse read (the preflight,
     the price history, the engine run and the provenance) happens inside
     one lake session, at `--lake-time` or the default lake time, and the
-    provenance records it.
+    provenance records it. Unless `--no-loader-store`, the session's
+    window store is declared from the start date minus the warm-up to the
+    end date. The loader query counts go to stderr as one
+    `LOADER_QUERY_COUNTS_PREFIX` line.
 
     Run with every argument given (assets + --start-date + --end-date) for a
     fully non-interactive, scriptable invocation — nothing is prompted, and a
@@ -430,6 +464,11 @@ def run(
     )
     with lake_session(requested_lake_time) as session:
         logger.info("Reading the lake at lake time %s", session.lake_time.isoformat())
+        _declare_run_window(
+            loader_store,
+            parsed_start_date - timedelta(days=DEFAULT_BACKTEST_WARMUP_DAYS),
+            parsed_end_date,
+        )
         analysts = resolve_roster_after_preflight(
             build_default_analysts(),
             resolved_assets,
@@ -450,6 +489,7 @@ def run(
                 "verbose": verbose,
                 "no_log": no_log,
                 "lake_time": lake_time,
+                "loader_store": loader_store,
             },
             [analyst.agent_id for analyst in analysts],
             [manager.agent_id for manager in managers],
@@ -495,6 +535,7 @@ def run(
             )
             raise
         verify_rebuilt_whole_builds()
+        _echo_loader_query_counts()
         typer.echo(
             json.dumps(
                 {
@@ -586,6 +627,9 @@ def experiment(
     no_log: bool = typer.Option(
         False, "--no-log", help="Disable logging entirely — nothing is written to the log file."
     ),
+    loader_store: bool = typer.Option(
+        True, "--loader-store/--no-loader-store", help=_LOADER_STORE_HELP
+    ),
 ) -> None:
     """Run a calibration phase followed by a separate out-of-sample test phase.
 
@@ -597,10 +641,13 @@ def experiment(
     Both phases, the baselines and the provenance read the lake inside one
     lake session: at `--lake-time` when given; otherwise, with `--resume`,
     at the lake time stored in the checkpoints; otherwise at the default
-    lake time.
+    lake time. Unless `--no-loader-store`, the session's window store is
+    declared from the training start minus `--warmup-days` to the test
+    end.
 
-    The JSON result is the only thing on stdout; progress messages go to
-    stderr and the run log to `log/agentic_trading.log` (none with
+    The JSON result is the only thing on stdout; progress messages and
+    one `LOADER_QUERY_COUNTS_PREFIX` line of loader query counts go to
+    stderr, and the run log to `log/agentic_trading.log` (none with
     `--no-log`).
     """
     parsed_train_start = _parse_date_flag(train_start, "--train-start")
@@ -644,6 +691,9 @@ def experiment(
     )
     with lake_session(requested_lake_time) as session:
         typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
+        _declare_run_window(
+            loader_store, parsed_train_start - timedelta(days=warmup_days), parsed_test_end
+        )
         analysts = resolve_roster_after_preflight(
             analysts,
             resolved_assets,
@@ -676,6 +726,7 @@ def experiment(
                 "verbose": verbose,
                 "no_log": no_log,
                 "lake_time": lake_time,
+                "loader_store": loader_store,
             },
             [analyst.agent_id for analyst in analysts],
             [manager.agent_id for manager in managers],
@@ -836,6 +887,7 @@ def experiment(
                     mode="json"
                 )
         verify_rebuilt_whole_builds()
+        _echo_loader_query_counts()
         typer.echo(
             json.dumps(
                 {

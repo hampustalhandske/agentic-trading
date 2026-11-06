@@ -154,7 +154,9 @@ def _rate(as_of_date: date) -> float:
 
 def _snapshot(underlying: str, as_of_date: date) -> pd.DataFrame | None:
     """The cached latest snapshot for `underlying` as of `as_of_date`,
-    `None` when there is none or it is older than the age window."""
+    `None` when there is none or it is older than the age window. Each
+    call returns its own copy-on-write copy of the cached frame, so a
+    caller changing it never changes the cache."""
     _use_caches_at_current_lake_time()
     key = (underlying, as_of_date)
     if key not in _CHAIN_CACHE:
@@ -176,7 +178,7 @@ def _snapshot(underlying: str, as_of_date: date) -> pd.DataFrame | None:
     age = (as_of_date - snapshot_date).days
     if age < 0 or age > settings.options.max_snapshot_age_days:
         return None
-    return frame
+    return frame.copy(deep=False)
 
 
 def _finite(value: Any, default: float) -> float:
@@ -335,7 +337,9 @@ _QUOTE_CACHE: dict[tuple[str, date], pd.Series | None] = {}
 def _last_quote_row(contract: OptionContract, as_of_date: date) -> pd.Series | None:
     """The contract's own latest quote within `settings.options.max_mark_age_days`
     when the latest snapshot no longer lists its expiry (the historical
-    chain carries three expiries per snapshot and rotates the near ones)."""
+    chain carries three expiries per snapshot and rotates the near ones).
+    Each call returns its own copy of the cached row, so a caller changing
+    it never changes what a later call reads."""
     _use_caches_at_current_lake_time()
     key = (contract.contract_id, as_of_date)
     if key not in _QUOTE_CACHE:
@@ -349,8 +353,9 @@ def _last_quote_row(contract: OptionContract, as_of_date: date) -> pd.Series | N
             as_of_date,
             settings.options.max_mark_age_days,
         )
-        _QUOTE_CACHE[key] = None if frame is None or frame.empty else frame.iloc[0]
-    return _QUOTE_CACHE[key]
+        _QUOTE_CACHE[key] = None if frame is None or frame.empty else frame.iloc[0].copy()
+    row = _QUOTE_CACHE[key]
+    return None if row is None else row.copy()
 
 
 def load_option_mark(contract: OptionContract, as_of_date: date, spot: float) -> OptionMark | None:
