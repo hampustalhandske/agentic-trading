@@ -39,6 +39,7 @@ _EMPTY_CASES: dict[str, Callable[[], Any]] = {
         [1], _START, _END
     ),
     "load_sp500_member_count": lambda: lakehouse_loader.load_sp500_member_count(_START, _END),
+    "load_split_ex_dates": lambda: lakehouse_loader.load_split_ex_dates("AAPL", _AS_OF) or None,
     "load_options_snapshot_from_lakehouse": lambda: (
         lakehouse_loader.load_options_snapshot_from_lakehouse("AAPL", _AS_OF)
     ),

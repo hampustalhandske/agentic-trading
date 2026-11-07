@@ -152,6 +152,7 @@ def test_sec_fundamentals_t_stat_matches_classical_ols_standard_error(monkeypatc
         }
     )
     monkeypatch.setattr(mod, "load_company_facts_from_lakehouse", lambda _asset, _as_of: facts)
+    monkeypatch.setattr(mod, "load_split_ex_dates", lambda _asset, _as_of: [])
 
     signal = mod.SecFundamentalsAnalyst().generate_signal(
         "AAPL", pd.DataFrame(), pd.Timestamp(filed_dates[-1]) + pd.Timedelta(days=1)

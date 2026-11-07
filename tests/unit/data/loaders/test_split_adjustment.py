@@ -1,5 +1,6 @@
 # test_split_adjustment.py
-"""Unit tests for agentic_trading.data.loaders.lakehouse_loader.split_adjustment_factor."""
+"""Unit tests for agentic_trading.data.loaders.lakehouse_loader.split_adjustment_factor and
+load_split_ex_dates."""
 
 from datetime import date
 from typing import Any
@@ -24,16 +25,29 @@ _ROWS = [
     ("XYZ", "2023-03-01", 0.5, None),
 ]
 
+# Out of ex-date order, with a duplicated ex-date, a reverse split (ratio 2) and rows whose
+# ratio is 1, missing, zero or negative.
+_EX_DATE_ROWS = [
+    ("ZZSP", "2019-05-01", 0.5, True),
+    ("ZZSP", "2016-03-01", 0.25, True),
+    ("ZZSP", "2016-03-01", 0.5, True),
+    ("ZZSP", "2017-01-03", 1.0, True),
+    ("ZZSP", "2017-06-01", None, True),
+    ("ZZSP", "2018-01-02", 0.0, True),
+    ("ZZSP", "2018-06-01", -0.5, True),
+    ("ZZSP", "2021-01-04", 2.0, True),
+]
+
 
 def _load_splits(fake_lake: Any, rows: list[tuple]) -> None:
-    """Registers yahoo_split_close_basis with a nullable boolean in_close_basis column."""
+    """Registers yahoo_split_close_basis with nullable ratio and in_close_basis columns."""
     frame = pd.DataFrame(
         [(t, d, r, b, None, None, None, None) for t, d, r, b in rows], columns=_COLUMNS
     )
     frame = frame.astype(
         {
             "ticker": "string",
-            "ratio": float,
+            "ratio": "Float64",
             "in_close_basis": "boolean",
             "c0": float,
             "c1": float,
@@ -89,3 +103,24 @@ def test_unknown_ticker_and_empty_table_return_one(fake_lake: Any) -> None:
     assert lakehouse_loader.split_adjustment_factor("MSFT", date(2020, 1, 2)) == 1.0
     _load_splits(fake_lake, [])
     assert lakehouse_loader.split_adjustment_factor("AAPL", date(2020, 8, 28)) == 1.0
+
+
+def test_load_split_ex_dates(fake_lake: Any) -> None:
+    """Ex-dates up to as_of with a positive ratio other than 1, ascending and unique."""
+    _load_splits(fake_lake, _ROWS + _EX_DATE_ROWS)
+    load = lakehouse_loader.load_split_ex_dates
+
+    assert load("AAPL", date(2014, 6, 8)) == []
+    assert load("AAPL", date(2014, 6, 9)) == [date(2014, 6, 9)]
+    assert load("AAPL", date(2014, 8, 1)) == [date(2014, 6, 9)]
+    assert load("AAPL", date(2024, 1, 2)) == [date(2014, 6, 9), date(2020, 8, 31)]
+    assert load("ZZSP", date(2016, 2, 29)) == []
+    assert load("ZZSP", date(2021, 1, 3)) == [date(2016, 3, 1), date(2019, 5, 1)]
+    assert load("ZZSP", date(2021, 1, 4)) == [date(2016, 3, 1), date(2019, 5, 1), date(2021, 1, 4)]
+    assert load("MSFT", date(2024, 1, 2)) == []
+
+    for day in pd.date_range("2013-01-01", "2025-01-01", freq="QS").date:
+        for ticker in ("AAPL", "NVDA", "TSLA", "ZZSP"):
+            ex_dates = load(ticker, day)
+            assert all(type(ex_date) is date and ex_date <= day for ex_date in ex_dates)
+            assert ex_dates == sorted(set(ex_dates))

@@ -3,11 +3,14 @@
 """Tests for the discrete-quarter construction and trend signal of `SecFundamentalsAnalyst`."""
 
 from datetime import date
+from typing import Any
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from agentic_trading.agents.analysts.event_credit_pod import sec_fundamentals_analyst as mod
+from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders import lakehouse_loader as ll
 from agentic_trading.stage_a.decisions import check_source_as_of, row_source
 
@@ -31,6 +34,50 @@ _FACTS = [
 ]
 _EXPECTED = [1.20, 1.29, 1.88, 1.52, 1.26, 1.47, 2.18, 1.53]
 
+# AAPL's 7-for-1 split; the first filing on the new share basis is the 10-Q of 2014-07-23.
+_EX_DATE = date(2014, 6, 9)
+# AAPL's diluted-EPS filings of fiscal 2012-2014 as (period_end, value, filed, form). The
+# 10-Q of 2014-07-23 restates only the two quarters it presents; the 10-K of 2014-10-27
+# restates the trailing eight.
+_RESTATED = [1.97, 1.44, 1.07, 1.18, 2.07, 1.66, 1.28, 1.42]
+_RESTATED_ENDS = [
+    "2012-12-29",
+    "2013-03-30",
+    "2013-06-29",
+    "2013-09-28",
+    "2013-12-28",
+    "2014-03-29",
+    "2014-06-28",
+    "2014-09-27",
+]
+_AAPL_FILINGS = [
+    ("2012-06-30", 9.32, "2013-07-24", "10-Q"),
+    ("2013-06-29", 7.47, "2013-07-24", "10-Q"),
+    ("2012-09-29", 8.67, "2013-10-30", "10-K"),
+    ("2013-09-28", 8.26, "2013-10-30", "10-K"),
+    ("2012-12-29", 13.81, "2014-01-28", "10-Q"),
+    ("2013-12-28", 14.50, "2014-01-28", "10-Q"),
+    ("2013-03-30", 10.09, "2014-04-24", "10-Q"),
+    ("2014-03-29", 11.62, "2014-04-24", "10-Q"),
+    ("2013-06-29", 1.07, "2014-07-23", "10-Q"),
+    ("2014-06-28", 1.28, "2014-07-23", "10-Q"),
+    *[
+        (end, value, "2014-10-27", "10-K")
+        for end, value in zip(_RESTATED_ENDS, _RESTATED, strict=True)
+    ],
+]
+# The pre-split values of the eight quarters ending 2012-06-30 .. 2014-03-29, in period order.
+_PRE_SPLIT = [9.32, 8.67, 13.81, 10.09, 7.47, 8.26, 14.50, 11.62]
+
+_DISCRETE_QUARTERS = mod.discrete_quarters
+_OLS = mod.ols
+
+
+@pytest.fixture(autouse=True)
+def _no_splits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gives every test an unsplit ticker; a test with splits replaces `load_split_ex_dates`."""
+    monkeypatch.setattr(mod, "load_split_ex_dates", lambda ticker, as_of_date: [], raising=False)
+
 
 def _facts(rows: list[tuple[str, str, float]] = _FACTS) -> pd.DataFrame:
     frame = pd.DataFrame(rows, columns=["period_start", "period_end", "value"])
@@ -41,6 +88,71 @@ def _facts(rows: list[tuple[str, str, float]] = _FACTS) -> pd.DataFrame:
     frame["filed"] = frame["period_end"] + pd.Timedelta(days=35)
     frame["available_date"] = frame["filed"]
     return frame
+
+
+def _filings(rows: list[tuple[str, float, str, str]]) -> pd.DataFrame:
+    """Company facts shaped like `load_company_facts_from_lakehouse` output: one 90-day quarter
+    of `_CONCEPT` per (period_end, value, filed, form), available the day after it is filed."""
+    period_end = pd.to_datetime([r[0] for r in rows])
+    filed = pd.to_datetime([r[2] for r in rows])
+    return pd.DataFrame(
+        {
+            "concept": _CONCEPT,
+            "unit": "USD/shares",
+            "period_start": period_end - pd.Timedelta(days=90),
+            "period_end": period_end,
+            "value": [r[1] for r in rows],
+            "fiscal_year": filed.year,
+            "fiscal_period": ["FY" if r[3] == "10-K" else "Q" for r in rows],
+            "form": [r[3] for r in rows],
+            "filed": filed,
+            "available_date": filed + pd.Timedelta(days=1),
+        }
+    )
+
+
+def _aapl_known_on(as_of: str) -> pd.DataFrame:
+    """`_AAPL_FILINGS` as the loader serves them on `as_of`: the latest filing per quarter
+    among those available by then."""
+    facts = _filings(_AAPL_FILINGS)
+    facts = facts.loc[facts["available_date"] <= pd.Timestamp(as_of)]
+    return facts.sort_values("filed", kind="stable").drop_duplicates("period_end", keep="last")
+
+
+def _run(
+    monkeypatch: pytest.MonkeyPatch, facts: pd.DataFrame, ex_dates: list[date], as_of: str
+) -> tuple[AgentSignal, list[float], list[float], list[tuple[str, Any]]]:
+    """The signal on `as_of` over loader output `facts` for a ticker split on `ex_dates`, with
+    the values `discrete_quarters` received, the values `ols` fitted and the ex-date reads."""
+    received: list[float] = []
+    fitted: list[float] = []
+    reads: list[tuple[str, Any]] = []
+
+    def split_ex_dates(ticker: str, as_of_date: date) -> list[date]:
+        reads.append((ticker, as_of_date))
+        return [ex_date for ex_date in ex_dates if ex_date <= as_of_date]
+
+    def spy_quarters(frame: pd.DataFrame, concept: str) -> pd.DataFrame:
+        received.extend(float(v) for v in frame["value"])
+        return _DISCRETE_QUARTERS(frame, concept)
+
+    def spy_ols(values: Any, *args: Any, **kwargs: Any) -> Any:
+        fitted.extend(np.asarray(values, dtype=np.float64).tolist())
+        return _OLS(values, *args, **kwargs)
+
+    monkeypatch.setattr(mod, "load_company_facts_from_lakehouse", lambda _a, _d: facts)
+    monkeypatch.setattr(mod, "load_split_ex_dates", split_ex_dates, raising=False)
+    monkeypatch.setattr(mod, "discrete_quarters", spy_quarters)
+    monkeypatch.setattr(mod, "ols", spy_ols)
+    signal = mod.SecFundamentalsAnalyst().generate_signal(
+        "AAPL", pd.DataFrame(), pd.Timestamp(as_of)
+    )
+    return signal, received, fitted, reads
+
+
+def _is_unavailable(signal: AgentSignal) -> bool:
+    """True when `signal` is an `unavailable`, flat, zero-confidence non-signal."""
+    return (signal.status, signal.direction, signal.confidence) == ("unavailable", "flat", 0.0)
 
 
 def test_discrete_quarters_derive_q4_and_exclude_ytd_facts() -> None:
@@ -169,3 +281,69 @@ def test_signal_from_loader_selection_passes_source_as_of_audit(monkeypatch) -> 
     assert later.source_as_of == date(2024, 5, 3)
     assert later.sample_count == 5
     check_source_as_of(later.source_as_of, next_session.date(), source)
+
+
+def test_trend_around_aapl_2014_split_uses_one_share_basis(monkeypatch) -> None:
+    """Around AAPL's 7-for-1 split the fit uses only filings on or after the latest ex-date."""
+    splits = [date(2005, 2, 28), _EX_DATE]
+    mixed, received, fitted, reads = _run(
+        monkeypatch, _aapl_known_on("2014-08-01"), splits, "2014-08-01"
+    )
+    assert set(reads) == {("AAPL", date(2014, 8, 1))}
+    assert _is_unavailable(mixed)
+    assert sorted(received) == [1.07, 1.28]
+    assert not set(received + fitted) & set(_PRE_SPLIT)
+
+    restated, received, fitted, _ = _run(
+        monkeypatch, _aapl_known_on("2014-11-01"), splits, "2014-11-01"
+    )
+    assert restated.status == "active"
+    assert restated.sample_count == 8
+    assert restated.source_as_of == date(2014, 10, 27)
+    assert fitted == pytest.approx(_RESTATED, abs=1e-12)
+    assert not set(received) & set(_PRE_SPLIT)
+
+    before, _, fitted, _ = _run(monkeypatch, _aapl_known_on("2014-05-01"), [_EX_DATE], "2014-05-01")
+    assert before.status == "active"
+    assert before.sample_count == 8
+    assert before.source_as_of == date(2014, 4, 24)
+    assert fitted == pytest.approx(_PRE_SPLIT, abs=1e-12)
+
+
+def test_filing_on_the_ex_date_counts_as_post_split(monkeypatch) -> None:
+    """Filings dated on the latest ex-date are used; with the ex-date a day later none are."""
+    facts = _aapl_known_on("2014-11-01")
+
+    on_ex_date, _, fitted, _ = _run(monkeypatch, facts, [date(2014, 10, 27)], "2014-11-01")
+    assert on_ex_date.status == "active"
+    assert on_ex_date.sample_count == 8
+    assert fitted == pytest.approx(_RESTATED, abs=1e-12)
+
+    day_after, received, _, _ = _run(monkeypatch, facts, [date(2014, 10, 28)], "2014-11-01")
+    assert _is_unavailable(day_after)
+    assert received == []
+
+
+def test_quarter_last_filed_before_split_is_excluded_from_trailing_window(monkeypatch) -> None:
+    """A quarter known only from a pre-split filing is dropped even inside the trailing eight."""
+    facts = _filings(
+        [
+            ("2012-12-29", 13.81, "2014-01-28", "10-Q"),
+            ("2013-03-30", 10.09, "2014-04-24", "10-Q"),
+            ("2013-06-29", 1.07, "2014-07-23", "10-Q"),
+            ("2013-09-28", 8.26, "2013-10-30", "10-K"),
+            ("2013-12-28", 2.07, "2015-01-28", "10-Q"),
+            ("2014-03-29", 11.62, "2014-04-24", "10-Q"),
+            ("2014-06-28", 1.28, "2014-07-23", "10-Q"),
+            ("2014-09-27", 1.42, "2014-10-27", "10-K"),
+            ("2014-12-27", 3.06, "2015-01-28", "10-Q"),
+        ]
+    )
+
+    signal, received, fitted, _ = _run(monkeypatch, facts, [_EX_DATE], "2015-02-01")
+
+    assert signal.status == "active"
+    assert signal.sample_count == 5
+    assert signal.source_as_of == date(2015, 1, 28)
+    assert fitted == pytest.approx([1.07, 2.07, 1.28, 1.42, 3.06], abs=1e-12)
+    assert not set(received + fitted) & {13.81, 10.09, 8.26, 11.62}

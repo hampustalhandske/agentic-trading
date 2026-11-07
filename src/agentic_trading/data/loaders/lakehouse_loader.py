@@ -1729,6 +1729,34 @@ def split_adjustment_factor(ticker: str, quote_date: date) -> float:
     return _select_split_factor(splits, quote_date)
 
 
+@_counted("load_split_ex_dates")
+def load_split_ex_dates(ticker: str, as_of_date: date) -> list[date]:
+    """The ex-dates of `ticker`'s splits on or before `as_of_date`,
+    ascending and unique: the rows of the lake's `yahoo_split_close_basis`
+    that `split_adjustment_factor` reads (`in_close_basis` true or null)
+    whose `ratio` is present, positive and not 1. Spin-offs Yahoo writes
+    as fractional splits are included. Returns an empty list when the
+    ticker has no such row.
+
+    Raises `EmptyAdjustmentTableError` when `yahoo_split_close_basis` has
+    no rows at all. A split is known from its ex-date, so `as_of_date` is
+    the knowledge time `_guard_data_end` checks."""
+    _guard_data_end(as_of_date, "load_split_ex_dates")
+    adjustment_table_row_count("yahoo_split_close_basis")
+    splits = _SPLIT_RATIOS.read([ticker], date.min, as_of_date)[ticker]
+    return _select_split_ex_dates(splits, as_of_date)
+
+
+def _select_split_ex_dates(splits: pd.DataFrame, as_of_date: date) -> list[date]:
+    """The unique ex-dates, ascending, of the `_fetch_split_ratios` rows
+    dated on or before `as_of_date` whose ratio is present, positive and
+    not 1."""
+    ratio = pd.to_numeric(splits["ratio"], errors="coerce").astype(np.float64)
+    known = splits["ex_date"] <= pd.Timestamp(as_of_date)
+    rows = _rows_where(splits, known & (ratio > 0) & (ratio != 1))
+    return sorted({stamp.date() for stamp in rows["ex_date"]})
+
+
 def _fetch_split_ratios(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
     """Each of `tickers`' `yahoo_split_close_basis` rows with an ex-date
     after `start` that the close reflects (`in_close_basis` true or null),

@@ -11,7 +11,10 @@ from agentic_trading.agents._market_math import clamp
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, is_likely_equity
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
-from agentic_trading.data.loaders.lakehouse_loader import load_company_facts_from_lakehouse
+from agentic_trading.data.loaders.lakehouse_loader import (
+    load_company_facts_from_lakehouse,
+    load_split_ex_dates,
+)
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -95,11 +98,21 @@ class SecFundamentalsAnalyst(AnalystAgent):
     the latest `trailing_filings` quarters, with time measured in
     quarters since the first of them (`_DAYS_PER_QUARTER`), so a missing
     quarter leaves a gap rather than compressing the axis. Fewer than four
-    quarters give an `unavailable` signal. Discrete quarters do not
-    overlap, so the plain OLS standard error is used rather than a HAC
-    estimate. Reports the latest filing date among the quarters used as
-    `source_as_of` and their number as `sample_count`, so
-    EventCreditManager can dampen on staleness."""
+    quarters give an `unavailable` signal.
+
+    When the asset has split on or before the decision date
+    (`load_split_ex_dates`), only facts filed on or after the latest
+    ex-date are used, and no value is rescaled. A filing made after a
+    split restates on the new share basis only the periods it presents,
+    so quarters taken from filings on both sides of a split would mix
+    share bases. Until four post-split quarters have been filed the
+    signal is `unavailable`. A spin-off Yahoo lists as a split counts as
+    a split here too.
+
+    Discrete quarters do not overlap, so the plain OLS standard error is
+    used rather than a HAC estimate. Reports the latest filing date among
+    the quarters used as `source_as_of` and their number as
+    `sample_count`, so EventCreditManager can dampen on staleness."""
 
     agent_id: str = "sec_fundamentals_analyst"
 
@@ -146,15 +159,26 @@ class SecFundamentalsAnalyst(AnalystAgent):
                 status="unavailable",
             )
 
+        ex_dates = load_split_ex_dates(asset, as_of_date.date())
+        latest_split = ex_dates[-1] if ex_dates else None
+        if latest_split is not None:
+            facts = facts.loc[facts["filed"] >= pd.Timestamp(latest_split)]
+
         quarters = discrete_quarters(facts, self.concept)
         if len(quarters) < 4:
+            rationale = (
+                f"insufficient {self.concept} quarters for a trend fit"
+                if latest_split is None
+                else f"fewer than 4 {self.concept} quarters filed since the split of "
+                f"{latest_split.isoformat()}"
+            )
             return AgentSignal(
                 agent_id=self.agent_id,
                 asset=asset,
                 as_of_date=as_of_date.date(),
                 direction="flat",
                 confidence=0.0,
-                rationale=f"insufficient {self.concept} quarters for a trend fit",
+                rationale=rationale,
                 status="unavailable",
             )
 
