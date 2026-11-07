@@ -152,9 +152,9 @@ class FirmConfig(BaseModel):
     # for the current and pending day only. The checkpoint keeps the whole
     # history. 300 covers `portfolio.ic_lookback_days` (250), the longest
     # trailing window any reader takes, so the record decides as an
-    # unbounded run does; a read reaching further back raises. It changes
-    # how the run holds its history, not what it computes, so it is left
-    # out of the spec hash (`stage_a.spec.RUNTIME_SETTINGS_FIELDS`).
+    # unbounded run does; a read reaching further back raises. It is part
+    # of the spec hash: the engine's BacktestResult holds the decisions of
+    # the retained days only.
     history_horizon_days: int = Field(default=300, ge=1)
 
 
