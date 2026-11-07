@@ -318,6 +318,7 @@ def test_trial_dir_holds_the_submission_only(tmp_path: Path) -> None:
         "last_completed",
         "complete",
         "counted",
+        "paused_for_memory",
     }
     spec = json.loads((trial / "spec.json").read_text())
     assert spec["spec_hash"] == result.spec_hash
@@ -375,6 +376,141 @@ def test_registered_record_writes_one_trial_row(
     assert trials == [
         (FIRM_HYPOTHESIS_ID, "agentic-firm", result.spec_hash, len(_SESSIONS), "submitted", None)
     ]
+
+
+def test_record_paused_for_memory_resumes_to_the_unbroken_rows(tmp_path: Path) -> None:
+    """With resident memory above the restart threshold the pass stops once it has written
+    `restart_min_days` days and says so; resumed by a fresh firm, it ends with exactly the rows
+    of an unbroken record."""
+    paused = _run(
+        tmp_path / "paused", restart_above_rss_mb=100.0, restart_min_days=3, rss_mb=lambda: 101.0
+    )
+    assert (paused.days_written, paused.complete, paused.paused_for_memory) == (3, False, True)
+    assert paused.last_completed == _SESSIONS[2].date()
+    resumed = _run(tmp_path / "paused")
+    unbroken = _run(tmp_path / "unbroken")
+
+    assert resumed.days_written == len(_SESSIONS) - 3
+    assert resumed.complete and not resumed.paused_for_memory
+    assert _rows(tmp_path / "paused", resumed) == _rows(tmp_path / "unbroken", unbroken)
+
+
+def test_record_below_the_restart_threshold_runs_through(tmp_path: Path) -> None:
+    """Resident memory at the threshold, not above it, never stops the pass."""
+    result = _run(tmp_path, restart_above_rss_mb=100.0, rss_mb=lambda: 100.0)
+
+    assert result.complete and not result.paused_for_memory
+    assert result.days_written == len(_SESSIONS)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"restart_above_rss_mb": 0.0},
+        {"restart_above_rss_mb": -1.0},
+        {"restart_above_rss_mb": 100.0, "restart_min_days": 0},
+    ],
+)
+def test_restart_options_are_checked(tmp_path: Path, options: dict[str, Any]) -> None:
+    """A restart threshold that is not positive, or a minimum below one day, is refused before
+    anything is written."""
+    with pytest.raises(ValueError, match="restart_"):
+        _run(tmp_path / "store", **options)
+    assert not (tmp_path / "store").exists()
+
+
+def test_resident_memory_is_read_only_after_the_minimum_days(tmp_path: Path) -> None:
+    """Without a threshold the memory is never read; with one, only once the pass has written
+    `restart_min_days` days, at each later day boundary."""
+    calls: list[float] = []
+
+    def reading() -> float:
+        calls.append(1.0)
+        return 1.0
+
+    _run(tmp_path / "off", rss_mb=reading)
+    assert calls == []
+    _run(tmp_path / "on", restart_above_rss_mb=100.0, restart_min_days=5, rss_mb=reading)
+    assert len(calls) == len(_SESSIONS) - 5
+
+
+def test_unreadable_memory_turns_the_threshold_off(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When resident memory cannot be read the pass logs a warning once and runs to the end."""
+    calls: list[int] = []
+
+    def failing() -> float:
+        calls.append(1)
+        raise OSError("ps is missing")
+
+    package_logger = logging.getLogger("agentic_trading")
+    previous_level = package_logger.level
+    package_logger.addHandler(caplog.handler)
+    package_logger.setLevel(logging.DEBUG)
+    try:
+        result = _run(tmp_path, restart_above_rss_mb=100.0, restart_min_days=1, rss_mb=failing)
+    finally:
+        package_logger.setLevel(previous_level)
+        package_logger.removeHandler(caplog.handler)
+
+    assert result.complete and not result.paused_for_memory
+    assert calls == [1]
+    assert "cannot read resident memory" in caplog.text
+
+
+def test_record_paused_for_memory_records_no_trial_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A counted pass that stops for memory records no trial row; the pass that resumes it to
+    the end records the one row, with n every session."""
+    monkeypatch.setattr(runner_module, "source_tree_state", lambda: ("c" * 40, False))
+    ledger, repo = _ledger(tmp_path, registered=True)
+    paused = _run(
+        tmp_path / "store",
+        ledger=ledger,
+        repo_root=repo,
+        restart_above_rss_mb=100.0,
+        restart_min_days=1,
+        rss_mb=lambda: 101.0,
+    )
+    with duckdb.connect(str(ledger.path), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM trials").fetchone() == (0,)
+    resumed = _run(tmp_path / "store", ledger=ledger, repo_root=repo)
+    with duckdb.connect(str(ledger.path), read_only=True) as con:
+        trials = con.execute("SELECT config_hash, n FROM trials").fetchall()
+
+    assert paused.paused_for_memory and paused.counted
+    assert resumed.complete
+    assert trials == [(resumed.spec_hash, len(_SESSIONS))]
+
+
+def test_max_days_stops_before_memory_on_the_same_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the pass reaches max_days with memory above the threshold, it stops for max_days:
+    not paused for memory, and a counted pass records its trial row."""
+    monkeypatch.setattr(runner_module, "source_tree_state", lambda: ("c" * 40, False))
+    ledger, repo = _ledger(tmp_path, registered=True)
+    result = _run(
+        tmp_path / "store",
+        ledger=ledger,
+        repo_root=repo,
+        max_days=2,
+        restart_above_rss_mb=100.0,
+        restart_min_days=2,
+        rss_mb=lambda: 101.0,
+    )
+    with duckdb.connect(str(ledger.path), read_only=True) as con:
+        trials = con.execute("SELECT n FROM trials").fetchall()
+
+    assert result.days_written == 2 and not result.paused_for_memory
+    assert trials == [(2,)]
+
+
+def test_process_rss_mb_reads_this_process() -> None:
+    """The resident memory of the running interpreter is a plausible positive number of MB."""
+    assert 10.0 < runner_module.process_rss_mb() < 64 * 1024
 
 
 @pytest.mark.parametrize("state", [("c" * 40, True), (None, None)], ids=["dirty", "no-git"])
