@@ -35,13 +35,16 @@ from agentic_trading.config import settings
 # Dotted `settings` paths (`<group>.<field>`, or `pod_sizing.<pod>.<field>`)
 # that tune how a run executes or where it is recorded rather than what it
 # computes, and so are left out of the hashed snapshot: the batch runner's
-# resource guard, and the `trials` group (the trial ledger, the registry
-# directory and the firm family), which is therefore absent from the
-# snapshot. Every other `settings` field is a strategy constant.
+# resource guard, the firm record's in-memory history horizon (a horizon
+# too short for a reader raises rather than changing a result), and the
+# `trials` group (the trial ledger, the registry directory and the firm
+# family), which is therefore absent from the snapshot. Every other
+# `settings` field is a strategy constant.
 RUNTIME_SETTINGS_FIELDS: tuple[str, ...] = (
     "stage_a.min_free_memory_pct",
     "stage_a.min_free_disk_gb",
     "stage_a.check_every_days",
+    "firm.history_horizon_days",
     "trials.ledger_path",
     "trials.registry_dir",
     "trials.firm_family",

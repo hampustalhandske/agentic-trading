@@ -87,6 +87,7 @@ def test_build_spec_records_the_trial() -> None:
         "stage_a.min_free_memory_pct",
         "stage_a.min_free_disk_gb",
         "stage_a.check_every_days",
+        "firm.history_horizon_days",
         "trials.ledger_path",
         "trials.registry_dir",
         "trials.firm_family",

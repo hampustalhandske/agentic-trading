@@ -22,7 +22,10 @@ stops the pass before the day is written.
 The engine checkpoints every day to `store_dir / <spec hash>.checkpoint.sqlite`,
 beside the trial directory, so a pass stopped after `max_days`, or killed,
 resumes with the firm's state as it stood and ends with the rows of an
-unbroken pass. A pass killed after a day's rows were written but before its
+unbroken pass. The engine holds only `settings.firm.history_horizon_days`
+of track record and its last two days of decisions in memory (read at
+call time); the checkpoint holds the whole history, and every report is
+read from it. A pass killed after a day's rows were written but before its
 checkpoint drops the store's days past the checkpoint and computes them
 again. The checkpoint holds the book's value and stays outside the trial
 directory, which holds only the submission: the store's spec.json,
@@ -69,7 +72,7 @@ from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.managers.cvar_manager import ConditionalValueAtRiskManager
 from agentic_trading.agents.managers.tail_hedge_manager import TailHedgeManager
-from agentic_trading.agents.schemas import PortfolioDecision, ShortWarmup, UnfilledOrder
+from agentic_trading.agents.schemas import ShortWarmup, UnfilledOrder
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.engine_inputs import EngineInputs, require_policy_rates
@@ -78,7 +81,10 @@ from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import HoldoutReadError, lake_session
 from agentic_trading.data.trading_calendar import sessions_between
-from agentic_trading.firm_record.availability import analyst_availability
+from agentic_trading.firm_record.availability import (
+    analyst_availability,
+    analyst_availability_of_payloads,
+)
 from agentic_trading.firm_record.rows import (
     analyst_sources,
     firm_day_rows,
@@ -163,7 +169,8 @@ def _on_sessions(market_data: pd.DataFrame, sessions: list[date]) -> pd.DataFram
 
 def _checkpoint_payload(path: Path) -> dict[str, Any] | None:
     """`checkpoint_store.read_all` of the engine checkpoint at `path`,
-    `None` when the file is absent or holds no state."""
+    `None` when the file is absent or holds no state. Loads the whole
+    history; the pass itself reads single columns instead."""
     if not path.exists():
         return None
     connection = checkpoint_store.connect(path, resume=True)
@@ -176,10 +183,13 @@ def _checkpoint_payload(path: Path) -> dict[str, Any] | None:
 def _checkpoint_last_day(path: Path) -> date | None:
     """The last day the engine checkpoint at `path` holds, `None` when the
     file is absent or holds no day."""
-    payload = _checkpoint_payload(path)
-    if payload is None or not payload["portfolio_value_history"]:
+    if not path.exists():
         return None
-    return date.fromisoformat(payload["portfolio_value_history"][-1][0])
+    connection = checkpoint_store.connect(path, resume=True)
+    try:
+        return checkpoint_store.read_last_day(connection)
+    finally:
+        connection.close()
 
 
 def _write_checkpoint_reports(
@@ -190,27 +200,29 @@ def _write_checkpoint_reports(
     records, in day order, and the signals of each analyst id of `roster`,
     and of any other analyst, in the decisions of every day it holds; it
     holds none when the file is absent or holds no state), with `meta`
-    updated to match as agentic_meta.json; return that `meta`."""
-    payload = _checkpoint_payload(checkpoint_path)
-    orders = (
-        []
-        if payload is None
-        else [UnfilledOrder.model_validate(order) for order in payload["unfilled_orders"]]
-    )
-    decisions_by_day = (
-        {}
-        if payload is None
-        else {
-            date.fromisoformat(day): [
-                PortfolioDecision.model_validate(decision) for decision in decisions
-            ]
-            for day, decisions in payload["decisions_by_day"].items()
-        }
-    )
+    updated to match as agentic_meta.json; return that `meta`. Reads only
+    the checkpoint's unfilled orders and its decisions, one day at a time."""
+    orders: list[UnfilledOrder] = []
+    availability = analyst_availability({}, roster)
+    if checkpoint_path.exists():
+        connection = checkpoint_store.connect(checkpoint_path, resume=True)
+        try:
+            if checkpoint_store.read_last_day(connection) is not None:
+                orders = [
+                    UnfilledOrder.model_validate(order)
+                    for order in checkpoint_store.read_unfilled_orders(connection)
+                ]
+                availability = analyst_availability_of_payloads(
+                    (
+                        (date.fromisoformat(day), payload)
+                        for day, payload in checkpoint_store.iter_decision_payloads(connection)
+                    ),
+                    roster,
+                )
+        finally:
+            connection.close()
     meta = write_unfilled_orders(trial_dir, orders, meta)
-    return write_analyst_availability(
-        trial_dir, analyst_availability(decisions_by_day, roster), meta
-    )
+    return write_analyst_availability(trial_dir, availability, meta)
 
 
 def _held_contracts(portfolio: Portfolio) -> dict[str, float]:
@@ -401,10 +413,11 @@ def run_firm_record(
         if pending:
             frame = _on_sessions(inputs.market_data, sessions)
             aligned = inputs.model_copy(update={"market_data": frame})
+            horizon_days = settings.firm.history_horizon_days
             engine = BacktestEngine(
                 commander=commander,
                 portfolio=aligned.portfolio(),
-                track_record=TrackRecord(),
+                track_record=TrackRecord(horizon_days=horizon_days),
                 data_loader=aligned.data_loader,
                 start_date=window_start,
                 end_date=window_end,
@@ -416,6 +429,7 @@ def run_firm_record(
                 risk_free_rate_series=aligned.risk_free_rate_series,
                 policy_rates=aligned.policy_rates,
                 benchmark_returns=aligned.benchmark_returns,
+                history_horizon_days=horizon_days,
             )
             refused_before = len(session.holdout_violations)
             previous = row_provenance(store.day_rows(last)) if last is not None else {}
