@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 import pytest
 
+from agentic_trading.agents.roster import FIRM_V1_EQUITIES
 from agentic_trading.data.loaders import lakehouse_loader
 
 
@@ -368,8 +369,9 @@ _INSIDER_COLUMNS = [
 def _issuer_rows() -> list[dict[str, Any]]:
     """One Form 4 line per owner, stored out of filed order: Google Inc. (owner 1) and Alphabet
     (owner 2) printed as GOOG, another issuer printed as GOOG (owner 3), Apple printed as AAPL
-    (owner 4) and as APPLE (owner 5), Microsoft (owner 6), and an issuer outside the reviewed
-    map printed as GOOGL (owner 7)."""
+    (owner 4) and as APPLE (owner 5), Microsoft (owner 6), an issuer outside the reviewed
+    map printed as GOOGL (owner 7), another issuer printed as C (owner 8) and Citigroup printed
+    as C (owner 9)."""
     lines = [
         ("G2", "GOOG", _ALPHABET, 2, "2016-03-01"),
         ("G1", "GOOG", _GOOGLE_INC, 1, "2015-03-02"),
@@ -378,6 +380,8 @@ def _issuer_rows() -> list[dict[str, Any]]:
         ("A1", "AAPL", 320193, 4, "2015-04-01"),
         ("A2", "APPLE", 320193, 5, "2015-05-01"),
         ("M1", "MSFT", 789019, 6, "2015-07-01"),
+        ("C1", "C", 1043325, 8, "2015-08-03"),
+        ("C2", "C", 831001, 9, "2015-09-01"),
     ]
     return [
         _insider_row(
@@ -400,26 +404,40 @@ def _seed_issuer_rows(fake_lake: Any, rows: list[dict[str, Any]]) -> None:
     _seed_insiders(fake_lake, rows)
 
 
-def test_issuer_ciks_by_ticker_maps_googl_to_google_and_alphabet() -> None:
-    """The reviewed predecessor map sends GOOGL to Google Inc. and Alphabet."""
-    assert lakehouse_loader.ISSUER_CIKS_BY_TICKER == {"GOOGL": (_GOOGLE_INC, _ALPHABET)}
+def test_issuer_ciks_by_ticker_lists_one_cik_per_firm_equity() -> None:
+    """The reviewed map covers exactly firm-v1's equities, one issuer CIK each, except GOOGL,
+    which has Google Inc. and Alphabet."""
+    ciks = lakehouse_loader.ISSUER_CIKS_BY_TICKER
+    assert set(ciks) == set(FIRM_V1_EQUITIES)
+    assert ciks["GOOGL"] == (_GOOGLE_INC, _ALPHABET)
+    assert ciks["C"] == (831001,)
+    assert all(len(found) == 1 for ticker, found in ciks.items() if ticker != "GOOGL")
 
 
 @pytest.mark.parametrize(
     ("ticker", "owners"),
     [
-        ("GOOGL", [1, 2, 7]),
-        ("GOOG", [1, 3, 2]),
+        ("GOOGL", [1, 2]),
+        ("GOOG", None),
         ("AAPL", [4, 5]),
         ("MSFT", [6]),
+        ("C", [9]),
         ("ZZZZ", None),
     ],
-    ids=["mapped-and-own-ciks", "own-ciks-only", "own-cik-other-print", "single-cik", "unknown"],
+    ids=[
+        "mapped-ciks-other-print",
+        "unlisted-ticker",
+        "listed-cik-other-print",
+        "single-cik",
+        "foreign-cik-printed-as-ticker",
+        "unknown",
+    ],
 )
 def test_insider_transactions_select_rows_by_issuer_cik(
     fake_lake: Any, ticker: str, owners: list[int] | None
 ) -> None:
-    """A ticker gets the lines of its own and mapped issuer CIKs whatever their printed ticker."""
+    """A ticker gets the lines of its listed issuer CIKs whatever their printed ticker, and no
+    line of any other CIK, even one printed with the ticker."""
     _seed_issuer_rows(fake_lake, _issuer_rows())
 
     result = lakehouse_loader.load_insider_transactions_from_lakehouse(ticker, _AFTER_FILINGS)

@@ -3476,11 +3476,45 @@ def _select_short_interest(history: pd.DataFrame, as_of_date: date) -> pd.DataFr
     return frame
 
 
-# Issuer CIKs a security's Form 4 lines were filed under that its own
-# printed ticker does not reach: Google Inc. (1288776) and Alphabet
-# (1652044) for Alphabet class A. The lake's security registry does not
-# carry these yet (lake issue LK-103).
-ISSUER_CIKS_BY_TICKER: dict[str, tuple[int, ...]] = {"GOOGL": (1288776, 1652044)}
+# The issuer CIKs whose Form 4 lines belong to each ticker, reviewed
+# against the issuer's name in the lake (`sec_sic_classification`,
+# `sec_filings`): one CIK per security of firm-v1's universe, and for
+# Alphabet class A both Google Inc. (1288776, until 2015-10-02) and
+# Alphabet (1652044), whose lines are printed as GOOG. The lake's security
+# registry does not carry these yet (lake issue LK-103). A ticker absent
+# here has no insider lines.
+ISSUER_CIKS_BY_TICKER: dict[str, tuple[int, ...]] = {
+    "AAPL": (320193,),
+    "AIG": (5272,),
+    "AMZN": (1018724,),
+    "BAC": (70858,),
+    "C": (831001,),
+    "COP": (1163165,),
+    "CSCO": (858877,),
+    "CVX": (93410,),
+    "FCX": (831259,),
+    "FSLR": (1274494,),
+    "GE": (40545,),
+    "GOOGL": (1288776, 1652044),
+    "GS": (886982,),
+    "HPQ": (47217,),
+    "IBM": (51143,),
+    "INTC": (50863,),
+    "JNJ": (200406,),
+    "JPM": (19617,),
+    "MON": (1110783,),
+    "MS": (895421,),
+    "MSFT": (789019,),
+    "ORCL": (1341439,),
+    "PFE": (78003,),
+    "PG": (80424,),
+    "QCOM": (804328,),
+    "T": (732717,),
+    "V": (1403161,),
+    "WFC": (72971,),
+    "WMT": (104169,),
+    "XOM": (34088,),
+}
 
 
 @_counted("load_insider_transactions_from_lakehouse")
@@ -3496,10 +3530,9 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
     collapses distinct lines of one filing into one row until lake issue
     LK-14 lands. Inside a `lake_session` only scrapes at or before its
     lake time are read. A line belongs to `ticker` when its `issuer_cik`
-    is one of the ticker's issuer CIKs: every `issuer_cik` on a line
-    printed with `issuer_ticker = ticker`, plus the CIKs
-    `ISSUER_CIKS_BY_TICKER` maps the ticker to; a line with no
-    `issuer_cik` belongs to no ticker. Rows identical apart from their
+    is one of the CIKs `ISSUER_CIKS_BY_TICKER` lists for the ticker,
+    whatever ticker the filing printed; a ticker the map does not list
+    has no lines, and no other CIK is ever read. Rows identical apart from their
     printed ticker and their scrape (`issuer_ticker`, `scraped_at`, `dt`,
     `table`) count once, so a line printed under two tickers counts once,
     and two genuinely identical lines in one filing also count once.
@@ -3533,8 +3566,8 @@ def _fetch_insider_transactions(
     acceptance = _sec_acceptance_query()
     frames: dict[str, pd.DataFrame] = {}
     for ticker in tickers:
-        mapped = ISSUER_CIKS_BY_TICKER.get(ticker, ())
-        mapped_sql = f" OR issuer_cik IN ({', '.join('?' for _ in mapped)})" if mapped else ""
+        ciks = ISSUER_CIKS_BY_TICKER.get(ticker, ())
+        cik_sql = f"issuer_cik IN ({', '.join('?' for _ in ciks)})" if ciks else "FALSE"
         query = f"""
             SELECT t.owner_cik, t.owner_name, t.is_officer, t.is_director, t.is_ten_percent_owner,
                    t.transaction_date, t.transaction_code, t.shares, t.price_per_share,
@@ -3542,16 +3575,14 @@ def _fetch_insider_transactions(
             FROM (
                 SELECT DISTINCT * EXCLUDE (issuer_ticker, scraped_at, dt, "table")
                 FROM {log}
-                WHERE filed_date <= ?
-                  AND (issuer_cik IN (SELECT issuer_cik FROM {log} WHERE issuer_ticker = ?)
-                       {mapped_sql})
+                WHERE filed_date <= ? AND {cik_sql}
             ) t
             LEFT JOIN ({acceptance}) f ON f.accession_number = t.accession_number
             ORDER BY t.filed_date, t.transaction_date, t.owner_cik, t.owner_name,
                      t.transaction_code, t.acquired_disposed, t.shares, t.price_per_share,
                      t.is_officer, t.is_director, t.is_ten_percent_owner, f.accepted_at
         """
-        params: list[Any] = [end.isoformat(), ticker, *mapped]
+        params: list[Any] = [end.isoformat(), *ciks]
         frames[ticker] = _gated(_query(query, params), end, "filed_date")
     return frames
 

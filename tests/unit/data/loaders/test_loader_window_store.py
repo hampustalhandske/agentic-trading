@@ -594,7 +594,10 @@ def ab_lake(preflight_lake: Any) -> Any:
 
 
 @pytest.fixture(autouse=True)
-def _fresh_loader_state() -> Iterator[None]:
+def _fresh_loader_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    # The live insider loader reads only the issuer CIKs listed for a ticker;
+    # the synthetic issuer AAA files its Form 4 lines under CIK 100.
+    monkeypatch.setitem(ll.ISSUER_CIKS_BY_TICKER, "AAA", (100,))
     ll.clear_loader_window()
     ll.clear_unfactored_split_move_registry()
     ll.reset_loader_query_counts()
