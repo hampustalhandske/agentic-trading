@@ -106,7 +106,8 @@ def test_unknown_ticker_and_empty_table_return_one(fake_lake: Any) -> None:
 
 
 def test_load_split_ex_dates(fake_lake: Any) -> None:
-    """Ex-dates up to as_of with a positive ratio other than 1, ascending and unique."""
+    """Ex-dates up to as_of with a positive ratio other than 1, ascending
+    and unique, from the rows whose in_close_basis is true or null."""
     _load_splits(fake_lake, _ROWS + _EX_DATE_ROWS)
     load = lakehouse_loader.load_split_ex_dates
 
@@ -118,6 +119,9 @@ def test_load_split_ex_dates(fake_lake: Any) -> None:
     assert load("ZZSP", date(2021, 1, 3)) == [date(2016, 3, 1), date(2019, 5, 1)]
     assert load("ZZSP", date(2021, 1, 4)) == [date(2016, 3, 1), date(2019, 5, 1), date(2021, 1, 4)]
     assert load("MSFT", date(2024, 1, 2)) == []
+    assert load("AVB", date(2026, 12, 31)) == []
+    assert load("SSP", date(2026, 1, 2)) == [date(2015, 4, 1)]
+    assert load("XYZ", date(2023, 3, 1)) == [date(2023, 3, 1)]
 
     for day in pd.date_range("2013-01-01", "2025-01-01", freq="QS").date:
         for ticker in ("AAPL", "NVDA", "TSLA", "ZZSP"):

@@ -1740,7 +1740,10 @@ def load_split_ex_dates(ticker: str, as_of_date: date) -> list[date]:
 
     Raises `EmptyAdjustmentTableError` when `yahoo_split_close_basis` has
     no rows at all. A split is known from its ex-date, so `as_of_date` is
-    the knowledge time `_guard_data_end` checks."""
+    the knowledge time `_guard_data_end` checks. The rows are read through
+    the source `split_adjustment_factor` shares, which holds every split up
+    to the lake time, including those after a session's `data_end`; only
+    ex-dates on or before `as_of_date` leave this function."""
     _guard_data_end(as_of_date, "load_split_ex_dates")
     adjustment_table_row_count("yahoo_split_close_basis")
     splits = _SPLIT_RATIOS.read([ticker], date.min, as_of_date)[ticker]

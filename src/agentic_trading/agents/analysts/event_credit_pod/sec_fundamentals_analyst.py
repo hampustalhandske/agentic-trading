@@ -107,7 +107,9 @@ class SecFundamentalsAnalyst(AnalystAgent):
     so quarters taken from filings on both sides of a split would mix
     share bases. Until four post-split quarters have been filed the
     signal is `unavailable`. A spin-off Yahoo lists as a split counts as
-    a split here too.
+    a split here too. The rule applies whatever `concept` is, so it fits a
+    per-share concept; for a concept a split leaves unchanged, such as
+    revenue, it costs post-split quarters without need.
 
     Discrete quarters do not overlap, so the plain OLS standard error is
     used rather than a HAC estimate. Reports the latest filing date among
