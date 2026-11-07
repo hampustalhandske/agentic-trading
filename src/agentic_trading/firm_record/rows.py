@@ -114,7 +114,14 @@ def osi_symbol(contract: OptionContract) -> str:
     Raises `ValueError` when OSI cannot carry the contract exactly: a root
     that is not 1-6 uppercase letters, an expiry outside 2000-2099, or a
     strike with more than 3 dp or whose x 1000 value needs more than 8
-    digits. A strike is never rounded."""
+    digits. A strike is never rounded.
+
+    The strike and root are those the firm's contract carries: its contract
+    id prints the strike at 2 dp, and an option-chain strike is divided by
+    the underlying's later splits. The symbol is the lake's as-traded one
+    when the chain strike has at most 2 dp and the underlying did not split
+    or change ticker after the contract, as holds for every SPY contract the
+    2010-2017 chains list."""
     if not _OSI_ROOT.fullmatch(contract.underlying):
         raise ValueError(f"OSI root must be 1-6 uppercase letters, not {contract.underlying!r}")
     if not 2000 <= contract.expiry.year <= 2099:
@@ -132,8 +139,9 @@ def osi_symbol(contract: OptionContract) -> str:
 def row_instrument_id(asset: str, instrument: OptionContract | None = None) -> str:
     """The `instrument_id` a row for `asset` is written under, the id
     edgelab's replay reads bars by: an option (`instrument`, the contract
-    `asset` names) its OSI symbol (`osi_symbol`); a continuous future's root
-    (`GC` for `GC=F`); an equity, ETF, FX pair or coin its lake ticker."""
+    `asset` names) its OSI symbol (`osi_symbol`, which raises `ValueError`
+    for a contract OSI cannot carry); a continuous future's root (`GC` for
+    `GC=F`); an equity, ETF, FX pair or coin its lake ticker."""
     if instrument is not None:
         return osi_symbol(instrument)
     return futures_root(asset) or asset
@@ -245,9 +253,10 @@ def firm_day_rows(
 
     Raises `ValueError` when a target is dated another day, a ticker has no
     kind, a signal comes from an analyst outside `analyst_sources`, or an
-    instrument of `absent` has a target that is not carried;
-    `LookAheadError` as `_row_source` documents, or when a kept
-    provenance fails `decisions.check_source_as_of`."""
+    instrument of `absent` has a target that is not carried, or an option's
+    contract has no OSI symbol (`osi_symbol`); `LookAheadError` as
+    `_row_source` documents, or when a kept provenance fails
+    `decisions.check_source_as_of`."""
     previous = previous or {}
     held_contracts = held_contracts or {}
     multiplier = float(settings.options.contract_multiplier)

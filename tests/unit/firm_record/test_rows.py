@@ -26,6 +26,7 @@ from agentic_trading.firm_record.rows import (
     firm_sources,
     osi_symbol,
     row_instrument_id,
+    row_provenance,
 )
 from agentic_trading.firm_record.runner import _held_contracts
 from agentic_trading.stage_a.decisions import LookAheadError
@@ -533,3 +534,40 @@ def test_carried_row_provenance_depends_on_whether_a_limit_scaled_it() -> None:
         date(2016, 1, 5),
         "active",
     )
+
+
+def test_a_held_option_carries_its_provenance_from_one_day_to_the_next() -> None:
+    """The provenance of day 1's option row, keyed by its OSI symbol, is what day 2's held
+    target keeps; keyed by the contract id instead, it would not be found."""
+    signal = _signal("fred_analyst", source_as_of=date(2016, 1, 5))
+    day1 = firm_day_rows(
+        _DAY,
+        [_target(0.004, signal, pod="tail_hedge_manager", asset=_PUT.contract_id, instrument=_PUT)],
+        absent={},
+        analyst_sources=_SOURCES,
+        instrument_kinds=_KINDS,
+        calendar="XNYS",
+    )
+    previous = row_provenance(day1)
+    assert set(previous) == {("SPY160318P00180000", "tail_hedge_manager")}
+
+    day2 = date(2016, 1, 7)
+    (row,) = firm_day_rows(
+        day2,
+        [
+            _target(
+                0.004,
+                _signal("price_analyst"),
+                pod="tail_hedge_manager",
+                asset=_PUT.contract_id,
+                instrument=_PUT,
+                held=True,
+            ).model_copy(update={"as_of_date": day2})
+        ],
+        absent={},
+        analyst_sources=_SOURCES,
+        instrument_kinds=_KINDS,
+        calendar="XNYS",
+        previous=previous,
+    )
+    assert (row.source, row.source_as_of) == previous[("SPY160318P00180000", "tail_hedge_manager")]
