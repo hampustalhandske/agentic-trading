@@ -38,6 +38,7 @@ def _fact(concept: str, value: float, form: str) -> dict[str, Any]:
 def _trade(owner: str, shares: float, code: str) -> dict[str, Any]:
     return {
         "issuer_ticker": "JPM",
+        "issuer_cik": 19617,
         "owner_cik": 1000 + len(owner),
         "owner_name": owner,
         "is_officer": True,

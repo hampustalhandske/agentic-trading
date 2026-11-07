@@ -3476,6 +3476,13 @@ def _select_short_interest(history: pd.DataFrame, as_of_date: date) -> pd.DataFr
     return frame
 
 
+# Issuer CIKs a security's Form 4 lines were filed under that its own
+# printed ticker does not reach: Google Inc. (1288776) and Alphabet
+# (1652044) for Alphabet class A. The lake's security registry does not
+# carry these yet (lake issue LK-103).
+ISSUER_CIKS_BY_TICKER: dict[str, tuple[int, ...]] = {"GOOGL": (1288776, 1652044)}
+
+
 @_counted("load_insider_transactions_from_lakehouse")
 def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> pd.DataFrame | None:
     """SEC Form 4 insider transactions for `ticker` (`owner_cik`,
@@ -3488,9 +3495,14 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
     scrape, because the deduplicated `sec_insider_transactions` view
     collapses distinct lines of one filing into one row until lake issue
     LK-14 lands. Inside a `lake_session` only scrapes at or before its
-    lake time are read. Rows identical apart from their scrape
-    (`scraped_at`, `dt`, `table`) count once, so two genuinely identical
-    lines in one filing also count once.
+    lake time are read. A line belongs to `ticker` when its `issuer_cik`
+    is one of the ticker's issuer CIKs: every `issuer_cik` on a line
+    printed with `issuer_ticker = ticker`, plus the CIKs
+    `ISSUER_CIKS_BY_TICKER` maps the ticker to; a line with no
+    `issuer_cik` belongs to no ticker. Rows identical apart from their
+    printed ticker and their scrape (`issuer_ticker`, `scraped_at`, `dt`,
+    `table`) count once, so a line printed under two tickers counts once,
+    and two genuinely identical lines in one filing also count once.
 
     The trade date is not when a trade became public; the filing is.
     `available_date` (datetime64) is the next NYSE session after the
@@ -3510,29 +3522,38 @@ def load_insider_transactions_from_lakehouse(ticker: str, as_of_date: date) -> p
 def _fetch_insider_transactions(
     tickers: list[str], start: date, end: date
 ) -> dict[str, pd.DataFrame]:
-    """Each of `tickers`' distinct Form 4 lines filed on or before `end`,
-    joined to their filing's acceptance time, one query per ticker, with
-    the columns of `load_insider_transactions_from_lakehouse` before
-    `available_date` plus `accepted_at`, sorted on every column
-    (`filed_date` first). `start` is not used."""
-    query = f"""
-        SELECT t.owner_cik, t.owner_name, t.is_officer, t.is_director, t.is_ten_percent_owner,
-               t.transaction_date, t.transaction_code, t.shares, t.price_per_share,
-               t.acquired_disposed, t.filed_date, f.accepted_at
-        FROM (
-            SELECT DISTINCT * EXCLUDE (scraped_at, dt, "table")
-            FROM {_table_sql("sec_insider_transactions_log")}
-            WHERE issuer_ticker = ? AND filed_date <= ?
-        ) t
-        LEFT JOIN ({_sec_acceptance_query()}) f ON f.accession_number = t.accession_number
-        ORDER BY t.filed_date, t.transaction_date, t.owner_cik, t.owner_name, t.transaction_code,
-                 t.acquired_disposed, t.shares, t.price_per_share, t.is_officer, t.is_director,
-                 t.is_ten_percent_owner, f.accepted_at
-    """
-    return {
-        ticker: _gated(_query(query, [ticker, end.isoformat()]), end, "filed_date")
-        for ticker in tickers
-    }
+    """Each of `tickers`' distinct Form 4 lines filed on or before `end`
+    (the lines of the ticker's issuer CIKs, as
+    `load_insider_transactions_from_lakehouse` defines them), joined to
+    their filing's acceptance time, one query per ticker, with the columns
+    of `load_insider_transactions_from_lakehouse` before `available_date`
+    plus `accepted_at`, sorted on every column (`filed_date` first).
+    `start` is not used."""
+    log = _table_sql("sec_insider_transactions_log")
+    acceptance = _sec_acceptance_query()
+    frames: dict[str, pd.DataFrame] = {}
+    for ticker in tickers:
+        mapped = ISSUER_CIKS_BY_TICKER.get(ticker, ())
+        mapped_sql = f" OR issuer_cik IN ({', '.join('?' for _ in mapped)})" if mapped else ""
+        query = f"""
+            SELECT t.owner_cik, t.owner_name, t.is_officer, t.is_director, t.is_ten_percent_owner,
+                   t.transaction_date, t.transaction_code, t.shares, t.price_per_share,
+                   t.acquired_disposed, t.filed_date, f.accepted_at
+            FROM (
+                SELECT DISTINCT * EXCLUDE (issuer_ticker, scraped_at, dt, "table")
+                FROM {log}
+                WHERE filed_date <= ?
+                  AND (issuer_cik IN (SELECT issuer_cik FROM {log} WHERE issuer_ticker = ?)
+                       {mapped_sql})
+            ) t
+            LEFT JOIN ({acceptance}) f ON f.accession_number = t.accession_number
+            ORDER BY t.filed_date, t.transaction_date, t.owner_cik, t.owner_name,
+                     t.transaction_code, t.acquired_disposed, t.shares, t.price_per_share,
+                     t.is_officer, t.is_director, t.is_ten_percent_owner, f.accepted_at
+        """
+        params: list[Any] = [end.isoformat(), ticker, *mapped]
+        frames[ticker] = _gated(_query(query, params), end, "filed_date")
+    return frames
 
 
 _INSIDER_TRANSACTIONS: StoreSource[str, pd.DataFrame] = StoreSource(

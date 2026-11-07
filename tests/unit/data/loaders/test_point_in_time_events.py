@@ -8,7 +8,7 @@ announcement session implied by the `when` field, and SEC data on the next NYSE 
 after the later of the filing's filed date and its New York acceptance date.
 """
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -328,7 +328,7 @@ def test_insider_transactions_deduplicate_scrapes_but_keep_distinct_lines(fake_l
             _insider_row("A1", shares=100.0, price_per_share=171.0),
             _insider_row("A1", shares=100.0, scraped_at=later_scrape, dt="2024-03-14"),
             _insider_row("A1", shares=250.0, scraped_at=later_scrape, dt="2024-03-14"),
-            _insider_row("B2", issuer_ticker="MSFT"),
+            _insider_row("B2", issuer_ticker="MSFT", issuer_cik=789019),
         ],
     )
 
@@ -344,6 +344,173 @@ def test_insider_transactions_deduplicate_scrapes_but_keep_distinct_lines(fake_l
     assert (
         lakehouse_loader.load_insider_transactions_from_lakehouse("ZZZZ", date(2024, 3, 20)) is None
     )
+
+
+_GOOGLE_INC = 1288776
+_ALPHABET = 1652044
+_AFTER_FILINGS = date(2018, 1, 2)
+_INSIDER_COLUMNS = [
+    "owner_cik",
+    "owner_name",
+    "is_officer",
+    "is_director",
+    "is_ten_percent_owner",
+    "transaction_date",
+    "transaction_code",
+    "shares",
+    "price_per_share",
+    "acquired_disposed",
+    "filed_date",
+    "available_date",
+]
+
+
+def _issuer_rows() -> list[dict[str, Any]]:
+    """One Form 4 line per owner, stored out of filed order: Google Inc. (owner 1) and Alphabet
+    (owner 2) printed as GOOG, another issuer printed as GOOG (owner 3), Apple printed as AAPL
+    (owner 4) and as APPLE (owner 5), Microsoft (owner 6), and an issuer outside the reviewed
+    map printed as GOOGL (owner 7)."""
+    lines = [
+        ("G2", "GOOG", _ALPHABET, 2, "2016-03-01"),
+        ("G1", "GOOG", _GOOGLE_INC, 1, "2015-03-02"),
+        ("G3", "GOOG", 999999, 3, "2015-06-01"),
+        ("L1", "GOOGL", 7777777, 7, "2017-06-01"),
+        ("A1", "AAPL", 320193, 4, "2015-04-01"),
+        ("A2", "APPLE", 320193, 5, "2015-05-01"),
+        ("M1", "MSFT", 789019, 6, "2015-07-01"),
+    ]
+    return [
+        _insider_row(
+            accession,
+            issuer_ticker=ticker,
+            issuer_cik=cik,
+            owner_cik=owner,
+            filed_date=filed,
+            transaction_date=filed,
+        )
+        for accession, ticker, cik, owner, filed in lines
+    ]
+
+
+def _seed_issuer_rows(fake_lake: Any, rows: list[dict[str, Any]]) -> None:
+    """Seeds `rows` with each filing accepted before the close on its filed date."""
+    _seed_filings(
+        fake_lake, {row["accession_number"]: f"{row['filed_date']} 14:00:00" for row in rows}
+    )
+    _seed_insiders(fake_lake, rows)
+
+
+def test_issuer_ciks_by_ticker_maps_googl_to_google_and_alphabet() -> None:
+    """The reviewed predecessor map sends GOOGL to Google Inc. and Alphabet."""
+    assert lakehouse_loader.ISSUER_CIKS_BY_TICKER == {"GOOGL": (_GOOGLE_INC, _ALPHABET)}
+
+
+@pytest.mark.parametrize(
+    ("ticker", "owners"),
+    [
+        ("GOOGL", [1, 2, 7]),
+        ("GOOG", [1, 3, 2]),
+        ("AAPL", [4, 5]),
+        ("MSFT", [6]),
+        ("ZZZZ", None),
+    ],
+    ids=["mapped-and-own-ciks", "own-ciks-only", "own-cik-other-print", "single-cik", "unknown"],
+)
+def test_insider_transactions_select_rows_by_issuer_cik(
+    fake_lake: Any, ticker: str, owners: list[int] | None
+) -> None:
+    """A ticker gets the lines of its own and mapped issuer CIKs whatever their printed ticker."""
+    _seed_issuer_rows(fake_lake, _issuer_rows())
+
+    result = lakehouse_loader.load_insider_transactions_from_lakehouse(ticker, _AFTER_FILINGS)
+
+    if owners is None:
+        assert result is None
+        return
+    assert result is not None
+    assert list(result.columns) == _INSIDER_COLUMNS
+    assert list(result["owner_cik"]) == owners
+    assert result["filed_date"].is_monotonic_increasing
+
+
+@pytest.mark.parametrize(
+    ("accepted_utc", "available"),
+    [("2016-03-01 14:00:00", date(2016, 3, 2)), ("2016-03-02 14:00:00", date(2016, 3, 3))],
+    ids=["accepted-on-filed-date", "accepted-day-after-filed"],
+)
+def test_insider_transactions_through_ciks_gate_on_filing_not_trade_date(
+    fake_lake: Any, accepted_utc: str, available: date
+) -> None:
+    """A GOOG line filed 2016-03-01 but dated 2027-01-25 is gated for GOOGL on its filing alone."""
+    _seed_filings(fake_lake, {"G2": accepted_utc})
+    _seed_insiders(
+        fake_lake,
+        [
+            _insider_row(
+                "G2",
+                issuer_ticker="GOOG",
+                issuer_cik=_ALPHABET,
+                filed_date="2016-03-01",
+                transaction_date="2027-01-25",
+            )
+        ],
+    )
+
+    for as_of in (date(2016, 3, 1), available - timedelta(days=1)):
+        assert lakehouse_loader.load_insider_transactions_from_lakehouse("GOOGL", as_of) is None
+    result = lakehouse_loader.load_insider_transactions_from_lakehouse("GOOGL", available)
+
+    assert result is not None
+    assert list(result["available_date"]) == [pd.Timestamp(available)]
+    assert list(result["filed_date"]) == [pd.Timestamp("2016-03-01")]
+    assert list(result["transaction_date"]) == [pd.Timestamp("2027-01-25")]
+
+
+def test_insider_transactions_through_ciks_count_each_line_once(fake_lake: Any) -> None:
+    """A line from two scrapes counts once, reached through a mapped CIK or its own ticker."""
+    later_scrape = pd.Timestamp("2024-03-14 06:00:00", tz=_UTC)
+    alphabet: dict[str, Any] = {
+        "issuer_ticker": "GOOG",
+        "issuer_cik": _ALPHABET,
+        "filed_date": "2016-03-01",
+        "transaction_date": "2016-02-26",
+    }
+    _seed_filings(fake_lake, {"G2": "2016-03-01 14:00:00", "A1": _EARLY})
+    _seed_insiders(
+        fake_lake,
+        [
+            _insider_row("G2", shares=100.0, **alphabet),
+            _insider_row("G2", shares=100.0, scraped_at=later_scrape, dt="2024-03-14", **alphabet),
+            _insider_row("G2", shares=250.0, **alphabet),
+            _insider_row("A1"),
+            _insider_row("A1", scraped_at=later_scrape, dt="2024-03-14"),
+        ],
+    )
+
+    googl = lakehouse_loader.load_insider_transactions_from_lakehouse("GOOGL", date(2024, 3, 20))
+    aapl = lakehouse_loader.load_insider_transactions_from_lakehouse("AAPL", date(2024, 3, 20))
+
+    assert googl is not None
+    assert sorted(googl["shares"]) == [100.0, 250.0]
+    assert aapl is not None
+    assert len(aapl) == 1
+
+
+def test_insider_transactions_through_ciks_read_scrapes_up_to_lake_time(fake_lake: Any) -> None:
+    """Inside a lake session a line reached through a CIK is returned only if scraped by T."""
+    rows = _issuer_rows()[:2]
+    rows[0]["scraped_at"] = pd.Timestamp("2021-06-01", tz=_UTC)
+    rows[1]["scraped_at"] = pd.Timestamp("2020-06-01", tz=_UTC)
+    _seed_issuer_rows(fake_lake, rows)
+
+    with lakehouse_loader.lake_session(datetime(2021, 1, 1, tzinfo=UTC)):
+        pinned = lakehouse_loader.load_insider_transactions_from_lakehouse("GOOGL", _AFTER_FILINGS)
+    unpinned = lakehouse_loader.load_insider_transactions_from_lakehouse("GOOGL", _AFTER_FILINGS)
+
+    assert pinned is not None
+    assert list(pinned["owner_cik"]) == [1]
+    assert unpinned is not None
+    assert list(unpinned["owner_cik"]) == [1, 2]
 
 
 def _fact_row(accession: str) -> dict[str, Any]:
