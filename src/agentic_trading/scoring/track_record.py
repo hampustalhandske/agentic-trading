@@ -254,16 +254,17 @@ class TrackRecord:
         if self._log_in_date_order:
             while last_dropped + 1 < len(log) and log[last_dropped + 1].as_of_date < cutoff:
                 last_dropped += 1
-            kept = log[last_dropped + 1 :]
         else:
-            kept = []
             for position, entry in enumerate(log):
                 if entry.as_of_date < cutoff:
                     last_dropped = position
-                else:
-                    kept.append(entry)
         if last_dropped < 0:
             return
+        kept = (
+            log[last_dropped + 1 :]
+            if self._log_in_date_order
+            else [entry for entry in log if entry.as_of_date >= cutoff]
+        )
         # Every record after the last dropped one is kept, so `entries_since`
         # answers in full from the position just past it.
         recorded = len(self)

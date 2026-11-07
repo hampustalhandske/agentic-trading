@@ -573,7 +573,13 @@ class BacktestResult(BaseModel):
     final_information_ratio: float | None = None
     final_hit_rate: float
     final_profit_factor: float
+    # Every day's decisions, or with `history_horizon_days` set only the
+    # last days the engine held in memory (the current and the pending
+    # day's); the run's checkpoint then holds every day's.
     decisions_by_day: dict[date, list[PortfolioDecision]] = Field(default_factory=dict)
+    # The engine's history horizon in calendar days, `None` for a run that
+    # kept its whole history in memory.
+    history_horizon_days: int | None = None
     trade_log: list[TradeRecord] = Field(default_factory=list)
     # Decisions the engine skipped rather than executed, in fill order.
     unfilled_orders: list[UnfilledOrder] = Field(default_factory=list)

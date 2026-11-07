@@ -12,7 +12,7 @@ import sqlite3
 import types
 from collections.abc import Callable, Iterator
 from contextlib import closing
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -29,11 +29,21 @@ from agentic_trading.agents.schemas import (
     PerformanceRecord,
     PortfolioDecision,
 )
-from agentic_trading.backtest.engine import BacktestEngine
+from agentic_trading.backtest.engine import (
+    HELD_DECISION_DAYS,
+    BacktestEngine,
+    DecisionWindow,
+    longest_track_record_lookback,
+)
 from agentic_trading.backtest.portfolio import Portfolio
 from agentic_trading.config import temporary_overrides
 from agentic_trading.scoring.track_record import HistoryHorizonError, TrackRecord
-from agentic_trading.scoring.weighting import DrawdownAwareWeight, EqualWeight
+from agentic_trading.scoring.weighting import (
+    DrawdownAwareWeight,
+    EqualWeight,
+    SharpeWeight,
+    ShrinkageWeight,
+)
 
 # The smallest horizon the measured-IC window (at least 20 calendar days) fits inside.
 _HORIZON_DAYS = 20
@@ -183,7 +193,7 @@ def _reachable(root: object, kind: type) -> int:
 
 
 def _without_decisions(result: BacktestResult) -> str:
-    return result.model_dump_json(exclude={"decisions_by_day"})
+    return result.model_dump_json(exclude={"decisions_by_day", "history_horizon_days"})
 
 
 @pytest.fixture(autouse=True)
@@ -271,3 +281,79 @@ def test_horizon_resume_matches_the_unbroken_run(tmp_path: Path, stop: int) -> N
     assert resumed.model_dump_json() == unbroken.model_dump_json()
     assert _without_decisions(resumed) == _without_decisions(plain)
     assert _checkpoint(path) == _checkpoint(tmp_path / "plain.sqlite")
+
+
+def _decisions(day: date) -> list[PortfolioDecision]:
+    return [
+        PortfolioDecision(asset="AAPL", as_of_date=day, target_weight=0.1, contributing_signals=[])
+    ]
+
+
+def test_decision_window_raises_on_whole_history_reads() -> None:
+    """Once a day was dropped, iteration, len and the views raise; `held()` gives the held days."""
+    window = DecisionWindow(HELD_DECISION_DAYS)
+    window[_DAYS[0]] = _decisions(_DAYS[0])
+    window[_DAYS[1]] = _decisions(_DAYS[1])
+    assert list(window) == _DAYS[:2]
+    assert len(window) == 2
+
+    window[_DAYS[2]] = _decisions(_DAYS[2])
+
+    assert window.held() == {day: _decisions(day) for day in _DAYS[1:3]}
+    assert window[_DAYS[2]] == _decisions(_DAYS[2])
+    for read in (list, len, lambda w: list(w.keys()), lambda w: list(w.items()), dict):
+        with pytest.raises(HistoryHorizonError):
+            read(window)
+    with pytest.raises(HistoryHorizonError):
+        _ = window[_DAYS[0]]
+    with pytest.raises(KeyError):
+        _ = window[_DAYS[3]]
+
+
+def test_decision_window_restored_past_dropped_days() -> None:
+    """A window restored with earlier days left in the checkpoint refuses whole-history reads."""
+    window = DecisionWindow(HELD_DECISION_DAYS)
+    window.restore({day: _decisions(day) for day in _DAYS[3:5]}, earlier_days_dropped=True)
+
+    assert window.held() == {day: _decisions(day) for day in _DAYS[3:5]}
+    with pytest.raises(HistoryHorizonError):
+        list(window)
+    with pytest.raises(HistoryHorizonError):
+        _ = window[_DAYS[2]]
+
+
+def test_result_carries_the_horizon(tmp_path: Path) -> None:
+    """A horizon run's result records its horizon and the held days; an unbounded one records
+    None and every day."""
+    _, plain = _run(tmp_path / "plain.sqlite", None)
+    _, bounded = _run(tmp_path / "bounded.sqlite", _HORIZON_DAYS)
+
+    assert plain.history_horizon_days is None
+    assert list(plain.decisions_by_day) == _DAYS
+    assert bounded.history_horizon_days == _HORIZON_DAYS
+    assert list(bounded.decisions_by_day) == _DAYS[-HELD_DECISION_DAYS:]
+
+
+def test_horizon_shorter_than_a_lookback_is_refused(tmp_path: Path) -> None:
+    """The engine refuses a horizon shorter than the IC window or any weighting window."""
+    assert longest_track_record_lookback(_commander()) == _HORIZON_DAYS
+    with pytest.raises(ValueError, match="track-record window"):
+        _engine(tmp_path / "short.sqlite", _HORIZON_DAYS - 1)
+
+    with temporary_overrides({"portfolio.ic_lookback_days": _HORIZON_DAYS + 5}):
+        with pytest.raises(ValueError, match="track-record window"):
+            _engine(tmp_path / "ic.sqlite", _HORIZON_DAYS)
+
+    manager = _PassThroughManager(
+        agent_id="sharpe_manager",
+        managed_analysts=[_MomentumAnalyst()],
+        weighting_strategy=ShrinkageWeight(EqualWeight()),
+        portfolio_constructor=_ViewConstructor(),
+    )
+    commander = Commander(
+        managers=[manager], weighting_strategy=ShrinkageWeight(SharpeWeight(lookback_days=45))
+    )
+    assert longest_track_record_lookback(commander) == 45
+    commander = Commander(managers=[manager], weighting_strategy=EqualWeight())
+    # ShrinkageWeight counts observations over 30 days around a strategy without a window.
+    assert longest_track_record_lookback(commander) == 30

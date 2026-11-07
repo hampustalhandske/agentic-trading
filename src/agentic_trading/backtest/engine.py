@@ -39,6 +39,7 @@ from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.portfolio import MarkedPosition, OptionPosition, Portfolio
 from agentic_trading.backtest.resume_fingerprint import (
     agents_by_id,
+    roster_agents,
     roster_fingerprint,
     settings_fingerprint,
 )
@@ -50,6 +51,7 @@ from agentic_trading.data.point_in_time import get_point_in_time_data
 from agentic_trading.logging_config import get_logger, log_progress
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.track_record import HistoryHorizonError, TrackRecord
+from agentic_trading.scoring.weighting import WeightingStrategy
 
 logger = get_logger(__name__)
 
@@ -84,7 +86,11 @@ class DecisionWindow(Mapping[date, list[PortfolioDecision]]):
     Setting a day's decisions drops the oldest day once more than `days`
     are held. A day before the earliest day held raises
     `HistoryHorizonError` once an earlier day was dropped (or left in the
-    checkpoint on restore); any other day not held raises `KeyError`."""
+    checkpoint on restore); any other day not held raises `KeyError`.
+
+    Once an earlier day was dropped the window no longer holds every day,
+    so iterating it, its `len` and its `keys`/`items`/`values` raise
+    `HistoryHorizonError` too; `held()` returns the days it holds."""
 
     def __init__(self, days: int) -> None:
         if days < 1:
@@ -123,11 +129,47 @@ class DecisionWindow(Mapping[date, list[PortfolioDecision]]):
             )
         raise KeyError(day)
 
+    def held(self) -> dict[date, list[PortfolioDecision]]:
+        """The days held and their decisions, in day order, as a new dict."""
+        return dict(self._held)
+
+    def _require_every_day(self, reader: str) -> None:
+        """Raises `HistoryHorizonError` naming `reader` once an earlier
+        day was dropped."""
+        if self._horizon_start is not None:
+            raise HistoryHorizonError(
+                f"{reader} needs every day's decisions, but the days before "
+                f"{self._horizon_start} were dropped; held() returns the days held"
+            )
+
     def __iter__(self) -> Iterator[date]:
+        self._require_every_day("iterating the decisions")
         return iter(self._held)
 
     def __len__(self) -> int:
+        self._require_every_day("len() of the decisions")
         return len(self._held)
+
+
+def longest_track_record_lookback(commander: object) -> int:
+    """The longest trailing track-record window, in calendar days ending
+    on the decision day, that `commander` reads while deciding:
+    `settings.portfolio.ic_lookback_days` (read now; each manager's
+    measured information coefficients) or the `track_record_lookback_days`
+    of the commander's own `weighting_strategy` or of any of its
+    managers', whichever is longest."""
+    strategies = [
+        getattr(agent, "weighting_strategy", None)
+        for agent in [commander, *roster_agents(commander)]
+    ]
+    return max(
+        [settings.portfolio.ic_lookback_days]
+        + [
+            strategy.track_record_lookback_days()
+            for strategy in strategies
+            if isinstance(strategy, WeightingStrategy)
+        ]
+    )
 
 
 class CommanderLike(Protocol):
@@ -205,6 +247,12 @@ class BacktestEngine:
                     f"history_horizon_days {history_horizon_days} needs a TrackRecord built "
                     f"with the same horizon_days, not {track_record.horizon_days}"
                 )
+            longest = longest_track_record_lookback(commander)
+            if history_horizon_days < longest:
+                raise ValueError(
+                    f"history_horizon_days {history_horizon_days} is shorter than the "
+                    f"{longest}-day track-record window the commander reads"
+                )
         self.commander = commander
         self.portfolio = portfolio
         self.track_record = track_record
@@ -247,8 +295,10 @@ class BacktestEngine:
         # dated more than this many days before the session, the decisions
         # of all but the last `HELD_DECISION_DAYS` days are dropped, and
         # the whole-history results (`source_performance`) are read from
-        # the checkpoint. The run's results, checkpoint and every read
-        # within the horizon are the same as without one.
+        # the checkpoint. The checkpoint, every read within the horizon and
+        # the run's results are the same as without one, but for the
+        # result's `decisions_by_day`, which holds only the days held, and
+        # its `history_horizon_days`, which records the horizon.
         self.history_horizon_days = history_horizon_days
         # The decisions of each day of the current run, keyed by day: every
         # day without a horizon, the last `HELD_DECISION_DAYS` with one
@@ -629,7 +679,8 @@ class BacktestEngine:
         CLI and the GUI's Desks/Analysts drill-down are built from. With a
         `history_horizon_days`, the result's `decisions_by_day` holds only
         the last `HELD_DECISION_DAYS` days (the checkpoint holds every
-        day's), and everything else in it is as without a horizon.
+        day's) and its `history_horizon_days` records the horizon;
+        everything else in it is as without a horizon.
 
         `on_day_complete`, if given, is called once per simulated day after
         that day's trades are applied — the hook a live progress UI hangs
@@ -666,6 +717,7 @@ class BacktestEngine:
                 final_calmar_ratio=0.0,
                 final_hit_rate=0.0,
                 final_profit_factor=0.0,
+                history_horizon_days=self.history_horizon_days,
                 unfactored_split_moves=lakehouse_loader.unfactored_split_move_registry(),
             )
 
@@ -1337,7 +1389,12 @@ class BacktestEngine:
             final_information_ratio=final_information_ratio,
             final_hit_rate=final_hit_rate,
             final_profit_factor=final_profit_factor,
-            decisions_by_day=dict(decisions_by_day),
+            decisions_by_day=(
+                decisions_by_day.held()
+                if isinstance(decisions_by_day, DecisionWindow)
+                else decisions_by_day
+            ),
+            history_horizon_days=self.history_horizon_days,
             trade_log=trade_log,
             unfilled_orders=unfilled_orders,
             capital_usage=capital_usage,

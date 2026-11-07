@@ -39,6 +39,12 @@ class WeightingStrategy(ABC):
         the result is combined with other multiplicative factors."""
         ...
 
+    def track_record_lookback_days(self) -> int:
+        """The longest trailing window, in calendar days ending on the
+        decision day, this strategy reads from the track record: its
+        `lookback_days` when it has one, else 0 (it reads none)."""
+        return int(getattr(self, "lookback_days", 0))
+
 
 class Hedge(WeightingStrategy):
     """Exponentiated trailing-return weighting normalized to average 1.0."""
@@ -137,6 +143,14 @@ class ShrinkageWeight(WeightingStrategy):
                 shrinkage_factor * weight + (1.0 - shrinkage_factor) * average_weight
             )
         return shrunk_weights
+
+    def track_record_lookback_days(self) -> int:
+        """The longer of the wrapped strategy's own window and the window
+        the observation counts are taken over (the wrapped strategy's
+        `lookback_days`, 30 when it has none)."""
+        return max(
+            self.base.track_record_lookback_days(), int(getattr(self.base, "lookback_days", 30))
+        )
 
 
 class DrawdownAwareWeight(WeightingStrategy):
