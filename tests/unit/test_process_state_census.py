@@ -128,9 +128,10 @@ _ALLOWED: dict[str, str] = {
     ),
     "agentic_trading.data.loaders.lakehouse_loader:_SESSION_LOCK": _LOCK,
     "agentic_trading.data.loaders.lakehouse_loader:_STORE": (
-        "the session's window store; a call's answer equals a direct fetch up to rows tied on "
-        "the query's ORDER BY, which a resumed process re-fetches from the lake pinned at the "
-        "same lake time"
+        "the session's window store; a resumed process re-fetches from the lake pinned at the "
+        "same lake time, and every stored query orders by every column it returns, by the "
+        "table's unique key, or aggregates to one row per group, so rows tied on its ORDER BY "
+        "are equal in every column and their order cannot change the returned frame"
     ),
     "agentic_trading.data.loaders.lakehouse_loader:_STORE_LOCK": _LOCK,
     "agentic_trading.data.loaders.lakehouse_loader:_LOADER_CALL": (
