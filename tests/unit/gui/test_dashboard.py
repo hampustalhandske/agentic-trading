@@ -17,6 +17,7 @@ so pre-seeding only `backtest_result`/`scoreboard` no longer exercises any
 tab's real content — see render_dashboard()'s own `desk_run is None` guard.
 """
 
+import dataclasses
 import json
 from datetime import date
 from typing import Any
@@ -1071,3 +1072,13 @@ def test_manual_step_while_playing_advances_by_exactly_one_not_two() -> None:
     _find_button(at, "Step backward").click().run(timeout=30)
     assert not at.exception
     assert at.session_state["current_day_index"] == index_before_backward - 1
+
+
+def test_desk_run_refuses_a_result_with_a_history_horizon() -> None:
+    """AT-140: a result from a horizon run holds only its last days' decisions, so the dashboard
+    refuses it rather than show a partial history."""
+    desk_run = _fake_desk_run()
+    bounded = desk_run.backtest_result.model_copy(update={"history_horizon_days": 300})
+
+    with pytest.raises(ValueError, match="300-day history horizon"):
+        dataclasses.replace(desk_run, backtest_result=bounded)

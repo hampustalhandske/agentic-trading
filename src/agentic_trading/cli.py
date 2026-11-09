@@ -1,6 +1,9 @@
 # cli.py
 
 import json
+import logging
+import os
+import sys
 from datetime import date, datetime, timedelta
 from importlib import metadata
 from pathlib import Path
@@ -887,6 +890,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Exit code of `agentic-trading-stage-a` when the batch stopped for resources.
 _EXIT_STOPPED_FOR_RESOURCES = 3
+# Resident memory (MB) above which a firm record restarts in a fresh process
+# (`firm_record --restart-above-rss-mb`): above the 3-3.5 GB the 2010-2017
+# record is projected to reach, and well below the 16 GB of the machine it
+# runs on. A fresh process resumed from the checkpoint starts near 0.8 GB.
+_FIRM_RECORD_RESTART_RSS_MB = 4096
 
 
 def _stage_a_analysts(agent_ids: list[str]) -> list[AnalystAgent]:
@@ -1103,6 +1111,14 @@ def firm_record(
     loader_store: bool = typer.Option(
         True, "--loader-store/--no-loader-store", help=_LOADER_STORE_HELP
     ),
+    restart_above_rss_mb: int = typer.Option(
+        _FIRM_RECORD_RESTART_RSS_MB,
+        "--restart-above-rss-mb",
+        min=0,
+        help="Once the process's resident memory is above this many MB, stop at the next day "
+        "boundary and resume from the checkpoint in a fresh process; 0 never restarts. Not "
+        "part of the spec.",
+    ),
 ) -> None:
     """Record the registered firm (agentic-firm-v1) from --start to --end:
     the Commander's daily pod targets written as a `decision_file.v1` trial
@@ -1139,7 +1155,12 @@ def firm_record(
     registered in the trial ledger at `trials.ledger_path` from its
     registry file before the first day; without that file the record is
     uncounted. Prints the result as JSON, which holds no performance
-    figure. Exits 2 on a usage error: a reversed window, one ending after
+    figure. When the pass stopped because its resident memory passed
+    --restart-above-rss-mb, the command then replaces its process with the
+    same command line (`_restart_record`), pinned to the lake time it read
+    and, with --max-days, to the days still allowed, so the record resumes
+    from its checkpoint in a fresh process under the same pid. Exits 2
+    on a usage error: a reversed window, one ending after
     stage_a.data_end, a --store-dir inside the repository, a naive
     --lake-time or a bad --set. `--set` overrides apply before any setting
     is read."""
@@ -1225,10 +1246,33 @@ def firm_record(
             ledger=TrialLedger(_REPO_ROOT / settings.trials.ledger_path, _REPO_ROOT),
             repo_root=_REPO_ROOT,
             short_warmup=[entry.short_warmup for entry in coverage if entry.short_warmup],
+            restart_above_rss_mb=restart_above_rss_mb or None,
         )
         echo_loader_query_counts()
         echo_loader_store_usage()
+        pinned_lake_time = session.lake_time
     typer.echo(result.model_dump_json(indent=2))
+    if result.paused_for_memory:
+        extra = ["--lake-time", pinned_lake_time.isoformat()]
+        if max_days is not None:
+            extra += ["--max-days", str(max_days - result.days_written)]
+        logger.info(
+            "Firm record: restarting in a fresh process after %d day(s), at %s",
+            result.days_written,
+            result.last_completed,
+        )
+        _restart_record(extra)
+
+
+def _restart_record(extra_args: list[str]) -> None:
+    """Replaces this process with the command line it was started with
+    (`sys.orig_argv`) plus `extra_args`, whose options override earlier
+    ones of the same name, after flushing the standard streams and the log
+    handlers. The pid stays the same."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    logging.shutdown()
+    os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:], *extra_args])
 
 
 def main(args: list[str] | None = None) -> None:

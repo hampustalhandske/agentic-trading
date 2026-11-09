@@ -22,7 +22,14 @@ stops the pass before the day is written.
 The engine checkpoints every day to `store_dir / <spec hash>.checkpoint.sqlite`,
 beside the trial directory, so a pass stopped after `max_days`, or killed,
 resumes with the firm's state as it stood and ends with the rows of an
-unbroken pass. A pass killed after a day's rows were written but before its
+unbroken pass. With `restart_above_rss_mb`, a pass also stops at the
+next day boundary once the process's resident memory is above that many
+MB, after writing at least `restart_min_days` days, and its result says
+so (`paused_for_memory`), so its caller can resume it in a fresh
+process. The engine holds only `settings.firm.history_horizon_days` of
+track record and its last two days of decisions in memory (read at
+call time); the checkpoint holds the whole history, and every report is
+read from it. A pass killed after a day's rows were written but before its
 checkpoint drops the store's days past the checkpoint and computes them
 again. The checkpoint holds the book's value and stays outside the trial
 directory, which holds only the submission: the store's spec.json,
@@ -56,7 +63,9 @@ submission declares one trial; every pass needs a known commit, which its
 submission.json names."""
 
 import logging
-from collections.abc import Iterator, Sequence
+import os
+import subprocess
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -69,7 +78,7 @@ from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.managers.cvar_manager import ConditionalValueAtRiskManager
 from agentic_trading.agents.managers.tail_hedge_manager import TailHedgeManager
-from agentic_trading.agents.schemas import PortfolioDecision, ShortWarmup, UnfilledOrder
+from agentic_trading.agents.schemas import ShortWarmup, UnfilledOrder
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.engine_inputs import EngineInputs, require_policy_rates
@@ -78,7 +87,10 @@ from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import HoldoutReadError, lake_session
 from agentic_trading.data.trading_calendar import sessions_between
-from agentic_trading.firm_record.availability import analyst_availability
+from agentic_trading.firm_record.availability import (
+    analyst_availability,
+    analyst_availability_of_payloads,
+)
 from agentic_trading.firm_record.rows import (
     analyst_sources,
     firm_day_rows,
@@ -118,10 +130,11 @@ _ENGINE_LOGGER = "agentic_trading.backtest.engine"
 class FirmRecordResult(BaseModel):
     """What one `run_firm_record` call did: the trial's `spec_hash`, the
     `days_written` by this call, the store's `last_completed` day after it,
-    whether every session of the window is now written (`complete`), and
+    whether every session of the window is now written (`complete`),
     whether the pass is counted in the trial ledger (`counted`: the firm's
-    registry file exists and a ledger was given). It carries no
-    performance figure."""
+    registry file exists and a ledger was given), and whether it stopped
+    because the process's resident memory passed `restart_above_rss_mb`
+    (`paused_for_memory`). It carries no performance figure."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -130,10 +143,34 @@ class FirmRecordResult(BaseModel):
     last_completed: date | None
     complete: bool
     counted: bool
+    paused_for_memory: bool = False
+
+
+# Days a pass writes before resident memory may stop it: a process resumed
+# from the checkpoint already holds the whole horizon, so a threshold just
+# above that still lets it write this many days before the next restart.
+_RESTART_MIN_DAYS = 20
 
 
 class _RecordPausedError(Exception):
-    """Raised from the engine's day hook to stop a pass after `max_days`."""
+    """Raised from the engine's day hook to stop a pass after `max_days`,
+    or when its resident memory passes `restart_above_rss_mb`."""
+
+
+def process_rss_mb() -> float:
+    """This process's resident set size now, in MB: from /proc/self/statm
+    where it exists (Linux), otherwise from `ps` (macOS), which reports KB."""
+    statm = Path("/proc/self/statm")
+    if statm.exists():
+        resident_pages = int(statm.read_text().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / 2**20
+    completed = subprocess.run(
+        ["ps", "-o", "rss=", "-p", str(os.getpid())],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return int(completed.stdout.strip()) / 1024
 
 
 @contextmanager
@@ -163,7 +200,8 @@ def _on_sessions(market_data: pd.DataFrame, sessions: list[date]) -> pd.DataFram
 
 def _checkpoint_payload(path: Path) -> dict[str, Any] | None:
     """`checkpoint_store.read_all` of the engine checkpoint at `path`,
-    `None` when the file is absent or holds no state."""
+    `None` when the file is absent or holds no state. Loads the whole
+    history; the pass itself reads single columns instead."""
     if not path.exists():
         return None
     connection = checkpoint_store.connect(path, resume=True)
@@ -176,10 +214,13 @@ def _checkpoint_payload(path: Path) -> dict[str, Any] | None:
 def _checkpoint_last_day(path: Path) -> date | None:
     """The last day the engine checkpoint at `path` holds, `None` when the
     file is absent or holds no day."""
-    payload = _checkpoint_payload(path)
-    if payload is None or not payload["portfolio_value_history"]:
+    if not path.exists():
         return None
-    return date.fromisoformat(payload["portfolio_value_history"][-1][0])
+    connection = checkpoint_store.connect(path, resume=True)
+    try:
+        return checkpoint_store.read_last_day(connection)
+    finally:
+        connection.close()
 
 
 def _write_checkpoint_reports(
@@ -190,27 +231,29 @@ def _write_checkpoint_reports(
     records, in day order, and the signals of each analyst id of `roster`,
     and of any other analyst, in the decisions of every day it holds; it
     holds none when the file is absent or holds no state), with `meta`
-    updated to match as agentic_meta.json; return that `meta`."""
-    payload = _checkpoint_payload(checkpoint_path)
-    orders = (
-        []
-        if payload is None
-        else [UnfilledOrder.model_validate(order) for order in payload["unfilled_orders"]]
-    )
-    decisions_by_day = (
-        {}
-        if payload is None
-        else {
-            date.fromisoformat(day): [
-                PortfolioDecision.model_validate(decision) for decision in decisions
-            ]
-            for day, decisions in payload["decisions_by_day"].items()
-        }
-    )
+    updated to match as agentic_meta.json; return that `meta`. Reads only
+    the checkpoint's unfilled orders and its decisions, one day at a time."""
+    orders: list[UnfilledOrder] = []
+    availability = analyst_availability({}, roster)
+    if checkpoint_path.exists():
+        connection = checkpoint_store.connect(checkpoint_path, resume=True)
+        try:
+            if checkpoint_store.read_last_day(connection) is not None:
+                orders = [
+                    UnfilledOrder.model_validate(order)
+                    for order in checkpoint_store.read_unfilled_orders(connection)
+                ]
+                availability = analyst_availability_of_payloads(
+                    (
+                        (date.fromisoformat(day), payload)
+                        for day, payload in checkpoint_store.iter_decision_payloads(connection)
+                    ),
+                    roster,
+                )
+        finally:
+            connection.close()
     meta = write_unfilled_orders(trial_dir, orders, meta)
-    return write_analyst_availability(
-        trial_dir, analyst_availability(decisions_by_day, roster), meta
-    )
+    return write_analyst_availability(trial_dir, availability, meta)
 
 
 def _held_contracts(portfolio: Portfolio) -> dict[str, float]:
@@ -246,11 +289,20 @@ def run_firm_record(
     ledger: TrialLedger | None = None,
     repo_root: Path | None = None,
     short_warmup: Sequence[ShortWarmup] = (),
+    restart_above_rss_mb: float | None = None,
+    restart_min_days: int = _RESTART_MIN_DAYS,
+    rss_mb: Callable[[], float] = process_rss_mb,
 ) -> FirmRecordResult:
     """Record `commander` over `universe` on the sessions of
     `settings.stage_a.session_calendar` (read at call time) from
     `window_start` to `window_end` under `store_dir` (see the module
-    docstring), writing at most `max_days` days in this call.
+    docstring), writing at most `max_days` days in this call. With
+    `restart_above_rss_mb`, the call stops before writing a further day
+    once it has written `restart_min_days` days and `rss_mb()` (this
+    process's resident memory in MB, `process_rss_mb` by default) is above
+    it; such a call records no trial row, since its caller resumes the same
+    pass in a fresh process. When `rss_mb()` fails, a warning is logged and
+    the call runs on without the threshold.
 
     Runs the engine on `inputs` (`backtest.engine_inputs.load_engine_inputs`
     builds them), whose assets are `universe` and whose `market_data` is
@@ -270,7 +322,8 @@ def run_firm_record(
     reversed, holds no session, or ends after `settings.stage_a.data_end`,
     when `inputs` are for other assets than `universe`, when `universe`
     holds a spot FX pair and `inputs` carry no policy rates (naming the
-    pairs), when `max_days` is below 1, when a `ledger` is given without a
+    pairs), when `max_days` is below 1, when `restart_above_rss_mb` is not
+    positive or `restart_min_days` below 1, when a `ledger` is given without a
     `repo_root`, when HEAD is unknown, when the pass would be counted but
     the `src/` tree has changes or the registry file lacks
     `trials.declared_n` or `trials.prior_exposure`, or when the submission
@@ -293,6 +346,10 @@ def run_firm_record(
         )
     if max_days is not None and max_days < 1:
         raise ValueError(f"max_days must be at least 1, got {max_days}")
+    if restart_above_rss_mb is not None and restart_above_rss_mb <= 0:
+        raise ValueError(f"restart_above_rss_mb must be positive, got {restart_above_rss_mb}")
+    if restart_min_days < 1:
+        raise ValueError(f"restart_min_days must be at least 1, got {restart_min_days}")
     if ledger is not None and repo_root is None:
         raise ValueError("a ledger needs the repo_root its registry files live under")
     if list(inputs.assets) != list(universe):
@@ -398,13 +455,16 @@ def run_firm_record(
             len(sessions),
         )
         written = 0
+        paused_for_memory = False
+        memory_limit_mb = restart_above_rss_mb
         if pending:
             frame = _on_sessions(inputs.market_data, sessions)
             aligned = inputs.model_copy(update={"market_data": frame})
+            horizon_days = settings.firm.history_horizon_days
             engine = BacktestEngine(
                 commander=commander,
                 portfolio=aligned.portfolio(),
-                track_record=TrackRecord(),
+                track_record=TrackRecord(horizon_days=horizon_days),
                 data_loader=aligned.data_loader,
                 start_date=window_start,
                 end_date=window_end,
@@ -416,14 +476,37 @@ def run_firm_record(
                 risk_free_rate_series=aligned.risk_free_rate_series,
                 policy_rates=aligned.policy_rates,
                 benchmark_returns=aligned.benchmark_returns,
+                history_horizon_days=horizon_days,
             )
             refused_before = len(session.holdout_violations)
             previous = row_provenance(store.day_rows(last)) if last is not None else {}
 
             def write_day(_index: int, _total: int, day: date, value: float) -> None:
-                nonlocal written, previous
+                nonlocal written, previous, paused_for_memory, memory_limit_mb
                 if max_days is not None and written >= max_days:
                     raise _RecordPausedError
+                if memory_limit_mb is not None and written >= restart_min_days:
+                    try:
+                        resident = rss_mb()
+                    except (OSError, subprocess.SubprocessError, ValueError) as error:
+                        logger.warning(
+                            "Firm record: cannot read resident memory (%s); the pass runs on "
+                            "without the %.0f MB restart threshold",
+                            error,
+                            memory_limit_mb,
+                        )
+                        memory_limit_mb = None
+                    else:
+                        if resident > memory_limit_mb:
+                            logger.info(
+                                "Firm record: %.0f MB resident after %d day(s), above the %.0f "
+                                "MB restart threshold",
+                                resident,
+                                written,
+                                memory_limit_mb,
+                            )
+                            paused_for_memory = True
+                            raise _RecordPausedError
                 refused = session.holdout_violations[refused_before:]
                 if refused:
                     raise HoldoutReadError(
@@ -466,7 +549,13 @@ def run_firm_record(
                 else f"declared {meta.expected_availability[flagged.analyst_id]!r}",
             )
         last_completed = store.last_completed()
-        if counted and written and ledger is not None and last_completed is not None:
+        if (
+            counted
+            and written
+            and not paused_for_memory
+            and ledger is not None
+            and last_completed is not None
+        ):
             ledger.record_trial(
                 firm_trial_row(
                     record,
@@ -481,4 +570,5 @@ def run_firm_record(
         last_completed=last_completed,
         complete=last_completed == sessions[-1],
         counted=counted,
+        paused_for_memory=paused_for_memory,
     )

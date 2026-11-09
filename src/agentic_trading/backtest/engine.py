@@ -4,8 +4,8 @@ import itertools
 import math
 import sqlite3
 import time
-from collections.abc import Callable
-from datetime import date, datetime
+from collections.abc import Callable, Iterator, Mapping
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -39,6 +39,7 @@ from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.portfolio import MarkedPosition, OptionPosition, Portfolio
 from agentic_trading.backtest.resume_fingerprint import (
     agents_by_id,
+    roster_agents,
     roster_fingerprint,
     settings_fingerprint,
 )
@@ -49,7 +50,8 @@ from agentic_trading.data.loaders.option_marks import OptionMark, load_option_ma
 from agentic_trading.data.point_in_time import get_point_in_time_data
 from agentic_trading.logging_config import get_logger, log_progress
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
-from agentic_trading.scoring.track_record import TrackRecord
+from agentic_trading.scoring.track_record import HistoryHorizonError, TrackRecord
+from agentic_trading.scoring.weighting import WeightingStrategy
 
 logger = get_logger(__name__)
 
@@ -71,6 +73,103 @@ _COST_KINDS = ("transaction_cost", "slippage_cost", "impact_cost", "spread_cost"
 # old @st.cache_data-wrapped simulation loop, BacktestEngine.run() is never
 # itself cached, so there's no CacheReplayClosureError risk here.
 DayCompleteCallback = Callable[[int, int, date, float], None]
+
+# The decision days a horizon-bounded engine holds in memory: the current
+# day's and the pending day's (the one whose orders fill with a one-day
+# execution lag).
+HELD_DECISION_DAYS = 2
+
+
+class DecisionWindow(Mapping[date, list[PortfolioDecision]]):
+    """The Commander's decisions of the last `days` decision days, keyed
+    by day in day order: what a horizon-bounded engine holds in memory.
+    Setting a day's decisions drops the oldest day once more than `days`
+    are held. A day before the earliest day held raises
+    `HistoryHorizonError` once an earlier day was dropped (or left in the
+    checkpoint on restore); any other day not held raises `KeyError`.
+
+    Once an earlier day was dropped the window no longer holds every day,
+    so iterating it, its `len` and its `keys`/`items`/`values` raise
+    `HistoryHorizonError` too; `held()` returns the days it holds."""
+
+    def __init__(self, days: int) -> None:
+        if days < 1:
+            raise ValueError(f"days must be at least 1, got {days}")
+        self._days = days
+        self._held: dict[date, list[PortfolioDecision]] = {}
+        # The earliest day held once an earlier day is gone; None before.
+        self._horizon_start: date | None = None
+
+    def restore(
+        self, held: Mapping[date, list[PortfolioDecision]], earlier_days_dropped: bool
+    ) -> None:
+        """Holds the last `days` days of `held`, in day order; days before
+        them, and with `earlier_days_dropped` any day before the first of
+        `held`, count as dropped."""
+        ordered = sorted(held.items())
+        kept = ordered[-self._days :]
+        self._held = dict(kept)
+        if kept and (earlier_days_dropped or len(kept) < len(ordered)):
+            self._horizon_start = kept[0][0]
+
+    def __setitem__(self, day: date, decisions: list[PortfolioDecision]) -> None:
+        self._held[day] = decisions
+        while len(self._held) > self._days:
+            del self._held[next(iter(self._held))]
+            self._horizon_start = next(iter(self._held))
+
+    def __getitem__(self, day: date) -> list[PortfolioDecision]:
+        decisions = self._held.get(day)
+        if decisions is not None:
+            return decisions
+        if self._horizon_start is not None and day < self._horizon_start:
+            raise HistoryHorizonError(
+                f"the decisions of {day} were dropped; the engine holds the days from "
+                f"{self._horizon_start}"
+            )
+        raise KeyError(day)
+
+    def held(self) -> dict[date, list[PortfolioDecision]]:
+        """The days held and their decisions, in day order, as a new dict."""
+        return dict(self._held)
+
+    def _require_every_day(self, reader: str) -> None:
+        """Raises `HistoryHorizonError` naming `reader` once an earlier
+        day was dropped."""
+        if self._horizon_start is not None:
+            raise HistoryHorizonError(
+                f"{reader} needs every day's decisions, but the days before "
+                f"{self._horizon_start} were dropped; held() returns the days held"
+            )
+
+    def __iter__(self) -> Iterator[date]:
+        self._require_every_day("iterating the decisions")
+        return iter(self._held)
+
+    def __len__(self) -> int:
+        self._require_every_day("len() of the decisions")
+        return len(self._held)
+
+
+def longest_track_record_lookback(commander: object) -> int:
+    """The longest trailing track-record window, in calendar days ending
+    on the decision day, that `commander` reads while deciding:
+    `settings.portfolio.ic_lookback_days` (read now; each manager's
+    measured information coefficients) or the `track_record_lookback_days`
+    of the commander's own `weighting_strategy` or of any of its
+    managers', whichever is longest."""
+    strategies = [
+        getattr(agent, "weighting_strategy", None)
+        for agent in [commander, *roster_agents(commander)]
+    ]
+    return max(
+        [settings.portfolio.ic_lookback_days]
+        + [
+            strategy.track_record_lookback_days()
+            for strategy in strategies
+            if isinstance(strategy, WeightingStrategy)
+        ]
+    )
 
 
 class CommanderLike(Protocol):
@@ -131,7 +230,29 @@ class BacktestEngine:
         risk_free_rate_series: pd.Series | None = None,
         benchmark_returns: pd.Series | None = None,
         policy_rates: pd.DataFrame | None = None,
+        history_horizon_days: int | None = None,
     ) -> None:
+        if history_horizon_days is not None:
+            if history_horizon_days < 1:
+                raise ValueError(
+                    f"history_horizon_days must be at least 1, got {history_horizon_days}"
+                )
+            if checkpoint_path is None:
+                raise ValueError(
+                    "history_horizon_days needs a checkpoint_path: the run's whole history "
+                    "is read back from the checkpoint"
+                )
+            if track_record.horizon_days != history_horizon_days:
+                raise ValueError(
+                    f"history_horizon_days {history_horizon_days} needs a TrackRecord built "
+                    f"with the same horizon_days, not {track_record.horizon_days}"
+                )
+            longest = longest_track_record_lookback(commander)
+            if history_horizon_days < longest:
+                raise ValueError(
+                    f"history_horizon_days {history_horizon_days} is shorter than the "
+                    f"{longest}-day track-record window the commander reads"
+                )
         self.commander = commander
         self.portfolio = portfolio
         self.track_record = track_record
@@ -169,6 +290,20 @@ class BacktestEngine:
         # (`_carry_rates`). Omitted, or without either currency of a pair,
         # the pair accrues no carry.
         self.policy_rates = policy_rates
+        # Calendar days of history held in memory, or None for all of it.
+        # With a horizon, each session drops the track record's records
+        # dated more than this many days before the session, the decisions
+        # of all but the last `HELD_DECISION_DAYS` days are dropped, and
+        # the whole-history results (`source_performance`) are read from
+        # the checkpoint. The checkpoint, every read within the horizon and
+        # the run's results are the same as without one, but for the
+        # result's `decisions_by_day`, which holds only the days held, and
+        # its `history_horizon_days`, which records the horizon.
+        self.history_horizon_days = history_horizon_days
+        # The decisions of each day of the current run, keyed by day: every
+        # day without a horizon, the last `HELD_DECISION_DAYS` with one
+        # (a `DecisionWindow`). Filled as `run()` steps through the days.
+        self.decisions_by_day: Mapping[date, list[PortfolioDecision]] = {}
         self._checkpoint_connection: sqlite3.Connection | None = None
         # Previous day's close mark per option contract, for attribution
         # (log of today's mid over yesterday's); a contract seen for the
@@ -340,7 +475,11 @@ class BacktestEngine:
 
     def _restore_checkpoint(self, run_config: dict[str, Any]) -> dict[str, Any] | None:
         """The checkpointed state to resume from, or `None` when not
-        resuming or the checkpoint holds no day yet. Raises `ValueError`
+        resuming or the checkpoint holds no day yet. With a history
+        horizon it holds only the track record dated on or after the last
+        checkpointed day minus the horizon and the last
+        `HELD_DECISION_DAYS` days of decisions (`checkpoint_store.read_recent`).
+        Raises `ValueError`
         when the checkpoint's config differs from `run_config` (other
         dates, assets, strategy settings or roster; a checkpoint written
         without fingerprints never matches) or it carries state for an
@@ -353,7 +492,19 @@ class BacktestEngine:
         connection = self._checkpoint()
         if connection is None:
             return None
-        payload = checkpoint_store.read_all(connection)
+        if self.history_horizon_days is None:
+            payload = checkpoint_store.read_all(connection)
+        else:
+            last_day = checkpoint_store.read_last_day(connection)
+            payload = (
+                None
+                if last_day is None
+                else checkpoint_store.read_recent(
+                    connection,
+                    last_day - timedelta(days=self.history_horizon_days),
+                    HELD_DECISION_DAYS,
+                )
+            )
         if payload is None:
             return None
         if payload.get("config") != run_config:
@@ -437,14 +588,36 @@ class BacktestEngine:
             return 0.0
         return math.log(mark.mid / previous)
 
-    def _source_performance(self) -> dict[str, dict[str, float]]:
-        entries_by_source: dict[str, list[PerformanceRecord]] = {}
+    def _source_returns(self) -> dict[str, tuple[list[float], list[float]]]:
+        """Each source_id's attributable and raw attributable returns over
+        its track-record rows dated inside the run's window, in recording
+        order, sources in order of first appearance. Read from the
+        in-memory track record, or with a history horizon from the
+        checkpoint, which holds every row in the same order."""
+        returns_by_source: dict[str, tuple[list[float], list[float]]] = {}
+        if self.history_horizon_days is not None:
+            connection = self._checkpoint()
+            assert connection is not None  # a horizon needs a checkpoint_path
+            for source_id, attributable, raw_attributable in checkpoint_store.iter_source_returns(
+                connection, self.start_date, self.end_date
+            ):
+                returns, raw_returns = returns_by_source.setdefault(source_id, ([], []))
+                returns.append(attributable)
+                raw_returns.append(raw_attributable)
+            return returns_by_source
         entries = getattr(self.track_record, "_entries", None)
         if entries is None:
             entries = getattr(self.track_record, "entries", [])
         for entry in entries:
             if self.start_date <= entry.as_of_date <= self.end_date:
-                entries_by_source.setdefault(entry.source_id, []).append(entry)
+                returns, raw_returns = returns_by_source.setdefault(entry.source_id, ([], []))
+                returns.append(entry.attributable_return)
+                raw_returns.append(entry.raw_attributable_return)
+        return returns_by_source
+
+    def _source_performance(self) -> dict[str, dict[str, float]]:
+        """Each source's attribution statistics over the run's window (see
+        `_stats` below), from `_source_returns`."""
 
         def _stats(returns: np.ndarray) -> tuple[float, float, float, float]:
             """Returns (annualized_return, total_attributed_return, sharpe,
@@ -471,11 +644,9 @@ class BacktestEngine:
             return mean_return * 252.0, float(np.sum(returns)), sharpe, drawdown
 
         performance: dict[str, dict[str, float]] = {}
-        for source_id, entries in entries_by_source.items():
-            returns = np.asarray([entry.attributable_return for entry in entries], dtype=float)
-            raw_returns = np.asarray(
-                [entry.raw_attributable_return for entry in entries], dtype=float
-            )
+        for source_id, (attributable, raw_attributable) in self._source_returns().items():
+            returns = np.asarray(attributable, dtype=float)
+            raw_returns = np.asarray(raw_attributable, dtype=float)
             annualized_return, total_attributed_return, sharpe, drawdown = _stats(returns)
             raw_annualized_return, raw_total_attributed_return, raw_sharpe, raw_drawdown = _stats(
                 raw_returns
@@ -485,7 +656,7 @@ class BacktestEngine:
                 "total_attributed_return": total_attributed_return,
                 "sharpe_ratio": sharpe,
                 "max_drawdown": drawdown,
-                "observations": float(len(entries)),
+                "observations": float(len(returns)),
                 "raw_cumulative_return": raw_annualized_return,
                 "raw_total_attributed_return": raw_total_attributed_return,
                 "raw_sharpe_ratio": raw_sharpe,
@@ -505,7 +676,11 @@ class BacktestEngine:
         recording realized performance into track_record. Returns a
         BacktestResult summarizing the full run, including every day's
         PortfolioDecisions and the full trade log — the same data both the
-        CLI and the GUI's Desks/Analysts drill-down are built from.
+        CLI and the GUI's Desks/Analysts drill-down are built from. With a
+        `history_horizon_days`, the result's `decisions_by_day` holds only
+        the last `HELD_DECISION_DAYS` days (the checkpoint holds every
+        day's) and its `history_horizon_days` records the horizon;
+        everything else in it is as without a horizon.
 
         `on_day_complete`, if given, is called once per simulated day after
         that day's trades are applied — the hook a live progress UI hangs
@@ -542,6 +717,7 @@ class BacktestEngine:
                 final_calmar_ratio=0.0,
                 final_hit_rate=0.0,
                 final_profit_factor=0.0,
+                history_horizon_days=self.history_horizon_days,
                 unfactored_split_moves=lakehouse_loader.unfactored_split_move_registry(),
             )
 
@@ -568,7 +744,7 @@ class BacktestEngine:
             else []
         )
         portfolio_values = [value for _, value in portfolio_value_history]
-        decisions_by_day: dict[date, list[PortfolioDecision]] = (
+        restored_decisions: dict[date, list[PortfolioDecision]] = (
             {
                 date.fromisoformat(day): [
                     PortfolioDecision.model_validate(decision) for decision in decisions
@@ -578,6 +754,17 @@ class BacktestEngine:
             if checkpoint
             else {}
         )
+        decisions_by_day: dict[date, list[PortfolioDecision]] | DecisionWindow
+        if self.history_horizon_days is None:
+            decisions_by_day = restored_decisions
+        else:
+            decisions_by_day = DecisionWindow(HELD_DECISION_DAYS)
+            decisions_by_day.restore(
+                restored_decisions,
+                earlier_days_dropped=checkpoint is not None
+                and int(checkpoint["next_day_index"]) > len(restored_decisions),
+            )
+        self.decisions_by_day = decisions_by_day
         trade_log = (
             [TradeRecord.model_validate(trade) for trade in checkpoint["trade_log"]]
             if checkpoint
@@ -643,9 +830,24 @@ class BacktestEngine:
                 contract_id: position.last_mid
                 for contract_id, position in self.portfolio.option_positions.items()
             }
-            self.track_record.restore(
-                [PerformanceRecord.model_validate(entry) for entry in checkpoint["track_record"]]
-            )
+            restored_records = [
+                PerformanceRecord.model_validate(entry) for entry in checkpoint["track_record"]
+            ]
+            if self.history_horizon_days is None:
+                self.track_record.restore(restored_records)
+            else:
+                self.track_record.restore(
+                    restored_records,
+                    cutoff=portfolio_value_history[-1][0]
+                    - timedelta(days=self.history_horizon_days),
+                    recorded_count=int(checkpoint["track_record_count"]),
+                    dropped_first_dates={
+                        source_id: date.fromisoformat(first)
+                        for source_id, first in checkpoint[
+                            "track_record_dropped_first_dates"
+                        ].items()
+                    },
+                )
             self._restore_commander_risk_state(checkpoint.get("commander_risk_state"))
             # After the risk state, which restores the Commander's own state
             # and each manager's constructor state; the carried state then
@@ -661,6 +863,10 @@ class BacktestEngine:
 
         for day_index, as_of_timestamp in enumerate(days[start_day_index:], start=start_day_index):
             day_started_at = time.perf_counter()
+            if self.history_horizon_days is not None:
+                self.track_record.drop_before(
+                    as_of_timestamp.date() - timedelta(days=self.history_horizon_days)
+                )
             market_data = get_point_in_time_data(raw_market_data, as_of_timestamp)
             # Today's mark-to-mark log return of every open option position,
             # so the Commander's pod-return tracker sees option P&L the way
@@ -1164,6 +1370,7 @@ class BacktestEngine:
         close_commander = getattr(self.commander, "close", None)
         if close_commander is not None:
             close_commander()
+        source_performance = self._source_performance()
         if self._checkpoint_connection is not None:
             self._checkpoint_connection.close()
             self._checkpoint_connection = None
@@ -1182,14 +1389,19 @@ class BacktestEngine:
             final_information_ratio=final_information_ratio,
             final_hit_rate=final_hit_rate,
             final_profit_factor=final_profit_factor,
-            decisions_by_day=decisions_by_day,
+            decisions_by_day=(
+                decisions_by_day.held()
+                if isinstance(decisions_by_day, DecisionWindow)
+                else decisions_by_day
+            ),
+            history_horizon_days=self.history_horizon_days,
             trade_log=trade_log,
             unfilled_orders=unfilled_orders,
             capital_usage=capital_usage,
             sizing_diagnostics=sizing_diagnostics,
             signal_health=signal_health,
             market_data_source=self.market_data_source,
-            source_performance=self._source_performance(),
+            source_performance=source_performance,
             total_transaction_cost=total_transaction_cost,
             total_slippage_cost=total_slippage_cost,
             total_impact_cost=total_impact_cost,

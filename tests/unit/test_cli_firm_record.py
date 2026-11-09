@@ -7,9 +7,10 @@ session cut at `stage_a.data_end`, runs `run_firm_record` and prints its result,
 performance figure."""
 
 import inspect
+import sys
 import tomllib
 from collections.abc import Callable, Iterator
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ import pytest
 from click.testing import Result
 from typer.testing import CliRunner
 
+from agentic_trading import cli
 from agentic_trading.agents.roster import (
     FIRM_V1_EQUITY_SECURITY_IDS,
     FIRM_V1_EXCLUDED_ANALYST_IDS,
@@ -60,11 +62,11 @@ _RESULT = FirmRecordResult(
 
 
 def _invoke(
-    args: list[str], coverage: MagicMock | None = None
+    args: list[str], coverage: MagicMock | None = None, record_result: FirmRecordResult = _RESULT
 ) -> tuple[Result, MagicMock, MagicMock, MagicMock]:
     """Runs the command with the price load, the risk-free rate load and the record mocked
-    (the policy rates by `_policy_rates`), and the price coverage preflight replaced by
-    `coverage` (a passing mock by default)."""
+    (the record returning `record_result`, the policy rates by `_policy_rates`), and the price
+    coverage preflight replaced by `coverage` (a passing mock by default)."""
     with (
         patch(
             "agentic_trading.backtest.engine_inputs.load_price_history_with_fallback",
@@ -73,7 +75,7 @@ def _invoke(
         patch(
             "agentic_trading.backtest.engine_inputs.load_risk_free_rate_series", return_value=None
         ) as rates,
-        patch("agentic_trading.cli.run_firm_record", return_value=_RESULT) as record,
+        patch("agentic_trading.cli.run_firm_record", return_value=record_result) as record,
         patch("agentic_trading.cli.check_price_coverage", coverage or MagicMock()),
     ):
         result = runner.invoke(firm_record_app, args)
@@ -144,6 +146,95 @@ def test_firm_record_runs_the_registered_firm(tmp_path: Path, preflight_lake: An
     assert called["lake_time"].isoformat() == "2026-11-06T00:00:00+00:00"
     assert FirmRecordResult.model_validate_json(result.stdout[result.stdout.index("{") :]) == (
         _RESULT
+    )
+
+
+_ARGS = [
+    "--start",
+    "2010-01-04",
+    "--end",
+    "2010-01-05",
+    "--lake-time",
+    "2026-11-06T00:00:00Z",
+]
+
+
+def test_restart_threshold_defaults_to_4096_mb(tmp_path: Path, preflight_lake: Any) -> None:
+    """Without the flag the record restarts above 4096 MB; 0 never restarts; neither result
+    restarts the process when the pass did not stop for memory."""
+    with patch("agentic_trading.cli._restart_record") as restart:
+        default, _, _, record = _invoke([*_ARGS, "--store-dir", str(tmp_path)])
+        assert default.exit_code == 0, default.output
+        assert _bound(run_firm_record, record)["restart_above_rss_mb"] == 4096
+        off, _, _, record = _invoke(
+            [*_ARGS, "--store-dir", str(tmp_path), "--restart-above-rss-mb", "0"]
+        )
+        assert off.exit_code == 0, off.output
+        assert _bound(run_firm_record, record)["restart_above_rss_mb"] is None
+    restart.assert_not_called()
+
+
+@pytest.mark.parametrize(("max_days", "extra"), [(None, []), ("20", ["--max-days", "17"])])
+def test_pass_paused_for_memory_restarts_pinned(
+    tmp_path: Path, max_days: str | None, extra: list[str], preflight_lake: Any
+) -> None:
+    """A pass that stopped for memory prints its result, then restarts the command pinned to
+    the lake time it read and, with --max-days, to the days it has left."""
+    paused = _RESULT.model_copy(
+        update={"days_written": 3, "complete": False, "paused_for_memory": True}
+    )
+    args = [*_ARGS, "--store-dir", str(tmp_path), "--restart-above-rss-mb", "1500"]
+    args += [] if max_days is None else ["--max-days", max_days]
+    with patch("agentic_trading.cli._restart_record") as restart:
+        result, _, _, record = _invoke(args, record_result=paused)
+
+    assert result.exit_code == 0, result.output
+    assert _bound(run_firm_record, record)["restart_above_rss_mb"] == 1500
+    assert FirmRecordResult.model_validate_json(result.stdout[result.stdout.index("{") :]) == (
+        paused
+    )
+    restart.assert_called_once_with(["--lake-time", "2026-11-06T00:00:00+00:00", *extra])
+
+
+def test_restart_pins_the_lake_time_the_session_read(tmp_path: Path, preflight_lake: Any) -> None:
+    """Without --lake-time the restart is pinned to the lake time the session chose, which
+    parses back to the same instant."""
+    paused = _RESULT.model_copy(
+        update={"days_written": 3, "complete": False, "paused_for_memory": True}
+    )
+    args = ["--start", "2010-01-04", "--end", "2010-01-05", "--store-dir", str(tmp_path)]
+    with patch("agentic_trading.cli._restart_record") as restart:
+        result, _, _, record = _invoke(args, record_result=paused)
+
+    assert result.exit_code == 0, result.output
+    read = _bound(run_firm_record, record)["lake_time"]
+    flag, pinned = restart.call_args.args[0]
+    assert flag == "--lake-time"
+    assert datetime.fromisoformat(pinned) == read
+
+
+def test_later_options_override_earlier_ones(tmp_path: Path, preflight_lake: Any) -> None:
+    """A repeated --max-days or --lake-time takes its last value, which a restart relies on."""
+    args = [*_ARGS, "--store-dir", str(tmp_path), "--max-days", "20", "--max-days", "17"]
+    args += ["--lake-time", "2026-11-05T00:00:00+00:00"]
+    result, _, _, record = _invoke(args)
+    called = _bound(run_firm_record, record)
+
+    assert result.exit_code == 0, result.output
+    assert called["max_days"] == 17
+    assert called["lake_time"].isoformat() == "2026-11-05T00:00:00+00:00"
+
+
+def test_restart_record_execs_the_same_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The restart replaces the process with the interpreter running the original arguments
+    followed by the extra ones."""
+    monkeypatch.setattr(sys, "orig_argv", ["python3", "/venv/bin/record", "--start", "x"])
+    with patch("agentic_trading.cli.os.execv") as execv:
+        cli._restart_record(["--max-days", "5"])
+
+    execv.assert_called_once_with(
+        sys.executable,
+        [sys.executable, "/venv/bin/record", "--start", "x", "--max-days", "5"],
     )
 
 

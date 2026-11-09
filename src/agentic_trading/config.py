@@ -147,6 +147,15 @@ class FirmConfig(BaseModel):
     # of the window on missing data or errors, so the record's evidence for
     # its pod rests on far less of the window than it appears to.
     low_availability_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Calendar days of track record a firm record keeps in memory, and the
+    # engine drops its older records each session; its decisions it keeps
+    # for the current and pending day only. The checkpoint keeps the whole
+    # history. 300 covers `portfolio.ic_lookback_days` (250), the longest
+    # trailing window any reader takes, so the record decides as an
+    # unbounded run does; a read reaching further back raises. It is part
+    # of the spec hash: the engine's BacktestResult holds the decisions of
+    # the retained days only.
+    history_horizon_days: int = Field(default=300, ge=1)
 
 
 class OptionsConfig(BaseModel):

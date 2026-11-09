@@ -72,12 +72,26 @@ SP500_TICKER = "^GSPC"
 AUTOPLAY_INTERVAL_SECONDS = 0.9
 
 
+def _require_whole_decision_history(backtest_result: BacktestResult) -> None:
+    """Raises `ValueError` for a result whose engine ran with a history
+    horizon: its `decisions_by_day` holds only the last days, and every
+    view of the dashboard reads every day's decisions."""
+    if backtest_result.history_horizon_days is not None:
+        raise ValueError(
+            "the dashboard needs every day's decisions, but this backtest ran with a "
+            f"{backtest_result.history_horizon_days}-day history horizon and its result "
+            "holds only the last days' decisions; run it without a horizon"
+        )
+
+
 @dataclass(slots=True)
 class DeskRun:
     """Everything one simulation run produced: the multi-asset backtest
     itself (via the shared `BacktestEngine` — see `_simulate_desk`, there is
     no separate GUI-only simulation loop) plus the two benchmarks it's
-    judged against throughout the GUI."""
+    judged against throughout the GUI. Raises `ValueError` for a
+    `backtest_result` from a run with a history horizon, which lacks most
+    days' decisions."""
 
     tickers: list[str]
     group_name: str
@@ -92,6 +106,9 @@ class DeskRun:
     scoreboard: PerformanceScoreboard
     sp500_benchmark: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     basket_benchmark: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+
+    def __post_init__(self) -> None:
+        _require_whole_decision_history(self.backtest_result)
 
     @property
     def decisions_by_day(self) -> dict[date, list[PortfolioDecision]]:
@@ -567,6 +584,7 @@ def _simulate_desk(
             policy_rates=load_fx_policy_rates(tickers, start, end),
         )
         backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
+        _require_whole_decision_history(backtest_result)
 
         return DeskRun(
             tickers=tickers,

@@ -15,11 +15,17 @@ and the `carried_state` table, one row per agent holding its
 not grow with run length. Mirrors the append-only idiom `data/db.py` uses
 for the fetch log.
 
+`read_all` reads the whole state back; `read_recent` reads it with only
+the recent track record and decisions a horizon-bounded engine holds;
+`read_last_day`, `read_unfilled_orders`, `iter_decision_payloads` and
+`iter_source_returns` read single columns of one table each.
+
 A `carried_state` blob is a pickle: open with `connect` only checkpoint
 files this program wrote, never one from an untrusted source."""
 
 import json
 import sqlite3
+from collections.abc import Iterable, Iterator
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -334,6 +340,30 @@ def append_day(
             )
 
 
+_TRACK_RECORD_COLUMNS = (
+    "source_id, source_type, asset, as_of_date, attributable_return, "
+    "raw_attributable_return, signal_score, realized_return"
+)
+
+
+def _track_record_rows(rows: Iterable[tuple[Any, ...]]) -> list[dict[str, Any]]:
+    """`track_record` rows of `_TRACK_RECORD_COLUMNS` as `PerformanceRecord`
+    payload dicts."""
+    return [
+        {
+            "source_id": row[0],
+            "source_type": row[1],
+            "asset": row[2],
+            "as_of_date": row[3],
+            "attributable_return": row[4],
+            "raw_attributable_return": row[5],
+            "signal_score": row[6],
+            "realized_return": row[7],
+        }
+        for row in rows
+    ]
+
+
 def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
     """Bulk-reads the full checkpoint state in the shape
     `BacktestEngine._restore_checkpoint()` (and any offline reader, e.g. the
@@ -343,7 +373,86 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
     `None` when the run read outside a lake session. `config` holds the
     dates, the assets and the two fingerprints (`None` in a checkpoint
     written without them). `carried_states` is each agent's stored
-    `carried_state()` snapshot keyed by agent_id, still pickled."""
+    `carried_state()` snapshot keyed by agent_id, still pickled. Rows of
+    one day keep the order they were appended in."""
+    payload = _read_state(connection)
+    if payload is None:
+        return None
+    payload["track_record"] = _track_record_rows(
+        connection.execute(
+            f"SELECT {_TRACK_RECORD_COLUMNS} FROM track_record ORDER BY as_of_date, rowid"
+        )
+    )
+    payload["decisions_by_day"] = {
+        as_of_date_str: json.loads(payload_json)
+        for as_of_date_str, payload_json in iter_decision_payloads(connection)
+    }
+    return payload
+
+
+def read_recent(
+    connection: sqlite3.Connection, track_record_from: date, decision_days: int
+) -> dict[str, Any] | None:
+    """`read_all`'s payload with only the recent history a horizon-bounded
+    engine holds in memory: `track_record` is the rows dated on or after
+    `track_record_from`, in the order they were appended, and
+    `decisions_by_day` the last `decision_days` days of decisions. Two
+    keys describe the rows left out: `track_record_count`, the number of
+    rows the table holds, and `track_record_dropped_first_dates`, each
+    source_id's earliest ISO date among the rows dated before
+    `track_record_from`. Every other key is as `read_all` gives it.
+    Returns `None` when there is no cursor row yet. Raises `ValueError`
+    when a row dated before `track_record_from` was appended after one
+    dated on or after it, since the rows read would then not be the last
+    ones appended."""
+    payload = _read_state(connection)
+    if payload is None:
+        return None
+    cutoff = track_record_from.isoformat()
+    (interleaved,) = connection.execute(
+        "SELECT COUNT(*) FROM track_record WHERE as_of_date < ? AND rowid > "
+        "(SELECT MIN(rowid) FROM track_record WHERE as_of_date >= ?)",
+        (cutoff, cutoff),
+    ).fetchone()
+    if interleaved:
+        raise ValueError(
+            f"the checkpoint's track record has {interleaved} row(s) dated before {cutoff} "
+            "appended after a row dated on or after it"
+        )
+    payload["track_record"] = _track_record_rows(
+        connection.execute(
+            f"SELECT {_TRACK_RECORD_COLUMNS} FROM track_record WHERE as_of_date >= ? "
+            "ORDER BY rowid",
+            (cutoff,),
+        )
+    )
+    (payload["track_record_count"],) = connection.execute(
+        "SELECT COUNT(*) FROM track_record"
+    ).fetchone()
+    payload["track_record_dropped_first_dates"] = dict(
+        connection.execute(
+            "SELECT source_id, MIN(as_of_date) FROM track_record WHERE as_of_date < ? "
+            "GROUP BY source_id ORDER BY source_id",
+            (cutoff,),
+        )
+    )
+    payload["decisions_by_day"] = {
+        as_of_date_str: json.loads(payload_json)
+        for as_of_date_str, payload_json in connection.execute(
+            "SELECT as_of_date, payload FROM ("
+            "SELECT as_of_date, payload, rowid AS position FROM decisions "
+            "ORDER BY as_of_date DESC, rowid DESC LIMIT ?"
+            ") ORDER BY as_of_date, position",
+            (decision_days,),
+        )
+    }
+    return payload
+
+
+def _read_state(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    """Everything `read_all` returns but `track_record` and
+    `decisions_by_day`, the two histories a horizon-bounded engine keeps
+    only in part; `None` when there is no cursor row yet."""
     cursor_row = connection.execute(
         "SELECT next_day_index, start_date, end_date, assets, portfolio, "
         "signal_health, pending_decisions, commander_risk_state, total_financing_cost, "
@@ -374,41 +483,13 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
             "SELECT as_of_date, value FROM portfolio_value ORDER BY as_of_date"
         )
     ]
-    track_record = [
-        {
-            "source_id": row[0],
-            "source_type": row[1],
-            "asset": row[2],
-            "as_of_date": row[3],
-            "attributable_return": row[4],
-            "raw_attributable_return": row[5],
-            "signal_score": row[6],
-            "realized_return": row[7],
-        }
-        for row in connection.execute(
-            "SELECT source_id, source_type, asset, as_of_date, attributable_return, "
-            "raw_attributable_return, signal_score, realized_return FROM track_record "
-            "ORDER BY as_of_date"
-        )
-    ]
-    decisions_by_day = {
-        as_of_date_str: json.loads(payload)
-        for as_of_date_str, payload in connection.execute(
-            "SELECT as_of_date, payload FROM decisions ORDER BY as_of_date"
-        )
-    }
     trade_log = [
         json.loads(payload)
         for _as_of_date_str, payload in connection.execute(
-            "SELECT as_of_date, payload FROM trades ORDER BY as_of_date"
+            "SELECT as_of_date, payload FROM trades ORDER BY as_of_date, rowid"
         )
     ]
-    unfilled_orders = [
-        json.loads(payload)
-        for _as_of_date_str, payload in connection.execute(
-            "SELECT as_of_date, payload FROM unfilled_orders ORDER BY as_of_date"
-        )
-    ]
+    unfilled_orders = read_unfilled_orders(connection)
     capital_usage = [
         json.loads(payload)
         for _as_of_date_str, payload in connection.execute(
@@ -456,8 +537,6 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         "total_financing_cost": float(total_financing_cost),
         "total_option_premium_paid": float(total_option_premium_paid),
         "lake_time": None if lake_time is None else datetime.fromisoformat(lake_time),
-        "track_record": track_record,
-        "decisions_by_day": decisions_by_day,
         "trade_log": trade_log,
         "unfilled_orders": unfilled_orders,
         "capital_usage": capital_usage,
@@ -467,6 +546,48 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
         "portfolio_value_history": portfolio_value_history,
         "carried_states": carried_states,
     }
+
+
+def read_last_day(connection: sqlite3.Connection) -> date | None:
+    """The last day the checkpoint holds, `None` when there is no cursor
+    row yet. Reads two single values, not the history."""
+    if connection.execute("SELECT 1 FROM cursor WHERE id = 0").fetchone() is None:
+        return None
+    (last,) = connection.execute("SELECT MAX(as_of_date) FROM portfolio_value").fetchone()
+    return None if last is None else date.fromisoformat(last)
+
+
+def read_unfilled_orders(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every stored `UnfilledOrder` payload, in day order and, within a
+    day, in the order appended."""
+    return [
+        json.loads(payload)
+        for (payload,) in connection.execute(
+            "SELECT payload FROM unfilled_orders ORDER BY as_of_date, rowid"
+        )
+    ]
+
+
+def iter_decision_payloads(connection: sqlite3.Connection) -> Iterator[tuple[str, str]]:
+    """Each stored day's ISO date and its decisions as the JSON text
+    `append_day` wrote (a list of `PortfolioDecision` payloads), in day
+    order, read one row at a time."""
+    yield from connection.execute(
+        "SELECT as_of_date, payload FROM decisions ORDER BY as_of_date, rowid"
+    )
+
+
+def iter_source_returns(
+    connection: sqlite3.Connection, start_date: date, end_date: date
+) -> Iterator[tuple[str, float, float]]:
+    """`(source_id, attributable_return, raw_attributable_return)` of each
+    track-record row dated from `start_date` to `end_date` inclusive, in
+    the order the rows were appended, read one row at a time."""
+    yield from connection.execute(
+        "SELECT source_id, attributable_return, raw_attributable_return FROM track_record "
+        "WHERE as_of_date BETWEEN ? AND ? ORDER BY rowid",
+        (start_date.isoformat(), end_date.isoformat()),
+    )
 
 
 def read_lake_time(db_path: Path) -> datetime | None:
