@@ -680,7 +680,10 @@ class BacktestEngine:
         `history_horizon_days`, the result's `decisions_by_day` holds only
         the last `HELD_DECISION_DAYS` days (the checkpoint holds every
         day's) and its `history_horizon_days` records the horizon;
-        everything else in it is as without a horizon.
+        everything else in it is as without a horizon. A run that resumed
+        from a checkpoint's saved days returns `unfactored_split_moves` as
+        `None`: the split-move registry is not checkpointed, so this process
+        has seen only its own reads.
 
         `on_day_complete`, if given, is called once per simulated day after
         that day's trades are applied — the hook a live progress UI hangs
@@ -1414,7 +1417,11 @@ class BacktestEngine:
             pod_return_history=pod_return_history,
             pod_performance=pod_performance,
             pod_costs=_pod_cost_attribution(pod_cost_days, len(portfolio_value_history)),
-            unfactored_split_moves=lakehouse_loader.unfactored_split_move_registry(),
+            unfactored_split_moves=(
+                None
+                if checkpoint is not None
+                else lakehouse_loader.unfactored_split_move_registry()
+            ),
         )
 
 

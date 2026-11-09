@@ -2,7 +2,8 @@
 
 """A book holding a future and an FX pair, rolling and accruing carry, resumes
 from its checkpoint after any day to a `BacktestResult` byte-identical to the
-uninterrupted run's: the marked positions and their marks are checkpointed
+uninterrupted run's but for `unfactored_split_moves`, which a resumed run
+reports as `None`: the marked positions and their marks are checkpointed
 and restored."""
 
 from collections.abc import Callable
@@ -95,6 +96,7 @@ def _stop_after(day: int) -> Callable[..., None]:
 def test_resume_with_marked_positions_is_byte_identical(tmp_path: Path) -> None:
     expected = _engine().run()
     expected_json = expected.model_dump_json()
+    assert expected.unfactored_split_moves == []
     assert any(trade.action == "roll" for trade in expected.trade_log)
     assert expected.total_financing_cost != 0.0
 
@@ -105,6 +107,8 @@ def test_resume_with_marked_positions_is_byte_identical(tmp_path: Path) -> None:
 
         resumed = _engine(checkpoint_path, resume=True).run()
 
+        assert resumed.unfactored_split_moves is None
+        resumed = resumed.model_copy(update={"unfactored_split_moves": []})
         assert resumed.model_dump_json() == expected_json, f"interrupted after day {k}"
 
 

@@ -278,6 +278,10 @@ def test_horizon_resume_matches_the_unbroken_run(tmp_path: Path, stop: int) -> N
 
     resumed = _engine(path, _HORIZON_DAYS, resume=True).run()
 
+    # A resumed run reports no split-move list; every other field matches the unbroken run.
+    assert resumed.unfactored_split_moves is None
+    assert unbroken.unfactored_split_moves == []
+    resumed = resumed.model_copy(update={"unfactored_split_moves": []})
     assert resumed.model_dump_json() == unbroken.model_dump_json()
     assert _without_decisions(resumed) == _without_decisions(plain)
     assert _checkpoint(path) == _checkpoint(tmp_path / "plain.sqlite")

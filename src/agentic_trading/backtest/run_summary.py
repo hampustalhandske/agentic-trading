@@ -19,8 +19,9 @@ per asset per day like the fields this strips). `pod_performance` and
 through as they are, and `execution_costs` gives the run's fill-cost
 totals by kind. Per-pod sizing diagnostics are reduced to each pod's
 binding-stage shares and mean final-to-target vol ratio, and unfactored
-split-sized moves to a count per security; the per-day and per-move
-entries are not kept. `lake` carries the lake state the run read: its
+split-sized moves to a count per security (`None` for a resumed run,
+which carries no move list); the per-day and per-move entries are not
+kept. `lake` carries the lake state the run read: its
 lake time, the build of each rebuilt-whole table and the tables pinned on
 their own row time."""
 
@@ -117,10 +118,13 @@ def _sizing_summary(block: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {"sizing_binding_shares": binding_shares, "sizing_vol_ratio": vol_ratio}
 
 
-def _unfactored_split_move_counts(block: dict[str, Any]) -> dict[str, int]:
+def _unfactored_split_move_counts(block: dict[str, Any]) -> dict[str, int] | None:
     """The number of `unfactored_split_moves` entries per security in a
     period block, keyed by the security id as a string; `{}` when the block
-    has none."""
+    has none, and `None` when its `unfactored_split_moves` is null (a run
+    resumed from a checkpoint, whose list would be incomplete)."""
+    if "unfactored_split_moves" in block and block["unfactored_split_moves"] is None:
+        return None
     moves = block.get("unfactored_split_moves") or []
     return dict(Counter(str(move["security_id"]) for move in moves))
 

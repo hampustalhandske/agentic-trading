@@ -133,3 +133,19 @@ def test_run_summary_counts_unfactored_split_moves_per_security() -> None:
 
     assert summary["test"]["unfactored_split_moves_by_security"] == {"7": 2, "12": 1}
     assert summary["calibration"]["unfactored_split_moves_by_security"] == {}
+
+
+def test_run_summary_reports_none_for_a_resumed_period() -> None:
+    """A period whose `unfactored_split_moves` is null (a resumed run) reports `None`, not `{}`;
+    a block without the key reports `{}`."""
+    result = {
+        "experiment": {},
+        "market_data_source": "lakehouse data",
+        "calibration": _block(),
+        "test": _block(unfactored_split_moves=None),
+    }
+
+    summary = extract_run_summary(result)
+
+    assert summary["test"]["unfactored_split_moves_by_security"] is None
+    assert summary["calibration"]["unfactored_split_moves_by_security"] == {}

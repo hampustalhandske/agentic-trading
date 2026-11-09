@@ -3,8 +3,10 @@
 """A backtest interrupted after any day and resumed from its checkpoint gives a `BacktestResult`
 whose JSON is byte-identical to the uninterrupted run's, with an analyst and a manager whose
 signals rest on pydantic private state (a `RefitCache` and day counters) that the checkpoint
-carries. A resume under different strategy settings or a different roster raises `ValueError`; a
-resume that differs only in runtime-only settings reproduces the uninterrupted run."""
+carries; the one exception is `unfactored_split_moves`, which the uninterrupted run reports as a
+list and a resumed run as `None`, since the split-move registry is not checkpointed. A resume
+under different strategy settings or a different roster raises `ValueError`; a resume that
+differs only in runtime-only settings reproduces the uninterrupted run."""
 
 from collections.abc import Callable
 from pathlib import Path
@@ -19,10 +21,11 @@ from agentic_trading.agents._market_math import RefitCache
 from agentic_trading.agents.base import AnalystAgent, ManagerAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.portfolio_construction import PortfolioConstructor
-from agentic_trading.agents.schemas import AgentSignal, PortfolioDecision
+from agentic_trading.agents.schemas import AgentSignal, BacktestResult, PortfolioDecision
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
 from agentic_trading.config import temporary_overrides
+from agentic_trading.data.loaders import lakehouse_loader
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import EqualWeight
@@ -135,6 +138,12 @@ def _engine(
     )
 
 
+def _without_split_moves(result: BacktestResult) -> str:
+    """`result`'s JSON without `unfactored_split_moves`, the one field a resumed run reports
+    differently."""
+    return result.model_dump_json(exclude={"unfactored_split_moves"})
+
+
 def _stop_after(day: int) -> Callable[..., None]:
     def stop(day_index: int, *_args: object) -> None:
         if day_index == day:
@@ -161,7 +170,8 @@ def test_resume_after_any_day_is_byte_identical(tmp_path: Path) -> None:
     """Interrupted after any day k and resumed, the run's `BacktestResult` JSON equals the
     uninterrupted run's exactly, though the analyst's next signal differs without its state."""
     expected = _engine(_commander()).run()
-    expected_json = expected.model_dump_json()
+    expected_json = _without_split_moves(expected)
+    assert expected.unfactored_split_moves == []
     assert expected.trade_log
     assert [day for day, _ in expected.portfolio_value_history] == _DAYS
     uninterrupted = _signal_path(_StatefulAnalyst(), _SESSIONS)
@@ -173,7 +183,8 @@ def test_resume_after_any_day_is_byte_identical(tmp_path: Path) -> None:
 
         result = _engine(_commander(), checkpoint_path, resume=True).run()
 
-        assert result.model_dump_json() == expected_json, f"interrupted after day {k}"
+        assert result.unfactored_split_moves is None
+        assert _without_split_moves(result) == expected_json, f"interrupted after day {k}"
 
 
 @pytest.mark.parametrize(
@@ -191,7 +202,7 @@ def test_resume_checks_the_settings_fingerprint(
 ) -> None:
     """A resume under changed strategy settings raises `ValueError`; one under changed
     runtime-only settings reproduces the uninterrupted run byte for byte."""
-    expected_json = _engine(_commander()).run().model_dump_json()
+    expected_json = _without_split_moves(_engine(_commander()).run())
     checkpoint_path = _interrupted(tmp_path / "checkpoint.db")
 
     with temporary_overrides(overrides):
@@ -200,7 +211,7 @@ def test_resume_checks_the_settings_fingerprint(
             with pytest.raises(ValueError):
                 resumed.run()
         else:
-            assert resumed.run().model_dump_json() == expected_json
+            assert _without_split_moves(resumed.run()) == expected_json
 
 
 @pytest.mark.parametrize(
@@ -223,3 +234,39 @@ def test_resume_checks_the_roster_fingerprint(
 
     with pytest.raises(ValueError):
         resumed.run()
+
+
+def test_a_resumed_run_reports_no_split_move_list(tmp_path: Path) -> None:
+    """A run that started from day 0 reports the split moves its reads flagged; a run resumed
+    from a checkpoint reports `None`, even when its own reads flagged a move, since the moves
+    flagged before the interruption are not carried."""
+    move = (7, _DAYS[0])
+
+    def _flagging_loader(_assets: object, _start: object, _end: object) -> pd.DataFrame:
+        with lakehouse_loader._UNFACTORED_SPLIT_MOVES_LOCK:
+            lakehouse_loader._UNFACTORED_SPLIT_MOVES.setdefault(move, 0.5)
+        return _frame()
+
+    def _flagging_engine(
+        checkpoint_path: Path | None = None, resume: bool = False
+    ) -> BacktestEngine:
+        """`_engine` whose price load flags `move` as its lakehouse reads would."""
+        engine = _engine(_commander(), checkpoint_path, resume)
+        engine.data_loader = _flagging_loader
+        return engine
+
+    try:
+        fresh = _flagging_engine().run()
+        checkpoint_path = tmp_path / "checkpoint.db"
+        with pytest.raises(_InterruptError):
+            _flagging_engine(checkpoint_path).run(on_day_complete=_stop_after(2))
+        resumed = _flagging_engine(checkpoint_path, resume=True).run()
+    finally:
+        lakehouse_loader.clear_unfactored_split_move_registry()
+
+    assert fresh.unfactored_split_moves is not None
+    assert [(m.security_id, m.as_of_date, m.ratio) for m in fresh.unfactored_split_moves] == [
+        (*move, 0.5)
+    ]
+    assert resumed.unfactored_split_moves is None
+    assert resumed.model_dump(mode="json")["unfactored_split_moves"] is None

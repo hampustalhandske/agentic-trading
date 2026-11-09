@@ -620,5 +620,7 @@ class BacktestResult(BaseModel):
     # to `total_transaction_cost`), and premium to `total_option_premium_paid`.
     pod_costs: dict[str, PodCostAttribution] = Field(default_factory=dict)
     # Split-sized moves the run's lakehouse reads found with no adjustment
-    # factor, one per (security, date), sorted by security then date.
-    unfactored_split_moves: list[UnfactoredSplitMove] = Field(default_factory=list)
+    # factor, one per (security, date), sorted by security then date. None
+    # when the run resumed from a checkpoint: the registry is not carried,
+    # so the list would be incomplete.
+    unfactored_split_moves: list[UnfactoredSplitMove] | None = Field(default_factory=list)
