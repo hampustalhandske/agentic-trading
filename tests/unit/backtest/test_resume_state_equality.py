@@ -392,3 +392,30 @@ def test_the_walk_reaches_agent_caches_and_engine_marks(tmp_path: Path) -> None:
     assert any("._refit_cache._cache" in difference for difference in differences)
     assert any("._days_seen" in difference for difference in differences)
     assert any("._option_last_mid" in difference for difference in differences)
+
+
+def _without_option_marks(path: Path) -> None:
+    """Rewrites the checkpoint at `path` as one written before the engine stored option marks."""
+    connection = checkpoint_store.connect(path, resume=True)
+    with connection:
+        connection.execute("UPDATE cursor SET option_last_mid = NULL")
+    connection.close()
+
+
+def test_a_checkpoint_without_option_marks_after_an_option_decision_is_refused(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint that stores no option marks, of a run that has decided an option, refuses to
+    resume; the same checkpoint with its marks resumes."""
+    path = tmp_path / "checkpoint.db"
+    engine = _run_through(_engine(path), 3)
+    assert any(
+        decision.instrument is not None
+        for decisions in engine.decisions_by_day.values()
+        for decision in decisions
+    )
+    _run_through(_engine(path, resume=True), 4)
+    _without_option_marks(path)
+
+    with pytest.raises(ValueError, match="predates option_last_mid"):
+        _engine(path, resume=True).run()

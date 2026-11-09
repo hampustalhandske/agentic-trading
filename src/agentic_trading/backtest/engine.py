@@ -1,6 +1,7 @@
 # engine.py
 
 import itertools
+import json
 import math
 import sqlite3
 import time
@@ -307,9 +308,7 @@ class BacktestEngine:
         self._checkpoint_connection: sqlite3.Connection | None = None
         # Previous day's close mark per option contract, for attribution
         # (log of today's mid over yesterday's); a contract seen for the
-        # first time realizes 0.0. The checkpoint carries it whole; a
-        # checkpoint written without it restores each open position's
-        # `last_mid`.
+        # first time realizes 0.0. The checkpoint carries it whole.
         self._option_last_mid: dict[str, float] = {}
         self._unpriced_underlyings_warned: set[str] = set()
 
@@ -488,7 +487,11 @@ class BacktestEngine:
         when the checkpoint's config differs from `run_config` (other
         dates, assets, strategy settings or roster; a checkpoint written
         without fingerprints never matches) or it carries state for an
-        agent this commander does not run, and `LakeTimeError` when its
+        agent this commander does not run, or it stores no option marks
+        (`option_last_mid`, absent from checkpoints written before the
+        engine stored them) yet the run had an option decision or holds an
+        option position, so its option marks cannot be restored exactly;
+        and `LakeTimeError` when its
         stored lake time differs from the open lake session's (`None` on
         either side meaning no session), since the resumed days would read
         another lake state. Nothing is restored by this method."""
@@ -524,6 +527,13 @@ class BacktestEngine:
                 f"checkpoint {self.checkpoint_path} was written at lake time "
                 f"{_lake_time_text(stored_lake_time)}, but this run reads at "
                 f"{_lake_time_text(lake_time)}; resume it at its own lake time"
+            )
+        if payload.get("option_last_mid") is None and _checkpoint_traded_options(
+            connection, payload
+        ):
+            raise ValueError(
+                f"checkpoint {self.checkpoint_path} predates option_last_mid; its option marks "
+                "cannot be restored exactly; rerun from the start"
             )
         return payload
 
@@ -834,15 +844,12 @@ class BacktestEngine:
                 contract_id: OptionPosition.model_validate(position)
                 for contract_id, position in portfolio_state.get("option_positions", {}).items()
             }
-            stored_last_mid = checkpoint.get("option_last_mid")
-            self._option_last_mid = (
-                {contract_id: float(mid) for contract_id, mid in stored_last_mid.items()}
-                if stored_last_mid is not None
-                else {
-                    contract_id: position.last_mid
-                    for contract_id, position in self.portfolio.option_positions.items()
-                }
-            )
+            # `_restore_checkpoint` refuses a checkpoint without option marks
+            # unless the run never touched an option, whose marks are empty.
+            self._option_last_mid = {
+                contract_id: float(mid)
+                for contract_id, mid in (checkpoint.get("option_last_mid") or {}).items()
+            }
             restored_records = [
                 PerformanceRecord.model_validate(entry) for entry in checkpoint["track_record"]
             ]
@@ -1436,6 +1443,24 @@ class BacktestEngine:
                 else lakehouse_loader.unfactored_split_move_registry()
             ),
         )
+
+
+def _checkpoint_traded_options(connection: sqlite3.Connection, payload: dict[str, Any]) -> bool:
+    """Whether the checkpointed run holds an option position or has an
+    option decision on any stored day: one with an `instrument` or on an
+    option contract id."""
+    portfolio = payload.get("portfolio", {})
+    if portfolio.get("option_positions") or any(
+        OptionContract.is_contract_id(asset) for asset in portfolio.get("positions", {})
+    ):
+        return True
+    for _day, decisions_json in checkpoint_store.iter_decision_payloads(connection):
+        for decision in json.loads(decisions_json):
+            if decision.get("instrument") is not None or OptionContract.is_contract_id(
+                decision["asset"]
+            ):
+                return True
+    return False
 
 
 def _frame_field(

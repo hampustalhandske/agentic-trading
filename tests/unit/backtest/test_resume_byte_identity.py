@@ -22,6 +22,7 @@ from agentic_trading.agents.base import AnalystAgent, ManagerAgent
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.schemas import AgentSignal, BacktestResult, PortfolioDecision
+from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import Portfolio
 from agentic_trading.config import temporary_overrides
@@ -302,5 +303,22 @@ def test_a_negative_zero_pod_return_resumes_byte_identical(tmp_path: Path) -> No
         _engine(_negative_zero_commander(), checkpoint_path).run(on_day_complete=_stop_after(2))
 
     resumed = _engine(_negative_zero_commander(), checkpoint_path, resume=True).run()
+
+    assert _without_split_moves(resumed) == _without_split_moves(expected)
+
+
+def test_a_checkpoint_without_option_marks_and_no_option_decision_resumes(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint that stores no option marks, of a run that never decided an option, resumes
+    to the uninterrupted run's result."""
+    expected = _engine(_commander()).run()
+    checkpoint_path = _interrupted(tmp_path / "checkpoint.db")
+    connection = checkpoint_store.connect(checkpoint_path, resume=True)
+    with connection:
+        connection.execute("UPDATE cursor SET option_last_mid = NULL")
+    connection.close()
+
+    resumed = _engine(_commander(), checkpoint_path, resume=True).run()
 
     assert _without_split_moves(resumed) == _without_split_moves(expected)
