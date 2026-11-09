@@ -36,24 +36,23 @@ logger = get_logger(__name__)
 
 TRADING_DAYS_PER_YEAR = 252
 
-# Shared across every CVaR-pod analyst that calls annualized_garch_volatility
-# (a plain module-level function, not bound to any one analyst instance) —
-# keyed by (agent_id, asset), so each analyst still gets its own independent
-# refit cadence rather than accidentally sharing one analyst's fit with
-# another's.
-_GARCH_REFIT_CACHE = RefitCache()
-
 
 def annualized_garch_volatility(
-    returns: np.ndarray, agent_id: str, asset: str, as_of_date: pd.Timestamp
+    returns: np.ndarray,
+    refit_cache: RefitCache,
+    agent_id: str,
+    asset: str,
+    as_of_date: pd.Timestamp,
 ) -> float:
     """Annualized (sqrt 252) one-step-ahead conditional volatility from
     `_market_math.conditional_daily_volatility` (a sanity-checked
-    GARCH(1,1), EWMA when the fit is unusable), refit at most once every
-    `_GARCH_REFIT_CACHE.refit_interval_days` simulated days per
-    (agent_id, asset)."""
+    GARCH(1,1), EWMA when the fit is unusable). The fit is kept in the
+    caller's `refit_cache` under `"<agent_id>:<asset>"` and refit at most
+    once every `refit_cache.refit_interval_days` simulated days; the
+    calling analyst owns the cache as a private attribute, so it is
+    carried across a checkpoint with the rest of the analyst's state."""
     daily_volatility = conditional_daily_volatility(
-        returns, _GARCH_REFIT_CACHE, f"{agent_id}:{asset}", as_of_date, agent_id
+        returns, refit_cache, f"{agent_id}:{asset}", as_of_date, agent_id
     )
     return daily_volatility * float(np.sqrt(TRADING_DAYS_PER_YEAR))
 

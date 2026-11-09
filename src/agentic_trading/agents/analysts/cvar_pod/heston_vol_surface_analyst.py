@@ -4,9 +4,9 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
-from agentic_trading.agents._market_math import clamp, market_slice, raw_spot
+from agentic_trading.agents._market_math import RefitCache, clamp, market_slice, raw_spot
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
     annualized_garch_volatility,
     chain_snapshot_date,
@@ -72,7 +72,9 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
     term-structure model, so the signal uses the observed surface
     directly: `vrp = IV_30 - GARCH vol` (30-day ATM IV interpolated in
     total variance, against this analyst's own annualized GARCH(1,1) read
-    on a year of returns) and `slope = IV_longest - IV_nearest`.
+    on a year of returns) and `slope = IV_longest - IV_nearest`. The GARCH
+    read is refit at most once every `_refit_cache.refit_interval_days`
+    simulated days per asset — see `RefitCache`'s docstring.
 
     A rich premium (`vrp >= vrp_threshold`) in contango is long
     (Bollerslev-Tauchen-Zhou: a positive variance risk premium predicts
@@ -95,6 +97,7 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
     data_requirements: tuple[DataRequirement, ...] = Field(
         default_factory=options_chain_requirements
     )
+    _refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)
 
     def _flat(
         self,
@@ -149,7 +152,9 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
 
         iv_30 = _interpolated_atm_iv(days, ivs, TARGET_DTE)
         try:
-            model_vol = annualized_garch_volatility(returns, self.agent_id, asset, as_of_date)
+            model_vol = annualized_garch_volatility(
+                returns, self._refit_cache, self.agent_id, asset, as_of_date
+            )
         except (RuntimeError, ValueError):
             model_vol = float(np.std(returns[-REALIZED_FALLBACK_WINDOW:], ddof=1)) * np.sqrt(
                 settings.firm.trading_days_per_year
