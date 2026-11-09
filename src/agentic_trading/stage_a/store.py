@@ -145,7 +145,7 @@ class DecisionRow(BaseModel):
 
     `decision_date` is the day the weight was decided, after its close;
     `instrument_kind` one of the schema's kinds; `instrument_id` a lake
-    ticker or an option's contract id; `target_weight` finite and within
+    ticker, a future's root or an option's unpadded OSI symbol; `target_weight` finite and within
     +-`MAX_DECISION_WEIGHT`, a signed premium weight for an option;
     `status` the row's status, a non-active row weighing exactly 0;
     `source` and `source_as_of` the newest-dated input the row rests on,

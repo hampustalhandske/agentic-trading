@@ -39,11 +39,12 @@ Known limit: an instrument that stops trading (a delisting) has no bar
 again, so it is carried at its last decided target to the end of the
 window; edgelab settles delistings in replay."""
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, timedelta
 
 from agentic_trading.agents.base import AnalystAgent
-from agentic_trading.agents.schemas import ManagerSignal, PodTarget, SignalStatus
+from agentic_trading.agents.schemas import ManagerSignal, OptionContract, PodTarget, SignalStatus
 from agentic_trading.config import settings
 from agentic_trading.data.instruments import futures_root
 from agentic_trading.data.trading_calendar import sessions_between
@@ -97,11 +98,52 @@ def analyst_sources(analysts: Iterable[AnalystAgent]) -> dict[str, str | None]:
     return {analyst.agent_id: row_source(analyst) for analyst in analysts}
 
 
-def row_instrument_id(asset: str) -> str:
-    """The `instrument_id` a row for `asset` (a lake ticker, or an option's
-    contract id) is written under, the id edgelab's replay reads bars by: a
-    continuous future's root (`GC` for `GC=F`); an equity, ETF, FX pair or
-    coin its lake ticker; an option its contract id."""
+# An OSI root: 1 to 6 uppercase letters.
+_OSI_ROOT = re.compile(r"[A-Z]{1,6}")
+# Tolerance on strike x 1000 being a whole number, far below a strike's
+# 0.001 resolution and far above float error on strikes up to 1e5.
+_OSI_STRIKE_TOLERANCE = 1e-6
+
+
+def osi_symbol(contract: OptionContract) -> str:
+    """`contract`'s unpadded OSI symbol, the key the lake's option chains and
+    edgelab's replay use: the root, the expiry as yymmdd, `C` or `P`, and the
+    strike x 1000 in 8 zero-padded digits (`SPY150320P00190000` for the SPY
+    2015-03-20 190 put).
+
+    Raises `ValueError` when OSI cannot carry the contract exactly: a root
+    that is not 1-6 uppercase letters, an expiry outside 2000-2099, or a
+    strike with more than 3 dp or whose x 1000 value needs more than 8
+    digits. A strike is never rounded.
+
+    The strike and root are those the firm's contract carries: its contract
+    id prints the strike at 2 dp, and an option-chain strike is divided by
+    the underlying's later splits. The symbol is the lake's as-traded one
+    when the chain strike has at most 2 dp and the underlying did not split
+    or change ticker after the contract, as holds for every SPY contract the
+    2010-2017 chains list."""
+    if not _OSI_ROOT.fullmatch(contract.underlying):
+        raise ValueError(f"OSI root must be 1-6 uppercase letters, not {contract.underlying!r}")
+    if not 2000 <= contract.expiry.year <= 2099:
+        raise ValueError(f"OSI expiry must fall in 2000-2099, not {contract.expiry.isoformat()}")
+    milli = contract.strike * 1000
+    whole = round(milli)
+    if abs(milli - whole) > _OSI_STRIKE_TOLERANCE or not 0 < whole < 10**8:
+        raise ValueError(
+            f"OSI strike must have at most 3 dp and fit 8 digits x 1000, not {contract.strike!r}"
+        )
+    letter = "C" if contract.option_type == "call" else "P"
+    return f"{contract.underlying}{contract.expiry:%y%m%d}{letter}{whole:08d}"
+
+
+def row_instrument_id(asset: str, instrument: OptionContract | None = None) -> str:
+    """The `instrument_id` a row for `asset` is written under, the id
+    edgelab's replay reads bars by: an option (`instrument`, the contract
+    `asset` names) its OSI symbol (`osi_symbol`, which raises `ValueError`
+    for a contract OSI cannot carry); a continuous future's root (`GC` for
+    `GC=F`); an equity, ETF, FX pair or coin its lake ticker."""
+    if instrument is not None:
+        return osi_symbol(instrument)
     return futures_root(asset) or asset
 
 
@@ -201,7 +243,7 @@ def firm_day_rows(
     `absent` (no bar on `day`) without a target and each pod id it maps
     to, an unavailable weight-0 row. `analyst_sources` maps each roster
     analyst to its row source, `instrument_kinds` each ticker to its kind
-    (an option row is `option`, keyed by its contract id), and `calendar`
+    (an option row is `option`, keyed by its OSI symbol), and `calendar`
     is the decision calendar the after-close rule counts sessions on.
     `previous` maps (instrument id, pod id) to the provenance of the pod's
     row on the previous day, which a held target keeps; `held_contracts`
@@ -211,9 +253,10 @@ def firm_day_rows(
 
     Raises `ValueError` when a target is dated another day, a ticker has no
     kind, a signal comes from an analyst outside `analyst_sources`, or an
-    instrument of `absent` has a target that is not carried;
-    `LookAheadError` as `_row_source` documents, or when a kept
-    provenance fails `decisions.check_source_as_of`."""
+    instrument of `absent` has a target that is not carried, or an option's
+    contract has no OSI symbol (`osi_symbol`); `LookAheadError` as
+    `_row_source` documents, or when a kept provenance fails
+    `decisions.check_source_as_of`."""
     previous = previous or {}
     held_contracts = held_contracts or {}
     multiplier = float(settings.options.contract_multiplier)
@@ -253,7 +296,8 @@ def firm_day_rows(
                 update={"contributing_signals": [*target.contributing_signals, *day_signals]}
             )
         source, source_as_of = _row_source(day, inputs, analyst_sources, calendar)
-        kept = previous.get((row_instrument_id(target.asset), target.pod_id))
+        instrument_id = row_instrument_id(target.asset, target.instrument)
+        kept = previous.get((instrument_id, target.pod_id))
         if target.held and kept is not None:
             source, source_as_of = kept
             check_source_as_of(source_as_of, day, source)
@@ -263,7 +307,7 @@ def firm_day_rows(
                 instrument_kind="option"
                 if target.instrument is not None
                 else _kind(target.asset, instrument_kinds),
-                instrument_id=row_instrument_id(target.asset),
+                instrument_id=instrument_id,
                 target_weight=weight,
                 status=_row_status(target.contributing_signals, weight, target.carried),
                 source=source,

@@ -21,7 +21,13 @@ from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal, ManagerSignal, OptionContract, PodTarget
 from agentic_trading.backtest.portfolio import OptionPosition, Portfolio
 from agentic_trading.config import settings
-from agentic_trading.firm_record.rows import firm_day_rows, firm_sources, row_instrument_id
+from agentic_trading.firm_record.rows import (
+    firm_day_rows,
+    firm_sources,
+    osi_symbol,
+    row_instrument_id,
+    row_provenance,
+)
 from agentic_trading.firm_record.runner import _held_contracts
 from agentic_trading.stage_a.decisions import LookAheadError
 
@@ -179,7 +185,7 @@ def test_absent_instrument_with_a_target_is_refused() -> None:
 
 
 def test_option_and_kind_mapping() -> None:
-    """An option row is of kind option, keyed by its contract id, with its delta-equivalent
+    """An option row is of kind option, keyed by its OSI symbol, with its delta-equivalent
     weight; a ticker's kind comes from the mapping, and a ticker without one is refused."""
     put = OptionContract(
         underlying="SPY", expiry=date(2016, 3, 18), strike=180.0, option_type="put"
@@ -196,7 +202,7 @@ def test_option_and_kind_mapping() -> None:
     )
     (future,) = _rows(_target(0.1, _signal("price_analyst"), asset="CL=F"))
 
-    assert (option.instrument_kind, option.instrument_id) == ("option", "SPY 2016-03-18 P 180.00")
+    assert (option.instrument_kind, option.instrument_id) == ("option", "SPY160318P00180000")
     assert option.delta_equiv_weight == -0.3
     assert future.instrument_kind == "future"
     with pytest.raises(ValueError, match="GLD"):
@@ -380,12 +386,105 @@ def test_held_contracts_read_the_book_not_its_fill_mid() -> None:
         ("TLT", "TLT"),
         ("EURUSD=X", "EURUSD=X"),
         ("BTC-USD", "BTC-USD"),
-        (_PUT.contract_id, _PUT.contract_id),
     ],
 )
 def test_row_instrument_id(ticker: str, row_id: str) -> None:
     """A future's row is keyed by its root; every other instrument by its own id."""
     assert row_instrument_id(ticker) == row_id
+
+
+def test_an_option_row_is_keyed_by_its_osi_symbol() -> None:
+    """With its contract, an option's row id is the contract's OSI symbol."""
+    assert row_instrument_id(_PUT.contract_id, _PUT) == "SPY160318P00180000"
+
+
+@pytest.mark.parametrize(
+    ("contract", "symbol"),
+    [
+        (
+            OptionContract(
+                underlying="SPY", expiry=date(2015, 3, 20), strike=190.0, option_type="put"
+            ),
+            "SPY150320P00190000",
+        ),
+        (
+            OptionContract(
+                underlying="SPY", expiry=date(2016, 12, 16), strike=72.5, option_type="call"
+            ),
+            "SPY161216C00072500",
+        ),
+        (
+            OptionContract(
+                underlying="SPY", expiry=date(2017, 1, 20), strike=72.375, option_type="put"
+            ),
+            "SPY170120P00072375",
+        ),
+        (
+            OptionContract(
+                underlying="AAPL", expiry=date(2026, 12, 18), strike=5.0, option_type="call"
+            ),
+            "AAPL261218C00005000",
+        ),
+        (
+            OptionContract(
+                underlying="SPY", expiry=date(2016, 3, 18), strike=99999.999, option_type="put"
+            ),
+            "SPY160318P99999999",
+        ),
+    ],
+)
+def test_osi_symbol(contract: OptionContract, symbol: str) -> None:
+    """The unpadded OSI symbol: root, yymmdd expiry, C or P, strike x1000 in 8 digits."""
+    assert osi_symbol(contract) == symbol
+
+
+@pytest.mark.parametrize(
+    ("underlying", "expiry", "strike"),
+    [
+        ("SPY", date(2015, 3, 20), 190.0005),
+        ("SPY", date(2015, 3, 20), 100000.0),
+        ("spy", date(2015, 3, 20), 190.0),
+        ("ABCDEFG", date(2015, 3, 20), 190.0),
+        ("BRK.B", date(2015, 3, 20), 190.0),
+        ("SPY", date(1999, 3, 19), 190.0),
+    ],
+)
+def test_osi_symbol_refuses_what_osi_cannot_carry(
+    underlying: str, expiry: date, strike: float
+) -> None:
+    """A strike with more than 3 dp or over 8 digits x1000, a root that is not 1-6 uppercase
+    letters, or an expiry outside 2000-2099 is refused, never rounded."""
+    contract = OptionContract(
+        underlying=underlying, expiry=expiry, strike=strike, option_type="put"
+    )
+    with pytest.raises(ValueError, match="OSI"):
+        osi_symbol(contract)
+
+
+def test_a_held_option_keeps_its_provenance_under_its_osi_symbol() -> None:
+    """A held option's row keeps the previous day's provenance, looked up by its OSI symbol."""
+    kept = ("fred", date(2016, 1, 4))
+    (row,) = firm_day_rows(
+        _DAY,
+        [
+            _target(
+                0.004,
+                _signal("price_analyst"),
+                pod="tail_hedge_manager",
+                asset=_PUT.contract_id,
+                instrument=_PUT,
+                held=True,
+            )
+        ],
+        absent={},
+        analyst_sources=_SOURCES,
+        instrument_kinds=_KINDS,
+        calendar="XNYS",
+        previous={("SPY160318P00180000", "tail_hedge_manager"): kept},
+    )
+
+    assert row.instrument_id == "SPY160318P00180000"
+    assert (row.source, row.source_as_of) == kept
 
 
 def test_every_futures_row_is_keyed_by_its_root() -> None:
@@ -435,3 +534,40 @@ def test_carried_row_provenance_depends_on_whether_a_limit_scaled_it() -> None:
         date(2016, 1, 5),
         "active",
     )
+
+
+def test_a_held_option_carries_its_provenance_from_one_day_to_the_next() -> None:
+    """The provenance of day 1's option row, keyed by its OSI symbol, is what day 2's held
+    target keeps; keyed by the contract id instead, it would not be found."""
+    signal = _signal("fred_analyst", source_as_of=date(2016, 1, 5))
+    day1 = firm_day_rows(
+        _DAY,
+        [_target(0.004, signal, pod="tail_hedge_manager", asset=_PUT.contract_id, instrument=_PUT)],
+        absent={},
+        analyst_sources=_SOURCES,
+        instrument_kinds=_KINDS,
+        calendar="XNYS",
+    )
+    previous = row_provenance(day1)
+    assert set(previous) == {("SPY160318P00180000", "tail_hedge_manager")}
+
+    day2 = date(2016, 1, 7)
+    (row,) = firm_day_rows(
+        day2,
+        [
+            _target(
+                0.004,
+                _signal("price_analyst"),
+                pod="tail_hedge_manager",
+                asset=_PUT.contract_id,
+                instrument=_PUT,
+                held=True,
+            ).model_copy(update={"as_of_date": day2})
+        ],
+        absent={},
+        analyst_sources=_SOURCES,
+        instrument_kinds=_KINDS,
+        calendar="XNYS",
+        previous=previous,
+    )
+    assert (row.source, row.source_as_of) == previous[("SPY160318P00180000", "tail_hedge_manager")]
