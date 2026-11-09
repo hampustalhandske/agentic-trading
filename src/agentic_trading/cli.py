@@ -607,8 +607,8 @@ def experiment(
     ),
     include_isolated: bool = typer.Option(
         False,
-        help="Run every analyst and manager as an isolated test strategy; "
-        "slower but more diagnostic.",
+        help="Refused: the isolated runs would reuse the test phase's analyst instances, "
+        "whose model-refit caches hold fits dated up to the test end (look-ahead).",
     ),
     exclude_analyst: list[str] = typer.Option(  # noqa: B008
         [],
@@ -673,6 +673,12 @@ def experiment(
         raise typer.BadParameter("--train-end must be before --test-start")
     if parsed_test_end <= parsed_test_start:
         raise typer.BadParameter("--test-end must be after --test-start")
+    if include_isolated:
+        raise typer.BadParameter(
+            "--include-isolated is refused: the isolated runs would reuse the test phase's "
+            "analyst instances, whose model-refit caches hold fits dated up to the test end "
+            "(look-ahead)."
+        )
     requested_lake_time = _parse_lake_time_flag(lake_time)
     if requested_lake_time is None and resume:
         requested_lake_time = _checkpoint_lake_time([calibration_checkpoint, test_checkpoint])

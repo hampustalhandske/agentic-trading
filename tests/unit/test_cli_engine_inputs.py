@@ -18,7 +18,7 @@ from typer.testing import CliRunner
 from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.roster import FIRM_V1_EQUITY_SECURITY_IDS, FIRM_V1_UNIVERSE
 from agentic_trading.agents.schemas import BacktestResult
-from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystCommander
+from agentic_trading.backtest.baselines import BaselineCommander
 from agentic_trading.backtest.engine_inputs import EngineInputs, load_engine_inputs
 from agentic_trading.backtest.preflight import PreflightReport
 from agentic_trading.cli import app, experiment_app, firm_record_app
@@ -328,7 +328,6 @@ def test_every_experiment_engine_gets_the_rates_and_the_benchmark(
                 "--test-checkpoint",
                 test,
                 "--resume",
-                "--include-isolated",
                 "--yes",
             ],
         )
@@ -338,8 +337,7 @@ def test_every_experiment_engine_gets_the_rates_and_the_benchmark(
     calls = [call.kwargs for call in engine_cls.call_args_list]
     commanders = [type(kwargs["commander"]) for kwargs in calls]
     assert commanders[:2] == [Commander, Commander]
-    assert commanders[2:6] == [BaselineCommander] * 4
-    assert SingleAnalystCommander in commanders[6:] and Commander in commanders[6:]
+    assert commanders[2:] == [BaselineCommander] * 4
     expected_benchmark = benchmark["^GSPC"]["close"].pct_change().dropna()
     for kwargs in calls:
         assert kwargs["policy_rates"] is _POLICY_RATES
@@ -349,3 +347,27 @@ def test_every_experiment_engine_gets_the_rates_and_the_benchmark(
     ]
     assert phases[:2] == [(date(2024, 1, 2), calibration, True), (date(2024, 1, 8), test, True)]
     assert all(checkpoint is None and not resume for _, checkpoint, resume in phases[2:])
+
+
+def test_the_experiment_refuses_include_isolated_before_any_run() -> None:
+    with patch("agentic_trading.cli.BacktestEngine") as engine_cls:
+        result = runner.invoke(
+            experiment_app,
+            [
+                "AAPL",
+                "--train-start",
+                "2024-01-02",
+                "--train-end",
+                "2024-01-05",
+                "--test-start",
+                "2024-01-08",
+                "--test-end",
+                "2024-01-12",
+                "--include-isolated",
+                "--yes",
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "--include-isolated is refused" in result.output
+    engine_cls.assert_not_called()
