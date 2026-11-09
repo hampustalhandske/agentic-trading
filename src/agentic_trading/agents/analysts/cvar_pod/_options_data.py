@@ -48,9 +48,9 @@ def annualized_garch_volatility(
     `_market_math.conditional_daily_volatility` (a sanity-checked
     GARCH(1,1), EWMA when the fit is unusable). The fit is kept in the
     caller's `refit_cache` under `"<agent_id>:<asset>"` and refit at most
-    once every `refit_cache.refit_interval_days` simulated days; the
-    calling analyst owns the cache as a private attribute, so it is
-    carried across a checkpoint with the rest of the analyst's state."""
+    once every `refit_cache.refit_interval_days` simulated days. Pass a
+    cache the analyst holds as a private attribute, so a checkpoint
+    carries it."""
     daily_volatility = conditional_daily_volatility(
         returns, refit_cache, f"{agent_id}:{asset}", as_of_date, agent_id
     )

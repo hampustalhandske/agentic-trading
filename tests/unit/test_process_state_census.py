@@ -1,6 +1,6 @@
 # test_process_state_census.py
 
-"""Census of process-level mutable state in the packages a firm record runs through.
+"""Census of process-level mutable state in the code a firm record runs through.
 
 A firm record checkpoints each agent's pydantic private attributes (`carried_state`) and resumes
 in a fresh process, where every module-level object starts from what the module builds at
@@ -8,12 +8,19 @@ import. An object whose value depends on which sessions this process has already
 makes a resumed record differ from an unbroken one. Such state belongs on the agent as a private
 attribute, where the checkpoint carries it.
 
-The census imports every module under `_PACKAGES` and finds each object a module defines (a
-top-level assignment or `def`, read with `ast`, so imported names are skipped) that is process
-state: a mutable container, an instance of a class that is not known to be immutable (a
-`RefitCache`, a lock, a non-frozen pydantic model), a `functools.cache`/`lru_cache` function,
-or any name a function of the module rebinds with `global`. The objects found must be exactly
-those in `_ALLOWED`, each with the reason its value is the same after a resume, and those in
+The census imports every module of `agentic_trading` outside `_EXCLUDED` and reads its source
+with `ast`, so imported names are skipped. It finds each object the module defines that is
+process state:
+
+- a top-level assignment or a class-body assignment (a `ClassVar` included) whose value is a
+  mutable container or an instance of a class that is not known to be immutable (a
+  `RefitCache`, a lock, a non-frozen pydantic model);
+- a top-level function or a method decorated with `functools.cache`/`lru_cache`, and a method
+  decorated with `functools.cached_property`;
+- any name a function of the module rebinds with `global`.
+
+A class-level object is named `<Class>.<attribute>`. The objects found must be exactly those in
+`_ALLOWED`, each with the reason its value is the same after a resume, and those in
 `KNOWN_NOT_RESUME_SAFE`, each naming the issue that tracks it; no object is on both lists."""
 
 import ast
@@ -34,13 +41,10 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel
 
-_PACKAGES = (
-    "agentic_trading.agents",
-    "agentic_trading.firm_record",
-    "agentic_trading.backtest",
-    "agentic_trading.scoring",
-    "agentic_trading.data",
-)
+# The Streamlit dashboard and the command-line entry point, which no firm record imports.
+_EXCLUDED = ("agentic_trading.gui", "agentic_trading.cli")
+# Pydantic reads a model's `model_config` when it builds the class.
+_CLASS_CONFIG_NAMES = frozenset({"model_config"})
 
 # Values that cannot change after they are built.
 _IMMUTABLE_TYPES: tuple[type, ...] = (
@@ -74,6 +78,11 @@ _IMMUTABLE_TYPES: tuple[type, ...] = (
 
 _CONSTANT = "constant table built at import and never mutated"
 _LOCK = "lock serialising access to a module-level object; held only inside one call"
+_LOGGING = "whether logging is set up; decides only where log lines go, never a decision"
+_STORE_FILES = (
+    "class-level table of the store's files and their column dtypes, set in the class body "
+    "and only read"
+)
 _ROSTER_PAIRS = (
     "derived from the roster's _COINTEGRATED_PAIRS at import, rebuilt identically on start; "
     "each analyst gets its own copy"
@@ -119,8 +128,9 @@ _ALLOWED: dict[str, str] = {
     ),
     "agentic_trading.data.loaders.lakehouse_loader:_SESSION_LOCK": _LOCK,
     "agentic_trading.data.loaders.lakehouse_loader:_STORE": (
-        "the session's window store; a call's answer is the same whether it is served from the "
-        "store or fetched directly, whatever the store already holds"
+        "the session's window store; a call's answer equals a direct fetch up to rows tied on "
+        "the query's ORDER BY, which a resumed process re-fetches from the lake pinned at the "
+        "same lake time"
     ),
     "agentic_trading.data.loaders.lakehouse_loader:_STORE_LOCK": _LOCK,
     "agentic_trading.data.loaders.lakehouse_loader:_LOADER_CALL": (
@@ -173,6 +183,29 @@ _ALLOWED: dict[str, str] = {
         "the lake time the option-mark caches were read at, used only to empty them when the "
         "lake time changes"
     ),
+    "agentic_trading.config:settings": (
+        "process settings; a restart re-applies --set from the original argv and a resume is "
+        "refused when the settings fingerprint differs"
+    ),
+    "agentic_trading.config:_GROUP_CONFIG": "pydantic ConfigDict, a constant",
+    "agentic_trading.logging_config:_configured": _LOGGING,
+    "agentic_trading.logging_config:_explicitly_configured": _LOGGING,
+    "agentic_trading.logging_config:_gui_buffer": (
+        "recent log lines for the dashboard's log view, never read by a decision"
+    ),
+    "agentic_trading.stage_a.decisions:SOURCES": _CONSTANT,
+    "agentic_trading.stage_a.decisions:UNDATED_SOURCES": _CONSTANT,
+    "agentic_trading.stage_a.runner:EXCLUDED_ANALYSTS": _CONSTANT,
+    "agentic_trading.stage_a.store:_SIGNAL_COLUMNS": _CONSTANT,
+    "agentic_trading.stage_a.store:_DECISION_COLUMNS": _CONSTANT,
+    "agentic_trading.stage_a.store:_FIRM_DECISION_COLUMNS": _CONSTANT,
+    "agentic_trading.stage_a.store:_MEMORY_DTYPES": _CONSTANT,
+    "agentic_trading.stage_a.store:_TrialStore._files": _STORE_FILES,
+    "agentic_trading.stage_a.store:SignalStore._files": _STORE_FILES,
+    "agentic_trading.stage_a.store:FirmDecisionStore._files": _STORE_FILES,
+    "agentic_trading.trials.ledger:__all__": _CONSTANT,
+    "agentic_trading.trials.ledger:COLUMNS": _CONSTANT,
+    "agentic_trading.trials.ledger:_TIME_COLUMN": _CONSTANT,
     "agentic_trading.data.trading_calendar:_sessions": (
         "exchange-calendar sessions over a fixed range, memoized per calendar name; a pure "
         "function of its argument"
@@ -186,15 +219,19 @@ KNOWN_NOT_RESUME_SAFE: dict[str, str] = {
 }
 
 
+def _is_excluded(name: str) -> bool:
+    return any(name == excluded or name.startswith(f"{excluded}.") for excluded in _EXCLUDED)
+
+
 def _module_names() -> list[str]:
-    """Every module under `_PACKAGES`, the packages themselves included."""
-    names: list[str] = []
-    for package_name in _PACKAGES:
-        package = importlib.import_module(package_name)
-        names.append(package_name)
-        names.extend(
-            info.name for info in pkgutil.walk_packages(package.__path__, f"{package_name}.")
-        )
+    """Every module of `agentic_trading`, the package itself included, outside `_EXCLUDED`."""
+    package = importlib.import_module("agentic_trading")
+    names = [package.__name__]
+    names.extend(
+        info.name
+        for info in pkgutil.walk_packages(package.__path__, "agentic_trading.")
+        if not _is_excluded(info.name)
+    )
     return names
 
 
@@ -242,15 +279,57 @@ def _is_cache_decorator(decorator: ast.expr) -> bool:
     return isinstance(decorator, ast.Name) and decorator.id in {"cache", "lru_cache"}
 
 
-def _cached_functions(body: list[ast.stmt]) -> set[str]:
-    """Names of the module-level functions decorated with `cache` or `lru_cache`, read from the
-    source, so a cached function a test fixture has replaced is still found."""
+def _is_cached_property_decorator(decorator: ast.expr) -> bool:
+    """Whether `decorator` is `cached_property`, bare or as a `functools.` attribute."""
+    if isinstance(decorator, ast.Attribute):
+        return decorator.attr == "cached_property"
+    return isinstance(decorator, ast.Name) and decorator.id == "cached_property"
+
+
+def _cached_functions(body: list[ast.stmt], *, in_class: bool = False) -> set[str]:
+    """Names of the functions in `body` decorated with `cache` or `lru_cache`, and in a class
+    body also with `cached_property`, read from the source, so a cached function a test
+    fixture has replaced is still found."""
     return {
         node.name
         for node in body
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-        and any(_is_cache_decorator(decorator) for decorator in node.decorator_list)
+        and any(
+            _is_cache_decorator(decorator)
+            or (in_class and _is_cached_property_decorator(decorator))
+            for decorator in node.decorator_list
+        )
     }
+
+
+def _class_state(node: ast.ClassDef, cls: Any) -> list[str]:
+    """`<Class>.<name>` for the process state class `cls`, defined by `node`, holds at class
+    level: each class-body assignment whose value in the class namespace `_is_process_state`
+    (pydantic fields and private attributes are not in it; methods are not assignments), each
+    cached method, and the same for every class nested in it."""
+    if not isinstance(cls, type):
+        return []
+    namespace = vars(cls)
+    methods = {
+        child.name
+        for child in node.body
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    names = {
+        name
+        for name in _defined_names(node.body) - methods
+        if name in namespace
+        and name not in _CLASS_CONFIG_NAMES
+        and _is_process_state(namespace[name])
+    }
+    names |= _cached_functions(node.body, in_class=True)
+    found = [f"{node.name}.{name}" for name in names]
+    for child in node.body:
+        if isinstance(child, ast.ClassDef):
+            found.extend(
+                f"{node.name}.{nested}" for nested in _class_state(child, namespace.get(child.name))
+            )
+    return found
 
 
 def _rebound_globals(tree: ast.Module) -> set[str]:
@@ -278,18 +357,25 @@ def _is_process_state(value: Any) -> bool:
 def _process_state(module: ModuleType, source: str) -> list[str]:
     """The names of the process state `module`, whose source is `source`, defines: every defined
     name whose value `_is_process_state`, every function it decorates with `cache` or
-    `lru_cache`, and every name it rebinds with `global`."""
+    `lru_cache`, every name it rebinds with `global`, and the class-level state of every
+    top-level class (`_class_state`)."""
     tree = ast.parse(source)
     defined = {
         name
         for name in _defined_names(tree.body)
         if hasattr(module, name) and _is_process_state(getattr(module, name))
     }
-    return sorted(defined | _cached_functions(tree.body) | _rebound_globals(tree))
+    classes = {
+        name
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        for name in _class_state(node, getattr(module, node.name, None))
+    }
+    return sorted(defined | _cached_functions(tree.body) | _rebound_globals(tree) | classes)
 
 
 def _census() -> set[str]:
-    """`<module>:<name>` for the process state every module under `_PACKAGES` defines."""
+    """`<module>:<name>` for the process state every module `_module_names` lists defines."""
     found: set[str] = set()
     for name in _module_names():
         module = importlib.import_module(name)
@@ -331,6 +417,8 @@ import logging
 import re
 from enum import Enum
 
+from typing import ClassVar
+
 from pydantic import BaseModel
 
 from agentic_trading.agents._market_math import RefitCache
@@ -369,6 +457,44 @@ def _cached() -> int:
     return 1
 
 
+class _Holder:
+    _REGISTRY: ClassVar[dict[str, int]] = {}
+    _LIMIT = 3
+    _NAMES = ("a", "b")
+
+    class _Inner:
+        _SEEN: set[str] = set()
+
+    @functools.cache
+    def _cached_method(self) -> int:
+        return 1
+
+    @functools.lru_cache(maxsize=4)
+    def _lru_method(self) -> int:
+        return 1
+
+    @functools.cached_property
+    def _lazy(self) -> int:
+        return 1
+
+    @staticmethod
+    def _static() -> int:
+        return 1
+
+    @property
+    def _plain_property(self) -> int:
+        return 1
+
+
+class _Model(BaseModel):
+    items: list[int] = []
+    _SHARED: ClassVar[dict[str, int]] = {}
+    model_config = {"validate_assignment": True}
+
+    def _method(self) -> int:
+        return 1
+
+
 def _set_state() -> None:
     global _state
     _state = 1
@@ -381,7 +507,10 @@ def _plain() -> int:
 
 def test_census_finds_each_kind_of_process_state() -> None:
     """Mutable containers, a `RefitCache`, a cached function and a `global`-rebound name defined
-    by a module are found; imported, immutable and frozen objects are not."""
+    by a module are found, and so are a class's mutable class-level values (a `ClassVar` and a
+    nested class's included) and its `cache`/`lru_cache`/`cached_property` methods; imported,
+    immutable and frozen objects, pydantic fields and `model_config`, and plain methods are
+    not."""
     module = ModuleType("process_state_probe")
     exec(compile(_PROBE_SOURCE, "process_state_probe.py", "exec"), module.__dict__)
 
@@ -395,5 +524,11 @@ def test_census_finds_each_kind_of_process_state() -> None:
             "_TABLE",
             "_cached",
             "_state",
+            "_Holder._REGISTRY",
+            "_Holder._Inner._SEEN",
+            "_Holder._cached_method",
+            "_Holder._lru_method",
+            "_Holder._lazy",
+            "_Model._SHARED",
         ]
     )
