@@ -270,3 +270,37 @@ def test_a_resumed_run_reports_no_split_move_list(tmp_path: Path) -> None:
     ]
     assert resumed.unfactored_split_moves is None
     assert resumed.model_dump(mode="json")["unfactored_split_moves"] is None
+
+
+class _NegativeZeroPodCommander(Commander):
+    """A `Commander` whose pods record every day's return as a negative zero."""
+
+    def decide(self, *args: Any, **kwargs: Any) -> list[PortfolioDecision]:
+        decisions = super().decide(*args, **kwargs)
+        tracker = self._pod_return_tracker
+        tracker._history = {
+            pod_id: [(day, -0.0) for day, _ in entries]
+            for pod_id, entries in tracker._history.items()
+        }
+        return decisions
+
+
+def _negative_zero_commander() -> Commander:
+    """`_commander`'s pod under a `_NegativeZeroPodCommander`."""
+    return _NegativeZeroPodCommander(
+        managers=_commander().managers, weighting_strategy=EqualWeight()
+    )
+
+
+def test_a_negative_zero_pod_return_resumes_byte_identical(tmp_path: Path) -> None:
+    """A pod whose day return is a negative zero gives a resumed `BacktestResult` whose JSON,
+    `unfactored_split_moves` aside, equals the uninterrupted run's byte for byte."""
+    expected = _engine(_negative_zero_commander()).run()
+    assert expected.pod_return_history
+    checkpoint_path = tmp_path / "checkpoint.db"
+    with pytest.raises(_InterruptError):
+        _engine(_negative_zero_commander(), checkpoint_path).run(on_day_complete=_stop_after(2))
+
+    resumed = _engine(_negative_zero_commander(), checkpoint_path, resume=True).run()
+
+    assert _without_split_moves(resumed) == _without_split_moves(expected)

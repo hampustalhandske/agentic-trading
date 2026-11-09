@@ -417,7 +417,9 @@ class BacktestEngine:
     ) -> list[tuple[str, date, float]]:
         """Each pod's return dated `as_of_date` in the commander's risk
         state that is not yet in `seen`; the returned pairs are added to
-        `seen`. Empty for a commander with no risk state."""
+        `seen`. A negative zero return is kept as positive zero, the value
+        the checkpoint's SQLite REAL column holds, so a resumed run reads
+        back what it recorded. Empty for a commander with no risk state."""
         state = self._commander_risk_state()
         if state is None:
             return []
@@ -426,6 +428,7 @@ class BacktestEngine:
             for entry_date, value in entries:
                 if entry_date == as_of_date and (pod_id, entry_date) not in seen:
                     seen.add((pod_id, entry_date))
+                    value = value + 0.0
                     pod_return_history.setdefault(pod_id, []).append((entry_date, value))
                     new_entries.append((pod_id, entry_date, value))
         return new_entries
@@ -1070,7 +1073,9 @@ class BacktestEngine:
                     self._carry_rates(previous_valuation_date), days_held
                 )
             total_financing_cost += financing_cost
-            portfolio_value -= financing_cost
+            # Positive zero for a negative zero, as the checkpoint's SQLite
+            # REAL column stores it.
+            portfolio_value = portfolio_value - financing_cost + 0.0
             portfolio_values.append(portfolio_value)
             portfolio_value_history.append((as_of_timestamp.date(), portfolio_value))
             log_progress(
