@@ -2554,10 +2554,22 @@ def _fetch_crypto_prices(tickers: list[str], start: date, end: date) -> dict[str
     start) falls in that date's NYSE regular session in America/New_York:
     `open` is the open of the minute starting at `_SESSION_FIRST_MINUTE`,
     `close` the close of the minute starting at `_SESSION_LAST_MINUTE`,
-    `volume` the summed volume of the minutes from `_SESSION_FIRST_MINUTE`
-    to `_SESSION_LAST_MINUTE`. A date without a `_SESSION_LAST_MINUTE`
+    `volume` the volume of the minutes from `_SESSION_FIRST_MINUTE` to
+    `_SESSION_LAST_MINUTE`, each cast to `DECIMAL(38, 10)`, summed exactly
+    and rounded once to DOUBLE. A date without a `_SESSION_LAST_MINUTE`
     kline has no row. Every session minute of a local date lies in the
-    same UTC date, so a date's row does not depend on the range read."""
+    same UTC date, so a date's row does not depend on the range read.
+
+    The volume sum is in DECIMAL because DuckDB adds DOUBLEs across
+    threads in no fixed order, so a DOUBLE sum of the same minutes can
+    differ in its last bits between reads; DECIMAL addition is exact, so
+    every read gives the same bits. The cast rounds each minute's volume
+    to a multiple of 1e-10, the same way for the same value. It cannot
+    overflow silently: casting a value of magnitude 1e28 or more, NaN or
+    infinity raises a conversion error, and the sum accumulates in a
+    128-bit integer that raises on overflow (beyond about 1.7e28). One
+    session's at most 390 minutes of volume are many orders of magnitude
+    below that."""
     symbols = [_CRYPTO_KLINE_SYMBOLS[ticker] for ticker in tickers]
     placeholders = ", ".join("?" for _ in symbols)
     query = f"""
@@ -2565,7 +2577,7 @@ def _fetch_crypto_prices(tickers: list[str], start: date, end: date) -> dict[str
                CAST(local_time AS DATE) AS date,
                max(open) FILTER (WHERE CAST(local_time AS TIME) = CAST(? AS TIME)) AS open,
                max(close) FILTER (WHERE CAST(local_time AS TIME) = CAST(? AS TIME)) AS close,
-               sum(volume) AS volume
+               CAST(sum(CAST(volume AS DECIMAL(38, 10))) AS DOUBLE) AS volume
         FROM (
             SELECT symbol, open, close, volume,
                    timezone(?, open_time AT TIME ZONE 'UTC') AS local_time
