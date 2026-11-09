@@ -6,13 +6,14 @@ Each simulated day appends exactly that day's new rows to eight tables
 (`track_record`, `decisions`, `trades`, `unfilled_orders`, `capital_usage`,
 `sizing_diagnostics`, `pod_returns`, `pod_cost_days`) via `INSERT` — O(1) per day, O(n)
 total for a run of length n — and overwrites two things each day: a single
-small `cursor` row (next day index, portfolio state, signal health, pending
-decisions, the Commander's serialized risk state, the lake time the run
-reads at, and the run's own config for `_restore_checkpoint`'s
-match-check: dates, assets, settings fingerprint and roster fingerprint),
-and the `carried_state` table, one row per agent holding its
-`carried_state()` snapshot. Both hold one day's state, so their size does
-not grow with run length. Mirrors the append-only idiom `data/db.py` uses
+`cursor` row (next day index, portfolio state, signal health, pending
+decisions, the Commander's serialized risk state, the previous close mid
+of every option contract the run has marked, the lake time the run reads
+at, and the run's own config for `_restore_checkpoint`'s match-check:
+dates, assets, settings fingerprint and roster fingerprint), and the
+`carried_state` table, one row per agent holding its `carried_state()`
+snapshot. Both hold one day's state; the cursor grows only with the
+number of option contracts the run has marked. Mirrors the append-only idiom `data/db.py` uses
 for the fetch log.
 
 `read_all` reads the whole state back; `read_recent` reads it with only
@@ -116,6 +117,7 @@ CREATE TABLE IF NOT EXISTS cursor (
     commander_risk_state TEXT,
     total_financing_cost REAL NOT NULL DEFAULT 0.0,
     total_option_premium_paid REAL NOT NULL DEFAULT 0.0,
+    option_last_mid TEXT,
     lake_time TEXT,
     settings_fingerprint TEXT,
     roster_fingerprint TEXT
@@ -138,6 +140,7 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("cursor", "commander_risk_state", "TEXT"),
     ("cursor", "total_financing_cost", "REAL NOT NULL DEFAULT 0.0"),
     ("cursor", "total_option_premium_paid", "REAL NOT NULL DEFAULT 0.0"),
+    ("cursor", "option_last_mid", "TEXT"),
     ("cursor", "lake_time", "TEXT"),
     ("cursor", "settings_fingerprint", "TEXT"),
     ("cursor", "roster_fingerprint", "TEXT"),
@@ -214,6 +217,7 @@ def append_day(
     settings_fingerprint: str | None = None,
     roster_fingerprint: str | None = None,
     carried_states: dict[str, bytes] | None = None,
+    option_last_mid: dict[str, float] | None = None,
 ) -> None:
     """Appends exactly this simulated day's new rows — never touches a
     prior day's already-written rows — plus overwrites the single small
@@ -229,7 +233,9 @@ def append_day(
     are recorded with the dates and assets as the run's config, on the day
     the cursor row is first written. `carried_states` is each agent's
     `carried_state()` keyed by agent_id; when given it replaces every stored
-    snapshot, and when `None` the stored snapshots are left as they are."""
+    snapshot, and when `None` the stored snapshots are left as they are.
+    `option_last_mid` is the engine's previous close mid per option
+    contract, stored as JSON (`None` stores none)."""
     with connection:
         connection.execute(
             "INSERT INTO portfolio_value (as_of_date, value) VALUES (?, ?)",
@@ -303,9 +309,9 @@ def append_day(
             INSERT INTO cursor
                 (id, next_day_index, start_date, end_date, assets, portfolio,
                  signal_health, pending_decisions, commander_risk_state,
-                 total_financing_cost, total_option_premium_paid, lake_time,
-                 settings_fingerprint, roster_fingerprint)
-            VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 total_financing_cost, total_option_premium_paid, option_last_mid,
+                 lake_time, settings_fingerprint, roster_fingerprint)
+            VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 next_day_index = excluded.next_day_index,
                 portfolio = excluded.portfolio,
@@ -314,6 +320,7 @@ def append_day(
                 commander_risk_state = excluded.commander_risk_state,
                 total_financing_cost = excluded.total_financing_cost,
                 total_option_premium_paid = excluded.total_option_premium_paid,
+                option_last_mid = excluded.option_last_mid,
                 lake_time = excluded.lake_time
             """,
             (
@@ -327,6 +334,7 @@ def append_day(
                 None if commander_risk_state is None else json.dumps(commander_risk_state),
                 total_financing_cost,
                 total_option_premium_paid,
+                None if option_last_mid is None else json.dumps(option_last_mid),
                 None if lake_time is None else lake_time.isoformat(),
                 settings_fingerprint,
                 roster_fingerprint,
@@ -456,7 +464,8 @@ def _read_state(connection: sqlite3.Connection) -> dict[str, Any] | None:
     cursor_row = connection.execute(
         "SELECT next_day_index, start_date, end_date, assets, portfolio, "
         "signal_health, pending_decisions, commander_risk_state, total_financing_cost, "
-        "total_option_premium_paid, lake_time, settings_fingerprint, roster_fingerprint "
+        "total_option_premium_paid, option_last_mid, lake_time, settings_fingerprint, "
+        "roster_fingerprint "
         "FROM cursor WHERE id = 0"
     ).fetchone()
     if cursor_row is None:
@@ -472,6 +481,7 @@ def _read_state(connection: sqlite3.Connection) -> dict[str, Any] | None:
         commander_risk_state_json,
         total_financing_cost,
         total_option_premium_paid,
+        option_last_mid_json,
         lake_time,
         settings_fingerprint,
         roster_fingerprint,
@@ -536,6 +546,9 @@ def _read_state(connection: sqlite3.Connection) -> dict[str, Any] | None:
         ),
         "total_financing_cost": float(total_financing_cost),
         "total_option_premium_paid": float(total_option_premium_paid),
+        "option_last_mid": (
+            None if option_last_mid_json is None else json.loads(option_last_mid_json)
+        ),
         "lake_time": None if lake_time is None else datetime.fromisoformat(lake_time),
         "trade_log": trade_log,
         "unfilled_orders": unfilled_orders,

@@ -4,7 +4,7 @@ import re
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentic_trading.config import settings
 
@@ -299,7 +299,10 @@ class PerformanceRecord(BaseModel):
     analyst's own unscaled confidence, with no manager scale_factor or
     trailing-track-record weight applied — for reading an analyst's
     directional-call quality independent of how much the system came to
-    trust it. This class only defines the data shape, not the computation."""
+    trust it. This class only defines the data shape, not the computation.
+    A negative zero in any return or score field is stored as positive
+    zero, the value the checkpoint's SQLite REAL columns hold, so a
+    record read back from a checkpoint equals the one recorded."""
 
     source_id: str
     source_type: Literal["analyst", "manager"]
@@ -312,6 +315,13 @@ class PerformanceRecord(BaseModel):
     # `realized_return`) can be measured per source.
     signal_score: float = 0.0
     realized_return: float = 0.0
+
+    @field_validator(
+        "attributable_return", "raw_attributable_return", "signal_score", "realized_return"
+    )
+    @classmethod
+    def _positive_zero(cls, value: float) -> float:
+        return value + 0.0
 
 
 class AgentWeight(BaseModel):

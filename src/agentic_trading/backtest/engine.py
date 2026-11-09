@@ -307,7 +307,9 @@ class BacktestEngine:
         self._checkpoint_connection: sqlite3.Connection | None = None
         # Previous day's close mark per option contract, for attribution
         # (log of today's mid over yesterday's); a contract seen for the
-        # first time realizes 0.0.
+        # first time realizes 0.0. The checkpoint carries it whole; a
+        # checkpoint written without it restores each open position's
+        # `last_mid`.
         self._option_last_mid: dict[str, float] = {}
         self._unpriced_underlyings_warned: set[str] = set()
 
@@ -829,10 +831,15 @@ class BacktestEngine:
                 contract_id: OptionPosition.model_validate(position)
                 for contract_id, position in portfolio_state.get("option_positions", {}).items()
             }
-            self._option_last_mid = {
-                contract_id: position.last_mid
-                for contract_id, position in self.portfolio.option_positions.items()
-            }
+            stored_last_mid = checkpoint.get("option_last_mid")
+            self._option_last_mid = (
+                {contract_id: float(mid) for contract_id, mid in stored_last_mid.items()}
+                if stored_last_mid is not None
+                else {
+                    contract_id: position.last_mid
+                    for contract_id, position in self.portfolio.option_positions.items()
+                }
+            )
             restored_records = [
                 PerformanceRecord.model_validate(entry) for entry in checkpoint["track_record"]
             ]
@@ -1284,6 +1291,7 @@ class BacktestEngine:
                     settings_fingerprint=run_config["settings_fingerprint"],
                     roster_fingerprint=run_config["roster_fingerprint"],
                     carried_states=self._carried_states(),
+                    option_last_mid=self._option_last_mid,
                 )
 
             if on_day_complete is not None:
