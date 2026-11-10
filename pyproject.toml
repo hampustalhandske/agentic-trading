@@ -78,6 +78,9 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "determinism: reruns, resumes or parallelizes a pipeline and requires bit-identical output (part of the default suite; select with -m determinism)",
+]
 
 [tool.mypy]
 python_version = "3.12"
