@@ -17,7 +17,9 @@ gets no decision and one unavailable, weight-0 row per pod in its scope
 accounted the day and before its checkpoint takes the day, so a store
 refusal stops the pass with the checkpoint at the day before; a day on
 which a read past `data_end` was refused, even one an analyst caught,
-stops the pass before the day is written.
+stops the pass before the day is written. The pass writes its days inside
+the store's `appending()`: each day adds a part file, and decisions.parquet
+is written once, when the pass stops.
 
 The engine checkpoints every day to `store_dir / <spec hash>.checkpoint.sqlite`,
 beside the trial directory, so a pass stopped after `max_days`, or killed,
@@ -92,7 +94,7 @@ from agentic_trading.data.loaders.lakehouse_loader import HoldoutReadError, lake
 from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.firm_record.availability import (
     analyst_availability,
-    analyst_availability_of_payloads,
+    analyst_availability_of_counts,
 )
 from agentic_trading.firm_record.rows import (
     analyst_sources,
@@ -286,7 +288,9 @@ def _write_checkpoint_reports(
     and of any other analyst, in the decisions of every day it holds; it
     holds none when the file is absent or holds no state), with `meta`
     updated to match as agentic_meta.json; return that `meta`. Reads only
-    the checkpoint's unfilled orders and its decisions, one day at a time."""
+    the checkpoint's unfilled orders, the dates of its decisions and the
+    signal counts it stored with each day (`checkpoint_store.iter_signal_tally`),
+    not the decisions themselves."""
     orders: list[UnfilledOrder] = []
     availability = analyst_availability({}, roster)
     if checkpoint_path.exists():
@@ -297,10 +301,13 @@ def _write_checkpoint_reports(
                     UnfilledOrder.model_validate(order)
                     for order in checkpoint_store.read_unfilled_orders(connection)
                 ]
-                availability = analyst_availability_of_payloads(
+                availability = analyst_availability_of_counts(
+                    [date.fromisoformat(day) for day in checkpoint_store.decision_days(connection)],
                     (
-                        (date.fromisoformat(day), payload)
-                        for day, payload in checkpoint_store.iter_decision_payloads(connection)
+                        (date.fromisoformat(day), analyst_id, status, estimator, signals)
+                        for day, analyst_id, status, estimator, signals in (
+                            checkpoint_store.iter_signal_tally(connection)
+                        )
                     ),
                     roster,
                 )
@@ -592,7 +599,8 @@ def run_firm_record(
                 written += 1
 
             try:
-                engine.run(before_checkpoint=write_day)
+                with store.appending():
+                    engine.run(before_checkpoint=write_day)
             except _RecordPausedError:
                 commander.close()
                 logger.info("Firm record paused after %d day(s)", written)

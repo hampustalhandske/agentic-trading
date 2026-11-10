@@ -7,7 +7,9 @@ The counts are taken from the Commander's decisions of each recorded day
 (`PortfolioDecision.contributing_signals`), as the engine checkpoint holds
 them: `analyst_availability` counts decisions already built,
 `analyst_availability_of_payloads` the checkpoint's stored JSON of each
-day, reading only the fields counted. A signal counts once, on its
+day, reading only the fields counted, and `analyst_availability_of_counts`
+the per-day counts `day_signal_counts` gives, which the checkpoint stores
+as it writes each day; all three give the same record. A signal counts once, on its
 decision day, for each decision of an instrument (an equity, a future,
 an FX pair or a coin) it fed, when the signal itself is dated that day:
 an option row repeats its underlying's signals, and a decision on an
@@ -110,6 +112,9 @@ class _CountedSignal(BaseModel):
 
 # One counted signal: its analyst id, status and volatility estimator.
 _Counted = tuple[str, SignalStatus, VolatilityEstimator | None]
+# A number of counted signals of one analyst id, status and volatility
+# estimator.
+_CountedMany = tuple[str, SignalStatus, VolatilityEstimator | None, int]
 
 
 class _CountedDecision(BaseModel):
@@ -133,7 +138,8 @@ def analyst_availability(
     decision days and over every day (see the module docstring); an
     analyst without a signal in a period counts 0 in it."""
     return _tally(
-        ((day, _counted(day, decisions)) for day, decisions in decisions_by_day.items()), roster
+        ((day, _once(_counted(day, decisions))) for day, decisions in decisions_by_day.items()),
+        roster,
     )
 
 
@@ -145,9 +151,39 @@ def analyst_availability_of_payloads(
     stores for the day (a list of `PortfolioDecision` payloads), each day
     read once. Only the fields counted are parsed."""
     return _tally(
-        ((day, _counted(day, _COUNTED_DAY.validate_json(payload))) for day, payload in days),
+        ((day, _once(_counted(day, _COUNTED_DAY.validate_json(payload)))) for day, payload in days),
         roster,
     )
+
+
+def day_signal_counts(
+    day: date, decisions: Iterable[PortfolioDecision]
+) -> Counter[tuple[str, SignalStatus, VolatilityEstimator | None]]:
+    """How many signals of `decisions`, the Commander's decisions of
+    `day`, count on it per (analyst id, status, volatility estimator); see
+    the module docstring for which signals count."""
+    return Counter(_counted(day, decisions))
+
+
+def analyst_availability_of_counts(
+    days: Iterable[date],
+    counts: Iterable[tuple[date, str, SignalStatus, VolatilityEstimator | None, int]],
+    roster: Iterable[str],
+) -> AnalystAvailability:
+    """`analyst_availability` of the decision days `days`, given as the
+    `(day, analyst id, status, volatility estimator, signals)` entries of
+    `day_signal_counts` of each day's decisions rather than the decisions
+    themselves; an entry's day must be one of `days`."""
+    by_day: dict[date, list[_CountedMany]] = {}
+    for day, analyst_id, status, estimator, signals in counts:
+        by_day.setdefault(day, []).append((analyst_id, status, estimator, signals))
+    return _tally(((day, by_day.pop(day, [])) for day in days), roster)
+
+
+def _once(signals: Iterable[_Counted]) -> Iterator[_CountedMany]:
+    """Each of `signals` as a count of one."""
+    for analyst_id, status, estimator in signals:
+        yield analyst_id, status, estimator, 1
 
 
 def _counted(
@@ -166,23 +202,24 @@ def _counted(
 
 
 def _tally(
-    days: Iterable[tuple[date, Iterable[_Counted]]], roster: Iterable[str]
+    days: Iterable[tuple[date, Iterable[_CountedMany]]], roster: Iterable[str]
 ) -> AnalystAvailability:
-    """The availability record of the counted `(analyst id, status,
-    volatility estimator)` signals of each decision day of `days`, every
-    analyst id of `roster` listed, with every calendar year of the days."""
+    """The availability record of the counted signals of each decision day
+    of `days`, given as numbers of signals per `(analyst id, status,
+    volatility estimator)`, every analyst id of `roster` listed, with every
+    calendar year of the days."""
     years_seen: set[str] = set()
     by_year: dict[str, dict[str, Counter[SignalStatus]]] = {analyst_id: {} for analyst_id in roster}
     ewma_by_year: dict[str, Counter[str]] = {}
     for day, signals in days:
         year = str(day.year)
         years_seen.add(year)
-        for analyst_id, status, estimator in signals:
+        for analyst_id, status, estimator, count in signals:
             years = by_year.setdefault(analyst_id, {})
-            years.setdefault(year, Counter())[status] += 1
+            years.setdefault(year, Counter())[status] += count
             if estimator is not None:
                 ewma_years = ewma_by_year.setdefault(analyst_id, Counter())
-                ewma_years[year] += 1 if estimator == "ewma" else 0
+                ewma_years[year] += count if estimator == "ewma" else 0
     years_recorded = sorted(years_seen)
     record: dict[str, dict[str, AvailabilityCounts]] = {}
     for analyst_id in sorted(by_year):

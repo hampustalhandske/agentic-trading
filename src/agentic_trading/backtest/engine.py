@@ -1342,7 +1342,6 @@ class BacktestEngine:
                     assets=self.assets,
                     portfolio=self.portfolio.model_dump(mode="json"),
                     signal_health=signal_health,
-                    pending_decisions=pending_decisions,
                     commander_risk_state=(
                         None if risk_state is None else risk_state.model_dump(mode="json")
                     ),
