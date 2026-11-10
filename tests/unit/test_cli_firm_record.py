@@ -157,6 +157,23 @@ def test_firm_record_runs_the_registered_firm(tmp_path: Path, preflight_lake: An
     )
 
 
+def test_a_degraded_lake_refuses_the_record_before_it_reads(
+    tmp_path: Path, preflight_lake: Any
+) -> None:
+    """The command checks the lake's health before its lake session: a read table whose write
+    times are not ok stops it, naming the table, before any price is loaded or the record
+    runs."""
+    preflight_lake.write_times = {"instrument_prices": {"ok": False}}
+    args = ["--start", "2010-01-04", "--end", "2010-01-05", "--store-dir", str(tmp_path)]
+    result, load, _, record = _invoke(args)
+
+    assert isinstance(result.exception, ll.LakeHealthError)
+    assert "instrument_prices" in str(result.exception)
+    load.assert_not_called()
+    record.assert_not_called()
+    assert preflight_lake.calls == []
+
+
 _ARGS = [
     "--start",
     "2010-01-04",

@@ -350,8 +350,8 @@ _ALLOWED: dict[str, str] = {
         "sorts the values of a DatetimeIndex: tied values are equal"
     ),
     f"{_LOADER}:_deduplicated_log_sql:sql.row_number#1": (
-        "ORDER BY scraped_at DESC then the table's tie_order, or every non-key column when the "
-        "lake serves none (AT-157)"
+        "ORDER BY scraped_at DESC then the tie_order the lake serves for the table; a current "
+        "table it serves none for is refused (AT-157, AT-175)"
     ),
     f"{_LOADER}:_require_rows:sql.limit#1": (
         "SELECT 1 AS present ... LIMIT 1: every row is the constant 1"

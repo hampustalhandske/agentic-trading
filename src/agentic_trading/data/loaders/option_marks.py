@@ -14,9 +14,9 @@ mark is intrinsic value against the underlying's close on the last
 session on or before the expiry. Chain queries are cached in-process per
 (underlying, as_of_date) so marking several contracts on one underlying
 costs one lakehouse query per day. Every cache holds reads made at one
-lake time (the open `lake_session`'s, or unpinned outside one) and is
-emptied when reads move to another, so no mark reuses a read from a
-different lake time.
+lake time (the open `lake_session`'s, or unpinned inside
+`unpinned_lake_reads`) and is emptied when reads move to another, so no
+mark reuses a read from a different lake time.
 
 Marks read the chain as of the mark date. Contract selection
 (`select_expiry`, `nearest_strike`, `list_expiries`) reads it as of

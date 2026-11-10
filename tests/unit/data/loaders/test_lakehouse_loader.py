@@ -15,6 +15,8 @@ import pytest
 
 from agentic_trading.data.loaders import lakehouse_loader
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 
 def _short_interest_table() -> pd.DataFrame:
     return pd.DataFrame(

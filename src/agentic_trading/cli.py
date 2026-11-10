@@ -47,6 +47,7 @@ from agentic_trading.data.loaders.lakehouse_loader import (
     lake_session,
     loader_query_counts,
     loader_store_usage,
+    require_lake_health,
     reset_loader_query_counts,
     verify_rebuilt_whole_builds,
 )
@@ -1300,7 +1301,10 @@ def firm_record(
     without --allow-battery when the Mac draws from battery, is in Low
     Power Mode, or `pmset` fails or prints what cannot be read
     (`_require_mains_power`); a machine without `pmset` passes. A restart
-    runs the same check."""
+    runs the same check. Then, before the lake session opens, the lake's
+    health is checked (`lakehouse_loader.require_lake_health`): an answer
+    whose status is not ok, or whose write times are not ok for a table
+    the record reads, raises `LakeHealthError` naming it."""
     started_sources = _package_sources()
     _apply_cli_overrides(set_override)
     requested_lake_time = _parse_lake_time_flag(lake_time)
@@ -1339,6 +1343,7 @@ def firm_record(
         window_end,
         store_dir,
     )
+    require_lake_health()
     with lake_session(requested_lake_time, data_end=data_end) as session:
         typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
         declare_run_window(loader_store, window_start, window_end, settings.stage_a.warmup_days)

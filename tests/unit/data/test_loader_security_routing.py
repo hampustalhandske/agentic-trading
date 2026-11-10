@@ -19,6 +19,8 @@ from agentic_trading.config import SINGLE_NAME_OPTION_CHAINS_START
 from agentic_trading.data.loader import load_price_history_with_fallback
 from agentic_trading.data.trading_calendar import sessions_between
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _START, _END = date(2024, 3, 4), date(2024, 3, 8)
 _DAYS = sessions_between(_START, _END)
 _AAA_ID, _MON_ID = 7, 38786

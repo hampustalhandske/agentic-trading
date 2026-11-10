@@ -18,6 +18,8 @@ import pytest
 from agentic_trading.data.lakehouse_client import LakehouseError
 from agentic_trading.data.loaders import lakehouse_loader as ll
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _WAIT = 0.25
 _T = datetime(2024, 6, 1, 12, tzinfo=UTC)
 _MON, _TUE = date(2024, 3, 4), date(2024, 3, 5)

@@ -10,6 +10,8 @@ import pytest
 
 from agentic_trading.data.loaders import lakehouse_loader
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _START = date(2023, 1, 17)
 _END = date(2023, 6, 17)
 

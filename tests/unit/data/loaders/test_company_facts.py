@@ -7,8 +7,11 @@ from datetime import date
 from typing import Any
 
 import pandas as pd
+import pytest
 
 from agentic_trading.data.loaders import lakehouse_loader
+
+pytestmark = pytest.mark.unpinned_lake_reads
 
 _Q2_START, _Q2_END = "2023-01-01", "2023-04-01"
 

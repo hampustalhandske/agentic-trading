@@ -2,7 +2,8 @@
 
 """A pinned read of a "current" table keeps one row per key whatever order the lake stores its
 log rows in: among rows of one key with the newest `scraped_at`, the row first in the table's
-other columns, in column order, ascending with nulls last, wins."""
+`tie_order` (as `/v1/tables/{table}` serves it), each column ascending with nulls last, wins. A
+current table whose metadata carries no `tie_order` is refused, naming the table."""
 
 from datetime import UTC, date, datetime
 from typing import Any
@@ -50,17 +51,18 @@ def _toy_rows() -> list[dict[str, Any]]:
 def _read_toy(
     lake: Any, rows: list[dict[str, Any]], tie_order: list[str] | None = None
 ) -> pd.DataFrame:
-    """The pinned read of `toy` at `_T`, with the lake's `tie_order`, with its log holding
-    `rows` in that order."""
+    """The pinned read of `toy` at `_T`, with its log holding `rows` in that order, deduplicated
+    on `tie_order`, or on the tie order the lake serves for `toy` when `tie_order` is `None`."""
     lake.add("toy", pd.DataFrame(rows), ("date",), key_columns=_KEYS)
-    relation = ll._deduplicated_log_sql("toy", _KEYS, _T, tie_order)
+    order = lake.describe("toy")["tie_order"] if tie_order is None else tie_order
+    relation = ll._deduplicated_log_sql("toy", _KEYS, _T, order)
     return lake.sql(f"SELECT ticker, date, close, note FROM ({relation}) ORDER BY ticker, date", [])
 
 
 def test_tied_log_rows_give_one_answer_in_every_insertion_order(fake_lake: Any) -> None:
-    """Without a tie order from the lake, each rotation of the log's rows, forwards and
-    reversed, gives the same rows: one per key, the tied version first in its non-key columns
-    other than the bookkeeping ones (AAA's lower close, BBB's non-null close)."""
+    """With the tie order the lake serves (`close`, then `note`), each rotation of the log's
+    rows, forwards and reversed, gives the same rows: one per key, the tied version first in
+    that order (AAA's lower close, BBB's non-null close)."""
     rows = _toy_rows()
     orders = [rows[i:] + rows[:i] for i in range(len(rows))]
     orders += [list(reversed(order)) for order in orders]
@@ -91,12 +93,27 @@ def test_a_tie_order_from_the_lake_decides_in_its_own_order(fake_lake: Any) -> N
     assert forwards["close"].tolist()[0] == 101.0
 
 
-def test_the_fallback_tie_order_is_the_non_key_value_columns_in_column_order(
+def test_an_empty_tie_order_orders_on_scraped_at_alone(fake_lake: Any) -> None:
+    """A table whose every column is a key has an empty tie order: the dedupe orders on
+    `scraped_at` alone and keeps the newest row of each key."""
+    rows = pd.DataFrame(
+        {"ticker": ["AAA", "AAA"], "scraped_at": [_OLDER, _TIED]},
+    )
+    fake_lake.add("keys_only", rows, key_columns=["ticker"])
+    relation = ll._deduplicated_log_sql("keys_only", ["ticker"], _T, [])
+    frame = fake_lake.sql(f"SELECT ticker, scraped_at FROM ({relation})", [])
+
+    assert frame["ticker"].tolist() == ["AAA"]
+    assert pd.Timestamp(frame["scraped_at"].iloc[0]) == _TIED
+
+
+def test_the_fake_lake_serves_the_non_key_value_columns_as_the_tie_order(
     fake_lake: Any,
 ) -> None:
-    """For an `instrument_prices`-shaped log keyed on (ticker, date), the fallback tie order is
-    asset_class, open, high, low, close, adj_close, volume: every non-key column in the
-    table's column order, without `scraped_at`, `dt` and `table`."""
+    """The fake lake serves, as the lake does, an `instrument_prices`-shaped table keyed on
+    (ticker, date) with the tie order asset_class, open, high, low, close, adj_close, volume:
+    every non-key column in the table's column order, without `scraped_at`, `dt` and `table`,
+    and its key columns as `keys` beside `key_columns`."""
     prices = pd.DataFrame(
         {
             "ticker": ["SPY"],
@@ -114,10 +131,18 @@ def test_the_fallback_tie_order_is_the_non_key_value_columns_in_column_order(
         }
     )
     fake_lake.add("instrument_prices", prices, ("date",), key_columns=_KEYS)
-    selector = ll._fallback_tie_columns_sql(_KEYS)
-    columns = fake_lake.sql(f"SELECT {selector} FROM instrument_prices_log LIMIT 0", []).columns
+    metadata = fake_lake.describe("instrument_prices")
 
-    assert list(columns) == ["asset_class", "open", "high", "low", "close", "adj_close", "volume"]
+    assert metadata["tie_order"] == [
+        "asset_class",
+        "open",
+        "high",
+        "low",
+        "close",
+        "adj_close",
+        "volume",
+    ]
+    assert metadata["keys"] == metadata["key_columns"] == _KEYS
 
 
 def _bis_rows(first_value: float, second_value: float) -> pd.DataFrame:
@@ -159,14 +184,30 @@ def test_a_loader_reads_the_same_tied_version_in_either_insertion_order(
     assert rates.loc["2024-01-03", "USD"] == pytest.approx(0.0525)
 
 
-def test_the_fallback_picks_what_the_lakes_per_column_rule_picks_with_nulls(
-    fake_lake: Any,
-) -> None:
-    """Tied rows that differ only by a null in one tie column: the fallback order (a struct of
-    the non-key columns) keeps the same row as the lake's rule written out column by column,
-    each ascending with nulls last. DDD's tied rows differ only by a null `note`, so the row
-    with a note wins; EEE's pair a null `close` with a note against a close with a null note,
-    so the row with a close wins."""
+def test_a_current_table_without_a_tie_order_is_refused_naming_it(fake_lake: Any) -> None:
+    """A current table whose metadata carries no `tie_order` cannot be deduplicated as of T: a
+    read of it inside a lake session raises `MissingTieOrderError` naming the table, before
+    any query of the table is sent."""
+    fake_lake.add(
+        "bis_observations",
+        _bis_rows(5.25, 5.5),
+        ("date",),
+        key_columns=["dataflow", "series_key", "period"],
+    )
+    fake_lake.tie_order_overrides["bis_observations"] = None
+
+    with ll.lake_session(_T):
+        sent = len(fake_lake.calls)
+        with pytest.raises(ll.MissingTieOrderError, match="bis_observations"):
+            ll.load_policy_rates_from_lakehouse(["USD"], date(2024, 1, 2), date(2024, 1, 8))
+        assert not any("bis_observations" in query for query, _ in fake_lake.calls[sent:])
+
+
+def test_tie_columns_compare_one_by_one_with_nulls_last(fake_lake: Any) -> None:
+    """Tied rows that differ only by a null in one tie column, with the tie order (`close`,
+    `note`): DDD's tied rows differ only by a null `note`, so the row with a note wins; EEE's
+    pair a null `close` with a note against a close with a null note, so the row with a close
+    wins. Either insertion order gives the same rows."""
     rows = [
         _toy_row("DDD", 5.0, None, "2024-05-01", _TIED),
         _toy_row("DDD", 5.0, "a", "2024-05-01", _TIED),
@@ -182,7 +223,5 @@ def test_the_fallback_picks_what_the_lakes_per_column_rule_picks_with_nulls(
         }
     )
     for order in (rows, list(reversed(rows))):
-        fallback = _read_toy(fake_lake, order).reset_index(drop=True)
-        per_column = _read_toy(fake_lake, order, ["close", "note"]).reset_index(drop=True)
-        pd.testing.assert_frame_equal(fallback, per_column)
-        pd.testing.assert_frame_equal(fallback, expected, check_dtype=False)
+        result = _read_toy(fake_lake, order, ["close", "note"]).reset_index(drop=True)
+        pd.testing.assert_frame_equal(result, expected, check_dtype=False)

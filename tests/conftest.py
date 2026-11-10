@@ -21,6 +21,7 @@ import json
 import math
 import sys
 import threading
+import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,18 +36,29 @@ from agentic_trading.logging_config import configure_logging
 configure_logging(disable=True)
 
 from agentic_trading import provenance  # noqa: E402
+from agentic_trading.data import lakehouse_client  # noqa: E402
 from agentic_trading.data.loaders import lakehouse_loader  # noqa: E402
 from agentic_trading.data.loaders.lakehouse_loader import LakeProvenance  # noqa: E402
 from edgelab_live import configure as configure_edgelab_live  # noqa: E402
 
+_UNPINNED_LAKE_READS_MARKER = "unpinned_lake_reads"
+
 
 def pytest_configure(config: pytest.Config) -> None:
     """Registers the `edgelab_live` marker and the skip guard of `tests/edgelab_live.py`: a run
-    with any skip other than a live edgelab check skipped for an absent checkout fails."""
+    with any skip other than a live edgelab check skipped for an absent checkout fails. Also
+    registers the `unpinned_lake_reads` marker (see `_unpinned_lake_reads`)."""
     configure_edgelab_live(config)
+    config.addinivalue_line(
+        "markers",
+        f"{_UNPINNED_LAKE_READS_MARKER}: the test reads the fake lake's current tables with no "
+        "lake session open, inside lakehouse_loader.unpinned_lake_reads",
+    )
 
 
 _DEFAULT_SCRAPED_AT = "2020-01-01T00:00:00Z"
+# A log table's bookkeeping columns, never part of the tie order the lake serves.
+_LOG_BOOKKEEPING_COLUMNS = ("scraped_at", "dt", "table")
 
 
 def _utc_iso(value: Any) -> str:
@@ -70,9 +82,16 @@ class FakeLake:
     to the log only. A table added with `pin_column` (an append-only table
     with no `scraped_at`) gets no log; its pin is its own row-time column.
     `add_view` registers a view with no log. `describe`, `tables`, `status`
-    and `health` answer from that metadata (`kind`, `key_columns`,
-    `rebuilt_whole`); `last_write_overrides` replaces a table's `last_write`.
-    `sql` runs the query against the tables and exposes `version` as
+    and `health` answer from that metadata (`kind`, `key_columns` and the
+    same list as `keys`, `rebuilt_whole`); `last_write_overrides` replaces a
+    table's `last_write`. A "current" table's `describe` serves the lake's
+    `tie_order`, its non-key columns in column order without `scraped_at`,
+    `dt` and `table`; `tie_order_overrides` replaces it, and an override of
+    `None` serves none.
+    `health` answers HTTP 200's body: `version`, `health_status` as `status`
+    ("ok" by default) and `write_times` (table to entry, empty by default)
+    under `write_times.tables`, so a test plants a degraded answer by setting
+    those two. `sql` runs the query against the tables and exposes `version` as
     `last_version`. Setting `fixed_result` makes every query return that
     frame regardless of the SQL (for testing a loader's own guards against
     a result its query should never produce); setting `error` makes every
@@ -89,6 +108,9 @@ class FakeLake:
         self.version = "fake-lake-1"
         self.last_version: str | None = None
         self.last_write_overrides: dict[str, str] = {}
+        self.tie_order_overrides: dict[str, list[str] | None] = {}
+        self.health_status: str | None = "ok"
+        self.write_times: dict[str, dict[str, Any]] = {}
         self._meta: dict[str, dict[str, Any]] = {}
         self._date_columns: dict[str, tuple[str, ...]] = {}
 
@@ -205,8 +227,10 @@ class FakeLake:
             return {
                 "kind": "current",
                 "key_columns": [],
+                "keys": [],
                 "rebuilt_whole": False,
                 "last_write": None,
+                "tie_order": [],
             }
         last_write = self.last_write_overrides.get(table)
         source = f"max({meta['pin_column']})" if meta["pin_column"] else "max(scraped_at)"
@@ -216,12 +240,25 @@ class FakeLake:
             if newest is not None and newest[0] is not None:
                 rounded = datetime.fromtimestamp(math.ceil(newest[0]), UTC)
                 last_write = rounded.isoformat().replace("+00:00", "Z")
-        return {
+        described: dict[str, Any] = {
             "kind": meta["kind"],
             "key_columns": list(meta["key_columns"]),
+            "keys": list(meta["key_columns"]),
             "rebuilt_whole": meta["rebuilt_whole"],
             "last_write": last_write,
         }
+        if meta["kind"] == "current":
+            tie_order = self.tie_order_overrides.get(table, self._tie_order(table))
+            if tie_order is not None:
+                described["tie_order"] = list(tie_order)
+        return described
+
+    def _tie_order(self, table: str) -> list[str]:
+        """The tie order the lake serves for current table `table`: its columns other than
+        the key columns and the bookkeeping columns `scraped_at`, `dt` and `table`, in the
+        table's column order."""
+        excluded = {*self._meta[table]["key_columns"], *_LOG_BOOKKEEPING_COLUMNS}
+        return [column for column in self._columns(table) if column not in excluded]
 
     def tables(self, include_logs: bool = False) -> list[dict[str, Any]]:
         return [{"table": name, "kind": meta["kind"]} for name, meta in self._meta.items()]
@@ -230,7 +267,12 @@ class FakeLake:
         return {"generated_at": None, "tables": self.tables()}
 
     def health(self) -> dict[str, Any]:
-        return {"version": self.version}
+        tables = {table: dict(entry) for table, entry in self.write_times.items()}
+        return {
+            "version": self.version,
+            "status": self.health_status,
+            "write_times": {"tables": tables},
+        }
 
     def sql(self, query: str, params: list[Any] | None = None) -> pd.DataFrame:
         self.calls.append((query, list(params or [])))
@@ -254,8 +296,9 @@ _CATALOGUE_LAST_WRITE = "2020-01-01T00:00:00Z"
 class _OfflineLake:
     """The lake a test without `fake_lake` sees: its catalogue (`describe`)
     answers every table as an empty current table last written at
-    `_CATALOGUE_LAST_WRITE`, so a `lake_session` can open, and every other
-    call (any SQL read, `status`, `health`, ...) raises."""
+    `_CATALOGUE_LAST_WRITE`, so a `lake_session` can open, its `health` is
+    an ok status with no table entries, so a firm record's health check
+    passes, and every other call (any SQL read, `status`, ...) raises."""
 
     last_version: str | None = None
 
@@ -266,6 +309,9 @@ class _OfflineLake:
             "rebuilt_whole": False,
             "last_write": _CATALOGUE_LAST_WRITE,
         }
+
+    def health(self) -> dict[str, Any]:
+        return {"status": "ok", "write_times": {"tables": {}}}
 
     def __getattr__(self, name: str) -> Any:
         raise RuntimeError(_NO_NETWORK_MESSAGE)
@@ -289,6 +335,31 @@ def _block_real_lake(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     yield
     monkeypatch.undo()
     _REAL_LAKE_ACCESSOR.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _lake_client_state_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Points the lake client's state directory (its request markers and last timeout, see
+    `data.lakehouse_client`) at a fresh directory under the session's temporary root for each
+    test, so no test reads or writes the user's own state and no timeout one test records
+    refuses another's calls. Subprocesses a test starts inherit it."""
+    directory = tmp_path_factory.getbasetemp() / "lake-client-state" / uuid.uuid4().hex
+    monkeypatch.setenv(lakehouse_client.STATE_DIR_ENV_VAR, str(directory))
+
+
+@pytest.fixture(autouse=True)
+def _unpinned_lake_reads(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Runs a test marked `unpinned_lake_reads` inside
+    `lakehouse_loader.unpinned_lake_reads`, so its loader calls with no lake session open read
+    the fake lake's current tables. Every other test keeps the refusal of a read with no
+    session open."""
+    if request.node.get_closest_marker(_UNPINNED_LAKE_READS_MARKER) is None:
+        yield
+        return
+    with lakehouse_loader.unpinned_lake_reads("the test reads the fake lake's current tables"):
+        yield
 
 
 # The test module that specifies the empty-read retry: it checks the real

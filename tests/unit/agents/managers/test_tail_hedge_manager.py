@@ -22,6 +22,8 @@ from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import EqualWeight
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 AS_OF = pd.Timestamp("2024-06-20")
 SPOT = 500.0
 CONFIDENCE = 0.5

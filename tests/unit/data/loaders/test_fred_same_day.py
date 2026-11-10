@@ -15,6 +15,8 @@ import pytest
 from agentic_trading.data.loaders import lakehouse_loader
 from agentic_trading.stage_a.decisions import SOURCES
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _VINTAGE_DATES = ("date", "realtime_start")
 
 

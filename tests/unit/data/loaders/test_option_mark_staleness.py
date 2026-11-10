@@ -24,6 +24,8 @@ from agentic_trading.config import temporary_overrides
 from agentic_trading.data.loaders import option_marks
 from agentic_trading.data.loaders.option_marks import _query_rate, load_option_mark
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 UNDERLYING = "AAPL"
 RATE = 0.05
 SPOT = 180.0

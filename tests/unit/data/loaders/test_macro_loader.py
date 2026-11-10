@@ -16,6 +16,8 @@ from agentic_trading.data.loaders.macro_loader import (
     load_risk_free_rate_series,
 )
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _VINTAGE_DATES = ("date", "realtime_start")
 
 

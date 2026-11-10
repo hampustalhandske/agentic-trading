@@ -32,6 +32,8 @@ from agentic_trading.agents.analysts.macro_rates_pod.cot_positioning_analyst imp
 )
 from agentic_trading.data.loaders.lakehouse_loader import IndexMember
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _VINTAGE_DATES = ("date", "realtime_start")
 _ZB, _ZN = "020601", "043602"
 

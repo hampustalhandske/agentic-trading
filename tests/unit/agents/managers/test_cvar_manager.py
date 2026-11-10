@@ -26,6 +26,8 @@ from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import WeightingStrategy
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 AS_OF = pd.Timestamp("2024-06-20")
 SPOT = 100.0
 MID = {"call": 5.0, "put": 4.0}

@@ -17,6 +17,8 @@ import pytest
 from agentic_trading.agents.roster import FIRM_V1_EQUITIES
 from agentic_trading.data.loaders import lakehouse_loader
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 
 def _short_interest(rows: list[tuple[str, str, str, str | None]]) -> pd.DataFrame:
     """Rows of (symbol, settlement, lake dissemination, revision_flag)."""

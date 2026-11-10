@@ -26,23 +26,42 @@ answers busy, and holds the slot of a request whose client went away until the r
 deadline, so the seven sends span at least about six and a half minutes. Each retry is logged as
 a warning, and the answer to the last send raises like any other. Every other refusal or failure
 raises at once.
+
+After a request times out, or a run is killed with a request unfinished, the lake may keep working
+on it, so no new call is sent for `settings.lake.request_quiet_seconds` (read at each call). The
+rule holds across processes through files in the client's state directory (`state_dir()`: the
+directory `AGENTIC_LAKE_STATE_DIR` names, else `agentic-trading/lake` under the user's XDG state
+directory, `~/.local/state` by default). Each request writes a marker file under `requests/`
+naming its process and start time when it starts, and removes it when it ends; a request that
+times out (`httpx.TimeoutException`, also when it cuts off a streamed result) removes its marker
+and records the time in `last_timeout.json`, and one interrupted by `KeyboardInterrupt` or
+`SystemExit` leaves its marker. Before each call the client refuses with `LakeQuietPeriodError`,
+naming the earliest UTC time a call is allowed, when the recorded timeout is within the window,
+or when a leftover marker (one whose process has exited, or one naming this process that no
+request of it holds) started within the window. A leftover marker older than the window is
+removed. A marker of another live process is that process's request in flight and never refuses.
+The timeout and the refusal are each logged as a warning.
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import random
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pyarrow as pa
 
+from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -58,10 +77,69 @@ BUSY_RETRY_JITTER = 0.2
 # The status and the text of its detail that mean the lake's query slots are all in use.
 _BUSY_STATUS = 503
 _BUSY_DETAIL = "query slots are busy"
+# Names the client's state directory (see `state_dir`).
+STATE_DIR_ENV_VAR = "AGENTIC_LAKE_STATE_DIR"
+# Under the state directory: one marker file per request in flight, and the last client timeout.
+MARKER_DIR = "requests"
+TIMEOUT_FILE = "last_timeout.json"
 
 
 class LakehouseError(RuntimeError):
     """The API refused or failed the request; the message is the server's explanation."""
+
+
+class LakeQuietPeriodError(RuntimeError):
+    """A call refused before it was sent: a lake request timed out, or a run left one unfinished,
+    less than `settings.lake.request_quiet_seconds` ago, so the lake may still be working on it.
+    `earliest` is the first UTC time a call is allowed; the message names it and each cause."""
+
+    def __init__(self, message: str, earliest: datetime) -> None:
+        super().__init__(message)
+        self.earliest = earliest
+
+
+def state_dir() -> Path:
+    """The directory of the client's request markers and its last timeout: the one
+    `AGENTIC_LAKE_STATE_DIR` names when it is set and non-empty, else `agentic-trading/lake` under
+    `XDG_STATE_HOME`, or under `~/.local/state` when that is unset. Read at each call."""
+    named = os.environ.get(STATE_DIR_ENV_VAR)
+    if named:
+        return Path(named).expanduser()
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base).expanduser() / "agentic-trading" / "lake"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _is_timeout(error: BaseException) -> bool:
+    """Whether `error`, or an error it was raised from, is an httpx timeout."""
+    seen: BaseException | None = error
+    while seen is not None:
+        if isinstance(seen, httpx.TimeoutException):
+            return True
+        seen = seen.__cause__
+    return False
+
+
+def _process_alive(pid: int) -> bool:
+    """Whether a process with `pid` exists (one of another user counts)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Writes `payload` to `path` whole: through a temporary file beside it, then a rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(f"{path.name}.partial")
+    partial.write_text(json.dumps(payload))
+    os.replace(partial, path)
 
 
 class _ByteStream(io.RawIOBase):
@@ -94,12 +172,15 @@ class _ByteStream(io.RawIOBase):
 class Lake:
     """A client of the lakehouse API at `base_url` with `token`. `transport` replaces the HTTP
     transport (tests), `busy_retry_delays` the waits before each new send of a busy-slots answer
-    (see the module docstring) and `sleep` the function that waits. `in_flight` counts this
-    client's requests sent and not yet finished, over every thread, and
-    `Lake.in_flight_in_process()` those of every client in the process."""
+    (see the module docstring), `sleep` the function that waits and `clock` the one that gives the
+    current aware time for the quiet period. `in_flight` counts this client's requests sent and
+    not yet finished, over every thread, and `Lake.in_flight_in_process()` those of every client
+    in the process."""
 
     _process_in_flight = 0
     _process_lock = threading.Lock()
+    # The marker files of this process's requests in flight, over every client.
+    _process_markers: set[Path] = set()
 
     def __init__(
         self,
@@ -110,6 +191,7 @@ class Lake:
         transport: httpx.BaseTransport | None = None,
         busy_retry_delays: tuple[float, ...] = BUSY_RETRY_DELAYS,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.base_url = (base_url or os.getenv("LAKEHOUSE_API_URL", DEFAULT_URL)).rstrip("/")
         token = token or os.getenv("LAKEHOUSE_API_TOKEN", "")
@@ -121,6 +203,7 @@ class Lake:
         )
         self._busy_retry_delays = busy_retry_delays
         self._sleep = sleep
+        self._clock = clock
         self._in_flight = 0
         self._in_flight_lock = threading.Lock()
         self.last_version: str | None = None
@@ -210,8 +293,27 @@ class Lake:
     @contextlib.contextmanager
     def _response(self, method: str, path: str, **kwargs: Any) -> Iterator[httpx.Response]:
         """The streamed response to `method` `path`, after recording its version and raising
-        `LakehouseError` for a refusal. A busy-slots answer is sent again after each of the busy
-        retry delays, each logged; the answer after the last delay raises like any other."""
+        `LakehouseError` for a refusal. Raises `LakeQuietPeriodError` before sending inside the
+        quiet period, and holds a request marker until the response is done (see the module
+        docstring). A busy-slots answer is sent again after each of the busy retry delays, each
+        logged; the answer after the last delay raises like any other."""
+        marker = self._begin_request(method, path)
+        keep_marker = False
+        try:
+            with self._sent(method, path, **kwargs) as resp:
+                yield resp
+        except BaseException as error:
+            if _is_timeout(error):
+                self._record_timeout(method, path)
+            elif isinstance(error, KeyboardInterrupt | SystemExit):
+                keep_marker = True
+            raise
+        finally:
+            self._end_request(marker, keep_marker)
+
+    @contextlib.contextmanager
+    def _sent(self, method: str, path: str, **kwargs: Any) -> Iterator[httpx.Response]:
+        """The sends of `_response`, busy retries included."""
         delays = self._busy_retry_delays
         for attempt in range(len(delays) + 1):
             self._count_in_flight(1)
@@ -237,6 +339,122 @@ class Lake:
                 wait,
             )
             self._sleep(wait)
+
+    # -- quiet period -------------------------------------------------------------------
+
+    def _now(self) -> datetime:
+        return self._clock().astimezone(UTC)
+
+    def _begin_request(self, method: str, path: str) -> Path:
+        """Refuses inside the quiet period, then writes this request's marker and returns its
+        path. The marker is held in this process's set before it is written, so no other thread
+        reads it as left over."""
+        now = self._now()
+        directory = state_dir()
+        self._refuse_inside_quiet_period(directory, now)
+        marker = directory / MARKER_DIR / f"{os.getpid()}-{uuid.uuid4().hex}.json"
+        with Lake._process_lock:
+            Lake._process_markers.add(marker)
+        payload = {"pid": os.getpid(), "started_at": now.isoformat(), "method": method, "path": path}
+        try:
+            _write_json(marker, payload)
+        except BaseException:
+            with Lake._process_lock:
+                Lake._process_markers.discard(marker)
+            raise
+        return marker
+
+    @staticmethod
+    def _end_request(marker: Path, keep: bool) -> None:
+        """Removes `marker` unless `keep`, then lets it go from this process's set, so a marker
+        on disk is always either held or left over."""
+        if not keep:
+            marker.unlink(missing_ok=True)
+        with Lake._process_lock:
+            Lake._process_markers.discard(marker)
+
+    def _record_timeout(self, method: str, path: str) -> None:
+        """Records a client timeout of `method` `path` now in the state directory and logs it."""
+        now = self._now()
+        _write_json(
+            state_dir() / TIMEOUT_FILE,
+            {"at": now.isoformat(), "pid": os.getpid(), "method": method, "path": path},
+        )
+        resume = now + timedelta(seconds=settings.lake.request_quiet_seconds)
+        logger.warning(
+            "Lakehouse request %s %s timed out at %s; the lake may still be working on it, so no "
+            "lake call is sent before %s",
+            method,
+            path,
+            now.isoformat(),
+            resume.isoformat(),
+        )
+
+    @staticmethod
+    def _marker_start(marker: Path) -> tuple[int | None, datetime] | None:
+        """The process and start time `marker` records, `None` when it is gone. A marker that
+        cannot be read gives no process and its file's modification time."""
+        try:
+            text = marker.read_text()
+            modified = datetime.fromtimestamp(marker.stat().st_mtime, UTC)
+        except FileNotFoundError:
+            return None
+        try:
+            payload = json.loads(text)
+            return int(payload["pid"]), datetime.fromisoformat(payload["started_at"]).astimezone(UTC)
+        except (ValueError, KeyError, TypeError):
+            return None, modified
+
+    def _refuse_inside_quiet_period(self, directory: Path, now: datetime) -> None:
+        """Raises `LakeQuietPeriodError` when the recorded timeout, or a leftover marker's start,
+        is less than the quiet period before `now`; removes each leftover marker older than that."""
+        window = timedelta(seconds=settings.lake.request_quiet_seconds)
+        causes: list[tuple[datetime, str]] = []
+        timeout = directory / TIMEOUT_FILE
+        if timeout.exists():
+            try:
+                at = datetime.fromisoformat(json.loads(timeout.read_text())["at"]).astimezone(UTC)
+            except (ValueError, KeyError, TypeError):
+                at = datetime.fromtimestamp(timeout.stat().st_mtime, UTC)
+            if now < at + window:
+                causes.append((at + window, f"a lake request timed out at {at.isoformat()}"))
+        markers = directory / MARKER_DIR
+        for marker in sorted(markers.glob("*.json")) if markers.is_dir() else []:
+            with Lake._process_lock:
+                if marker in Lake._process_markers:
+                    continue
+            recorded = self._marker_start(marker)
+            if recorded is None:
+                continue
+            pid, started = recorded
+            if pid is not None and pid != os.getpid() and _process_alive(pid):
+                continue
+            owner = "an unreadable marker" if pid is None else f"process {pid}"
+            if now < started + window:
+                causes.append(
+                    (
+                        started + window,
+                        f"{owner} left a lake request unfinished that started at "
+                        f"{started.isoformat()} ({marker})",
+                    )
+                )
+            else:
+                marker.unlink(missing_ok=True)
+                logger.info(
+                    "Removed the marker of a lake request %s left unfinished at %s, older than "
+                    "the quiet period",
+                    owner,
+                    started.isoformat(),
+                )
+        if causes:
+            earliest = max(when for when, _ in causes)
+            message = (
+                f"lake call refused until {earliest.isoformat()} "
+                f"({settings.lake.request_quiet_seconds:g} s quiet period): "
+                + "; ".join(cause for _, cause in causes)
+            )
+            logger.warning("%s", message)
+            raise LakeQuietPeriodError(message, earliest)
 
     @staticmethod
     def _retry_after(resp: httpx.Response) -> float:

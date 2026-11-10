@@ -25,6 +25,8 @@ from agentic_trading.config import settings, temporary_overrides
 from agentic_trading.data.loaders import option_marks
 from agentic_trading.scoring.weighting import EqualWeight
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 AS_OF = pd.Timestamp("2020-01-02")
 SPOT = 70.0
 EXPIRATION = "2020-03-20"

@@ -12,6 +12,8 @@ import pytest
 
 from agentic_trading.data.loaders import lakehouse_loader as ll
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _T = datetime(2024, 8, 1, tzinfo=UTC)
 
 

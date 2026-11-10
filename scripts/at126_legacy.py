@@ -25,8 +25,11 @@ per period, the latest filed row known by the decision day (ties: the
 latest `available_date`, then the latest acceptance); and inside a lake
 session every reference reads a current table through the loader
 module's `_table_sql`, whose dedupe takes, among one key's rows written at
-its latest `scraped_at`, the first in the table's tie order
-(`_tie_order_sql`)."""
+its latest `scraped_at`, the first in the tie order the lake serves for
+the table (`_tie_order_sql`), and refuses a current table the lake serves
+no tie order for (`MissingTieOrderError`); with no session open, every
+reference is refused (`UnpinnedLakeReadError`) outside
+`unpinned_lake_reads`."""
 
 from datetime import date, timedelta
 

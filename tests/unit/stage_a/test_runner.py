@@ -49,6 +49,7 @@ _RUNTIME_FIELDS = {
     "trials.ledger_path",
     "trials.registry_dir",
     "trials.firm_family",
+    "lake.request_quiet_seconds",
 }
 _ERRORS: dict[str, type[Exception]] = {
     "value": ValueError,
