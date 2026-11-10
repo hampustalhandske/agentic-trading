@@ -111,8 +111,8 @@ def test_engine_all_cash_book_compounds_interest_into_nav() -> None:
     assert result.total_financing_cost == pytest.approx(-(values[-1] - _CAPITAL), rel=1e-9)
 
     # The benchmark accrues the same rate over the same calendar gap, so a
-    # cash book's excess return is zero every day and its ratios report 0.0.
+    # cash book's excess return is zero every day and its ratios are undefined.
     excess = values[1:] / values[:-1] - 1.0 - _RATE * gaps / 365
     assert np.max(np.abs(excess)) < 1e-12
-    assert result.final_sharpe_ratio == 0.0
-    assert result.final_sortino_ratio == 0.0
+    assert result.final_sharpe_ratio is None
+    assert result.final_sortino_ratio is None

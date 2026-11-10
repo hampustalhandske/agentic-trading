@@ -92,5 +92,5 @@ def test_first_gap_after_a_rate_step_accrues_at_the_previous_rate() -> None:
     assert result.total_financing_cost == pytest.approx(-(values[-1] - _CAPITAL), rel=1e-9)
     excess = values[1:] / values[:-1] - 1.0 - rates * gaps / 365
     assert np.max(np.abs(excess)) < 1e-12
-    assert result.final_sharpe_ratio == 0.0
-    assert result.final_sortino_ratio == 0.0
+    assert result.final_sharpe_ratio is None
+    assert result.final_sortino_ratio is None

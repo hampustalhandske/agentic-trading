@@ -81,8 +81,8 @@ def _summary_metric(name: str, compute: Callable[[], float]) -> float | None:
 # Largest absolute daily excess return still treated as zero. A book that
 # only ever holds cash earns exactly the benchmark accrual, so its excess
 # returns are floating-point residue (around 1e-17); Sharpe and Sortino of
-# that series are meaningless (zero or near-zero variance gives a division
-# by zero or noise), and the run reports 0.0 for both instead.
+# that series are undefined (zero or near-zero variance gives a division by
+# zero or noise), and the run reports None for both.
 ZERO_EXCESS_RETURN_TOLERANCE = 1e-12
 
 # The per-pod cost kinds `PodCostDay` and `PodCostAttribution` carry, one
@@ -1376,8 +1376,13 @@ class BacktestEngine:
         else:
             excess_returns_array = returns_array - self._risk_free_accrual_array(valuation_dates)
             if np.all(np.abs(excess_returns_array) <= ZERO_EXCESS_RETURN_TOLERANCE):
-                final_sharpe_ratio = 0.0
-                final_sortino_ratio = 0.0
+                logger.warning(
+                    "Sharpe and Sortino are undefined on this run: every daily excess return "
+                    "is within %g of zero; reporting None.",
+                    ZERO_EXCESS_RETURN_TOLERANCE,
+                )
+                final_sharpe_ratio = None
+                final_sortino_ratio = None
             else:
                 final_sharpe_ratio = _summary_metric(
                     "sharpe ratio", lambda: sharpe_ratio(excess_returns_array)
