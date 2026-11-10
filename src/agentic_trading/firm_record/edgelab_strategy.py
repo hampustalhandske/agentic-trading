@@ -1,9 +1,13 @@
 """The text of an edgelab replay strategy folder: `strategy.yaml` as
-`edgelab strategy init <slug> --asset-class replay` scaffolds it (edgelab
-policy edgelab-2026.10.3), and the `strategy.py` shim whose `Replay`
-subclasses edgelab's built-in `TargetWeightsReplay`.
+`edgelab strategy init <slug> --asset-class replay` scaffolds it at edgelab
+62a7151, whose grading block measures as edgelab-2026.11.0, and the
+`strategy.py` shim whose `Replay` subclasses edgelab's built-in
+`TargetWeightsReplay`.
 
-`REPLAY_STRATEGY_YAML` is the scaffold with its comment lines removed; its
+`REPLAY_STRATEGY_YAML` is the scaffold with its comment lines removed (the
+scaffold itself is vendored as `tests/fixtures/edgelab_replay_strategy.yaml`
+and its grading block's JSON schema as
+`tests/fixtures/edgelab_grading_spec.json`); its
 `<...>` placeholders, `strategy`, universe, data block, capital, seed and
 replication are replaced by `firm_record.submission.strategy_config`. The
 files are written as text, so edgelab is never imported here."""
@@ -178,14 +182,12 @@ grading:
     - 5
     - 10
     n_subperiods: 3
-    structural_break: null
     n_start_date_shifts: 5
   gates:
     min_hac_t_multiple: 2.5
     min_hac_t_single: 2.0
     min_psr: 0.95
     min_dsr: 0.95
-    max_spa_p: 0.05
     max_pbo_green: 0.2
     max_pbo_red: 0.5
     require_min_trl: true
@@ -194,7 +196,6 @@ grading:
     require_holdout_positive: true
     min_breakeven_cost_multiple: 2.0
     min_delay_sharpe_retention: 0.5
-    min_plateau_share: 0.6
     min_factor_alpha_t: 2.0
     max_random_entry_p: 0.05
     max_calibration_p: 0.05

@@ -42,6 +42,7 @@ from agentic_trading.stage_a.decisions import check_source_as_of
 from agentic_trading.stage_a.store import DecisionRow
 from agentic_trading.trials.ledger import LedgerError, TrialLedger
 from agentic_trading.trials.rows import FIRM_HYPOTHESIS_ID
+from unit.firm_record.test_replay_strategy_fixture import validate_grading_block
 
 _T = datetime(2026, 11, 6, tzinfo=UTC)
 _WARMUP = pd.DatetimeIndex(sessions_between(date(2015, 12, 1), date(2015, 12, 31)))
@@ -687,6 +688,7 @@ def test_uncounted_record_writes_a_valid_submission_folder(
     assert strategy["strategy"] == "strategy.py:Replay"
     assert strategy["data"]["params"]["path"] == "../data"
     assert strategy["params"]["universe"]["symbols"] == _UNIVERSE
+    validate_grading_block(strategy["grading"])
     assert "class Replay(TargetWeightsReplay):" in (trial / "strategy" / "strategy.py").read_text()
     assert (trial / "data").is_dir()
 
