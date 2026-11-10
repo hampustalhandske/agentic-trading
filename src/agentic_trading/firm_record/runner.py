@@ -25,8 +25,9 @@ The engine checkpoints every day to `store_dir / <spec hash>.checkpoint.sqlite`,
 beside the trial directory, so a pass stopped after `max_days`, or killed,
 resumes with the firm's state as it stood and ends with the rows of an
 unbroken pass; a resume runs only under the numerical libraries, quantcore
-commit, Python version and machine architecture its agentic_meta.json
-records. With `restart_above_rss_mb`, a pass also stops at the
+commit, Python version, machine architecture, BLAS thread settings and
+loaded BLAS libraries its agentic_meta.json records. With
+`restart_above_rss_mb`, a pass also stops at the
 next day boundary once the process's resident memory is above that many
 MB, after writing at least `restart_min_days` days, and its result says
 so (`paused_for_memory`), so its caller can resume it in a fresh
@@ -160,15 +161,17 @@ _RESTART_MIN_DAYS = 20
 
 # The `RuntimeEnvironment` fields a resume must share with the environment
 # its trial's agentic_meta.json records: the numerical libraries, the
-# quantcore commit, the interpreter, the machine architecture and the BLAS
-# and OpenMP thread settings. The OS release and the BLAS report are left
-# out, so a minor OS update does not block a resume.
+# quantcore commit, the interpreter, the machine architecture, the BLAS
+# and OpenMP thread settings and the BLAS libraries loaded, with their
+# versions. The OS release and numpy's BLAS build report are left out, so
+# a minor OS update that keeps the loaded BLAS does not block a resume.
 _RESUME_ENVIRONMENT_FIELDS = (
     "libraries",
     "quantcore_sha",
     "python_version",
     "platform_machine",
     "blas_threads",
+    "linked_blas",
 )
 
 
@@ -396,9 +399,10 @@ def run_firm_record(
     or engine checkpoint already holds days, raises `ValueError` before
     writing anything when the trial's agentic_meta.json records no
     environment, or one whose numerical libraries, quantcore commit,
-    Python version or machine architecture differ from
-    `runtime_environment()`; the OS release and the BLAS report may
-    differ, so a minor OS update does not block a resume.
+    Python version, machine architecture, BLAS thread settings or loaded
+    BLAS libraries differ from `runtime_environment()`; the OS release and
+    numpy's BLAS build report may differ, so a minor OS update that keeps
+    the loaded BLAS does not block a resume.
     `HoldoutReadError` and the store's refusals propagate with the day
     unwritten; a `LedgerError` from registering or recording propagates."""
     data_end = settings.stage_a.data_end
