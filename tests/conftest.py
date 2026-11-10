@@ -47,6 +47,8 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 _DEFAULT_SCRAPED_AT = "2020-01-01T00:00:00Z"
+# A log table's bookkeeping columns, never part of the tie order the lake serves.
+_LOG_BOOKKEEPING_COLUMNS = ("scraped_at", "dt", "table")
 
 
 def _utc_iso(value: Any) -> str:
@@ -70,8 +72,12 @@ class FakeLake:
     to the log only. A table added with `pin_column` (an append-only table
     with no `scraped_at`) gets no log; its pin is its own row-time column.
     `add_view` registers a view with no log. `describe`, `tables`, `status`
-    and `health` answer from that metadata (`kind`, `key_columns`,
-    `rebuilt_whole`); `last_write_overrides` replaces a table's `last_write`.
+    and `health` answer from that metadata (`kind`, `key_columns` and the
+    same list as `keys`, `rebuilt_whole`); `last_write_overrides` replaces a
+    table's `last_write`. A "current" table's `describe` serves the lake's
+    `tie_order`, its non-key columns in column order without `scraped_at`,
+    `dt` and `table`; `tie_order_overrides` replaces it, and an override of
+    `None` serves none.
     `sql` runs the query against the tables and exposes `version` as
     `last_version`. Setting `fixed_result` makes every query return that
     frame regardless of the SQL (for testing a loader's own guards against
@@ -89,6 +95,7 @@ class FakeLake:
         self.version = "fake-lake-1"
         self.last_version: str | None = None
         self.last_write_overrides: dict[str, str] = {}
+        self.tie_order_overrides: dict[str, list[str] | None] = {}
         self._meta: dict[str, dict[str, Any]] = {}
         self._date_columns: dict[str, tuple[str, ...]] = {}
 
@@ -205,8 +212,10 @@ class FakeLake:
             return {
                 "kind": "current",
                 "key_columns": [],
+                "keys": [],
                 "rebuilt_whole": False,
                 "last_write": None,
+                "tie_order": [],
             }
         last_write = self.last_write_overrides.get(table)
         source = f"max({meta['pin_column']})" if meta["pin_column"] else "max(scraped_at)"
@@ -216,12 +225,25 @@ class FakeLake:
             if newest is not None and newest[0] is not None:
                 rounded = datetime.fromtimestamp(math.ceil(newest[0]), UTC)
                 last_write = rounded.isoformat().replace("+00:00", "Z")
-        return {
+        described: dict[str, Any] = {
             "kind": meta["kind"],
             "key_columns": list(meta["key_columns"]),
+            "keys": list(meta["key_columns"]),
             "rebuilt_whole": meta["rebuilt_whole"],
             "last_write": last_write,
         }
+        if meta["kind"] == "current":
+            tie_order = self.tie_order_overrides.get(table, self._tie_order(table))
+            if tie_order is not None:
+                described["tie_order"] = list(tie_order)
+        return described
+
+    def _tie_order(self, table: str) -> list[str]:
+        """The tie order the lake serves for current table `table`: its columns other than
+        the key columns and the bookkeeping columns `scraped_at`, `dt` and `table`, in the
+        table's column order."""
+        excluded = {*self._meta[table]["key_columns"], *_LOG_BOOKKEEPING_COLUMNS}
+        return [column for column in self._columns(table) if column not in excluded]
 
     def tables(self, include_logs: bool = False) -> list[dict[str, Any]]:
         return [{"table": name, "kind": meta["kind"]} for name, meta in self._meta.items()]

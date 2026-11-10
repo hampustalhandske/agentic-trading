@@ -17,7 +17,8 @@ the table (`Lake.describe`, read once when the session opens):
 
 - a "current" table reads `<table>_log` filtered on `scraped_at <= T` and
   deduplicated on the table's key columns (the latest write at or before
-  T wins); the loader's own filters apply after that dedupe;
+  T wins, ties broken in the table's `tie_order`); the loader's own
+  filters apply after that dedupe;
 - an append-only table reads `<table>_log` filtered on `scraped_at <= T`
   with no dedupe, and `crypto_klines_1m`, which has no `scraped_at`, is
   filtered on its own row time `open_time <= T`;
@@ -233,8 +234,8 @@ class LakeTableMetadata(BaseModel):
     newest write the lake's status file records (rounded up to the second;
     it can lag the data; `None` when the lake reports no write), and
     `tie_order`, the columns that decide between a key's log rows written
-    at one `scraped_at` (`None` when the lake serves none; see
-    `_tie_order_sql`)."""
+    at one `scraped_at` (see `_tie_order_sql`; `None` when the lake serves
+    none, which a pinned read of a "current" table refuses)."""
 
     kind: str = "current"
     key_columns: list[str] = []
@@ -512,65 +513,46 @@ def _scraped_at_pin(lake_time: datetime) -> str:
     return f"scraped_at <= CAST('{lake_time.astimezone(UTC).isoformat()}' AS TIMESTAMPTZ)"
 
 
-# The lake's bookkeeping columns of a log table, never part of a tie order.
-_LOG_BOOKKEEPING_COLUMNS = ("scraped_at", "dt", "table")
+class MissingTieOrderError(LakeTimeError):
+    """A "current" table read inside a `lake_session` has no `tie_order` in
+    the metadata the lake serves for it (`/v1/tables/{table}`), so its log
+    cannot be deduplicated as of T in an order that never depends on how
+    the lake stores rows. The message names the table."""
 
 
-def _sql_string(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
-def _fallback_tie_columns_sql(key_columns: list[str], with_scraped_at: bool = False) -> str:
-    """A DuckDB `COLUMNS` selector, over a table's log, of the fallback tie
-    order of a table keyed on `key_columns`: every column of the log in the
-    order the lake reports them, except the keys and the bookkeeping
-    columns `scraped_at`, `dt` and `table`; `with_scraped_at` keeps
-    `scraped_at` at its place among them."""
-    excluded = ", ".join(
-        _sql_string(column) for column in [*key_columns, *_LOG_BOOKKEEPING_COLUMNS]
-    )
-    condition = f"c NOT IN ({excluded})"
-    if with_scraped_at:
-        condition = f"c = 'scraped_at' OR {condition}"
-    return f"COLUMNS(c -> {condition})"
-
-
-def _tie_order_sql(key_columns: list[str], tie_order: list[str] | None) -> str:
+def _tie_order_sql(tie_order: list[str]) -> str:
     """The `ORDER BY` terms, placed after `scraped_at DESC` in the dedupe
     of a table's log, that decide between log rows sharing a key and a
     `scraped_at` (the lake's own tie rule, LK-13): each column of
     `tie_order` in turn, ascending with nulls last, compared as stored.
-
     `tie_order` is the table's `tie_order` as `/v1/tables/{table}` serves
     it (lake contract v2, LK-119); the dedupe of `<table>_log` uses the
-    base table's. When the lake serves none (`None`), the order falls
-    back to the base table's non-key columns in the column order the lake
-    reports, without `scraped_at` and the bookkeeping columns `dt` and
-    `table` (`_fallback_tie_columns_sql`): for `instrument_prices`, keyed
-    on (`ticker`, `date`), that is `asset_class`, `open`, `high`, `low`,
-    `close`, `adj_close`, `volume`. The fallback is one term, a struct of
-    those columns in that order with `scraped_at` among them, which DuckDB
-    compares field by field with a null field after every value;
-    `scraped_at` is equal among tied rows, so it never decides, and it
-    keeps the struct from being empty for a table whose every column is a
-    key."""
-    if tie_order is not None:
-        return ", ".join(f"{_quote_identifier(column)} ASC NULLS LAST" for column in tie_order)
-    return f"row(*{_fallback_tie_columns_sql(key_columns, with_scraped_at=True)}) ASC NULLS LAST"
+    base table's. An empty `tie_order` (a table whose every column is a
+    key) gives no terms."""
+    return ", ".join(f"{_quote_identifier(column)} ASC NULLS LAST" for column in tie_order)
 
 
 def _deduplicated_log_sql(
-    table: str, key_columns: list[str], lake_time: datetime, tie_order: list[str] | None = None
+    table: str, key_columns: list[str], lake_time: datetime, tie_order: list[str] | None
 ) -> str:
     """`table` as it stood at `lake_time`: the rows of `<table>_log` with
     `scraped_at <= lake_time`, keeping one row per `key_columns`, the
     latest write; among rows of a key written at the same latest
     `scraped_at`, the first in `_tie_order_sql`'s order for `tie_order`.
-    The pick never depends on the order the lake stores rows in."""
+    The pick never depends on the order the lake stores rows in. Raises
+    `LakeTimeError` when `key_columns` is empty and `MissingTieOrderError`
+    when `tie_order` is `None`, each naming `table`."""
     if not key_columns:
         raise LakeTimeError(f"the lake reports no key columns for {table}; cannot read it as of T")
+    if tie_order is None:
+        raise MissingTieOrderError(
+            f"the lake serves no tie_order for current table {table}; cannot deduplicate its log "
+            "as of T"
+        )
     keys = ", ".join(_quote_identifier(column) for column in key_columns)
-    order = f"scraped_at DESC, {_tie_order_sql(key_columns, tie_order)}"
+    order = "scraped_at DESC"
+    if tie_order:
+        order += f", {_tie_order_sql(tie_order)}"
     return (
         "SELECT * EXCLUDE (_rn) FROM ("
         f"SELECT *, row_number() OVER (PARTITION BY {keys} ORDER BY {order}) AS _rn "
