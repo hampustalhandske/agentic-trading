@@ -373,6 +373,13 @@ _ALLOWED: dict[str, str] = {
         "keys unique: its only caller passes _log_return_series output, one row per date per "
         "security after the dedupe on (security_id, date)"
     ),
+    f"{_LOADER}:_fetch_security_bars:sql.asof_join#1": (
+        "keys unique: the factors are grouped to one row per (security_id, effective_date), "
+        "and a joined group with more than one cum_factor is refused"
+    ),
+    f"{_LOADER}:_refuse_factor_collisions:pandas.drop_duplicates#1": (
+        "drop_duplicates over all columns (security_id, factor_date): tied rows are identical"
+    ),
     f"{_LOADER}:_select_security_bars:pandas.drop_duplicates#1": (
         "ORDER BY security_id, date, raw_close (then open, volume when read): rows tied on "
         "these are equal in every column returned"
@@ -433,10 +440,6 @@ _ALLOWED: dict[str, str] = {
 # "<module>:<qualname>:<kind>#<n>": the issue tracking a pick whose result can depend on the order
 # tied rows arrive in, and what can tie.
 KNOWN_UNTIED: dict[str, str] = {
-    f"{_LOADER}:_fetch_security_bars:sql.asof_join#1": (
-        "AT-176: two equity_adjustment_factors rows of one security_id on one effective_date "
-        "tie for a bar"
-    ),
     f"{_LOADER}:load_sp500_member_count:pandas.sort_index#1": (
         "AT-176: two sp500_member_count rows of one date tie, in the lake's order"
     ),

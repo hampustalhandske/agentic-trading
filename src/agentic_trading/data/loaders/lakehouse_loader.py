@@ -1226,6 +1226,13 @@ class EmptyAdjustmentTableError(EmptyTableReadError):
     every price read through it would come back unadjusted."""
 
 
+class AdjustmentFactorCollisionError(RuntimeError):
+    """`equity_adjustment_factors` holds factor rows of one `security_id`
+    and `effective_date` with more than one `cum_factor` (a null counting
+    as one), so which factor prices a bar would depend on the lake's row
+    order."""
+
+
 def adjustment_table_row_count(table: AdjustmentTable) -> int:
     """The total row count of adjustment table `table`, from a `count(*)`
     query sent through `_query_table`, which returns no row for an empty
@@ -1447,7 +1454,9 @@ def _adjusted_security_bars(
     positive is left out. Each bar takes the `cum_factor` of the
     security's factor row with the smallest `effective_date` strictly
     after the bar's date (1.0 when there is none); bars and factors are
-    joined on `security_id`, never on ticker.
+    joined on `security_id`, never on ticker. Raises
+    `AdjustmentFactorCollisionError` when that row is not one
+    `cum_factor` (see `_fetch_security_bars`).
     Columns:
 
     - `security_id`, `date` (a `Timestamp`);
@@ -1513,6 +1522,13 @@ def _fetch_security_bars(
     `_adjusted_security_bars`), sorted by security, date, raw price, then
     (with `with_open_and_volume`) raw open and raw volume.
 
+    The factor rows of one `security_id` and `effective_date` count as one
+    row when they share one `cum_factor` (or are all null), whatever their
+    other columns. Raises `AdjustmentFactorCollisionError`, naming the
+    security and the date, when the rows joined to a bar hold more than
+    one `cum_factor`, a null counting as one; rows that price no bar in
+    the read are not checked.
+
     Only factor rows with `effective_date > start` are joined, which never
     changes the factor a bar in the range takes: that factor's
     `effective_date` is after the bar's date, so after `start`. A bar's
@@ -1533,7 +1549,8 @@ def _fetch_security_bars(
         SELECT bars.security_id, bars.date,
                bars.raw_close * COALESCE(factors.cum_factor, 1.0) AS close,
                bars.raw_close,{open_and_volume}
-               factors.effective_date AS factor_date
+               factors.effective_date AS factor_date,
+               factors.cum_factor_values
         FROM (
             SELECT security_id, date, {SECURITY_RAW_PRICE_SQL} AS raw_close{bar_columns}
             FROM {_table_sql("equity_daily_from_bars")}
@@ -1542,10 +1559,13 @@ def _fetch_security_bars(
               AND {SECURITY_RAW_PRICE_SQL} > 0
         ) AS bars
         ASOF LEFT JOIN (
-            SELECT security_id, effective_date, cum_factor
+            SELECT security_id, effective_date, min(cum_factor) AS cum_factor,
+                   count(DISTINCT cum_factor)
+                       + CAST(bool_or(cum_factor IS NULL) AS INTEGER) AS cum_factor_values
             FROM {_table_sql("equity_adjustment_factors")}
             WHERE security_id IN ({placeholders})
               AND effective_date > ?
+            GROUP BY security_id, effective_date
         ) AS factors
           ON factors.security_id = bars.security_id
          AND bars.date < factors.effective_date
@@ -1553,7 +1573,29 @@ def _fetch_security_bars(
     """
     ids = [int(security_id) for security_id in security_ids]
     params = [*ids, start.isoformat(), end.isoformat(), *ids, start.isoformat()]
-    return _split_by_key(_gated(_query(query, params), end, "date"), "security_id", ids)
+    frame = _query(query, params)
+    _refuse_factor_collisions(frame)
+    frame = frame.drop(columns="cum_factor_values")
+    return _split_by_key(_gated(frame, end, "date"), "security_id", ids)
+
+
+def _refuse_factor_collisions(frame: pd.DataFrame) -> None:
+    """Raises `AdjustmentFactorCollisionError` naming every
+    (`security_id`, `factor_date`) of a `_fetch_security_bars` read whose
+    joined factor rows hold more than one `cum_factor`
+    (`cum_factor_values` above 1)."""
+    collided = frame.loc[frame["cum_factor_values"].fillna(0) > 1, ["security_id", "factor_date"]]
+    if collided.empty:
+        return
+    pairs = ", ".join(
+        f"security_id {int(security_id)} on {pd.Timestamp(day).date().isoformat()}"
+        for security_id, day in collided.drop_duplicates().itertuples(index=False)
+    )
+    raise AdjustmentFactorCollisionError(
+        f"equity_adjustment_factors holds more than one cum_factor for one security_id and "
+        f"effective_date: {pairs}; the factor pricing those bars would depend on the lake's "
+        "row order"
+    )
 
 
 # Adjusted security bars without and with the bars' open and volume.
