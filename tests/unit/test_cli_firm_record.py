@@ -6,7 +6,9 @@ prices aligned on `stage_a.session_calendar` with the stage (a) warm-up inside o
 session cut at `stage_a.data_end`, runs `run_firm_record` and prints its result, which holds no
 performance figure."""
 
+import importlib.util
 import inspect
+import shutil
 import sys
 import tomllib
 from collections.abc import Callable, Iterator
@@ -22,10 +24,13 @@ from click.testing import Result
 from typer.testing import CliRunner
 
 from agentic_trading import cli
+from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.roster import (
     FIRM_V1_EQUITY_SECURITY_IDS,
     FIRM_V1_EXCLUDED_ANALYST_IDS,
     FIRM_V1_UNIVERSE,
+    build_default_analysts,
+    build_default_managers,
 )
 from agentic_trading.agents.schemas import ShortWarmup
 from agentic_trading.backtest.preflight import (
@@ -35,10 +40,13 @@ from agentic_trading.backtest.preflight import (
 )
 from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.cli import firm_record_app
-from agentic_trading.config import settings
+from agentic_trading.config import settings, temporary_overrides
 from agentic_trading.data.loader import load_price_history_with_fallback
 from agentic_trading.data.loaders import lakehouse_loader as ll
 from agentic_trading.firm_record.runner import FirmRecordResult, run_firm_record
+from agentic_trading.firm_record.spec import build_firm_spec
+from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
+from agentic_trading.stage_a.spec import FirmSpecRecord, firm_spec_hash
 from agentic_trading.trials.ledger import TrialLedger
 
 runner = CliRunner()
@@ -185,7 +193,10 @@ def test_pass_paused_for_memory_restarts_pinned(
     )
     args = [*_ARGS, "--store-dir", str(tmp_path), "--restart-above-rss-mb", "1500"]
     args += [] if max_days is None else ["--max-days", max_days]
-    with patch("agentic_trading.cli._restart_record") as restart:
+    with (
+        patch("agentic_trading.cli._require_unchanged_source"),
+        patch("agentic_trading.cli._restart_record") as restart,
+    ):
         result, _, _, record = _invoke(args, record_result=paused)
 
     assert result.exit_code == 0, result.output
@@ -203,7 +214,10 @@ def test_restart_pins_the_lake_time_the_session_read(tmp_path: Path, preflight_l
         update={"days_written": 3, "complete": False, "paused_for_memory": True}
     )
     args = ["--start", "2010-01-04", "--end", "2010-01-05", "--store-dir", str(tmp_path)]
-    with patch("agentic_trading.cli._restart_record") as restart:
+    with (
+        patch("agentic_trading.cli._require_unchanged_source"),
+        patch("agentic_trading.cli._restart_record") as restart,
+    ):
         result, _, _, record = _invoke(args, record_result=paused)
 
     assert result.exit_code == 0, result.output
@@ -343,3 +357,278 @@ def test_firm_record_passes_the_policy_rates(
     assert window.start <= date(2010, 1, 4) - timedelta(days=ll.POLICY_RATE_LOOKBACK_DAYS)
     assert window.end == date(2010, 1, 5)
     assert _bound(run_firm_record, record)["inputs"].policy_rates is _POLICY_RATES
+
+
+_PROBE_MODULE = "agentic_trading._restart_source_probe"
+
+
+def _paused_trial(store_dir: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Any]:
+    """Loads a probe `agentic_trading` module from a file under `store_dir`, writes the
+    spec.json of the registered firm's trial (built as the command builds it, the probe among
+    its loaded modules) under `store_dir`, and returns the probe's source file and a result of
+    that trial paused for memory."""
+    probe = store_dir / "probe_source" / "probe.py"
+    probe.parent.mkdir()
+    probe.write_text("VALUE = 1\n")
+    found = importlib.util.spec_from_file_location(_PROBE_MODULE, probe)
+    assert found is not None
+    monkeypatch.setitem(sys.modules, _PROBE_MODULE, importlib.util.module_from_spec(found))
+    analysts = build_default_analysts(excluded_analyst_ids=FIRM_V1_EXCLUDED_ANALYST_IDS)
+    commander = Commander(
+        managers=build_default_managers(analysts), weighting_strategy=ShrinkageWeight(Hedge())
+    )
+    spec = build_firm_spec(
+        commander,
+        list(FIRM_V1_UNIVERSE),
+        date(2010, 1, 4),
+        date(2010, 1, 5),
+        datetime.fromisoformat("2026-11-06T00:00:00+00:00"),
+    )
+    record = FirmSpecRecord(
+        spec=spec,
+        spec_hash=firm_spec_hash(spec),
+        lake_time=spec.lake_time,
+        lake_version="v",
+        quantcore_version="q",
+    )
+    assert _PROBE_MODULE in spec.module_hashes
+    trial_dir = store_dir / record.spec_hash
+    trial_dir.mkdir()
+    (trial_dir / "spec.json").write_text(record.model_dump_json())
+    paused = _RESULT.model_copy(
+        update={
+            "spec_hash": record.spec_hash,
+            "days_written": 3,
+            "complete": False,
+            "paused_for_memory": True,
+        }
+    )
+    return probe, paused
+
+
+def test_restart_proceeds_while_the_source_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preflight_lake: Any
+) -> None:
+    """A pass paused for memory restarts when the source on disk still gives the running
+    trial's spec hash."""
+    _, paused = _paused_trial(tmp_path, monkeypatch)
+    with patch("agentic_trading.cli._restart_record") as restart:
+        result, _, _, _ = _invoke([*_ARGS, "--store-dir", str(tmp_path)], record_result=paused)
+
+    assert result.exit_code == 0, result.output
+    restart.assert_called_once()
+
+
+def test_restart_refuses_when_a_module_changed_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preflight_lake: Any
+) -> None:
+    """A module whose file changed on disk since the pass began, though its loaded code did
+    not, would give the restarted process another spec hash, so the restart is refused."""
+    probe, paused = _paused_trial(tmp_path, monkeypatch)
+    probe.write_text("VALUE = 2\n")
+    with patch("agentic_trading.cli._restart_record") as restart:
+        result, _, _, _ = _invoke([*_ARGS, "--store-dir", str(tmp_path)], record_result=paused)
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, RuntimeError)
+    assert _PROBE_MODULE in str(result.exception)
+    assert paused.spec_hash in str(result.exception)
+    restart.assert_not_called()
+
+
+def test_restart_refuses_without_the_running_trials_spec(
+    tmp_path: Path, preflight_lake: Any
+) -> None:
+    """A pass paused for memory whose trial has no readable spec.json under --store-dir is not
+    restarted."""
+    paused = _RESULT.model_copy(
+        update={"days_written": 3, "complete": False, "paused_for_memory": True}
+    )
+    with patch("agentic_trading.cli._restart_record") as restart:
+        result, _, _, _ = _invoke([*_ARGS, "--store-dir", str(tmp_path)], record_result=paused)
+
+    assert isinstance(result.exception, RuntimeError)
+    assert "spec.json" in str(result.exception)
+    restart.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("value", "exit_code"),
+    [((settings.stage_a.data_end + timedelta(days=1)).isoformat(), 2), ("2010-06-30", 0)],
+)
+def test_set_cannot_move_data_end_past_the_holdout(
+    tmp_path: Path, value: str, exit_code: int, preflight_lake: Any
+) -> None:
+    """--set stage_a.data_end later than the locked holdout cut is a usage error before any
+    read; an earlier cut is accepted and the record runs."""
+    args = [*_ARGS, "--store-dir", str(tmp_path), "--set", f"stage_a.data_end={value}"]
+    with temporary_overrides({"stage_a.data_end": settings.stage_a.data_end}):
+        result, load, _, record = _invoke(args)
+
+    assert result.exit_code == exit_code, result.output
+    assert load.called is (exit_code == 0)
+    assert record.called is (exit_code == 0)
+
+
+_ON_AC = (
+    "Now drawing from 'AC Power'\n"
+    " -InternalBattery-0 (id=20447331)\t62%; charging; 2:14 remaining present: true\n"
+)
+_ON_BATTERY = (
+    "Now drawing from 'Battery Power'\n"
+    " -InternalBattery-0 (id=20447331)\t80%; discharging; 5:10 remaining present: true\n"
+)
+
+
+def _power_settings(low_power_mode: int) -> str:
+    """`pmset -g` output with Low Power Mode at `low_power_mode`."""
+    return (
+        "System-wide power settings:\nCurrently in use:\n standby              1\n"
+        f" lowpowermode         {low_power_mode}\n womp                 1\n"
+    )
+
+
+# The real power reader, kept before `tests/conftest.py` stubs it for each test.
+_READ_POWER_STATE = getattr(cli, "read_power_state", None)
+
+
+@pytest.fixture
+def pmset(monkeypatch: pytest.MonkeyPatch) -> Callable[[str | None, str | None], None]:
+    """Restores the real power reader over a stubbed `pmset`: `pmset -g batt` prints the first
+    argument and `pmset -g` the second; `None` for both is a host without pmset."""
+
+    def stub(battery_report: str | None, power_settings: str | None) -> None:
+        outputs = {("-g", "batt"): battery_report, ("-g",): power_settings}
+        monkeypatch.setattr(cli, "read_power_state", _READ_POWER_STATE, raising=False)
+        monkeypatch.setattr(cli, "_run_pmset", lambda *args: outputs[args], raising=False)
+
+    return stub
+
+
+@pytest.mark.parametrize(
+    ("battery_report", "power_settings", "extra", "refused"),
+    [
+        (_ON_BATTERY, _power_settings(0), [], True),
+        (_ON_AC, _power_settings(1), [], True),
+        ("no power source here\n", _power_settings(0), [], True),
+        (_ON_AC, "System-wide power settings:\n standby 1\n", [], True),
+        (_ON_AC, _power_settings(0), [], False),
+        (None, None, [], False),
+        (_ON_BATTERY, _power_settings(1), ["--allow-battery"], False),
+    ],
+    ids=[
+        "battery",
+        "low-power",
+        "unparseable-source",
+        "no-low-power-line",
+        "ac",
+        "no-pmset",
+        "allow-battery",
+    ],
+)
+def test_power_preflight(
+    tmp_path: Path,
+    pmset: Callable[[str | None, str | None], None],
+    battery_report: str | None,
+    power_settings: str | None,
+    extra: list[str],
+    refused: bool,
+    preflight_lake: Any,
+) -> None:
+    """The record refuses to start on battery, in Low Power Mode or on pmset output it cannot
+    read, naming --allow-battery and reading nothing; on AC power, on a host without pmset or
+    with --allow-battery it runs."""
+    pmset(battery_report, power_settings)
+    result, load, _, record = _invoke([*_ARGS, "--store-dir", str(tmp_path), *extra])
+
+    if refused:
+        assert result.exit_code == 1, result.output
+        assert "--allow-battery" in result.output
+        load.assert_not_called()
+        record.assert_not_called()
+    else:
+        assert result.exit_code == 0, result.output
+        record.assert_called_once()
+
+
+def test_power_preflight_refuses_when_pmset_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preflight_lake: Any
+) -> None:
+    """An installed pmset that exits non-zero refuses the record."""
+    monkeypatch.setattr(cli, "read_power_state", _READ_POWER_STATE, raising=False)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    failed = MagicMock(return_value=MagicMock(returncode=1, stdout="", stderr="pmset: boom"))
+    monkeypatch.setattr(cli.subprocess, "run", failed)
+    result, _, _, record = _invoke([*_ARGS, "--store-dir", str(tmp_path)])
+
+    assert result.exit_code == 1, result.output
+    assert "pmset: boom" in result.output
+    record.assert_not_called()
+
+
+def test_run_pmset_without_pmset_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Where pmset is not installed (Linux, CI) there is no output to read, and nothing runs."""
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: None)
+    ran = MagicMock()
+    monkeypatch.setattr(cli.subprocess, "run", ran)
+
+    assert cli._run_pmset("-g", "batt") is None
+    ran.assert_not_called()
+
+
+_PACKAGE_DIR = Path(cli.__file__).resolve().parent
+
+
+@pytest.mark.parametrize(
+    ("change", "named"),
+    [
+        (None, None),
+        (lambda package: (package / "planted.py").write_text("VALUE = 1\n"), "planted.py"),
+        (
+            lambda package: (package / "cli.py").write_text(
+                (package / "cli.py").read_text() + "\nimport agentic_trading.planted\n"
+            ),
+            "cli.py",
+        ),
+        (lambda package: (package / "gui" / "dashboard.py").unlink(), "dashboard.py"),
+    ],
+    ids=["unchanged", "added", "cli-edited", "removed"],
+)
+def test_restart_refuses_when_a_package_file_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: Callable[[Path], Any] | None,
+    named: str | None,
+    preflight_lake: Any,
+) -> None:
+    """A .py file under the package added, edited (cli.py among them, which the spec does not
+    hash) or removed between the command's start and a restart refuses the restart, naming the
+    file; an unchanged package restarts. The package is a copy, changed during the pass."""
+    package = tmp_path / "package" / "agentic_trading"
+    shutil.copytree(_PACKAGE_DIR, package, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(cli, "_PACKAGE_DIR", package, raising=False)
+
+    def coverage(*_args: Any, **_kwargs: Any) -> list[PriceCoverage]:
+        if change is not None:
+            change(package)
+        return []
+
+    paused = _RESULT.model_copy(
+        update={"days_written": 3, "complete": False, "paused_for_memory": True}
+    )
+    store = tmp_path / "store"
+    with (
+        patch("agentic_trading.cli._require_unchanged_source"),
+        patch("agentic_trading.cli._restart_record") as restart,
+    ):
+        result, _, _, _ = _invoke(
+            [*_ARGS, "--store-dir", str(store)], MagicMock(side_effect=coverage), paused
+        )
+
+    if named is None:
+        assert result.exit_code == 0, result.output
+        restart.assert_called_once()
+    else:
+        assert isinstance(result.exception, RuntimeError), result.output
+        assert named in str(result.exception)
+        restart.assert_not_called()

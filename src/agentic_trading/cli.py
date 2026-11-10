@@ -1,8 +1,12 @@
 # cli.py
 
+import hashlib
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import sys
 from datetime import date, datetime, timedelta
 from importlib import metadata
@@ -10,6 +14,7 @@ from pathlib import Path
 from typing import cast, get_args
 
 import typer
+from pydantic import BaseModel, ConfigDict
 
 from agentic_trading import provenance
 from agentic_trading.agents.base import AnalystAgent
@@ -30,6 +35,7 @@ from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystC
 from agentic_trading.backtest.engine import BacktestEngine, CommanderLike
 from agentic_trading.backtest.engine_inputs import load_engine_inputs
 from agentic_trading.backtest.preflight import check_data_availability, check_price_coverage
+from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.config import apply_overrides, parse_override, settings
 from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
@@ -55,11 +61,18 @@ from agentic_trading.data.ticker_catalog import (
     tickers_by_asset_class,
 )
 from agentic_trading.firm_record.runner import run_firm_record
+from agentic_trading.firm_record.spec import _HASHED_ROOTS
 from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.provenance import build_run_provenance
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
 from agentic_trading.stage_a.runner import EXCLUDED_ANALYSTS, run_batch
+from agentic_trading.stage_a.spec import (
+    FirmSpecRecord,
+    _module_hashes,
+    _package_source,
+    firm_spec_hash,
+)
 from agentic_trading.stage_a.store import InstrumentKind
 from agentic_trading.trials.ledger import TrialLedger
 
@@ -894,6 +907,9 @@ def experiment(
 # The repository root; a stage (a) store must lie outside it, and the trial
 # ledger's relative paths are resolved against it.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+# The `agentic_trading` package directory whose source files a firm record's
+# restart requires unchanged (`_package_sources`).
+_PACKAGE_DIR = Path(__file__).resolve().parent
 
 # Exit code of `agentic-trading-stage-a` when the batch stopped for resources.
 _EXIT_STOPPED_FOR_RESOURCES = 3
@@ -902,6 +918,105 @@ _EXIT_STOPPED_FOR_RESOURCES = 3
 # record is projected to reach, and well below the 16 GB of the machine it
 # runs on. A fresh process resumed from the checkpoint starts near 0.8 GB.
 _FIRM_RECORD_RESTART_RSS_MB = 4096
+# Seconds `pmset` may take before the firm record's power preflight gives up
+# on it and refuses: it answers in well under a second.
+_PMSET_TIMEOUT_SECONDS = 10.0
+# The `pmset -g batt` power source the firm record runs on without
+# --allow-battery: on battery and in Low Power Mode a record runs about 1.6x
+# slower (AT-170).
+_MAINS_POWER_SOURCE = "AC Power"
+
+
+class PowerState(BaseModel):
+    """The Mac's power as `pmset` reports it: `source`, the name in the
+    `Now drawing from '<source>'` line of `pmset -g batt` ('AC Power',
+    'Battery Power', 'UPS Power'), and `low_power_mode`, whether the
+    `lowpowermode` setting of `pmset -g` is 1."""
+
+    model_config = ConfigDict(frozen=True)
+
+    source: str
+    low_power_mode: bool
+
+
+class PowerCheckError(RuntimeError):
+    """`pmset` is installed but failed, or its output could not be read."""
+
+
+def _run_pmset(*args: str) -> str | None:
+    """The standard output of `pmset <args>`, or `None` when `pmset` is not
+    on the PATH (Linux, CI). Raises `PowerCheckError` when it cannot be
+    run, exits non-zero or takes longer than `_PMSET_TIMEOUT_SECONDS`."""
+    if shutil.which("pmset") is None:
+        return None
+    command = ["pmset", *args]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=_PMSET_TIMEOUT_SECONDS, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PowerCheckError(f"{' '.join(command)} failed: {exc}") from exc
+    if completed.returncode != 0:
+        raise PowerCheckError(
+            f"{' '.join(command)} exited {completed.returncode}: {completed.stderr.strip()}"
+        )
+    return str(completed.stdout)
+
+
+def parse_power_state(battery_report: str, power_settings: str) -> PowerState:
+    """The `PowerState` in `battery_report` (the output of `pmset -g batt`)
+    and `power_settings` (the output of `pmset -g`). Raises
+    `PowerCheckError` when the first has no `Now drawing from '<source>'`
+    line or the second no `lowpowermode 0` or `lowpowermode 1` line."""
+    source = re.search(r"Now drawing from '([^']+)'", battery_report)
+    if source is None:
+        raise PowerCheckError(f"pmset -g batt names no power source: {battery_report!r}")
+    low_power = re.search(r"^\s*lowpowermode\s+([01])\s*$", power_settings, re.MULTILINE)
+    if low_power is None:
+        raise PowerCheckError(f"pmset -g reports no lowpowermode setting: {power_settings!r}")
+    return PowerState(source=source.group(1), low_power_mode=low_power.group(1) == "1")
+
+
+def read_power_state() -> PowerState | None:
+    """This machine's `PowerState`, read from `pmset -g batt` and `pmset -g`
+    (`_run_pmset`, `parse_power_state`); `None` when `pmset` is not
+    installed, as on Linux and in CI, where there is nothing to check.
+    Raises `PowerCheckError` when `pmset` fails or its output cannot be
+    read."""
+    battery_report = _run_pmset("-g", "batt")
+    power_settings = _run_pmset("-g")
+    if battery_report is None or power_settings is None:
+        return None
+    return parse_power_state(battery_report, power_settings)
+
+
+def _require_mains_power(allow_battery: bool) -> None:
+    """Exits with code 1, saying why, unless `allow_battery` or this machine
+    draws from `_MAINS_POWER_SOURCE` with Low Power Mode off
+    (`read_power_state`). A machine without `pmset` passes; a `pmset` that
+    fails or prints what cannot be read refuses."""
+    if allow_battery:
+        return
+    try:
+        state = read_power_state()
+    except PowerCheckError as exc:
+        typer.echo(
+            f"Refusing to start the firm record: the power source cannot be checked ({exc}). "
+            "Pass --allow-battery to run anyway.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    if state is None:
+        return
+    if state.source != _MAINS_POWER_SOURCE or state.low_power_mode:
+        typer.echo(
+            f"Refusing to start the firm record: the Mac draws from {state.source!r} with Low "
+            f"Power Mode {'on' if state.low_power_mode else 'off'}; it needs "
+            f"{_MAINS_POWER_SOURCE!r} with Low Power Mode off. Pass --allow-battery to run "
+            "anyway.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
 
 def _stage_a_analysts(agent_ids: list[str]) -> list[AnalystAgent]:
@@ -1126,6 +1241,12 @@ def firm_record(
         "boundary and resume from the checkpoint in a fresh process; 0 never restarts. Not "
         "part of the spec.",
     ),
+    allow_battery: bool = typer.Option(
+        False,
+        "--allow-battery",
+        help="Start even when the Mac draws from battery, is in Low Power Mode or its power "
+        "cannot be checked; not part of the spec.",
+    ),
 ) -> None:
     """Record the registered firm (agentic-firm-v1) from --start to --end:
     the Commander's daily pod targets written as a `decision_file.v1` trial
@@ -1166,11 +1287,21 @@ def firm_record(
     --restart-above-rss-mb, the command then replaces its process with the
     same command line (`_restart_record`), pinned to the lake time it read
     and, with --max-days, to the days still allowed, so the record resumes
-    from its checkpoint in a fresh process under the same pid. Exits 2
+    from its checkpoint in a fresh process under the same pid. It raises
+    `RuntimeError` instead when the source on disk no longer gives the
+    running trial's spec hash (`_require_unchanged_source`). Exits 2
     on a usage error: a reversed window, one ending after
     stage_a.data_end, a --store-dir inside the repository, a naive
     --lake-time or a bad --set. `--set` overrides apply before any setting
-    is read."""
+    is read. The sha256 of every .py file under the package directory
+    is taken when the command starts, and a restart raises `RuntimeError`
+    when any has changed, been added or been removed since
+    (`_require_unchanged_package`). After the usage checks and before anything is read, exits 1
+    without --allow-battery when the Mac draws from battery, is in Low
+    Power Mode, or `pmset` fails or prints what cannot be read
+    (`_require_mains_power`); a machine without `pmset` passes. A restart
+    runs the same check."""
+    started_sources = _package_sources()
     _apply_cli_overrides(set_override)
     requested_lake_time = _parse_lake_time_flag(lake_time)
     data_end = settings.stage_a.data_end
@@ -1190,6 +1321,7 @@ def firm_record(
             f"{store_dir} is inside the repository; give a directory outside it.",
             param_hint="--store-dir",
         )
+    _require_mains_power(allow_battery)
     analysts = build_default_analysts(excluded_analyst_ids=FIRM_V1_EXCLUDED_ANALYST_IDS)
     commander = Commander(
         managers=build_default_managers(analysts),
@@ -1268,7 +1400,101 @@ def firm_record(
             result.days_written,
             result.last_completed,
         )
+        _require_unchanged_source(store_dir, result.spec_hash, commander)
+        _require_unchanged_package(started_sources)
         _restart_record(extra)
+
+
+def _package_sources() -> dict[str, str]:
+    """Each .py file under `_PACKAGE_DIR`, `__pycache__` aside, by its
+    POSIX path relative to that directory, to the sha256 hex digest of its
+    bytes on disk, sorted by path. Every file counts, the command line and
+    the dashboard included, since a restarted process runs whatever is on
+    disk."""
+    sources: dict[str, str] = {}
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        relative = path.relative_to(_PACKAGE_DIR).as_posix()
+        sources[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return sources
+
+
+def _require_unchanged_package(started: dict[str, str]) -> None:
+    """Raises `RuntimeError` naming the changed, added and removed files
+    when `_package_sources()` now differs from `started`, the sources the
+    command started with: a restarted process would run other code."""
+    now = _package_sources()
+    changed = sorted(name for name in set(started) & set(now) if started[name] != now[name])
+    added = sorted(set(now) - set(started))
+    removed = sorted(set(started) - set(now))
+    if changed or added or removed:
+        raise RuntimeError(
+            f"the firm record cannot restart: the package source under {_PACKAGE_DIR} changed "
+            f"since the command started (changed: {changed}, added: {added}, "
+            f"removed: {removed})"
+        )
+
+
+def _on_disk_module_hashes(names: list[str], commander: Commander) -> dict[str, str]:
+    """Dotted module name to the sha256 hex digest of its source file as
+    it is on disk now, for each of `names` and for every module
+    `firm_record.spec.build_firm_spec` hashes from `commander`'s agents'
+    modules and `firm_record.spec._HASHED_ROOTS` (`stage_a.spec._module_hashes`,
+    which parses source without importing it). A loaded module's file is
+    its `__file__`, any other's is found under the package directory. A
+    name whose file is gone is left out. Raises `RuntimeError` when a root
+    module's source cannot be read."""
+    hashes: dict[str, str] = {}
+    for name in names:
+        file = getattr(sys.modules.get(name), "__file__", None)
+        path = Path(file) if file is not None else _package_source(name)
+        if path is None or not path.is_file():
+            continue
+        hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    roots = {type(agent).__module__ for agent in roster_agents(commander)} | set(_HASHED_ROOTS)
+    for root in sorted(roots):
+        try:
+            hashes.update(_module_hashes(root))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"cannot read the source of {root}: {exc}") from exc
+    return dict(sorted(hashes.items()))
+
+
+def _require_unchanged_source(store_dir: Path, spec_hash: str, commander: Commander) -> None:
+    """Raises `RuntimeError` unless the source on disk gives the running
+    trial `spec_hash` the same spec hash: a restarted process hashes the
+    files on disk, so changed source would start it on another trial. The
+    running trial's spec is read from `store_dir / spec_hash / spec.json`;
+    its module hashes are recomputed from disk (`_on_disk_module_hashes`)
+    over the modules it records and those `commander` and the record's
+    roots reach, and the spec is hashed again with them. Also raises when
+    that spec.json is missing, unreadable or of another trial."""
+    spec_path = store_dir / spec_hash / "spec.json"
+    try:
+        record = FirmSpecRecord.model_validate_json(spec_path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"the firm record cannot restart: the running trial's {spec_path} "
+            f"cannot be read ({exc})"
+        ) from exc
+    if record.spec_hash != spec_hash:
+        raise RuntimeError(
+            f"the firm record cannot restart: {spec_path} holds trial {record.spec_hash}, "
+            f"not the running trial {spec_hash}"
+        )
+    recorded = record.spec.module_hashes
+    on_disk = _on_disk_module_hashes(list(recorded), commander)
+    on_disk_hash = firm_spec_hash(record.spec.model_copy(update={"module_hashes": on_disk}))
+    if on_disk_hash != spec_hash:
+        changed = sorted(
+            name for name in set(recorded) | set(on_disk) if recorded.get(name) != on_disk.get(name)
+        )
+        raise RuntimeError(
+            f"the firm record cannot restart: the source on disk gives spec hash "
+            f"{on_disk_hash}, not the running trial's {spec_hash}, so a restart would start "
+            f"another trial; changed since the pass began: {', '.join(changed)}"
+        )
 
 
 def _restart_record(extra_args: list[str]) -> None:
