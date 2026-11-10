@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -1171,6 +1171,29 @@ class BacktestEngine:
                     # bar) leaves shares and cash as they are and records
                     # no trade; the signals are still scored on the day's
                     # close-to-close return, as for an unmarked option.
+                    # Spot FX trades through the night, so with a one-day
+                    # lag its order fills at the previous session's close
+                    # instead, when that close is usable.
+                    fill_basis: Literal["open", "prev_close"] = "open"
+                    if (
+                        not (math.isfinite(fill_price) and fill_price > 0.0)
+                        and self.execution_lag_days
+                        and currency_pair(decision.asset) is not None
+                    ):
+                        previous_close = _previous_session_close(
+                            raw_market_data, decision.asset, as_of_timestamp
+                        )
+                        if previous_close is not None:
+                            logger.info(
+                                "Day %s: %s open unusable (got %s) — filled at the "
+                                "previous session close %s.",
+                                as_of_timestamp.date().isoformat(),
+                                decision.asset,
+                                fill_price,
+                                previous_close,
+                            )
+                            fill_price = previous_close
+                            fill_basis = "prev_close"
                     if math.isfinite(fill_price) and fill_price > 0.0:
                         adv_shares, daily_vol = _liquidity_inputs(
                             raw_market_data, decision.asset, as_of_timestamp
@@ -1182,6 +1205,10 @@ class BacktestEngine:
                             adv_shares=adv_shares,
                             daily_vol=daily_vol,
                         )
+                        if fill_basis != "open":
+                            equity_trade = equity_trade.model_copy(
+                                update={"fill_basis": fill_basis}
+                            )
                         trade_log.append(equity_trade)
                         _charge_fill(day_pod_costs, equity_trade, fill_deltas)
                     else:
@@ -1498,6 +1525,27 @@ def _holding_shares(
             if weight != 0.0:
                 shares.setdefault(asset, {})[pod_id] = abs(weight)
     return shares
+
+
+def _previous_session_close(
+    raw_market_data: pd.DataFrame, asset: str, as_of_date: pd.Timestamp
+) -> float | None:
+    """`asset`'s close on the session before `as_of_date` in the run's
+    frame (the row just before it), when that close is finite and
+    positive; `None` when it is not, or when `as_of_date` is the frame's
+    first session or not in it. An older close is never used."""
+    if as_of_date not in raw_market_data.index:
+        return None
+    position = raw_market_data.index.get_loc(as_of_date)
+    if not isinstance(position, int) or position == 0:
+        return None
+    column: str | tuple[str, str] = (
+        (asset, "close") if isinstance(raw_market_data.columns, pd.MultiIndex) else "close"
+    )
+    if column not in raw_market_data.columns:
+        return None
+    close = float(cast(float, raw_market_data[column].iloc[position - 1]))
+    return close if math.isfinite(close) and close > 0.0 else None
 
 
 def _valuation_prices(
