@@ -8,6 +8,7 @@ performance figure."""
 
 import importlib.util
 import inspect
+import shutil
 import sys
 import tomllib
 from collections.abc import Callable, Iterator
@@ -573,3 +574,61 @@ def test_run_pmset_without_pmset_is_none(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert cli._run_pmset("-g", "batt") is None
     ran.assert_not_called()
+
+
+_PACKAGE_DIR = Path(cli.__file__).resolve().parent
+
+
+@pytest.mark.parametrize(
+    ("change", "named"),
+    [
+        (None, None),
+        (lambda package: (package / "planted.py").write_text("VALUE = 1\n"), "planted.py"),
+        (
+            lambda package: (package / "cli.py").write_text(
+                (package / "cli.py").read_text() + "\nimport agentic_trading.planted\n"
+            ),
+            "cli.py",
+        ),
+        (lambda package: (package / "gui" / "dashboard.py").unlink(), "dashboard.py"),
+    ],
+    ids=["unchanged", "added", "cli-edited", "removed"],
+)
+def test_restart_refuses_when_a_package_file_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: Callable[[Path], Any] | None,
+    named: str | None,
+    preflight_lake: Any,
+) -> None:
+    """A .py file under the package added, edited (cli.py among them, which the spec does not
+    hash) or removed between the command's start and a restart refuses the restart, naming the
+    file; an unchanged package restarts. The package is a copy, changed during the pass."""
+    package = tmp_path / "package" / "agentic_trading"
+    shutil.copytree(_PACKAGE_DIR, package, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(cli, "_PACKAGE_DIR", package, raising=False)
+
+    def coverage(*_args: Any, **_kwargs: Any) -> list[PriceCoverage]:
+        if change is not None:
+            change(package)
+        return []
+
+    paused = _RESULT.model_copy(
+        update={"days_written": 3, "complete": False, "paused_for_memory": True}
+    )
+    store = tmp_path / "store"
+    with (
+        patch("agentic_trading.cli._require_unchanged_source"),
+        patch("agentic_trading.cli._restart_record") as restart,
+    ):
+        result, _, _, _ = _invoke(
+            [*_ARGS, "--store-dir", str(store)], MagicMock(side_effect=coverage), paused
+        )
+
+    if named is None:
+        assert result.exit_code == 0, result.output
+        restart.assert_called_once()
+    else:
+        assert isinstance(result.exception, RuntimeError), result.output
+        assert named in str(result.exception)
+        restart.assert_not_called()

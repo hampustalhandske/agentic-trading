@@ -907,6 +907,9 @@ def experiment(
 # The repository root; a stage (a) store must lie outside it, and the trial
 # ledger's relative paths are resolved against it.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+# The `agentic_trading` package directory whose source files a firm record's
+# restart requires unchanged (`_package_sources`).
+_PACKAGE_DIR = Path(__file__).resolve().parent
 
 # Exit code of `agentic-trading-stage-a` when the batch stopped for resources.
 _EXIT_STOPPED_FOR_RESOURCES = 3
@@ -1290,11 +1293,15 @@ def firm_record(
     on a usage error: a reversed window, one ending after
     stage_a.data_end, a --store-dir inside the repository, a naive
     --lake-time or a bad --set. `--set` overrides apply before any setting
-    is read. After the usage checks and before anything is read, exits 1
+    is read. The sha256 of every .py file under the package directory
+    is taken when the command starts, and a restart raises `RuntimeError`
+    when any has changed, been added or been removed since
+    (`_require_unchanged_package`). After the usage checks and before anything is read, exits 1
     without --allow-battery when the Mac draws from battery, is in Low
     Power Mode, or `pmset` fails or prints what cannot be read
     (`_require_mains_power`); a machine without `pmset` passes. A restart
     runs the same check."""
+    started_sources = _package_sources()
     _apply_cli_overrides(set_override)
     requested_lake_time = _parse_lake_time_flag(lake_time)
     data_end = settings.stage_a.data_end
@@ -1394,7 +1401,39 @@ def firm_record(
             result.last_completed,
         )
         _require_unchanged_source(store_dir, result.spec_hash, commander)
+        _require_unchanged_package(started_sources)
         _restart_record(extra)
+
+
+def _package_sources() -> dict[str, str]:
+    """Each .py file under `_PACKAGE_DIR`, `__pycache__` aside, by its
+    POSIX path relative to that directory, to the sha256 hex digest of its
+    bytes on disk, sorted by path. Every file counts, the command line and
+    the dashboard included, since a restarted process runs whatever is on
+    disk."""
+    sources: dict[str, str] = {}
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        relative = path.relative_to(_PACKAGE_DIR).as_posix()
+        sources[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return sources
+
+
+def _require_unchanged_package(started: dict[str, str]) -> None:
+    """Raises `RuntimeError` naming the changed, added and removed files
+    when `_package_sources()` now differs from `started`, the sources the
+    command started with: a restarted process would run other code."""
+    now = _package_sources()
+    changed = sorted(name for name in set(started) & set(now) if started[name] != now[name])
+    added = sorted(set(now) - set(started))
+    removed = sorted(set(started) - set(now))
+    if changed or added or removed:
+        raise RuntimeError(
+            f"the firm record cannot restart: the package source under {_PACKAGE_DIR} changed "
+            f"since the command started (changed: {changed}, added: {added}, "
+            f"removed: {removed})"
+        )
 
 
 def _on_disk_module_hashes(names: list[str], commander: Commander) -> dict[str, str]:
