@@ -1,5 +1,6 @@
 # tail_hedge_manager.py
 
+import math
 from collections.abc import Mapping
 from datetime import date, timedelta
 
@@ -333,20 +334,28 @@ def _log_protection(
 ) -> None:
     """Logs the protection level the premium budget buys at this strike
     and implied volatility (quantcore `protective_put_sizing` against
-    `_NOMINAL_NAV`, reported as fractions of NAV)."""
+    `_NOMINAL_NAV`, reported as fractions of NAV). Nothing depends on the
+    sizing but this line, so a sizing that raises `ValueError` or comes out
+    non-finite skips it."""
     time_to_expiry = (contract.expiry - day).days / _DAYS_PER_YEAR
     if mark.implied_volatility <= 0.0 or not 0.0 < budget < 1.0:
         return
-    sizing = protective_put_sizing(
-        _NOMINAL_NAV,
-        spot,
-        contract.strike,
-        mark.implied_volatility,
-        time_to_expiry,
-        0.0,
-        settings.options.tail_hedge_target_protection,
-        budget,
-    )
+    try:
+        sizing = protective_put_sizing(
+            _NOMINAL_NAV,
+            spot,
+            contract.strike,
+            mark.implied_volatility,
+            time_to_expiry,
+            0.0,
+            settings.options.tail_hedge_target_protection,
+            budget,
+        )
+    except ValueError as exc:
+        logger.debug("%s: tail hedge %s sizing undefined (%s).", day, contract.contract_id, exc)
+        return
+    if not (math.isfinite(sizing.protection_pct_achieved) and math.isfinite(sizing.breakeven)):
+        return
     logger.info(
         "%s: tail hedge %s at IV %.3f — premium budget %.4f of NAV implies %.2f%% protection "
         "(target %.0f%%, breakeven %.2f)",
