@@ -586,6 +586,20 @@ class TrialsConfig(BaseModel):
     firm_family: str = "agentic-firm"
 
 
+class LakeConfig(BaseModel):
+    """How the lake client paces its calls (`data.lakehouse_client`). It says
+    when a call may be sent, not what a trial computes, so it is left out of
+    the spec hash (`stage_a.spec.RUNTIME_SETTINGS_FIELDS`)."""
+
+    model_config = _GROUP_CONFIG
+
+    # Seconds after a lake request times out, or is left unfinished by a
+    # killed run, before the client sends any new lake call: the lake keeps
+    # working on such a request until its 300 s deadline, plus a 30 s margin.
+    # Policy choice.
+    request_quiet_seconds: float = Field(default=330.0, gt=0.0)
+
+
 class StrategyConfig(BaseModel):
     model_config = _GROUP_CONFIG
 
@@ -597,6 +611,7 @@ class StrategyConfig(BaseModel):
     analysts: AnalystConfig = Field(default_factory=AnalystConfig)
     stage_a: StageAConfig = Field(default_factory=StageAConfig)
     trials: TrialsConfig = Field(default_factory=TrialsConfig)
+    lake: LakeConfig = Field(default_factory=LakeConfig)
     # Per-pod sizing, keyed by manager `agent_id`; the research-grounded
     # reasoning for each row lives next to the manager in `roster.py`.
     pod_sizing: dict[str, PodSizingConfig] = Field(

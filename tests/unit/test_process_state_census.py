@@ -135,6 +135,10 @@ _ALLOWED: dict[str, str] = {
         _LOCK + "; it guards the count of the process's unfinished lake requests, which is 0 "
         "between sessions and decides only whether a restart may exec, never a result"
     ),
+    "agentic_trading.data.lakehouse_client:Lake._process_markers": (
+        "marker files of the process's unfinished lake requests, empty between requests; it "
+        "decides only whether a call is refused during the quiet period, never a result"
+    ),
     "agentic_trading.data.loaders.lakehouse_loader:_STORE": (
         "the session's window store; a resumed process re-fetches from the lake pinned at the "
         "same lake time, and every stored query orders by every column it returns, by the "

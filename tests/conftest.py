@@ -21,6 +21,7 @@ import json
 import math
 import sys
 import threading
+import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +36,7 @@ from agentic_trading.logging_config import configure_logging
 configure_logging(disable=True)
 
 from agentic_trading import provenance  # noqa: E402
+from agentic_trading.data import lakehouse_client  # noqa: E402
 from agentic_trading.data.loaders import lakehouse_loader  # noqa: E402
 from agentic_trading.data.loaders.lakehouse_loader import LakeProvenance  # noqa: E402
 from edgelab_live import configure as configure_edgelab_live  # noqa: E402
@@ -319,6 +321,18 @@ def _block_real_lake(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     yield
     monkeypatch.undo()
     _REAL_LAKE_ACCESSOR.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _lake_client_state_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Points the lake client's state directory (its request markers and last timeout, see
+    `data.lakehouse_client`) at a fresh directory under the session's temporary root for each
+    test, so no test reads or writes the user's own state and no timeout one test records
+    refuses another's calls. Subprocesses a test starts inherit it."""
+    directory = tmp_path_factory.getbasetemp() / "lake-client-state" / uuid.uuid4().hex
+    monkeypatch.setenv(lakehouse_client.STATE_DIR_ENV_VAR, str(directory))
 
 
 @pytest.fixture(autouse=True)
