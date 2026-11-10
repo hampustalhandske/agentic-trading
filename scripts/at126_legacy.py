@@ -22,7 +22,11 @@ a bar's raw price is this module's `SECURITY_RAW_PRICE_SQL` and its
 (the next NYSE session after the later of the filed date and the New
 York date of the EDGAR acceptance), and `legacy_company_facts` keeps,
 per period, the latest filed row known by the decision day (ties: the
-latest `available_date`, then the latest acceptance)."""
+latest `available_date`, then the latest acceptance); and inside a lake
+session every reference reads a current table through the loader
+module's `_table_sql`, whose dedupe takes, among one key's rows written at
+its latest `scraped_at`, the first in the table's tie order
+(`_tie_order_sql`)."""
 
 from datetime import date, timedelta
 

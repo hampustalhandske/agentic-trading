@@ -228,14 +228,18 @@ class LakeTableMetadata(BaseModel):
     """The lake's description of one table (`Lake.describe`): its `kind`
     ("current", "append-only", "log" or "compatibility view"), the
     `key_columns` a "current" table deduplicates on, whether it is
-    `rebuilt_whole` (holding only its latest build), and `last_write`, the
+    `rebuilt_whole` (holding only its latest build), `last_write`, the
     newest write the lake's status file records (rounded up to the second;
-    it can lag the data). `None` when the lake reports no write."""
+    it can lag the data; `None` when the lake reports no write), and
+    `tie_order`, the columns that decide between a key's log rows written
+    at one `scraped_at` (`None` when the lake serves none; see
+    `_tie_order_sql`)."""
 
     kind: str = "current"
     key_columns: list[str] = []
     rebuilt_whole: bool = False
     last_write: datetime | None = None
+    tie_order: list[str] | None = None
 
 
 class LakeSession(BaseModel):
@@ -507,15 +511,68 @@ def _scraped_at_pin(lake_time: datetime) -> str:
     return f"scraped_at <= CAST('{lake_time.astimezone(UTC).isoformat()}' AS TIMESTAMPTZ)"
 
 
-def _deduplicated_log_sql(table: str, key_columns: list[str], lake_time: datetime) -> str:
+# The lake's bookkeeping columns of a log table, never part of a tie order.
+_LOG_BOOKKEEPING_COLUMNS = ("scraped_at", "dt", "table")
+
+
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _fallback_tie_columns_sql(key_columns: list[str], with_scraped_at: bool = False) -> str:
+    """A DuckDB `COLUMNS` selector, over a table's log, of the fallback tie
+    order of a table keyed on `key_columns`: every column of the log in the
+    order the lake reports them, except the keys and the bookkeeping
+    columns `scraped_at`, `dt` and `table`; `with_scraped_at` keeps
+    `scraped_at` at its place among them."""
+    excluded = ", ".join(
+        _sql_string(column) for column in [*key_columns, *_LOG_BOOKKEEPING_COLUMNS]
+    )
+    condition = f"c NOT IN ({excluded})"
+    if with_scraped_at:
+        condition = f"c = 'scraped_at' OR {condition}"
+    return f"COLUMNS(c -> {condition})"
+
+
+def _tie_order_sql(key_columns: list[str], tie_order: list[str] | None) -> str:
+    """The `ORDER BY` terms, placed after `scraped_at DESC` in the dedupe
+    of a table's log, that decide between log rows sharing a key and a
+    `scraped_at` (the lake's own tie rule, LK-13): each column of
+    `tie_order` in turn, ascending with nulls last, compared as stored.
+
+    `tie_order` is the table's `tie_order` as `/v1/tables/{table}` serves
+    it (lake contract v2, LK-119); the dedupe of `<table>_log` uses the
+    base table's. When the lake serves none (`None`), the order falls
+    back to the base table's non-key columns in the column order the lake
+    reports, without `scraped_at` and the bookkeeping columns `dt` and
+    `table` (`_fallback_tie_columns_sql`): for `instrument_prices`, keyed
+    on (`ticker`, `date`), that is `asset_class`, `open`, `high`, `low`,
+    `close`, `adj_close`, `volume`. The fallback is one term, a struct of
+    those columns in that order with `scraped_at` among them, which DuckDB
+    compares field by field with a null field after every value;
+    `scraped_at` is equal among tied rows, so it never decides, and it
+    keeps the struct from being empty for a table whose every column is a
+    key."""
+    if tie_order is not None:
+        return ", ".join(f"{_quote_identifier(column)} ASC NULLS LAST" for column in tie_order)
+    return f"row(*{_fallback_tie_columns_sql(key_columns, with_scraped_at=True)}) ASC NULLS LAST"
+
+
+def _deduplicated_log_sql(
+    table: str, key_columns: list[str], lake_time: datetime, tie_order: list[str] | None = None
+) -> str:
     """`table` as it stood at `lake_time`: the rows of `<table>_log` with
-    `scraped_at <= lake_time`, keeping the latest write per `key_columns`."""
+    `scraped_at <= lake_time`, keeping one row per `key_columns`, the
+    latest write; among rows of a key written at the same latest
+    `scraped_at`, the first in `_tie_order_sql`'s order for `tie_order`.
+    The pick never depends on the order the lake stores rows in."""
     if not key_columns:
         raise LakeTimeError(f"the lake reports no key columns for {table}; cannot read it as of T")
     keys = ", ".join(_quote_identifier(column) for column in key_columns)
+    order = f"scraped_at DESC, {_tie_order_sql(key_columns, tie_order)}"
     return (
         "SELECT * EXCLUDE (_rn) FROM ("
-        f"SELECT *, row_number() OVER (PARTITION BY {keys} ORDER BY scraped_at DESC) AS _rn "
+        f"SELECT *, row_number() OVER (PARTITION BY {keys} ORDER BY {order}) AS _rn "
         f"FROM {table}_log WHERE {_scraped_at_pin(lake_time)}"
         ") WHERE _rn = 1"
     )
@@ -538,7 +595,7 @@ def _pinned_table_sql(session: LakeSession, table: str) -> str:
         return f"(SELECT * FROM {table} WHERE {_scraped_at_pin(lake_time)})"
     if metadata.kind == "append-only":
         return f"(SELECT * FROM {table}_log WHERE {_scraped_at_pin(lake_time)})"
-    return f"({_deduplicated_log_sql(table, metadata.key_columns, lake_time)})"
+    return f"({_deduplicated_log_sql(table, metadata.key_columns, lake_time, metadata.tie_order)})"
 
 
 def _table_sql(table: str) -> str:
@@ -2205,7 +2262,7 @@ def _fetch_cot_reports(
     (see `load_cot_reports_from_lakehouse`), one query per market:
     `report_date`, `net_positioning_ratio`, `published_date` and
     `untimed` (no `published_at`), sorted by report date, then
-    publication date, then ratio."""
+    publication date, then ratio, then `untimed`."""
     fetched: dict[tuple[str, str], pd.DataFrame] = {}
     for table, code in markets:
         query = f"""
@@ -2222,7 +2279,7 @@ def _fetch_cot_reports(
                   (pub.published_at IS NOT NULL AND pub.published_date <= ?)
                   OR (pub.published_at IS NULL AND pub.published_date < ?)
               )
-            ORDER BY cot.report_date, pub.published_date, net_positioning_ratio
+            ORDER BY cot.report_date, pub.published_date, net_positioning_ratio, untimed
         """
         cutoff = end.isoformat()
         frame = _query(query, [code, start.isoformat(), cutoff, cutoff, cutoff])
@@ -2491,7 +2548,8 @@ def _fetch_equity_prices(tickers: list[str], start: date, end: date) -> dict[str
     """Each of `tickers`' `instrument_prices` rows dated `start` to `end`,
     in one query: `ticker`, `date`, `open` (the raw open scaled by
     `adj_close / close`), `raw_open`, `raw_high`, `raw_low`, `close`
-    (`adj_close`), `raw_close` (`close`) and `volume`, sorted by date."""
+    (`adj_close`), `raw_close` (`close`) and `volume`, sorted by date,
+    then every other column but `open`, which they determine."""
     placeholders = ", ".join("?" for _ in tickers)
     query = f"""
         SELECT ticker, date,
@@ -2505,7 +2563,7 @@ def _fetch_equity_prices(tickers: list[str], start: date, end: date) -> dict[str
         FROM {_table_sql("instrument_prices")}
         WHERE ticker IN ({placeholders})
           AND date BETWEEN ? AND ?
-        ORDER BY ticker, date
+        ORDER BY ticker, date, close, raw_close, raw_open, raw_high, raw_low, volume
     """
     frame = _gated(_query(query, [*tickers, start.isoformat(), end.isoformat()]), end, "date")
     return _split_by_key(frame, "ticker", tickers)
@@ -2812,7 +2870,8 @@ def _fetch_futures_daily(roots: list[str], start: date, end: date) -> dict[str, 
     last kept bar (positive `ratio_adjusted_close`) before `start` (from
     `start` when there is none) to `end`, in one query: `root`, `date`,
     `front_contract`, `unadjusted_close`, `ratio_adjusted_close`,
-    `is_roll_day` and `roll_gap_known`, sorted by date."""
+    `is_roll_day` and `roll_gap_known`, sorted by date, then every
+    other column."""
     placeholders = ", ".join("?" for _ in roots)
     query = f"""
         SELECT root, date, front_contract, unadjusted_close, ratio_adjusted_close,
@@ -2827,7 +2886,8 @@ def _fetch_futures_daily(roots: list[str], start: date, end: date) -> dict[str, 
               AND date <= ?
         ) AS daily
         WHERE date >= COALESCE(previous_kept, ?)
-        ORDER BY root, date
+        ORDER BY root, date, front_contract, unadjusted_close, ratio_adjusted_close,
+                 is_roll_day, roll_gap_known
     """
     frame = _query(query, [start.isoformat(), *roots, end.isoformat(), start.isoformat()])
     return _split_by_key(_gated(frame, end, "date"), "root", roots)
@@ -3132,7 +3192,7 @@ def load_policy_rates_from_lakehouse(
 def _fetch_policy_rates(areas: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
     """Each of `areas`' daily `WS_CBPOL` observations with a value, dated
     `start` to `end` inclusive, in one query: `ref_area`, `date` and
-    `value` (per cent), sorted by date."""
+    `value` (per cent), sorted by date, then reference area, then value."""
     placeholders = ", ".join("?" for _ in areas)
     query = f"""
         SELECT ref_area, date, value
@@ -3142,7 +3202,7 @@ def _fetch_policy_rates(areas: list[str], start: date, end: date) -> dict[str, p
           AND ref_area IN ({placeholders})
           AND date BETWEEN ? AND ?
           AND value IS NOT NULL
-        ORDER BY date, ref_area
+        ORDER BY date, ref_area, value
     """
     frame = _query(
         query,
