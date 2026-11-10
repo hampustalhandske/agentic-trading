@@ -35,6 +35,16 @@ def is_not_mean_reverting(error: ValueError) -> bool:
     return NOT_MEAN_REVERTING_MESSAGE in str(error)
 
 
+def is_straight_line(spread: np.ndarray) -> bool:
+    """Whether `spread` moves by exactly the same amount every step, so its
+    AR(1) slope is exactly zero and no half-life is defined. Quantcore gap:
+    the pinned quantcore's `ou_half_life` does not detect a straight line,
+    and its least-squares slope then carries a rounding error whose sign
+    differs between BLAS builds."""
+    steps = np.diff(spread)
+    return steps.size > 0 and float(np.ptp(steps)) == 0.0
+
+
 def is_undefined_result(error: ValueError) -> bool:
     """Whether a `ValueError` from `ou_half_life` is quantcore's
     `UndefinedResultError`: the data cannot define a half-life."""
@@ -53,8 +63,8 @@ class OUMeanReversionAnalyst(AnalystAgent):
     it reverts inside.
 
     A spread under 10 points is unavailable, and so is one whose
-    half-life is undefined: a non-finite estimate (a straight-line spread
-    gives one) or quantcore's `UndefinedResultError`. A spread that is not
+    half-life is undefined: a straight line (`is_straight_line`), a
+    non-finite estimate or quantcore's `UndefinedResultError`. A spread that is not
     mean-reverting (`ou_half_life`'s phi >= 0 `ValueError`), whose finite
     half-life exceeds `settings.analysts.ou_max_half_life_windows` times the
     fitted spread's length (the data shows less than that many half-lives
@@ -101,6 +111,11 @@ class OUMeanReversionAnalyst(AnalystAgent):
             self._open_direction_by_asset.pop(asset, None)
             return self.unavailable_signal(
                 asset, as_of_date, "insufficient history to build an OU spread"
+            )
+        if is_straight_line(spread):
+            self._open_direction_by_asset.pop(asset, None)
+            return self.unavailable_signal(
+                asset, as_of_date, "OU half-life undefined on this spread: a straight line"
             )
 
         try:

@@ -97,15 +97,24 @@ def _raising(error: BaseException) -> Any:
     return _fit
 
 
+# A daily log return of 2**-10: its running sums, their mean and the de-meaned spread are exact
+# in float64, so the spread is a straight line on every platform and BLAS build.
+_DYADIC_STEP = 2.0**-10
+
+
 def test_ou_straight_line_spread_is_unavailable() -> None:
     """A log price rising by the same amount every day is a straight-line spread, whose
     half-life is undefined."""
     analyst = OUMeanReversionAnalyst()
     analyst._open_direction_by_asset["AAPL"] = "long"
+    market = _market(np.full(120, _DYADIC_STEP))
+    steps = np.diff(analyst._build_spread(market, AS_OF, "AAPL"))
+    assert steps.size > 0 and np.ptp(steps) == 0.0
 
-    signal = analyst.generate_signal("AAPL", _market(np.full(120, 0.001)), AS_OF)
+    signal = analyst.generate_signal("AAPL", market, AS_OF)
 
     assert _flat(signal) == ("unavailable", "flat", 0.0)
+    assert "straight line" in signal.rationale
     assert "AAPL" not in analyst._open_direction_by_asset
 
 
