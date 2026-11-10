@@ -2472,6 +2472,11 @@ _CRYPTO_KLINE_SYMBOLS = {
 # one-minute kline start times of each session.
 _SESSION_FIRST_MINUTE = "09:30:00"
 _SESSION_LAST_MINUTE = "15:59:00"
+# The largest one-minute crypto volume the loader accepts. A session has at
+# most 390 minutes, so the exact DECIMAL(38, 10) sum of one session's
+# accepted volumes stays below 3.9e26, well inside that type's range
+# (magnitude below 1e28).
+_MAX_CRYPTO_MINUTE_VOLUME = 1e24
 
 
 def _fetch_equity_prices(tickers: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
@@ -2564,12 +2569,16 @@ def _fetch_crypto_prices(tickers: list[str], start: date, end: date) -> dict[str
     threads in no fixed order, so a DOUBLE sum of the same minutes can
     differ in its last bits between reads; DECIMAL addition is exact, so
     every read gives the same bits. The cast rounds each minute's volume
-    to a multiple of 1e-10, the same way for the same value. It cannot
-    overflow silently: casting a value of magnitude 1e28 or more, NaN or
-    infinity raises a conversion error, and the sum accumulates in a
-    128-bit integer that raises on overflow (beyond about 1.7e28). One
-    session's at most 390 minutes of volume are many orders of magnitude
-    below that."""
+    to a multiple of 1e-10, the same way for the same value.
+
+    The sum never leaves the DECIMAL(38, 10) range, whatever the engine
+    does on overflow: the query also returns each row's largest absolute
+    minute volume, and a row whose largest is not below
+    `_MAX_CRYPTO_MINUTE_VOLUME` (or is NaN) raises `ValueError` before any
+    row is returned. Every accepted row therefore sums at most 390 minutes
+    each below 1e24, under 3.9e26 in total. Casting NaN, infinity or a
+    magnitude of 1e28 or more to the DECIMAL raises a conversion error in
+    the lake."""
     symbols = [_CRYPTO_KLINE_SYMBOLS[ticker] for ticker in tickers]
     placeholders = ", ".join("?" for _ in symbols)
     query = f"""
@@ -2577,7 +2586,8 @@ def _fetch_crypto_prices(tickers: list[str], start: date, end: date) -> dict[str
                CAST(local_time AS DATE) AS date,
                max(open) FILTER (WHERE CAST(local_time AS TIME) = CAST(? AS TIME)) AS open,
                max(close) FILTER (WHERE CAST(local_time AS TIME) = CAST(? AS TIME)) AS close,
-               CAST(sum(CAST(volume AS DECIMAL(38, 10))) AS DOUBLE) AS volume
+               CAST(sum(CAST(volume AS DECIMAL(38, 10))) AS DOUBLE) AS volume,
+               max(abs(volume)) AS max_abs_volume
         FROM (
             SELECT symbol, open, close, volume,
                    timezone(?, open_time AT TIME ZONE 'UTC') AS local_time
@@ -2602,7 +2612,17 @@ def _fetch_crypto_prices(tickers: list[str], start: date, end: date) -> dict[str
         _SESSION_LAST_MINUTE,
         _SESSION_LAST_MINUTE,
     ]
-    by_symbol = _split_by_key(_gated(_query(query, params), end, "date"), "symbol", symbols)
+    rows = _query(query, params)
+    oversized = rows[~(rows["max_abs_volume"] < _MAX_CRYPTO_MINUTE_VOLUME)]
+    if not oversized.empty:
+        first = oversized.iloc[0]
+        raise ValueError(
+            f"crypto_klines_1m {first['symbol']} on {first['date']} has a minute volume of "
+            f"{first['max_abs_volume']!r}, not below {_MAX_CRYPTO_MINUTE_VOLUME:g}; "
+            "its session volume cannot be summed exactly"
+        )
+    rows = rows.drop(columns="max_abs_volume")
+    by_symbol = _split_by_key(_gated(rows, end, "date"), "symbol", symbols)
     return {ticker: by_symbol[_CRYPTO_KLINE_SYMBOLS[ticker]] for ticker in tickers}
 
 

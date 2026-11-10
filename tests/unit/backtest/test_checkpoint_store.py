@@ -4,8 +4,13 @@ Covers the append-only day-by-day write path and, specifically, the
 `resume` flag on `connect()`: a fresh (non-resumed) run must never see
 rows left over in `db_path` from an earlier, unrelated run."""
 
+import math
+import sqlite3
+import struct
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 from agentic_trading.agents.schemas import PerformanceRecord, PortfolioDecision
 from agentic_trading.backtest import checkpoint_store
@@ -145,3 +150,71 @@ def test_cursor_round_trips_option_positions_and_premium_total(tmp_path: Path) -
     assert payload is not None
     assert payload["portfolio"]["option_positions"] == option_positions
     assert payload["total_option_premium_paid"] == 620.0
+
+
+# Option marks with a negative zero, a NaN, the largest and smallest positive doubles and an
+# awkward-to-print value, keyed out of sorted order.
+_OPTION_MARKS = {
+    "SPY 2024-03-15 P 450.00": -0.0,
+    "AAPL 2024-03-15 C 185.00": math.nan,
+    "SPY 2024-03-15 C 600.00": 1.7976931348623157e308,
+    "QQQ 2024-06-21 C 400.00": 5e-324,
+    "IWM 2024-06-21 P 180.00": 0.1 + 0.2,
+}
+
+
+def _bits(marks: dict[str, float]) -> list[tuple[str, bytes]]:
+    """`marks` as (contract id, IEEE 754 bytes) pairs in key order."""
+    return [(contract_id, struct.pack("<d", mid)) for contract_id, mid in marks.items()]
+
+
+@pytest.mark.parametrize("reader", ["read_all", "read_recent"])
+def test_option_marks_round_trip_with_exact_bits_and_key_order(tmp_path: Path, reader: str) -> None:
+    """`option_last_mid` written by `append_day` reads back from `read_all` and `read_recent` with
+    every value's exact bits, including -0.0 and NaN, and the keys in the order written."""
+    connection = checkpoint_store.connect(tmp_path / "checkpoint.db")
+    checkpoint_store.append_day(
+        connection,
+        as_of_date=DAY_ONE,
+        portfolio_value=100_000.0,
+        new_track_record=[],
+        decisions=[],
+        new_trades=[],
+        next_day_index=1,
+        start_date=DAY_ONE,
+        end_date=DAY_TWO,
+        assets=["AAPL"],
+        portfolio={"cash": 100_000.0},
+        signal_health={},
+        pending_decisions=[],
+        option_last_mid=_OPTION_MARKS,
+    )
+
+    if reader == "read_all":
+        payload = checkpoint_store.read_all(connection)
+    else:
+        payload = checkpoint_store.read_recent(connection, DAY_ONE, decision_days=1)
+
+    assert payload is not None
+    assert _bits(payload["option_last_mid"]) == _bits(_OPTION_MARKS)
+
+
+def test_a_cursor_without_the_option_marks_column_reads_them_as_none(tmp_path: Path) -> None:
+    """A checkpoint whose cursor table has no `option_last_mid` column gets it, NULL, when
+    connected for resume, and reads back with `option_last_mid` None."""
+    path = tmp_path / "checkpoint.db"
+    connection = checkpoint_store.connect(path)
+    _append(connection, DAY_ONE, next_day_index=1)
+    with connection:
+        connection.execute("ALTER TABLE cursor DROP COLUMN option_last_mid")
+    connection.close()
+    raw = sqlite3.connect(path)
+    assert "option_last_mid" not in {row[1] for row in raw.execute("PRAGMA table_info(cursor)")}
+    raw.close()
+
+    connection = checkpoint_store.connect(path, resume=True)
+    payload = checkpoint_store.read_all(connection)
+
+    assert payload is not None
+    assert payload["option_last_mid"] is None
+    assert payload["next_day_index"] == 1

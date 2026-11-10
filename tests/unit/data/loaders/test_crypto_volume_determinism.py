@@ -8,13 +8,17 @@ random order so each session's minutes are spread over many row groups, and ther
 several threads' partial sums. Volumes are seeded random floats spanning six orders of
 magnitude, with all their significant digits. On this data a plain `sum(volume)` over the
 DOUBLE column gives daily volumes that differ in their last bits between reads (DuckDB 1.5.6,
-8 threads)."""
+8 threads).
+
+`_fetch_crypto_prices` also refuses a session holding a minute volume of magnitude 1e24 or
+more, and leaves every other session's volume exactly as the DECIMAL sum gives it."""
 
 from datetime import date
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from agentic_trading.data.loaders import lakehouse_loader
 
@@ -83,4 +87,108 @@ def test_crypto_daily_volume_is_bit_identical_across_multithreaded_reads(fake_la
     days = [pd.Timestamp(day).date() for day in btc["date"]]
     np.testing.assert_allclose(
         btc["volume"].to_numpy(dtype=np.float64), expected.loc[days].to_numpy(), rtol=1e-12
+    )
+
+
+# Five UTC days of minutes for the guard tests, from a Monday.
+_GUARD_START = date(2023, 6, 12)
+_GUARD_DAYS = 5
+
+
+def _guard_klines() -> pd.DataFrame:
+    """Every UTC minute of `_GUARD_DAYS` days from `_GUARD_START` for both symbols, with seeded
+    log-uniform volumes from 1e-3 to 1e3, and one BTCUSDT session minute of volume 9.99e23."""
+    rng = np.random.default_rng(1024)
+    minutes = pd.date_range(pd.Timestamp(_GUARD_START), periods=_GUARD_DAYS * 1440, freq="min")
+    frames = [
+        pd.DataFrame(
+            {
+                "symbol": symbol,
+                "open_time": minutes,
+                "open": 20_000.0,
+                "close": 20_000.0,
+                "volume": 10.0 ** rng.uniform(-3.0, 3.0, minutes.size),
+            }
+        )
+        for symbol in ("BTCUSDT", "ETHUSDT")
+    ]
+    klines = pd.concat(frames, ignore_index=True)
+    klines.loc[_minute(klines, "BTCUSDT", "2023-06-13 15:00"), "volume"] = 9.99e23
+    return klines
+
+
+def _minute(klines: pd.DataFrame, symbol: str, open_time: str) -> pd.Series:
+    """The mask of `symbol`'s kline opening at UTC `open_time`."""
+    return (klines["symbol"] == symbol) & (klines["open_time"] == pd.Timestamp(open_time))
+
+
+def _read_guard_days() -> dict[str, pd.DataFrame]:
+    """One `_fetch_crypto_prices` read of both tickers over the guard days."""
+    end = _GUARD_START + pd.Timedelta(days=_GUARD_DAYS - 1)
+    return lakehouse_loader._fetch_crypto_prices(_TICKERS, _GUARD_START, end)
+
+
+def _plain_decimal_volumes(fake_lake: Any) -> dict[str, bytes]:
+    """Each symbol's daily session volumes from a plain DECIMAL(38, 10) sum of the lake's
+    minutes, with no guard, as raw float64 bytes in date order."""
+    frame = fake_lake._connection.execute(
+        """
+        SELECT symbol, CAST(local_time AS DATE) AS date,
+               CAST(sum(CAST(volume AS DECIMAL(38, 10))) AS DOUBLE) AS volume
+        FROM (
+            SELECT symbol, volume,
+                   timezone('America/New_York', open_time AT TIME ZONE 'UTC') AS local_time
+            FROM crypto_klines_1m
+        )
+        WHERE CAST(local_time AS TIME) BETWEEN TIME '09:30:00' AND TIME '15:59:00'
+        GROUP BY symbol, CAST(local_time AS DATE)
+        ORDER BY symbol, date
+        """
+    ).df()
+    return {
+        symbol: rows["volume"].to_numpy(dtype=np.float64).tobytes()
+        for symbol, rows in frame.groupby("symbol")
+    }
+
+
+def test_volumes_below_the_minute_limit_are_the_plain_decimal_sum(fake_lake: Any) -> None:
+    """With every session minute volume below 1e24, including one of 9.99e23, each daily volume
+    has the same bytes as a plain DECIMAL(38, 10) sum of its session minutes."""
+    fake_lake.add("crypto_klines_1m", _guard_klines(), pin_column="open_time", kind="append-only")
+
+    frames = _read_guard_days()
+
+    assert {
+        lakehouse_loader._CRYPTO_KLINE_SYMBOLS[ticker]: frame["volume"]
+        .to_numpy(dtype=np.float64)
+        .tobytes()
+        for ticker, frame in frames.items()
+    } == _plain_decimal_volumes(fake_lake)
+    assert len(frames["BTC-USD"]) == _GUARD_DAYS
+
+
+@pytest.mark.parametrize("volume", [1e24, -1e24, 5e27])
+def test_a_session_minute_volume_of_1e24_or_more_raises(fake_lake: Any, volume: float) -> None:
+    """A session minute whose volume has magnitude 1e24 or more makes the read raise, naming the
+    symbol and the date."""
+    klines = _guard_klines()
+    klines.loc[_minute(klines, "ETHUSDT", "2023-06-14 18:00"), "volume"] = volume
+    fake_lake.add("crypto_klines_1m", klines, pin_column="open_time", kind="append-only")
+
+    with pytest.raises(ValueError, match=r"ETHUSDT on 2023-06-14 .* not below 1e\+24"):
+        _read_guard_days()
+
+
+def test_a_minute_volume_of_1e24_outside_the_session_is_ignored(fake_lake: Any) -> None:
+    """A minute volume of 1e24 outside every session's minutes leaves the read and its volumes
+    unchanged."""
+    klines = _guard_klines()
+    klines.loc[_minute(klines, "ETHUSDT", "2023-06-14 02:00"), "volume"] = 1e24
+    fake_lake.add("crypto_klines_1m", klines, pin_column="open_time", kind="append-only")
+
+    frames = _read_guard_days()
+
+    assert (
+        frames["ETH-USD"]["volume"].to_numpy(dtype=np.float64).tobytes()
+        == _plain_decimal_volumes(fake_lake)["ETHUSDT"]
     )

@@ -647,19 +647,26 @@ def test_the_walk_sees_every_kind_of_state(tmp_path: Path) -> None:
         _differences(left, right, "engine")
 
 
-def _without_option_marks(path: Path) -> None:
-    """Rewrites the checkpoint at `path` as one written before the engine stored option marks."""
+def _without_option_marks(path: Path, schema: str) -> None:
+    """Leaves the checkpoint at `path` with no stored option marks: for `schema` "null" its
+    `option_last_mid` is set to NULL, and for "no column" the column is dropped from the cursor
+    table, so the next `checkpoint_store.connect` adds it back as NULL."""
     connection = checkpoint_store.connect(path, resume=True)
     with connection:
-        connection.execute("UPDATE cursor SET option_last_mid = NULL")
+        if schema == "null":
+            connection.execute("UPDATE cursor SET option_last_mid = NULL")
+        else:
+            connection.execute("ALTER TABLE cursor DROP COLUMN option_last_mid")
     connection.close()
 
 
+@pytest.mark.parametrize("schema", ["null", "no column"])
 def test_a_checkpoint_without_option_marks_after_an_option_decision_is_refused(
-    tmp_path: Path,
+    tmp_path: Path, schema: str
 ) -> None:
-    """A checkpoint that stores no option marks, of a run that has decided an option, refuses to
-    resume; the same checkpoint with its marks resumes."""
+    """A checkpoint that stores no option marks, as a NULL or with no `option_last_mid` column at
+    all, of a run that has decided an option, refuses to resume; the same checkpoint with its
+    marks resumes."""
     path = tmp_path / "checkpoint.db"
     engine = _run_through(_engine(path), 3)
     assert any(
@@ -668,7 +675,7 @@ def test_a_checkpoint_without_option_marks_after_an_option_decision_is_refused(
         for decision in decisions
     )
     _run_through(_engine(path, resume=True), 4)
-    _without_option_marks(path)
+    _without_option_marks(path, schema)
 
-    with pytest.raises(ValueError, match="predates option_last_mid"):
+    with pytest.raises(ValueError, match="has no stored option marks; its option realized returns"):
         _engine(path, resume=True).run()

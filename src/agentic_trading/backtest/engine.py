@@ -487,10 +487,10 @@ class BacktestEngine:
         when the checkpoint's config differs from `run_config` (other
         dates, assets, strategy settings or roster; a checkpoint written
         without fingerprints never matches) or it carries state for an
-        agent this commander does not run, or it stores no option marks
-        (`option_last_mid`, absent from checkpoints written before the
-        engine stored them) yet the run had an option decision or holds an
-        option position, so its option marks cannot be restored exactly;
+        agent this commander does not run, or it has no stored option marks
+        (`option_last_mid` is NULL) yet the run had an option decision or
+        holds an option position, so its option realized returns cannot be
+        restored exactly;
         and `LakeTimeError` when its
         stored lake time differs from the open lake session's (`None` on
         either side meaning no session), since the resumed days would read
@@ -532,8 +532,8 @@ class BacktestEngine:
             connection, payload
         ):
             raise ValueError(
-                f"checkpoint {self.checkpoint_path} predates option_last_mid; its option marks "
-                "cannot be restored exactly; rerun from the start"
+                f"checkpoint {self.checkpoint_path} has no stored option marks; its option "
+                "realized returns cannot be restored exactly; rerun from the start"
             )
         return payload
 

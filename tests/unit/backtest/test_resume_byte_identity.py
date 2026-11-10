@@ -307,16 +307,25 @@ def test_a_negative_zero_pod_return_resumes_byte_identical(tmp_path: Path) -> No
     assert _without_split_moves(resumed) == _without_split_moves(expected)
 
 
+@pytest.mark.parametrize(
+    "clear_marks",
+    [
+        "UPDATE cursor SET option_last_mid = NULL",
+        "ALTER TABLE cursor DROP COLUMN option_last_mid",
+    ],
+    ids=["null", "no column"],
+)
 def test_a_checkpoint_without_option_marks_and_no_option_decision_resumes(
-    tmp_path: Path,
+    tmp_path: Path, clear_marks: str
 ) -> None:
-    """A checkpoint that stores no option marks, of a run that never decided an option, resumes
-    to the uninterrupted run's result."""
+    """A checkpoint that stores no option marks, as a NULL or with no `option_last_mid` column at
+    all (which `checkpoint_store.connect` adds back as NULL), of a run that never decided an
+    option, resumes to the uninterrupted run's result."""
     expected = _engine(_commander()).run()
     checkpoint_path = _interrupted(tmp_path / "checkpoint.db")
     connection = checkpoint_store.connect(checkpoint_path, resume=True)
     with connection:
-        connection.execute("UPDATE cursor SET option_last_mid = NULL")
+        connection.execute(clear_marks)
     connection.close()
 
     resumed = _engine(_commander(), checkpoint_path, resume=True).run()
