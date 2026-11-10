@@ -1069,6 +1069,7 @@ def _trust_panel_frame(desk_run: DeskRun, source_ids: list[str], as_of_date: dat
     weights = Hedge().get_weights(desk_run.scoreboard, source_ids, as_of_date)
     rows = []
     for source_id in source_ids:
+        sharpe: float | None
         try:
             sharpe = desk_run.scoreboard.sharpe_ratio(source_id, as_of_date, 30)
         except ValueError:
@@ -1201,6 +1202,12 @@ def _saved_run_pod_frame(source_performance: dict[str, dict[str, float]]) -> pd.
     return frame.sort_values("cumulative_return") if not frame.empty else frame
 
 
+def _ratio_text(value: float | None) -> str:
+    """A run-summary ratio to two decimals, or "n/a" when it is undefined
+    on the run (`None`)."""
+    return "n/a" if value is None else f"{value:.2f}"
+
+
 def _render_saved_run_tab() -> None:
     """A saved, already-completed run's results (loaded via the sidebar's
     "Load a saved run" panel), independent of the live desk simulation the
@@ -1234,12 +1241,12 @@ def _render_saved_run_tab() -> None:
         f" ({len(period_data['portfolio_value_history'])} trading days)"
     )
     metric_cols = st.columns(6)
-    metric_cols[0].metric("Sharpe", f"{period_data['final_sharpe_ratio']:.2f}")
-    metric_cols[1].metric("Sortino", f"{period_data['final_sortino_ratio']:.2f}")
-    metric_cols[2].metric("Calmar", f"{period_data['final_calmar_ratio']:.2f}")
+    metric_cols[0].metric("Sharpe", _ratio_text(period_data["final_sharpe_ratio"]))
+    metric_cols[1].metric("Sortino", _ratio_text(period_data["final_sortino_ratio"]))
+    metric_cols[2].metric("Calmar", _ratio_text(period_data["final_calmar_ratio"]))
     metric_cols[3].metric("Max drawdown", f"{period_data['final_max_drawdown']:.1%}")
     metric_cols[4].metric("Hit rate", f"{period_data['final_hit_rate']:.1%}")
-    metric_cols[5].metric("Profit factor", f"{period_data['final_profit_factor']:.2f}")
+    metric_cols[5].metric("Profit factor", _ratio_text(period_data["final_profit_factor"]))
 
     st.markdown("##### Equity curve")
     equity_frame = pd.DataFrame(
@@ -1402,7 +1409,7 @@ def _render_overview_tab() -> None:
             f"${current_value:,.2f}",
             f"{daily_change:,.2f} / {daily_change_pct:.2f}%",
         )
-        metric_mid.metric("Sharpe", f"{backtest_result.final_sharpe_ratio:.2f}")
+        metric_mid.metric("Sharpe", _ratio_text(backtest_result.final_sharpe_ratio))
         metric_right.metric("Max drawdown", f"{backtest_result.final_max_drawdown:,.2f}")
         metric_far.metric("Desk date", current_date.isoformat())
 

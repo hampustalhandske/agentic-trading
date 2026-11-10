@@ -1082,3 +1082,10 @@ def test_desk_run_refuses_a_result_with_a_history_horizon() -> None:
 
     with pytest.raises(ValueError, match="300-day history horizon"):
         dataclasses.replace(desk_run, backtest_result=bounded)
+
+
+@pytest.mark.parametrize(("value", "text"), [(None, "n/a"), (1.234, "1.23"), (-0.5, "-0.50")])
+def test_ratio_text_shows_an_undefined_ratio_as_not_available(
+    value: float | None, text: str
+) -> None:
+    assert dashboard_module._ratio_text(value) == text

@@ -1,5 +1,6 @@
 # macro_var_spillover_analyst.py
 
+import math
 from typing import Literal
 
 import numpy as np
@@ -42,10 +43,12 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
     selection, the Granger test, and the VAR fit are only re-run at most
     once every `_refit_cache.refit_interval_days` simulated days per
     asset — see `RefitCache`'s docstring; the forecast/impulse-response
-    step still scores against every day's fresh data. Every active
-    signal's `source_as_of` is the newest `known_at` (the later of a
-    vintage's publication date and its observation date) among the
-    macro vintages on the dates of the VAR system."""
+    step still scores against every day's fresh data. A Granger input
+    column (the asset's returns or the first macro series) with no range,
+    or a non-finite Granger p-value, is an error: the test is undefined
+    there. Every active signal's `source_as_of` is the newest `known_at`
+    (the later of a vintage's publication date and its observation date)
+    among the macro vintages on the dates of the VAR system."""
 
     agent_id: str = "macro_var_spillover_analyst"
 
@@ -138,6 +141,13 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                 asset, as_of_date, "insufficient overlapping history for a VAR spillover read"
             )
         source_as_of = newest_known.reindex(aligned.index).max().date()
+        if np.ptp(system[:, 0]) == 0.0 or np.ptp(system[:, 1]) == 0.0:
+            return self.error_signal(
+                asset,
+                as_of_date,
+                "a Granger input column is constant — the Granger test is undefined",
+                source_as_of=source_as_of,
+            )
 
         def _fit_var_system() -> tuple[int, float, np.ndarray | None, np.ndarray | None]:
             n_lags = (
@@ -146,7 +156,10 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
                 else select_var_lag_order(system, MAX_LAGS, LAG_SELECTION_CRITERION)
             )
             _, granger_p_value = granger_causality_test(system[:, 0], system[:, 1], n_lags)
-            if granger_p_value >= settings.analysts.significance_level:
+            if (
+                not math.isfinite(granger_p_value)
+                or granger_p_value >= settings.analysts.significance_level
+            ):
                 return n_lags, granger_p_value, None, None
             fitted_coef_matrix, fitted_sigma_u = var_fit(system, n_lags)
             return n_lags, granger_p_value, fitted_coef_matrix, fitted_sigma_u
@@ -155,6 +168,13 @@ class MacroVarSpilloverAnalyst(AnalystAgent):
             n_lags, p_value, coef_matrix, sigma_u = self._refit_cache.get_or_refit(
                 asset, as_of_date, _fit_var_system
             )
+            if not math.isfinite(p_value):
+                return self.error_signal(
+                    asset,
+                    as_of_date,
+                    f"Granger p-value undefined (p={p_value})",
+                    source_as_of=source_as_of,
+                )
             if coef_matrix is None or sigma_u is None:
                 return self.abstain_signal(
                     asset,

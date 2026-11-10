@@ -92,6 +92,15 @@ class ShortInterestSqueezeAnalyst(AnalystAgent):
         current_z = float(spread_zscore(days_to_cover, min(self.z_window, days_to_cover.size))[-1])
         latest_dissemination = sorted_history["dissemination_date"].max().date()
 
+        if not math.isfinite(current_z):
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                "days-to-cover constant over the z window — no z-score",
+                source_as_of=latest_dissemination,
+                sample_count=len(history),
+            )
+
         if current_z <= 0:
             return AgentSignal(
                 agent_id=self.agent_id,

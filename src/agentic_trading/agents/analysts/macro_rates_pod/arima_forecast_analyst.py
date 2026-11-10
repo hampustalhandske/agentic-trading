@@ -1,5 +1,6 @@
 # arima_forecast_analyst.py
 
+import math
 from typing import Literal
 
 import numpy as np
@@ -48,8 +49,12 @@ class ARIMAForecastAnalyst(AnalystAgent):
     coefficients (`quantcore.time_series.arima.arima_residuals`; residual
     autocorrelation means the order is misspecified and the forecast is
     not trusted); failing either gate abstains (active, flat, confidence
-    0). Too little history or no close is unavailable; a failed order
-    selection or fit, a non-converged one included, is an error. The order is re-identified every
+    0). Too little history or no close is unavailable, and so is a pretest
+    window with no range or a non-finite pretest p-value: Ljung-Box is
+    undefined there, giving NaN on zeros and a spuriously tiny p on a
+    non-zero constant. A failed order selection or fit, a non-converged one
+    included, is an error, and so are residuals with no range or a
+    non-finite residual p-value. The order is re-identified every
     `settings.analysts.arima_order_reselect_days` on the return series
     with d fixed at 1 (log price is I(1) by construction) and p, q in
     {0..MAX_P}, and coefficients re-estimated every
@@ -89,8 +94,16 @@ class ARIMAForecastAnalyst(AnalystAgent):
             )
 
         pretest_returns = returns[-settings.analysts.arima_pretest_window :]
+        if np.ptp(pretest_returns) == 0.0:
+            return self.unavailable_signal(
+                asset, as_of_date, "constant returns over the pretest window — Ljung-Box undefined"
+            )
         n_lags = min(LJUNG_BOX_MAX_LAGS, pretest_returns.size // 5)
         _, p_value = ljung_box_test(pretest_returns, n_lags, model_df=0)
+        if not math.isfinite(p_value):
+            return self.unavailable_signal(
+                asset, as_of_date, f"Ljung-Box pretest p-value undefined (p={p_value})"
+            )
         if p_value >= LJUNG_BOX_SIGNIFICANCE:
             return self.abstain_signal(
                 asset, as_of_date, f"no serial dependence to forecast (Ljung-Box p={p_value:.3f})"
@@ -115,8 +128,20 @@ class ARIMAForecastAnalyst(AnalystAgent):
             return self.error_signal(asset, as_of_date, "ARIMA order selection/fit failed")
 
         residuals = arima_residuals(log_prices, ar_coefs, ma_coefs, d)
+        if np.ptp(residuals) == 0.0:
+            return self.error_signal(
+                asset,
+                as_of_date,
+                f"ARIMA({p},{d},{q}) residuals are constant — Ljung-Box undefined",
+            )
         residual_lags = min(LJUNG_BOX_MAX_LAGS, max(residuals.size // 5, 1))
         _, residual_p_value = ljung_box_test(residuals, residual_lags, model_df=0)
+        if not math.isfinite(residual_p_value):
+            return self.error_signal(
+                asset,
+                as_of_date,
+                f"ARIMA({p},{d},{q}) residual Ljung-Box p-value undefined (p={residual_p_value})",
+            )
         if residual_p_value < LJUNG_BOX_SIGNIFICANCE:
             return self.abstain_signal(
                 asset,

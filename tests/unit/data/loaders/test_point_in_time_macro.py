@@ -150,22 +150,113 @@ def _dgs3mo_vintages() -> pd.DataFrame:
 
 
 def test_risk_free_series_forward_fills_without_backfilling(fake_lake: Any) -> None:
-    """From the first observation on, gaps are forward-filled and values are percent/100/252."""
+    """From the first day a value is known on, gaps are forward-filled and values are
+    percent/100/252; a value published on its own date is known from the next day."""
     fake_lake.add("fred_vintages", _dgs3mo_vintages(), date_columns=_VINTAGE_DATES)
 
-    result = macro_loader.load_risk_free_rate_series(date(2010, 1, 4), date(2010, 1, 8))
+    result = macro_loader.load_risk_free_rate_series(date(2010, 1, 5), date(2010, 1, 8))
 
-    assert list(result.index) == list(pd.date_range("2010-01-04", "2010-01-08", freq="D"))
-    assert result.loc["2010-01-04"] == pytest.approx(0.04 / 252)
+    assert list(result.index) == list(pd.date_range("2010-01-05", "2010-01-08", freq="D"))
     assert result.loc["2010-01-05"] == pytest.approx(0.04 / 252)
-    assert result.loc["2010-01-06"] == pytest.approx(0.05 / 252)
+    assert result.loc["2010-01-06"] == pytest.approx(0.04 / 252)
+    assert result.loc["2010-01-07"] == pytest.approx(0.05 / 252)
     assert result.loc["2010-01-08"] == pytest.approx(0.05 / 252)
     assert not result.isna().any()
 
 
-def test_risk_free_series_raises_when_start_precedes_first_observation(fake_lake: Any) -> None:
-    """A start date before the first DGS3MO observation raises ValueError naming that date."""
+def test_risk_free_series_accrues_each_day_at_the_value_known_that_day(fake_lake: Any) -> None:
+    """A revision published later does not reach back: each day carries the latest DGS3MO value
+    known before it, the vintage of that day, not the window end's."""
+    fake_lake.add(
+        "fred_vintages",
+        _vintages(
+            [
+                ("DGS3MO", "2010-01-04", "2010-01-04", 4.0),
+                ("DGS3MO", "2010-01-04", "2010-01-07", 4.8),
+                ("DGS3MO", "2010-01-08", "2010-01-08", 5.0),
+            ]
+        ),
+        date_columns=_VINTAGE_DATES,
+    )
+
+    result = macro_loader.load_risk_free_rate_series(date(2010, 1, 5), date(2010, 1, 10))
+
+    annual = {
+        "2010-01-05": 4.0,
+        "2010-01-06": 4.0,
+        "2010-01-07": 4.0,
+        "2010-01-08": 4.8,
+        "2010-01-09": 5.0,
+        "2010-01-10": 5.0,
+    }
+    assert list(result.index) == list(pd.date_range("2010-01-05", "2010-01-10", freq="D"))
+    for day, percent in annual.items():
+        assert result.loc[day] == pytest.approx(percent / 100 / 252), day
+
+
+def test_risk_free_series_reads_the_versions_once(fake_lake: Any) -> None:
+    """The versions are fetched in one query, then selected for every day of the window."""
+    fake_lake.add("fred_vintages", _dgs3mo_vintages(), date_columns=_VINTAGE_DATES)
+    reads: list[Any] = []
+    fetch = lakehouse_loader._FRED_VERSIONS.fetch
+
+    def _counting(*args: Any) -> Any:
+        reads.append(args)
+        return fetch(*args)
+
+    lakehouse_loader._FRED_VERSIONS.fetch = _counting
+    try:
+        macro_loader.load_risk_free_rate_series(date(2010, 1, 5), date(2010, 1, 20))
+    finally:
+        lakehouse_loader._FRED_VERSIONS.fetch = fetch
+
+    assert len(reads) == 1
+
+
+def _random_versions(seed: int) -> pd.DataFrame:
+    """`_fetch_fred_versions` rows, in its order, for 60 business days of observations: some
+    revised (up to three versions, some on the same date and with the same value), some with a
+    null value or a null `realtime_start`."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for observed in pd.bdate_range("2012-03-01", periods=60):
+        for _ in range(int(rng.integers(1, 4))):
+            lag = int(rng.integers(-2, 15))
+            realtime_start = None if rng.random() < 0.05 else observed + pd.Timedelta(days=lag)
+            value = None if rng.random() < 0.1 else float(rng.choice([1.0, 1.5, 2.0, 2.5]))
+            rows.append((observed, value, realtime_start))
+    frame = pd.DataFrame(rows, columns=["date", "value", "realtime_start"])
+    frame["realtime_start"] = pd.to_datetime(frame["realtime_start"])
+    frame["known_at"] = frame[["date", "realtime_start"]].max(axis=1)
+    frame = frame.sort_values(
+        ["date", "realtime_start", "value"], na_position="first", kind="stable"
+    )
+    return frame.reset_index(drop=True)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_known_value_by_day_is_the_last_value_of_each_days_selection(seed: int) -> None:
+    """Each day's value is the last non-null value of `_select_fred_vintages(versions, day)`."""
+    versions = _random_versions(seed)
+    days = pd.date_range("2012-02-25", "2012-06-30", freq="D")
+
+    result = macro_loader.known_value_by_day(versions, days)
+
+    expected = []
+    for day in days:
+        selected = lakehouse_loader._select_fred_vintages(versions, day.date())
+        known = None if selected is None else selected["value"].dropna()
+        expected.append(None if known is None or known.empty else float(known.iloc[-1]))
+    assert result == expected
+
+
+@pytest.mark.parametrize("start", [date(2010, 1, 1), date(2010, 1, 4)])
+def test_risk_free_series_raises_when_start_precedes_first_observation(
+    fake_lake: Any, start: date
+) -> None:
+    """A start date on or before the first DGS3MO observation, before any value is known,
+    raises ValueError naming that observation's date."""
     fake_lake.add("fred_vintages", _dgs3mo_vintages(), date_columns=_VINTAGE_DATES)
 
     with pytest.raises(ValueError, match="2010-01-04"):
-        macro_loader.load_risk_free_rate_series(date(2010, 1, 1), date(2010, 1, 8))
+        macro_loader.load_risk_free_rate_series(start, date(2010, 1, 8))

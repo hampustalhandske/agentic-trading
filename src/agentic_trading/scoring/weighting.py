@@ -82,7 +82,17 @@ class EqualWeight(WeightingStrategy):
 
 
 class SharpeWeight(WeightingStrategy):
-    """Positive trailing-Sharpe weighting with a conservative equal fallback."""
+    """Trailing-Sharpe weighting: each source's raw weight is
+    `max(floor, 1 + sharpe / 3)` over `lookback_days`, and the raw weights
+    are normalized to average 1.0.
+
+    A source with fewer than two observations has no track record yet and
+    takes the neutral raw weight 1.0. A source whose Sharpe is undefined
+    (`PerformanceScoreboard.sharpe_ratio` returns `None`: its returns have
+    zero standard deviation) takes the raw weight `floor`, the lowest any
+    measured Sharpe can reach: a record with no variance shows no skill, so
+    it never outweighs a source with a measured Sharpe, and the
+    normalization leaves the ratios between measured sources unchanged."""
 
     def __init__(self, lookback_days: int = 60, floor: float = 0.25) -> None:
         self.lookback_days = lookback_days
@@ -97,7 +107,10 @@ class SharpeWeight(WeightingStrategy):
                 score = scoreboard.sharpe_ratio(source_id, as_of_date, self.lookback_days)
             except ValueError:
                 score = 0.0
-            raw[source_id] = max(self.floor, 1.0 + score / 3.0)
+            if score is None:
+                raw[source_id] = self.floor
+            else:
+                raw[source_id] = max(self.floor, 1.0 + score / 3.0)
         average = sum(raw.values()) / len(raw)
         return {source_id: value / average for source_id, value in raw.items()}
 

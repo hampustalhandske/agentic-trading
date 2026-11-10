@@ -1,5 +1,6 @@
 # commander.py
 
+import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import cast
@@ -44,6 +45,13 @@ logger = get_logger(__name__)
 # recognizes which pod gets the fixed insurance budget below rather than
 # a risk-parity-sized share.
 TAIL_HEDGE_MANAGER_ID = "tail_hedge_manager"
+
+
+class NonFiniteRiskMeasureError(RuntimeError):
+    """The firm's one-day VaR or stressed loss on a book is not a finite
+    number, so the book cannot be held to `settings.firm.max_daily_var` or
+    `settings.firm.max_stress_loss`. Raised rather than passing the book
+    through unscaled; it stops the run."""
 
 
 class CommanderRiskState(BaseModel):
@@ -433,7 +441,8 @@ def _apply_firm_limits(
     risk estimate worth acting on. Step (d) is additionally skipped on
     its own, independent of history depth, whenever `market_data` carries
     no SPY close/log_return series in this run's frame at all. Every
-    binding limit is logged."""
+    binding limit is logged. Raises `NonFiniteRiskMeasureError` when the
+    VaR of step (c) or the stressed loss of step (e) is not finite."""
     firm = settings.firm
     limited = {
         asset: max(min(weight, firm.max_single_name_weight), -firm.max_single_name_weight)
@@ -484,6 +493,11 @@ def _apply_firm_limits(
         mean=0.0,
         volatility=portfolio_std,
     )
+    if not math.isfinite(var):
+        raise NonFiniteRiskMeasureError(
+            f"{as_of_date.date()}: firm one-day var is {var} for the book over {traded}; "
+            "the VaR limit cannot be applied"
+        )
     if var > firm.max_daily_var:
         scale = firm.max_daily_var / var
         limited = {asset: weight * scale for asset, weight in limited.items()}
@@ -572,6 +586,11 @@ def _apply_firm_limits(
         mean=0.0,
         volatility=stressed_portfolio_std,
     )
+    if not math.isfinite(stressed_loss):
+        raise NonFiniteRiskMeasureError(
+            f"{as_of_date.date()}: firm stress one-day loss is {stressed_loss} for the book over "
+            f"{traded}; the stress limit cannot be applied"
+        )
     if stressed_loss > firm.max_stress_loss:
         scale = firm.max_stress_loss / stressed_loss
         limited = {asset: weight * scale for asset, weight in limited.items()}

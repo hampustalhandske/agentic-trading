@@ -576,13 +576,15 @@ class BacktestResult(BaseModel):
     start_date: date
     end_date: date
     portfolio_value_history: list[tuple[date, float]]
-    final_sharpe_ratio: float
+    # Each ratio is None when it is undefined on the run (no return
+    # variance, no downside, no drawdown, zero tracking error, no benchmark).
+    final_sharpe_ratio: float | None
     final_max_drawdown: float
-    final_sortino_ratio: float
-    final_calmar_ratio: float
+    final_sortino_ratio: float | None
+    final_calmar_ratio: float | None
     final_information_ratio: float | None = None
     final_hit_rate: float
-    final_profit_factor: float
+    final_profit_factor: float | None
     # Every day's decisions, or with `history_horizon_days` set only the
     # last days the engine held in memory (the current and the pending
     # day's); the run's checkpoint then holds every day's.

@@ -55,17 +55,19 @@ class PerformanceScoreboard:
         source_id: str,
         as_of_date: date,
         lookback_days: int,
-    ) -> float:
+    ) -> float | None:
         """Trailing Sharpe ratio for `source_id` over the lookback window
         ending at `as_of_date`, computed from attributable_return in the
-        underlying TrackRecord history."""
+        underlying TrackRecord history. Raises `ValueError` with fewer than
+        two observations; `None` when the returns have zero standard
+        deviation, where the ratio is undefined."""
         history = self.track_record.history_for(source_id, as_of_date, lookback_days)
         returns = [entry.attributable_return for entry in history]
         if len(returns) < 2:
             raise ValueError("sharpe_ratio requires at least two observations")
         stdev = statistics.stdev(returns)
         if stdev == 0:
-            return 0.0
+            return None
         mean = statistics.mean(returns)
         return mean / stdev * math.sqrt(252)
 
@@ -170,13 +172,16 @@ class PerformanceScoreboard:
         history = self._analyst_history(source_id, as_of_date, settings.portfolio.ic_lookback_days)
         return shrink_information_coefficient(self._correlation(history), len(history))
 
-    def summary(self, as_of_date: date) -> dict[str, dict[str, float]]:
+    def summary(self, as_of_date: date) -> dict[str, dict[str, float | None]]:
         """Full snapshot of every known analyst's and manager's current
         metrics (sharpe_ratio, max_drawdown, cumulative_return) as of
-        `as_of_date`, keyed by source_id."""
+        `as_of_date`, keyed by source_id. `sharpe_ratio` is `None` where it
+        is undefined (zero-stdev returns) and 0.0 with fewer than two
+        observations."""
         source_ids = self.track_record.source_ids_as_of(as_of_date)
-        result: dict[str, dict[str, float]] = {}
+        result: dict[str, dict[str, float | None]] = {}
         for source_id in sorted(source_ids):
+            sharpe: float | None
             try:
                 sharpe = self.sharpe_ratio(source_id, as_of_date, DEFAULT_LOOKBACK_DAYS)
             except ValueError:

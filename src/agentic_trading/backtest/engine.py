@@ -56,6 +56,28 @@ from agentic_trading.scoring.weighting import WeightingStrategy
 
 logger = get_logger(__name__)
 
+
+def _summary_metric(name: str, compute: Callable[[], float]) -> float | None:
+    """`compute()` as a float, the run-summary metric `name`; `None` when
+    the metric is undefined on this run: `compute` raises `ValueError`
+    (quantcore's undefined-result error among them) or
+    `ZeroDivisionError`, or returns a non-finite value. Each `None` logs a
+    warning naming the metric and the reason."""
+    try:
+        value = float(compute())
+    except (ValueError, ZeroDivisionError) as exc:
+        logger.warning(
+            "Summary metric %s is undefined on this run (%s); reporting None.", name, exc
+        )
+        return None
+    if not math.isfinite(value):
+        logger.warning(
+            "Summary metric %s is not finite on this run (%s); reporting None.", name, value
+        )
+        return None
+    return value
+
+
 # Largest absolute daily excess return still treated as zero. A book that
 # only ever holds cash earns exactly the benchmark accrual, so its excess
 # returns are floating-point residue (around 1e-17); Sharpe and Sortino of
@@ -1324,66 +1346,69 @@ class BacktestEngine:
         valuation_dates = [day for day, _ in portfolio_value_history]
         return_dates = valuation_dates[1:]
 
-        if len(daily_returns) < 2 or float(np.std(daily_returns, ddof=1)) == 0.0:
-            # A flat (zero-variance) return series makes every ratio here
-            # undefined (division by zero) rather than merely large — 0.0
-            # is the same "nothing to report" default used for a too-short
-            # window.
-            final_sharpe_ratio = 0.0
-            final_sortino_ratio = 0.0
-            final_calmar_ratio = 0.0
+        # Each summary metric is computed on its own (`_summary_metric`), so
+        # one that is undefined on this run is None without touching the
+        # others. Max drawdown and hit rate are defined on any returns.
+        returns_array = np.array(daily_returns, dtype=np.float64)
+        if daily_returns:
+            final_max_drawdown = float(maximum_drawdown(returns_array))
+            final_hit_rate = float(hit_rate(returns_array))
+        else:
             final_max_drawdown = 0.0
             final_hit_rate = 0.0
-            final_profit_factor = 0.0
+
+        final_sharpe_ratio: float | None
+        final_sortino_ratio: float | None
+        final_calmar_ratio: float | None
+        final_profit_factor: float | None
+        if len(daily_returns) < 2 or float(np.std(daily_returns, ddof=1)) == 0.0:
+            # A flat (zero-variance) or too-short return series has no
+            # volatility to scale by: every ratio is undefined.
+            logger.warning(
+                "Summary ratios (sharpe, sortino, calmar, profit factor) are undefined on this "
+                "run: %d daily return(s), fewer than two or with zero variance; reporting None.",
+                len(daily_returns),
+            )
+            final_sharpe_ratio = None
+            final_sortino_ratio = None
+            final_calmar_ratio = None
+            final_profit_factor = None
         else:
-            returns_array = np.array(daily_returns, dtype=np.float64)
-            try:
-                excess_returns_array = returns_array - self._risk_free_accrual_array(
-                    valuation_dates
-                )
-                if np.all(np.abs(excess_returns_array) <= ZERO_EXCESS_RETURN_TOLERANCE):
-                    final_sharpe_ratio = 0.0
-                    final_sortino_ratio = 0.0
-                else:
-                    final_sharpe_ratio = float(sharpe_ratio(excess_returns_array))
-                    final_sortino_ratio = float(sortino_ratio(excess_returns_array))
-                # Calmar is annualized raw return over max drawdown with no
-                # excess-return concept (quantcore's own definition) — no
-                # risk-free adjustment applies here.
-                final_calmar_ratio = float(calmar_ratio(returns_array))
-                final_max_drawdown = float(maximum_drawdown(returns_array))
-                final_hit_rate = float(hit_rate(returns_array))
-                final_profit_factor = float(profit_factor(returns_array))
-            except ZeroDivisionError:
-                # A degenerate edge case (e.g. no downside deviation at
-                # all) that the zero-variance guard above didn't catch —
-                # same "nothing to report" default rather than crashing
-                # the run over a performance-summary metric.
-                logger.debug(
-                    "Performance metric computation hit a zero-division edge case — "
-                    "defaulting the run's summary ratios to 0.0.",
-                    exc_info=True,
-                )
+            excess_returns_array = returns_array - self._risk_free_accrual_array(valuation_dates)
+            if np.all(np.abs(excess_returns_array) <= ZERO_EXCESS_RETURN_TOLERANCE):
                 final_sharpe_ratio = 0.0
                 final_sortino_ratio = 0.0
-                final_calmar_ratio = 0.0
-                final_max_drawdown = 0.0
-                final_hit_rate = 0.0
-                final_profit_factor = 0.0
+            else:
+                final_sharpe_ratio = _summary_metric(
+                    "sharpe ratio", lambda: sharpe_ratio(excess_returns_array)
+                )
+                final_sortino_ratio = _summary_metric(
+                    "sortino ratio", lambda: sortino_ratio(excess_returns_array)
+                )
+            # Calmar is annualized raw return over max drawdown with no
+            # excess-return concept (quantcore's own definition) — no
+            # risk-free adjustment applies here.
+            final_calmar_ratio = _summary_metric(
+                "calmar ratio", lambda: calmar_ratio(returns_array)
+            )
+            final_profit_factor = _summary_metric(
+                "profit factor", lambda: profit_factor(returns_array)
+            )
 
         final_information_ratio: float | None = None
         if self.benchmark_returns is not None and len(daily_returns) >= 2:
             benchmark_array = self._benchmark_returns_array(return_dates)
             if benchmark_array is not None:
-                final_information_ratio = float(
-                    information_ratio(np.array(daily_returns, dtype=np.float64), benchmark_array)
+                benchmark = benchmark_array
+                final_information_ratio = _summary_metric(
+                    "information ratio", lambda: information_ratio(returns_array, benchmark)
                 )
 
         logger.info(
-            "Backtest complete: %d days simulated in %.1fs — final Sharpe=%.3f, max drawdown=%.2f",
+            "Backtest complete: %d days simulated in %.1fs — final Sharpe=%s, max drawdown=%.2f",
             len(days),
             time.perf_counter() - run_started_at,
-            final_sharpe_ratio,
+            "undefined" if final_sharpe_ratio is None else f"{final_sharpe_ratio:.3f}",
             final_max_drawdown,
         )
         pod_performance = {

@@ -4,6 +4,7 @@ the analyst's confidence, rolls it inside the roll window, and falls
 back to the short-SPY equity weight when no usable chain exists."""
 
 from datetime import date, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -286,3 +287,59 @@ def test_lagged_chain_listing_only_todays_expiry_selects_no_put(
         assert _manager()._select_put(_market_data(), AS_OF, 0.01) is None
     finally:
         option_marks.clear_cache()
+
+
+@pytest.fixture
+def manager_logs(caplog: pytest.LogCaptureFixture) -> Any:
+    """Routes the tail-hedge manager's logger (the package logger does not propagate) into
+    `caplog` at INFO."""
+    import logging
+
+    manager_logger = logging.getLogger("agentic_trading.agents.managers.tail_hedge_manager")
+    manager_logger.addHandler(caplog.handler)
+    previous_level = manager_logger.level
+    manager_logger.setLevel(logging.INFO)
+    yield caplog
+    manager_logger.setLevel(previous_level)
+    manager_logger.removeHandler(caplog.handler)
+
+
+def _protection_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records if "protection" in record.getMessage()]
+
+
+def test_logs_the_protection_the_budget_buys(chain, manager_logs) -> None:
+    _manager().construct_portfolio(["SPY"], _market_data(), AS_OF, _scoreboard())
+
+    assert _protection_lines(manager_logs)
+
+
+@pytest.mark.parametrize(
+    "sizing",
+    [
+        ValueError("undefined result"),
+        SimpleNamespace(protection_pct_achieved=float("nan"), breakeven=480.0),
+        SimpleNamespace(protection_pct_achieved=0.9, breakeven=float("inf")),
+    ],
+    ids=["raises", "nan_protection", "inf_breakeven"],
+)
+def test_an_undefined_protection_sizing_skips_only_the_log_line(
+    chain, monkeypatch: pytest.MonkeyPatch, manager_logs, sizing: Any
+) -> None:
+    """The sizing feeds only a log line: an undefined one leaves the decisions as they are."""
+    from agentic_trading.agents.managers import tail_hedge_manager
+
+    expected = _manager().construct_portfolio(["SPY"], _market_data(), AS_OF, _scoreboard())
+    manager_logs.clear()
+
+    def _sizing(*_args: Any) -> Any:
+        if isinstance(sizing, Exception):
+            raise sizing
+        return sizing
+
+    monkeypatch.setattr(tail_hedge_manager, "protective_put_sizing", _sizing)
+
+    decisions = _manager().construct_portfolio(["SPY"], _market_data(), AS_OF, _scoreboard())
+
+    assert decisions == expected
+    assert _protection_lines(manager_logs) == []

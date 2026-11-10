@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 import numpy as np
@@ -24,6 +25,8 @@ from agentic_trading.agents.analysts.cvar_pod._options_data import (
 from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
+from agentic_trading.data.loaders.lakehouse_loader import load_fred_vintages_from_lakehouse
+from agentic_trading.data.loaders.macro_loader import DGS3MO
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -40,19 +43,33 @@ class BlackScholesValuationAnalyst(AnalystAgent):
     `_options_data.real_atm_options_by_expiration`) — a model-vs-market
     read. Spot and strike are the unadjusted close
     (`_market_math.raw_spot`), the basis option strikes are quoted on.
-    Flat with zero confidence when no real snapshot or no close exists
-    for the date. The GARCH leg refits at most once every
+    Both legs price at the risk-free rate r, the latest DGS3MO value
+    known on the decision day (`load_fred_vintages_from_lakehouse`),
+    converted from percent to an annual decimal rate.
+
+    Unavailable (flat, zero confidence) when no real snapshot or no
+    close exists for the date, when the fitted or the chain volatility
+    is not a positive finite number, or when no DGS3MO value is known.
+    The GARCH leg refits at most once every
     `_refit_cache.refit_interval_days` simulated days per asset — see
     `RefitCache`'s docstring.
 
-    Every active signal's `source_as_of` is the date of the chain snapshot
-    it priced off (`_options_data.chain_snapshot_date`), the snapshot's own
-    date rather than the later decision date the publication lag first
-    makes it visible on."""
+    Every active signal's `source_as_of` is the newer of the date of the
+    chain snapshot it priced off (`_options_data.chain_snapshot_date`,
+    the snapshot's own date rather than the later decision date the
+    publication lag first makes it visible on) and the `known_at` of the
+    DGS3MO value r came from."""
 
     agent_id: str = "black_scholes_valuation_analyst"
+    # No `lookback_days` on DGS3MO: the latest value is read whatever its
+    # age, so there is no fixed window short of the warm-up.
     data_requirements: tuple[DataRequirement, ...] = Field(
-        default_factory=options_chain_requirements
+        default_factory=lambda: (
+            *options_chain_requirements(),
+            DataRequirement(
+                source="fred", identifier=DGS3MO, asset_scoped=False, description="FRED DGS3MO"
+            ),
+        )
     )
 
     _time_to_maturity: float = 0.25
@@ -102,37 +119,58 @@ class BlackScholesValuationAnalyst(AnalystAgent):
         benchmark_label = (
             f"real market ATM IV ({int(real_options.iloc[0]['days_to_expiration'])}d exp)"
         )
+        snapshot_date = chain_snapshot_date(real_options)
 
-        mean_return = float(np.mean(returns))
         fitted_volatility = self._annualized_garch_volatility(
             returns, self._refit_cache, asset, as_of_date
         )
+        for label, volatility in (("fitted", fitted_volatility), ("chain", benchmark_volatility)):
+            if not (math.isfinite(volatility) and volatility > 0.0):
+                return self.unavailable_signal(
+                    asset,
+                    as_of_date,
+                    f"{label} volatility {volatility} is not a positive finite number",
+                    source_as_of=snapshot_date,
+                )
+
+        vintages = load_fred_vintages_from_lakehouse(DGS3MO, as_of_date.date())
+        known_rates = None if vintages is None else vintages.dropna(subset=["value"])
+        if known_rates is None or known_rates.empty:
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                "no FRED DGS3MO value known on this date for the risk-free rate",
+                source_as_of=snapshot_date,
+            )
+        latest_rate = known_rates.iloc[-1]
+        risk_free_rate = float(latest_rate["value"]) / 100.0
+        source_as_of = max(snapshot_date, pd.Timestamp(latest_rate["known_at"]).date())
 
         fitted_call = black_scholes_call(
             spot,
             spot,
-            mean_return,
+            risk_free_rate,
             fitted_volatility,
             self._time_to_maturity,
         )
         benchmark_call = black_scholes_call(
             spot,
             spot,
-            mean_return,
+            risk_free_rate,
             benchmark_volatility,
             self._time_to_maturity,
         )
         fitted_put = black_scholes_put(
             spot,
             spot,
-            mean_return,
+            risk_free_rate,
             fitted_volatility,
             self._time_to_maturity,
         )
         benchmark_put = black_scholes_put(
             spot,
             spot,
-            mean_return,
+            risk_free_rate,
             benchmark_volatility,
             self._time_to_maturity,
         )
@@ -155,10 +193,11 @@ class BlackScholesValuationAnalyst(AnalystAgent):
             as_of_date=as_of_date.date(),
             direction=direction,
             confidence=confidence,
-            source_as_of=chain_snapshot_date(real_options),
+            source_as_of=source_as_of,
             rationale=(
                 f"quantcore Black-Scholes edge: {settings.analysts.risk_window_short}d fitted vol="
                 f"{fitted_volatility:.3f} vs {benchmark_label}={benchmark_volatility:.3f}, "
+                f"r={risk_free_rate:.4f}, "
                 f"call={fitted_call:.4f}/{benchmark_call:.4f}, "
                 f"put={fitted_put:.4f}/{benchmark_put:.4f}"
             ),

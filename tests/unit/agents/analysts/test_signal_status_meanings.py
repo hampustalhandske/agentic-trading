@@ -675,7 +675,7 @@ def test_arima_forecast(
     monkeypatch.setattr(module, "ljung_box_test", _ljung_box(*p_values))
     monkeypatch.setattr(module, "select_arima_order", _stub(order))
     monkeypatch.setattr(module, "arima_fit", _stub(fit))
-    monkeypatch.setattr(module, "arima_residuals", _Recorder(np.zeros(249)))
+    monkeypatch.setattr(module, "arima_residuals", _Recorder(_noise(249, 6)))
     analyst = module.ARIMAForecastAnalyst(agent_id="arima_forecast_analyst_rates")
 
     _assert_flat(analyst.generate_signal("TLT", market, AS_OF), status)
