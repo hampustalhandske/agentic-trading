@@ -19,7 +19,7 @@ _KEYS = ["ticker", "date"]
 
 
 def _toy_row(
-    ticker: str, close: float | None, note: str, dt: str, scraped_at: Any
+    ticker: str, close: float | None, note: str | None, dt: str, scraped_at: Any
 ) -> dict[str, Any]:
     return {
         "ticker": ticker,
@@ -157,3 +157,32 @@ def test_a_loader_reads_the_same_tied_version_in_either_insertion_order(
 
     assert rates is not None
     assert rates.loc["2024-01-03", "USD"] == pytest.approx(0.0525)
+
+
+def test_the_fallback_picks_what_the_lakes_per_column_rule_picks_with_nulls(
+    fake_lake: Any,
+) -> None:
+    """Tied rows that differ only by a null in one tie column: the fallback order (a struct of
+    the non-key columns) keeps the same row as the lake's rule written out column by column,
+    each ascending with nulls last. DDD's tied rows differ only by a null `note`, so the row
+    with a note wins; EEE's pair a null `close` with a note against a close with a null note,
+    so the row with a close wins."""
+    rows = [
+        _toy_row("DDD", 5.0, None, "2024-05-01", _TIED),
+        _toy_row("DDD", 5.0, "a", "2024-05-01", _TIED),
+        _toy_row("EEE", None, "a", "2024-05-01", _TIED),
+        _toy_row("EEE", 5.0, None, "2024-05-01", _TIED),
+    ]
+    expected = pd.DataFrame(
+        {
+            "ticker": ["DDD", "EEE"],
+            "date": pd.to_datetime(["2024-01-02"] * 2),
+            "close": [5.0, 5.0],
+            "note": ["a", None],
+        }
+    )
+    for order in (rows, list(reversed(rows))):
+        fallback = _read_toy(fake_lake, order).reset_index(drop=True)
+        per_column = _read_toy(fake_lake, order, ["close", "note"]).reset_index(drop=True)
+        pd.testing.assert_frame_equal(fallback, per_column)
+        pd.testing.assert_frame_equal(fallback, expected, check_dtype=False)
