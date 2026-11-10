@@ -17,7 +17,9 @@ gets no decision and one unavailable, weight-0 row per pod in its scope
 accounted the day and before its checkpoint takes the day, so a store
 refusal stops the pass with the checkpoint at the day before; a day on
 which a read past `data_end` was refused, even one an analyst caught,
-stops the pass before the day is written.
+stops the pass before the day is written. The pass writes its days inside
+the store's `appending()`: each day adds a part file, and decisions.parquet
+is written once, when the pass stops.
 
 The engine checkpoints every day to `store_dir / <spec hash>.checkpoint.sqlite`,
 beside the trial directory, so a pass stopped after `max_days`, or killed,
@@ -597,7 +599,8 @@ def run_firm_record(
                 written += 1
 
             try:
-                engine.run(before_checkpoint=write_day)
+                with store.appending():
+                    engine.run(before_checkpoint=write_day)
             except _RecordPausedError:
                 commander.close()
                 logger.info("Firm record paused after %d day(s)", written)

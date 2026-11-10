@@ -38,13 +38,27 @@ renamed over the old one, and progress.json is written after every
 Parquet file, so a write killed part way leaves every file whole and
 progress.json naming the last day fully written; rows dated after it are
 dropped when the store is next opened. Dates are stored as dates. The
-store reads no price or return."""
+store reads no price or return.
+
+By default each day's write rewrites every Parquet file whole. Inside
+`appending()`, a pass of many days, each day's rows go instead to a part
+file of their own under the trial directory's `.parts/` directory
+(`<file name>/<ISO day>.parquet`, written whole the same way, before
+progress.json), and each Parquet file is written once when the block
+ends, with the same bytes the day-by-day rewrites give, and `.parts/` is
+removed. Inside the block, a Parquet file holds only the days written
+before it began. A pass killed inside the block leaves its part files;
+the next `open` merges those of days up to progress.json's into the
+Parquet files, drops the rest and removes `.parts/`, so the trial
+directory then holds what it would had every day rewritten the files."""
 
 import json
 import os
+import shutil
 import tempfile
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self, TypedDict
@@ -106,6 +120,11 @@ _MEMORY_DTYPES: dict[str, Any] = {
     "double[pyarrow]": "float64",
     "int64[pyarrow]": "Int64",
 }
+
+
+# The directory of the trial directory holding the part files of a pass
+# written inside `_TrialStore.appending`.
+PARTS_DIR = ".parts"
 
 
 class StoreMismatchError(ValueError):
@@ -194,6 +213,9 @@ class _TrialStore:
         self.trial_dir = Path(store_dir) / record.spec_hash
         self._sources = sources
         self._tables = {name: _frame([], columns) for name, (columns, _) in self._files.items()}
+        # Inside `appending`, each file's rows of the days written in the
+        # block, by day in write order; `None` outside it.
+        self._pending: dict[str, dict[date, pd.DataFrame]] | None = None
         self._last_completed: date | None = None
         self._opened = False
 
@@ -234,7 +256,68 @@ class _TrialStore:
             name: self._load(self.trial_dir / name, columns, day_column)
             for name, (columns, day_column) in self._files.items()
         }
+        if (self.trial_dir / PARTS_DIR).exists():
+            self._merge_parts_left()
         self._opened = True
+
+    @contextmanager
+    def appending(self) -> Iterator[None]:
+        """Write the days of the block as part files and each Parquet file
+        once at its end, also when the block raises (see the module
+        docstring). Raises `RuntimeError` when the store is not open or
+        already appending."""
+        self._require_open()
+        if self._pending is not None:
+            raise RuntimeError(f"{type(self).__name__} is already appending")
+        self._pending = {name: {} for name in self._files}
+        try:
+            yield
+        finally:
+            pending, self._pending = self._pending, None
+            self._merge(pending)
+
+    def _part_path(self, name: str, day: date) -> Path:
+        """The part file of `name`'s rows of `day`."""
+        return self.trial_dir / PARTS_DIR / name / f"{day.isoformat()}.parquet"
+
+    def _merge(self, pending: Mapping[str, Mapping[date, pd.DataFrame]]) -> None:
+        """Write each file holding rows of `pending` (file name to its new
+        rows by day, in day order) with its stored rows followed by those,
+        then remove the part files."""
+        for name, (columns, _) in self._files.items():
+            frames = list(pending[name].values())
+            if not frames:
+                continue
+            table = _append(self._tables[name], pd.concat(frames, ignore_index=True), columns)
+            _write_parquet(self.trial_dir / name, table, columns)
+            self._tables[name] = table
+        shutil.rmtree(self.trial_dir / PARTS_DIR, ignore_errors=True)
+
+    def _merge_parts_left(self) -> None:
+        """Merge the part files a killed pass left (see the module
+        docstring): each file's parts of days up to the last completed one
+        replace its stored rows of those days and follow the rest."""
+        pending: dict[str, dict[date, pd.DataFrame]] = {}
+        for name, (columns, day_column) in self._files.items():
+            pending[name] = {}
+            for path in sorted((self.trial_dir / PARTS_DIR / name).glob("*.parquet")):
+                day = date.fromisoformat(path.stem)
+                if self._last_completed is None or day > self._last_completed:
+                    continue
+                pending[name][day] = pd.read_parquet(path).astype(_memory_dtypes(columns))
+            table = self._tables[name]
+            replaced = table[day_column].isin([pd.Timestamp(day) for day in pending[name]])
+            self._tables[name] = table[~replaced].reset_index(drop=True)
+        self._merge(pending)
+
+    def _table(self, name: str) -> pd.DataFrame:
+        """Every row of `name` written so far, the rows of an open
+        `appending` block included."""
+        frames = [] if self._pending is None else list(self._pending[name].values())
+        if not frames:
+            return self._tables[name]
+        columns = self._files[name][0]
+        return _append(self._tables[name], pd.concat(frames, ignore_index=True), columns)
 
     def last_completed(self) -> date | None:
         """The last day written in full, `None` before the first."""
@@ -264,7 +347,11 @@ class _TrialStore:
     def _commit(self, day: date, rows: Mapping[str, list[dict[str, Any]]]) -> None:
         """Append `rows` (file name to that file's new rows) to each file,
         after dropping any row dated `day` already there, write the files in
-        order, then record `day` in progress.json."""
+        order, then record `day` in progress.json. Inside `appending`, the
+        rows are written as `day`'s part file of each file instead."""
+        if self._pending is not None:
+            self._commit_part(day, rows)
+            return
         stamp = pd.Timestamp(day)
         tables = {
             name: _append(
@@ -281,6 +368,29 @@ class _TrialStore:
             json.dumps({"last_completed": day.isoformat()}) + "\n",
         )
         self._tables, self._last_completed = tables, day
+
+    def _commit_part(self, day: date, rows: Mapping[str, list[dict[str, Any]]]) -> None:
+        """`_commit` inside `appending`: write each file's part file of
+        `day` in order, record `day` in progress.json, then hold `rows` as
+        `day`'s rows of each file, replacing any held or stored before."""
+        assert self._pending is not None
+        frames = {name: _frame(rows[name], columns) for name, (columns, _) in self._files.items()}
+        for name, (columns, _) in self._files.items():
+            path = self._part_path(name, day)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _write_parquet(path, frames[name], columns)
+        _write_text(
+            self.trial_dir / "progress.json",
+            json.dumps({"last_completed": day.isoformat()}) + "\n",
+        )
+        stamp = pd.Timestamp(day)
+        for name, (_, day_column) in self._files.items():
+            table = self._tables[name]
+            stored = table[day_column] == stamp
+            if stored.any():
+                self._tables[name] = table[~stored].reset_index(drop=True)
+            self._pending[name][day] = frames[name]
+        self._last_completed = day
 
     def _load(self, path: Path, columns: dict[str, str], day_column: str) -> pd.DataFrame:
         """The rows of `path` dated on or before the last completed day, as
@@ -398,7 +508,7 @@ class SignalStore(_TrialStore):
         appearance, and the annual turnover of the stored decisions (see
         `StoreCounts`); turnover is 0.0 for an empty store."""
         self._require_open()
-        decisions = self._tables["decisions.parquet"]
+        decisions = self._table("decisions.parquet")
         by_status = pd.crosstab(decisions["instrument_id"], decisions["status"])
         instruments: dict[str, StatusCounts] = {}
         for instrument in decisions["instrument_id"].unique():
@@ -468,7 +578,7 @@ class FirmDecisionStore(_TrialStore):
         """The rows stored for `day`, in stored order; empty for a day not
         written."""
         self._require_open()
-        table = self._tables["decisions.parquet"]
+        table = self._table("decisions.parquet")
         picked = table[table["decision_date"] == pd.Timestamp(day)]
         return [
             DecisionRow(
@@ -495,8 +605,10 @@ class FirmDecisionStore(_TrialStore):
         """Drop every row dated after `day` (every row for `None`) and
         record `day` as the last completed day, so those days are written
         again. Raises `StoreOrderError` when `day` is after
-        `last_completed()`."""
+        `last_completed()`, and `RuntimeError` inside `appending`."""
         self._require_open()
+        if self._pending is not None:
+            raise RuntimeError(f"{type(self).__name__} cannot rewind while appending")
         last = self._last_completed
         if day is not None and (last is None or day > last):
             raise StoreOrderError(
