@@ -19,9 +19,9 @@ A change on either side fails here until the copies are refreshed.
 The grading block of `REPLAY_STRATEGY_YAML`, and its cost table on its own, are pinned by
 canonical sha256 (`_canonical_sha256`), and a firm record's strategy.yaml carries that block
 unchanged, so an edit to the block fails here even when the vendored scaffold is changed with it.
-edgelab's golden accept/refuse cases for grading blocks (EL-75) are not published; they belong
-in `_EL75_GOLDEN_CASES`, and vendoring them there fails
-`test_el75_golden_cases_are_not_vendored_unchecked` until a test checks the block against them."""
+edgelab's golden accept/refuse cases and pinned schemas (EL-75), vendored at
+`tests/fixtures/edgelab_grading_golden/`, are checked against a firm record's outputs in
+`test_edgelab_grading_golden.py`."""
 
 import copy
 import hashlib
@@ -51,8 +51,6 @@ _MEASUREMENT = "edgelab-2026.11.0"
 _GRADING_BLOCK_SHA256 = "aa1fea3ee707b83e9937cbd8231dd708ea4c54332f07b077f207ac1f60c1cfb5"
 _COST_TABLE_SHA256 = "35550da6cebd0a2832b97f80e752b41c9ad91e93bd4c248e7bfd73f850c0647c"
 _COST_ASSET_CLASSES = {"equity", "future", "option", "fx", "crypto", "prediction_market"}
-# Where edgelab's EL-75 golden accept/refuse cases for grading blocks go once published.
-_EL75_GOLDEN_CASES = _FIXTURES / "edgelab_grading_golden"
 
 
 def _without_comment_lines(text: str) -> str:
@@ -103,13 +101,6 @@ def test_grading_block_and_cost_table_are_the_pinned_ones() -> None:
 def test_a_firm_record_writes_the_pinned_grading_block() -> None:
     """The strategy.yaml a firm record writes carries the pinned grading block unchanged."""
     assert _canonical_sha256(strategy_config(_record())["grading"]) == _GRADING_BLOCK_SHA256
-
-
-def test_el75_golden_cases_are_not_vendored_unchecked() -> None:
-    """Nothing is vendored at `_EL75_GOLDEN_CASES`: edgelab has not published its golden
-    grading cases, and once they are vendored this test is replaced by one checking the block
-    against them."""
-    assert not _EL75_GOLDEN_CASES.exists()
 
 
 @pytest.mark.parametrize(

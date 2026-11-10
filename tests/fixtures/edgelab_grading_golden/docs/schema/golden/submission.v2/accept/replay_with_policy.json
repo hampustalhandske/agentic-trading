@@ -1,0 +1,35 @@
+{
+  "client": {
+    "git_sha": "abc1234def",
+    "hypothesis_id": "hyp-1",
+    "project": "pitch-edge"
+  },
+  "data": {
+    "kind": "parquet",
+    "path": "data"
+  },
+  "decisions": {
+    "path": "decisions.parquet",
+    "sources": [
+      {
+        "can_publish_after_close": true,
+        "name": "earnings"
+      }
+    ]
+  },
+  "kind": "replay",
+  "policy": "edgelab-2026.11.1",
+  "profile": "fast",
+  "schema_version": 2,
+  "seed": 5,
+  "strategy_dir": "strategy",
+  "trials": {
+    "declared_n": 3,
+    "family_id": "family-a",
+    "test_keys": [
+      "k1",
+      "k2",
+      "k3"
+    ]
+  }
+}

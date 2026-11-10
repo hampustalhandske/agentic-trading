@@ -1,0 +1,107 @@
+{
+  "$id": "urn:edgelab:schema:decision_file.v1",
+  "additionalProperties": false,
+  "description": "One row of a replay decision file.\n\nAttributes:\n    decision_date: The day the weight was decided, after its close; filled at the open of the\n        next session.\n    instrument_kind: The instrument's kind. A replay runs `equity` (bond ETFs included) and\n        `fx`; the other kinds validate but are refused as not supported.\n    instrument_id: A lake ticker, a futures root or an OSI symbol for an option.\n    target_weight: Target weight, finite and within [-6, 6].\n    status: `active`, `unavailable` or `error`; absent means `active`. A non-active row has\n        weight 0.\n    source: The name of the newest-dated input, listed in the submission's sources; empty\n        together with `source_as_of`.\n    source_as_of: When that input was published: a UTC timestamp (`2020-01-10T21:30:00Z`) or\n        a date (`2020-01-10`); empty together with `source`.\n    pod_id: The client's sub-book the row belongs to, if any. A `(decision_date,\n        instrument_id)` pair may repeat when every row of it has a distinct, non-null\n        `pod_id`; the replay trades the sum of the pair's `target_weight`, which must lie in\n        [-6, 6].\n    delta_equiv_weight: The delta-equivalent weight of an option row, if any; validated and\n        unused.",
+  "properties": {
+    "decision_date": {
+      "format": "date",
+      "title": "Decision Date",
+      "type": "string"
+    },
+    "delta_equiv_weight": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Delta Equiv Weight"
+    },
+    "instrument_id": {
+      "minLength": 1,
+      "title": "Instrument Id",
+      "type": "string"
+    },
+    "instrument_kind": {
+      "enum": [
+        "equity",
+        "future",
+        "fx",
+        "crypto",
+        "option"
+      ],
+      "title": "Instrument Kind",
+      "type": "string"
+    },
+    "pod_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Pod Id"
+    },
+    "source": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source"
+    },
+    "source_as_of": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source As Of"
+    },
+    "status": {
+      "anyOf": [
+        {
+          "enum": [
+            "active",
+            "unavailable",
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Status"
+    },
+    "target_weight": {
+      "maximum": 6.0,
+      "minimum": -6.0,
+      "title": "Target Weight",
+      "type": "number"
+    }
+  },
+  "required": [
+    "decision_date",
+    "instrument_kind",
+    "instrument_id",
+    "target_weight"
+  ],
+  "title": "DecisionFileRow",
+  "type": "object"
+}
