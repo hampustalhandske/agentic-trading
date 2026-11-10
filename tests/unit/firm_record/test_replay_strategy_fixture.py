@@ -13,12 +13,19 @@ comment lines removed, and the grading block a firm record writes must validate 
 vendored schema. When an edgelab checkout is reachable (`EDGELAB_DIR`, or `edgelab` beside this
 repo's parent directory), its templates must compose to the vendored scaffold; when that
 checkout also has a `.venv`, its `GradingSpec` must produce the vendored schema and measure the
-block as `edgelab-2026.11.0`. A change on either side fails here until the copies are refreshed."""
+block as `edgelab-2026.11.0`; these live checks are marked `edgelab_live` (`tests/edgelab_live.py`).
+A change on either side fails here until the copies are refreshed.
+
+The grading block of `REPLAY_STRATEGY_YAML`, and its cost table on its own, are pinned by
+canonical sha256 (`_canonical_sha256`), and a firm record's strategy.yaml carries that block
+unchanged, so an edit to the block fails here even when the vendored scaffold is changed with it.
+edgelab's golden accept/refuse cases for grading blocks (EL-75) are not published; they belong
+in `_EL75_GOLDEN_CASES`, and vendoring them there fails
+`test_el75_golden_cases_are_not_vendored_unchecked` until a test checks the block against them."""
 
 import copy
 import hashlib
 import json
-import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -28,6 +35,9 @@ import pytest
 import yaml
 
 from agentic_trading.firm_record.edgelab_strategy import REPLAY_STRATEGY_YAML
+from agentic_trading.firm_record.submission import strategy_config
+from edgelab_live import edgelab_path
+from unit.firm_record.test_firm_store import _record
 
 _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
 _SCAFFOLD = _FIXTURES / "edgelab_replay_strategy.yaml"
@@ -36,16 +46,13 @@ _GRADING_SCHEMA = _FIXTURES / "edgelab_grading_spec.json"
 _GRADING_SCHEMA_SHA256 = "01151817bbe77012a3637ea12373c7fabc6a1f66c4189ba7c3ca5618dee6cbfb"
 _TEMPLATES = Path("src") / "edgelab" / "templates" / "strategy"
 _MEASUREMENT = "edgelab-2026.11.0"
-
-
-def _edgelab_dir() -> Path | None:
-    """The edgelab checkout: `EDGELAB_DIR` when set, else `edgelab` beside this repo's
-    parent directory; `None` when the repo sits too near the filesystem root to have one."""
-    configured = os.environ.get("EDGELAB_DIR")
-    if configured:
-        return Path(configured)
-    parents = Path(__file__).resolve().parents
-    return parents[5] / "edgelab" if len(parents) > 5 else None
+# The canonical sha256 of the grading block edgelab 62a7151 scaffolds and measures as
+# `_MEASUREMENT`, and of its cost table (`grading.costs`, one entry per asset class).
+_GRADING_BLOCK_SHA256 = "aa1fea3ee707b83e9937cbd8231dd708ea4c54332f07b077f207ac1f60c1cfb5"
+_COST_TABLE_SHA256 = "35550da6cebd0a2832b97f80e752b41c9ad91e93bd4c248e7bfd73f850c0647c"
+_COST_ASSET_CLASSES = {"equity", "future", "option", "fx", "crypto", "prediction_market"}
+# Where edgelab's EL-75 golden accept/refuse cases for grading blocks go once published.
+_EL75_GOLDEN_CASES = _FIXTURES / "edgelab_grading_golden"
 
 
 def _without_comment_lines(text: str) -> str:
@@ -53,6 +60,12 @@ def _without_comment_lines(text: str) -> str:
     return "".join(
         line for line in text.splitlines(keepends=True) if not line.lstrip().startswith("#")
     )
+
+
+def _canonical_sha256(value: Any) -> str:
+    """The sha256 of `value` as JSON with sorted keys and no whitespace."""
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def validate_grading_block(grading: dict[str, Any]) -> None:
@@ -78,6 +91,27 @@ def test_replay_grading_block_validates() -> None:
     validate_grading_block(yaml.safe_load(REPLAY_STRATEGY_YAML)["grading"])
 
 
+def test_grading_block_and_cost_table_are_the_pinned_ones() -> None:
+    """The grading block of `REPLAY_STRATEGY_YAML` and its cost table, one entry per asset
+    class, hash to their pinned canonical sha256."""
+    grading = yaml.safe_load(REPLAY_STRATEGY_YAML)["grading"]
+    assert set(grading["costs"]) == _COST_ASSET_CLASSES
+    assert _canonical_sha256(grading["costs"]) == _COST_TABLE_SHA256
+    assert _canonical_sha256(grading) == _GRADING_BLOCK_SHA256
+
+
+def test_a_firm_record_writes_the_pinned_grading_block() -> None:
+    """The strategy.yaml a firm record writes carries the pinned grading block unchanged."""
+    assert _canonical_sha256(strategy_config(_record())["grading"]) == _GRADING_BLOCK_SHA256
+
+
+def test_el75_golden_cases_are_not_vendored_unchecked() -> None:
+    """Nothing is vendored at `_EL75_GOLDEN_CASES`: edgelab has not published its golden
+    grading cases, and once they are vendored this test is replaced by one checking the block
+    against them."""
+    assert not _EL75_GOLDEN_CASES.exists()
+
+
 @pytest.mark.parametrize(
     ("section", "field", "value"),
     [
@@ -94,13 +128,11 @@ def test_a_field_edgelab_does_not_have_is_refused(section: str, field: str, valu
         validate_grading_block(grading)
 
 
+@pytest.mark.edgelab_live
 def test_edgelab_templates_compose_to_the_vendored_scaffold() -> None:
     """When an edgelab checkout is reachable, its replay templates compose to the vendored
     scaffold byte for byte."""
-    edgelab = _edgelab_dir()
-    templates = edgelab / _TEMPLATES if edgelab is not None else None
-    if templates is None or not (templates / "kinds" / "replay.yaml").exists():
-        pytest.skip(f"no edgelab checkout with {_TEMPLATES}; set EDGELAB_DIR to check drift")
+    templates = edgelab_path(_TEMPLATES / "kinds" / "replay.yaml").parents[1]
     composed = (
         (templates / "strategy.yaml")
         .read_text()
@@ -111,14 +143,13 @@ def test_edgelab_templates_compose_to_the_vendored_scaffold() -> None:
     )
 
 
+@pytest.mark.edgelab_live
 def test_edgelab_grading_spec_matches_and_measures_the_block() -> None:
     """When an edgelab checkout with a `.venv` is reachable, its `GradingSpec` schema equals the
     vendored one and it measures the grading block of `REPLAY_STRATEGY_YAML` as
     `edgelab-2026.11.0`."""
-    edgelab = _edgelab_dir()
-    python = edgelab / ".venv" / "bin" / "python" if edgelab is not None else None
-    if python is None or not python.exists():
-        pytest.skip("no edgelab checkout with a .venv; set EDGELAB_DIR to check drift")
+    python = edgelab_path(Path(".venv") / "bin" / "python")
+    edgelab = python.parents[2]
     program = (
         "import json, sys\n"
         "from edgelab.grading.policy import GradingSpec\n"
