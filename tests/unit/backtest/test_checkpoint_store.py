@@ -4,9 +4,11 @@ Covers the append-only day-by-day write path and, specifically, the
 `resume` flag on `connect()`: a fresh (non-resumed) run must never see
 rows left over in `db_path` from an earlier, unrelated run."""
 
+import json
 import math
 import sqlite3
 import struct
+import zlib
 from datetime import date
 from pathlib import Path
 
@@ -218,3 +220,43 @@ def test_a_cursor_without_the_option_marks_column_reads_them_as_none(tmp_path: P
     assert payload is not None
     assert payload["option_last_mid"] is None
     assert payload["next_day_index"] == 1
+
+
+def test_decisions_are_stored_compressed_and_read_back_as_written(tmp_path: Path) -> None:
+    """A day's decisions are stored zlib-compressed, and `iter_decision_payloads` gives back the
+    exact JSON text of the decisions appended."""
+    connection = checkpoint_store.connect(tmp_path / "checkpoint.db")
+    _append(connection, DAY_ONE, next_day_index=1)
+    written = json.dumps([_decision(DAY_ONE).model_dump(mode="json")])
+
+    (stored,) = connection.execute("SELECT payload FROM decisions").fetchone()
+
+    assert isinstance(stored, bytes)
+    assert zlib.decompress(stored) == written.encode()
+    assert list(checkpoint_store.iter_decision_payloads(connection)) == [
+        (DAY_ONE.isoformat(), written)
+    ]
+
+
+@pytest.mark.parametrize("version", [0, checkpoint_store.CHECKPOINT_FORMAT_VERSION - 1])
+def test_a_checkpoint_of_another_format_is_refused_for_resume(tmp_path: Path, version: int) -> None:
+    """A resume of a checkpoint of another format version raises `CheckpointFormatError`, naming
+    the file and telling to start over, and leaves the file as it was; a fresh run on the same
+    path starts from an empty checkpoint of the current format."""
+    path = tmp_path / "checkpoint.db"
+    connection = checkpoint_store.connect(path)
+    _append(connection, DAY_ONE, next_day_index=1)
+    connection.execute(f"PRAGMA user_version = {version}")
+    connection.close()
+    before = path.read_bytes()
+
+    with pytest.raises(checkpoint_store.CheckpointFormatError, match="start the run over") as error:
+        checkpoint_store.connect(path, resume=True)
+
+    assert str(path) in str(error.value)
+    assert path.read_bytes() == before
+    fresh = checkpoint_store.connect(path)
+    assert checkpoint_store.read_all(fresh) is None
+    assert fresh.execute("PRAGMA user_version").fetchone() == (
+        checkpoint_store.CHECKPOINT_FORMAT_VERSION,
+    )

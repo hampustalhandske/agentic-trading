@@ -21,11 +21,20 @@ the recent track record and decisions a horizon-bounded engine holds;
 `read_last_day`, `read_unfilled_orders`, `iter_decision_payloads` and
 `iter_source_returns` read single columns of one table each.
 
+Each day's decisions are stored as their JSON text, UTF-8 encoded and
+zlib-compressed (`DECISIONS_COMPRESSION_LEVEL`); every reader gives back
+the JSON text itself. The file records its layout as
+`CHECKPOINT_FORMAT_VERSION` in SQLite's `user_version`; `connect` with
+`resume=True` refuses a file of any other version with
+`CheckpointFormatError`, so a run is resumed only from a checkpoint of the
+layout this module writes.
+
 A `carried_state` blob is a pickle: open with `connect` only checkpoint
 files this program wrote, never one from an untrusted source."""
 
 import json
 import sqlite3
+import zlib
 from collections.abc import Iterable, Iterator
 from datetime import date, datetime
 from pathlib import Path
@@ -40,6 +49,21 @@ from agentic_trading.agents.schemas import (
     TradeRecord,
     UnfilledOrder,
 )
+
+# The layout version this module writes into SQLite's `user_version`; a
+# file of any other version (0 for a checkpoint written before versions
+# were recorded) is refused for a resume.
+CHECKPOINT_FORMAT_VERSION = 2
+# zlib level of each day's stored decisions: level 6 compresses a firm
+# record's day of decisions about 14x in about 10 ms; the higher levels
+# shrink it little more for several times the time.
+DECISIONS_COMPRESSION_LEVEL = 6
+
+
+class CheckpointFormatError(ValueError):
+    """A checkpoint file of another layout version than
+    `CHECKPOINT_FORMAT_VERSION`, which this module cannot resume from."""
+
 
 _CREATE_TRACK_RECORD = """
 CREATE TABLE IF NOT EXISTS track_record (
@@ -56,7 +80,7 @@ CREATE TABLE IF NOT EXISTS track_record (
 _CREATE_DECISIONS = """
 CREATE TABLE IF NOT EXISTS decisions (
     as_of_date TEXT NOT NULL,
-    payload TEXT NOT NULL
+    payload BLOB NOT NULL
 )
 """
 _CREATE_TRADES = """
@@ -154,40 +178,54 @@ def _add_missing_columns(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+# Every table this module creates, in creation order.
+_TABLES: tuple[tuple[str, str], ...] = (
+    ("track_record", _CREATE_TRACK_RECORD),
+    ("decisions", _CREATE_DECISIONS),
+    ("trades", _CREATE_TRADES),
+    ("unfilled_orders", _CREATE_UNFILLED_ORDERS),
+    ("capital_usage", _CREATE_CAPITAL_USAGE),
+    ("sizing_diagnostics", _CREATE_SIZING_DIAGNOSTICS),
+    ("pod_returns", _CREATE_POD_RETURNS),
+    ("pod_cost_days", _CREATE_POD_COST_DAYS),
+    ("portfolio_value", _CREATE_PORTFOLIO_VALUE),
+    ("cursor", _CREATE_CURSOR),
+    ("carried_state", _CREATE_CARRIED_STATE),
+)
+
+
 def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
     """Opens (creating tables if needed) the checkpoint database at
-    `db_path`. When `resume` is `False`, any rows already in the file are
-    cleared first — a fresh (non-resumed) run always starts from an empty
-    checkpoint, even if `db_path` points at a file left over from an
-    earlier, unrelated run, rather than silently appending its rows on
-    top of that leftover state."""
+    `db_path`. When `resume` is `False`, every table of this module already
+    in the file is dropped and created anew first — a fresh (non-resumed)
+    run always starts from an empty checkpoint of the current layout, even
+    if `db_path` points at a file left over from an earlier, unrelated
+    run, rather than silently appending its rows on top of that leftover
+    state. When `resume` is `True`, a file that already holds tables must
+    be of `CHECKPOINT_FORMAT_VERSION`; one of another version raises
+    `CheckpointFormatError`, naming the file and both versions, before
+    anything in it changes."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_path)
-    connection.execute(_CREATE_TRACK_RECORD)
-    connection.execute(_CREATE_DECISIONS)
-    connection.execute(_CREATE_TRADES)
-    connection.execute(_CREATE_UNFILLED_ORDERS)
-    connection.execute(_CREATE_CAPITAL_USAGE)
-    connection.execute(_CREATE_SIZING_DIAGNOSTICS)
-    connection.execute(_CREATE_POD_RETURNS)
-    connection.execute(_CREATE_POD_COST_DAYS)
-    connection.execute(_CREATE_PORTFOLIO_VALUE)
-    connection.execute(_CREATE_CURSOR)
-    connection.execute(_CREATE_CARRIED_STATE)
-    _add_missing_columns(connection)
-    if not resume:
-        with connection:
-            connection.execute("DELETE FROM track_record")
-            connection.execute("DELETE FROM decisions")
-            connection.execute("DELETE FROM trades")
-            connection.execute("DELETE FROM unfilled_orders")
-            connection.execute("DELETE FROM capital_usage")
-            connection.execute("DELETE FROM sizing_diagnostics")
-            connection.execute("DELETE FROM pod_returns")
-            connection.execute("DELETE FROM pod_cost_days")
-            connection.execute("DELETE FROM portfolio_value")
-            connection.execute("DELETE FROM cursor")
-            connection.execute("DELETE FROM carried_state")
+    (version,) = connection.execute("PRAGMA user_version").fetchone()
+    (tables,) = connection.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+    ).fetchone()
+    if resume and tables and version != CHECKPOINT_FORMAT_VERSION:
+        connection.close()
+        raise CheckpointFormatError(
+            f"checkpoint {db_path} is of checkpoint format {version}, but this program "
+            f"reads only format {CHECKPOINT_FORMAT_VERSION}; it cannot be resumed: remove it, "
+            "and the trial it belongs to, and start the run over"
+        )
+    with connection:
+        if not resume:
+            for name, _ in _TABLES:
+                connection.execute(f"DROP TABLE IF EXISTS {name}")
+        for _, create in _TABLES:
+            connection.execute(create)
+        _add_missing_columns(connection)
+        connection.execute(f"PRAGMA user_version = {CHECKPOINT_FORMAT_VERSION}")
     return connection
 
 
@@ -263,7 +301,9 @@ def append_day(
             "INSERT INTO decisions (as_of_date, payload) VALUES (?, ?)",
             (
                 as_of_date.isoformat(),
-                json.dumps([decision.model_dump(mode="json") for decision in decisions]),
+                _compressed(
+                    json.dumps([decision.model_dump(mode="json") for decision in decisions])
+                ),
             ),
         )
         connection.executemany(
@@ -346,6 +386,16 @@ def append_day(
                 "INSERT INTO carried_state (agent_id, state) VALUES (?, ?)",
                 sorted(carried_states.items()),
             )
+
+
+def _compressed(payload_json: str) -> bytes:
+    """`payload_json` as the bytes the `decisions` table stores."""
+    return zlib.compress(payload_json.encode("utf-8"), DECISIONS_COMPRESSION_LEVEL)
+
+
+def _decompressed(stored: bytes) -> str:
+    """The JSON text `_compressed` stored as `stored`."""
+    return zlib.decompress(stored).decode("utf-8")
 
 
 _TRACK_RECORD_COLUMNS = (
@@ -445,8 +495,8 @@ def read_recent(
         )
     )
     payload["decisions_by_day"] = {
-        as_of_date_str: json.loads(payload_json)
-        for as_of_date_str, payload_json in connection.execute(
+        as_of_date_str: json.loads(_decompressed(stored))
+        for as_of_date_str, stored in connection.execute(
             "SELECT as_of_date, payload FROM ("
             "SELECT as_of_date, payload, rowid AS position FROM decisions "
             "ORDER BY as_of_date DESC, rowid DESC LIMIT ?"
@@ -584,10 +634,11 @@ def read_unfilled_orders(connection: sqlite3.Connection) -> list[dict[str, Any]]
 def iter_decision_payloads(connection: sqlite3.Connection) -> Iterator[tuple[str, str]]:
     """Each stored day's ISO date and its decisions as the JSON text
     `append_day` wrote (a list of `PortfolioDecision` payloads), in day
-    order, read one row at a time."""
-    yield from connection.execute(
+    order, read and decompressed one row at a time."""
+    for as_of_date_str, stored in connection.execute(
         "SELECT as_of_date, payload FROM decisions ORDER BY as_of_date, rowid"
-    )
+    ):
+        yield as_of_date_str, _decompressed(stored)
 
 
 def iter_source_returns(
