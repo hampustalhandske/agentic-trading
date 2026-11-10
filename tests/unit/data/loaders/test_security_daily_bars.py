@@ -15,6 +15,7 @@ import pytest
 from agentic_trading.data.loaders.lakehouse_loader import (
     READ_TABLES,
     SECURITY_RAW_PRICE_SQL,
+    AdjustmentFactorCollisionError,
     EmptyAdjustmentTableError,
     load_security_daily_bars,
     load_security_log_returns,
@@ -73,7 +74,7 @@ def _factor(
     lake: Any,
     security_id: int,
     effective: date,
-    cum_factor: float,
+    cum_factor: float | None,
     split: float = 1.0,
     ticker: str = "AAA",
 ) -> None:
@@ -351,3 +352,40 @@ def test_daily_bars_identical_factor_copies_act_as_one_row(lake: Any) -> None:
 
     pd.testing.assert_frame_equal(frame[1], frame[2], check_exact=True)
     assert list(frame.index) == _days(_TUE, _WED, _THU)
+
+
+def test_daily_bars_collapse_factor_copies_differing_outside_cum_factor(lake: Any) -> None:
+    """Factor rows of one security and effective date that share their cum_factor, or are all
+    null, count as one row whatever their ticker and split_factor."""
+    for security_id, copies in ((1, (("AAA", 2.0),)), (2, (("AAA", 2.0), ("AAB", 3.0)))):
+        _bar(lake, security_id, _TUE, 200.0)
+        _bar(lake, security_id, _WED, 101.0)
+        _bar(lake, security_id, _THU, 102.0)
+        for ticker, split in copies:
+            _factor(lake, security_id, _WED, 0.5, split=split, ticker=ticker)
+            _factor(lake, security_id, _NEXT_MON, None, ticker=ticker)
+
+    frame = load_security_daily_bars([1, 2], _TUE, _THU)
+
+    pd.testing.assert_frame_equal(frame[1], frame[2], check_exact=True)
+    assert frame[(2, "close")].tolist() == pytest.approx([100.0, 101.0, 102.0])
+
+
+@pytest.mark.parametrize("other", [0.25, None])
+def test_daily_bars_refuse_two_cum_factors_on_one_effective_date(
+    lake: Any, other: float | None
+) -> None:
+    """Two factor rows of one security and effective date with different cum_factors (a null
+    one included) are refused, naming the table, the security and the date."""
+    _bar(lake, 7, _TUE, 200.0)
+    _bar(lake, 7, _WED, 101.0)
+    _factor(lake, 7, _WED, 0.5, ticker="AAA")
+    _factor(lake, 7, _WED, other, ticker="AAB")
+
+    with pytest.raises(AdjustmentFactorCollisionError) as raised:
+        load_security_daily_bars([7], _TUE, _WED)
+
+    message = str(raised.value)
+    assert "equity_adjustment_factors" in message
+    assert "security_id 7" in message
+    assert _WED.isoformat() in message
