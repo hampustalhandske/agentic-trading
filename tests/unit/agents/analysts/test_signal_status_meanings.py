@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from quantcore.core.stochastic import CIRNoMeanReversionError
+from quantcore.errors import UndefinedResultError
 from quantcore.risk import ConvergenceError
 from quantcore.risk.egarch import EGARCHParams, GJRGARCHParams
 
@@ -303,7 +304,7 @@ def test_lead_lag_broad_fetch_failure(
     ("rows", "half_life", "direction", "status"),
     [
         (5, 10.0, "long", "unavailable"),
-        (120, ValueError("phi >= 0, diverging"), "long", "active"),
+        (120, UndefinedResultError("phi >= 0, diverging"), "long", "active"),
         (120, 10.0, "flat", "active"),
     ],
     ids=["short_spread", "not_mean_reverting", "inside_exit_band"],

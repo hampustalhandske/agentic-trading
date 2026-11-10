@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+from quantcore.errors import UndefinedResultError
 
 from agentic_trading.agents.analysts.event_credit_pod.short_interest_squeeze_analyst import (
     ShortInterestSqueezeAnalyst,
@@ -86,10 +87,6 @@ def test_short_interest_constant_days_to_cover_is_unavailable(
     assert signal.sample_count == len(history)
 
 
-class UndefinedResultError(ValueError):
-    """Stands in for quantcore's undefined-result error, a `ValueError` subclass."""
-
-
 def _raising(error: BaseException) -> Any:
     def _fit(*_args: Any, **_kwargs: Any) -> Any:
         raise error
@@ -118,14 +115,30 @@ def test_ou_straight_line_spread_is_unavailable() -> None:
     assert "AAPL" not in analyst._open_direction_by_asset
 
 
+def test_ou_constant_level_before_the_last_observation_is_unavailable() -> None:
+    """A log price that does not move until the last day leaves the lagged level of the
+    spread with no range: no AR(1) slope is defined, so neither is a half-life."""
+    returns = np.zeros(120)
+    returns[-1] = 0.01
+    analyst = OUMeanReversionAnalyst()
+    analyst._open_direction_by_asset["AAPL"] = "long"
+    market = _market(returns)
+    spread = analyst._build_spread(market, AS_OF, "AAPL")
+    assert np.ptp(spread[:-1]) == 0.0 and np.ptp(np.diff(spread)) > 0.0
+    with pytest.raises(UndefinedResultError):
+        ou_mean_reversion_analyst.ou_half_life(spread)
+
+    signal = analyst.generate_signal("AAPL", market, AS_OF)
+
+    assert _flat(signal) == ("unavailable", "flat", 0.0)
+    assert "constant level" in signal.rationale
+    assert "AAPL" not in analyst._open_direction_by_asset
+
+
 @pytest.mark.parametrize(
     "fit",
-    [
-        lambda _spread: float("nan"),
-        lambda _spread: float("inf"),
-        _raising(UndefinedResultError("half-life undefined")),
-    ],
-    ids=["nan", "inf", "undefined_result"],
+    [lambda _spread: float("nan"), lambda _spread: float("inf")],
+    ids=["nan", "inf"],
 )
 def test_ou_undefined_half_life_is_unavailable(monkeypatch: pytest.MonkeyPatch, fit: Any) -> None:
     monkeypatch.setattr(ou_mean_reversion_analyst, "ou_half_life", fit)
@@ -139,13 +152,49 @@ def test_ou_undefined_half_life_is_unavailable(monkeypatch: pytest.MonkeyPatch, 
 
 
 def test_ou_not_mean_reverting_abstains(monkeypatch: pytest.MonkeyPatch) -> None:
-    """quantcore's phi >= 0 refusal is a spread the model declines to trade."""
-    error = ValueError("estimated series does not exhibit mean reversion (phi >= 0, diverging)")
+    """quantcore's `UndefinedResultError` on a spread whose AR(1) slope is defined is a fitted
+    slope with no mean reversion: a spread the model declines to trade."""
+    error = UndefinedResultError(
+        "estimated series does not exhibit mean reversion (phi >= 0, diverging)"
+    )
     monkeypatch.setattr(ou_mean_reversion_analyst, "ou_half_life", _raising(error))
+    analyst = OUMeanReversionAnalyst()
+    analyst._open_direction_by_asset["AAPL"] = "long"
 
-    signal = OUMeanReversionAnalyst().generate_signal("AAPL", _market(_noise(120)), AS_OF)
+    signal = analyst.generate_signal("AAPL", _market(_noise(120)), AS_OF)
 
     assert _flat(signal) == ("active", "flat", 0.0)
+    assert "not mean-reverting" in signal.rationale
+    assert "AAPL" not in analyst._open_direction_by_asset
+
+
+def _explosive_returns(size: int, growth: float = 1.03, seed: int = 5) -> np.ndarray:
+    """Daily log returns whose log price grows geometrically away from its start, with noise:
+    its AR(1) slope on the lagged level is clearly positive."""
+    log_price = np.empty(size + 1)
+    log_price[0] = 0.0
+    shocks = _noise(size, seed)
+    for t in range(1, size + 1):
+        log_price[t] = growth * log_price[t - 1] + shocks[t - 1]
+    return np.diff(log_price)
+
+
+def test_ou_real_non_mean_reverting_spread_abstains() -> None:
+    """A spread quantcore's `ou_half_life` refuses for a positive fitted slope (phi >= 0) is
+    not mean-reverting: the analyst abstains on it rather than calling it unavailable."""
+    analyst = OUMeanReversionAnalyst()
+    analyst._open_direction_by_asset["AAPL"] = "short"
+    market = _market(_explosive_returns(120))
+    spread = analyst._build_spread(market, AS_OF, "AAPL")
+    assert np.ptp(spread[:-1]) > 0.0 and np.ptp(np.diff(spread)) > 0.0
+    with pytest.raises(UndefinedResultError):
+        ou_mean_reversion_analyst.ou_half_life(spread)
+
+    signal = analyst.generate_signal("AAPL", market, AS_OF)
+
+    assert _flat(signal) == ("active", "flat", 0.0)
+    assert "not mean-reverting" in signal.rationale
+    assert "AAPL" not in analyst._open_direction_by_asset
 
 
 def test_ou_any_other_fit_failure_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:

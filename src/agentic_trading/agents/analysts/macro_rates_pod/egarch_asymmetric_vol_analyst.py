@@ -6,6 +6,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from pydantic import PrivateAttr
+from quantcore.errors import UndefinedResultError
 from quantcore.risk import ConvergenceError, variance_backcast
 from quantcore.risk.egarch import EGARCHParams, egarch_11_variance, egarch_fit
 
@@ -43,7 +44,9 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
 
     Stays flat at confidence 0, with the failing check named in the
     rationale, whenever the window is shorter than `min_garch_observations`
-    (unavailable); the fit or variance recursion raises, or the optimizer
+    or the fit is undefined on it (quantcore's `UndefinedResultError`:
+    returns with no range) (unavailable); the fit or variance recursion
+    raises otherwise, or the optimizer
     does not converge (`ConvergenceError` without SciPy's success message,
     named in the rationale) (error); the fit converges outside the
     stationary region (`classify_egarch_convergence_error`: an
@@ -75,6 +78,10 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
         try:
             fitted: EGARCHParams | ConvergenceError = self._refit_cache.get_or_refit(
                 asset, as_of_date, lambda: fit_or_convergence_error(egarch_fit, returns)
+            )
+        except UndefinedResultError as exc:
+            return self.unavailable_signal(
+                asset, as_of_date, f"EGARCH fit undefined on these returns: {exc}"
             )
         except (RuntimeError, ValueError) as exc:
             logger.debug(

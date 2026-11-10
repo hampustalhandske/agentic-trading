@@ -199,3 +199,24 @@ def test_run_summary_passes_pod_performance_through_or_defaults_empty() -> None:
 
     assert summary["test"]["pod_performance"] == perf
     assert summary["calibration"]["pod_performance"] == {}
+
+
+@pytest.mark.parametrize("value", [0.0, 0.002])
+def test_a_pod_with_constant_returns_has_no_sharpe(value: float) -> None:
+    """A pod return series with no range has an undefined Sharpe ratio (quantcore raises
+    `UndefinedResultError`; a constant such as 0.002 has a sample std of rounding residue, not
+    0): `sharpe_ratio` is None and the rest of the record stands."""
+    from quantcore.errors import UndefinedResultError
+
+    from agentic_trading.backtest.engine import _pod_performance
+
+    series = [value] * 20
+    if value != 0.0:
+        with pytest.raises(UndefinedResultError):
+            sharpe_ratio(np.array(series))
+
+    performance = _pod_performance(series)
+
+    assert performance.sharpe_ratio is None
+    assert performance.observations == 20
+    assert performance.max_drawdown == pytest.approx(0.0)

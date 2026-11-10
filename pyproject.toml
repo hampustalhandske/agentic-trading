@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "exchange-calendars>=4.13.2",
     "httpx>=0.28.1",
-    "numpy>=2.5.2",
+    "numpy==2.5.3",
     "pandas>=3.0.5",
     "pandas-stubs>=3.0.5.260730",
     "pyarrow>=25.0.1",
@@ -34,7 +34,7 @@ agentic-trading-stage-a = "agentic_trading.cli:stage_a_main"
 agentic-trading-firm-record = "agentic_trading.cli:firm_record_main"
 
 [tool.uv.sources]
-quantcore = { git = "https://github.com/hampustalhandske/quantcore.git", rev = "599b8bd339898cbbafd07c128b36791d4072d811" }
+quantcore = { git = "https://github.com/hampustalhandske/quantcore.git", rev = "4ddac1624e2cd4e46b721697e1f7fc99d8144820" }
 
 [tool.setuptools]
 package-dir = {"" = "src"}

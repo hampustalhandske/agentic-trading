@@ -6,6 +6,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from pydantic import Field
+from quantcore.errors import UndefinedResultError
 from quantcore.statistics.regression import factor_loadings
 
 from agentic_trading.agents._market_math import clamp, log_return_series
@@ -56,7 +57,14 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
     `factor_zscore_full` (an information-ratio-style ratio, so it does
     not saturate the way a t-stat does). Every active signal's
     `source_as_of` is the public date (`ken_french_public_date`) of the
-    newest factor row, which the expected premia rest on."""
+    newest factor row, which the expected premia rest on.
+
+    No factor coverage or fewer than `MIN_REGRESSION_OBSERVATIONS` joined
+    rows is unavailable, and so is a window on which quantcore's
+    `factor_loadings` is undefined: a factor column with no range
+    (`UndefinedResultError`) or excess returns with no range (NaN
+    t-statistics). No significant loading, or a z-score under
+    `factor_zscore_flat`, abstains."""
 
     agent_id: str = "fama_french_factor_analyst"
 
@@ -116,7 +124,24 @@ class FamaFrenchFactorAnalyst(AnalystAgent):
         # per factor column — drop the intercept so positions line up with
         # `factor_columns`, then gate each loading on its own Newey-West
         # t-stat (lag count from quantcore's sample-size rule).
-        regression = factor_loadings(excess_returns, factor_matrix)
+        try:
+            regression = factor_loadings(excess_returns, factor_matrix)
+        except UndefinedResultError as exc:
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"factor loadings undefined on this window: {exc}",
+                source_as_of=source_as_of,
+                sample_count=len(joined),
+            )
+        if np.any(np.isnan(regression.t_stats[1:])):
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                "factor loading t-statistics undefined: excess returns have no range",
+                source_as_of=source_as_of,
+                sample_count=len(joined),
+            )
         betas = np.where(
             np.abs(regression.t_stats[1:]) >= settings.analysts.t_stat_threshold,
             regression.loadings[1:],

@@ -12,6 +12,7 @@ from typing import Any, Literal, Protocol, cast
 
 import numpy as np
 import pandas as pd
+from quantcore.errors import UndefinedResultError
 from quantcore.performance.metrics import (
     calmar_ratio,
     hit_rate,
@@ -1727,7 +1728,10 @@ def _pod_cost_attribution(
 
 
 def _pod_performance(returns: list[float]) -> PodPerformance:
-    """`PodPerformance` for one pod's daily return series."""
+    """`PodPerformance` for one pod's daily return series. `sharpe_ratio`
+    is None with fewer than two returns or when the Sharpe ratio is
+    undefined on them (quantcore's `UndefinedResultError`: returns with no
+    range)."""
     series = np.array(returns, dtype=np.float64)
     observations = len(series)
     cumulative_return = float(np.prod(1.0 + series) - 1.0)
@@ -1740,11 +1744,16 @@ def _pod_performance(returns: list[float]) -> PodPerformance:
             max_drawdown=0.0,
         )
     daily_vol = float(np.std(series, ddof=1))
+    pod_sharpe: float | None
+    try:
+        pod_sharpe = float(sharpe_ratio(series))
+    except UndefinedResultError:
+        pod_sharpe = None
     return PodPerformance(
         observations=observations,
         cumulative_return=cumulative_return,
         annualized_vol=daily_vol * math.sqrt(settings.firm.trading_days_per_year),
-        sharpe_ratio=float(sharpe_ratio(series)) if daily_vol > 0.0 else None,
+        sharpe_ratio=pod_sharpe,
         max_drawdown=float(maximum_drawdown(series)),
     )
 
