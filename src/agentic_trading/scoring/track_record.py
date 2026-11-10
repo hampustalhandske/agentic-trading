@@ -274,6 +274,8 @@ class TrackRecord:
                 first = self._dropped_first_dates.get(source_id)
                 if first is None or history.earliest < first:
                     self._dropped_first_dates[source_id] = history.earliest
+        # Ordered by source_id, as `restore` receives them from a checkpoint.
+        self._dropped_first_dates = dict(sorted(self._dropped_first_dates.items()))
         _drop_from(self._by_source, cutoff)
         _drop_from(self._by_source_and_type, cutoff)
         self._dropped_count += len(log) - len(kept)
@@ -354,7 +356,7 @@ class TrackRecord:
         self._cutoff = cutoff
         self._dropped_count = recorded - len(entries)
         self._complete_from = self._dropped_count
-        self._dropped_first_dates = dict(dropped_first_dates or {})
+        self._dropped_first_dates = dict(sorted((dropped_first_dates or {}).items()))
 
     def history_for(
         self,
