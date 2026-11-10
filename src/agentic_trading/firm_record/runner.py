@@ -22,7 +22,9 @@ stops the pass before the day is written.
 The engine checkpoints every day to `store_dir / <spec hash>.checkpoint.sqlite`,
 beside the trial directory, so a pass stopped after `max_days`, or killed,
 resumes with the firm's state as it stood and ends with the rows of an
-unbroken pass. With `restart_above_rss_mb`, a pass also stops at the
+unbroken pass; a resume runs only under the numerical libraries, quantcore
+commit, Python version and machine architecture its agentic_meta.json
+records. With `restart_above_rss_mb`, a pass also stops at the
 next day boundary once the process's resident memory is above that many
 MB, after writing at least `restart_min_days` days, and its result says
 so (`paused_for_memory`), so its caller can resume it in a fresh
@@ -62,6 +64,7 @@ registry file the pass is uncounted, the ledger is not touched, and its
 submission declares one trial; every pass needs a known commit, which its
 submission.json names."""
 
+import json
 import logging
 import os
 import subprocess
@@ -100,6 +103,7 @@ from agentic_trading.firm_record.rows import (
 )
 from agentic_trading.firm_record.spec import build_firm_spec
 from agentic_trading.firm_record.submission import (
+    META_FILE,
     AgenticMeta,
     submission_for,
     write_analyst_availability,
@@ -107,7 +111,7 @@ from agentic_trading.firm_record.submission import (
     write_unfilled_orders,
 )
 from agentic_trading.logging_config import get_logger
-from agentic_trading.provenance import source_tree_state
+from agentic_trading.provenance import RuntimeEnvironment, runtime_environment, source_tree_state
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.stage_a.spec import FirmSpecRecord, firm_spec_hash
 from agentic_trading.stage_a.store import FirmDecisionStore
@@ -150,6 +154,50 @@ class FirmRecordResult(BaseModel):
 # from the checkpoint already holds the whole horizon, so a threshold just
 # above that still lets it write this many days before the next restart.
 _RESTART_MIN_DAYS = 20
+
+
+# The `RuntimeEnvironment` fields a resume must share with the environment
+# its trial's agentic_meta.json records: the numerical libraries, the
+# quantcore commit, the interpreter and the machine architecture. The OS
+# release and the BLAS report are left out, so a minor OS update does not
+# block a resume.
+_RESUME_ENVIRONMENT_FIELDS = ("libraries", "quantcore_sha", "python_version", "platform_machine")
+
+
+def _require_resume_environment(trial_dir: Path, current: RuntimeEnvironment) -> None:
+    """Raise `ValueError` unless the environment `trial_dir`'s
+    agentic_meta.json records matches `current` in every
+    `_RESUME_ENVIRONMENT_FIELDS` field (each library compared on its own);
+    the message names each differing field with its recorded and current
+    values. A missing agentic_meta.json, or one without an `environment`,
+    is refused too."""
+    meta_path = trial_dir / META_FILE
+    payload = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    if "environment" not in payload:
+        raise ValueError(
+            f"firm record trial {trial_dir.name} records no environment in its {META_FILE}, so "
+            "a resume cannot show it runs under the numerical libraries the trial started "
+            "with; remove the trial and its checkpoint and record again"
+        )
+    recorded = RuntimeEnvironment.model_validate(payload["environment"])
+    differences = []
+    for field in _RESUME_ENVIRONMENT_FIELDS:
+        if field == "libraries":
+            for library in recorded.libraries.model_fields:
+                was = getattr(recorded.libraries, library)
+                now = getattr(current.libraries, library)
+                if was != now:
+                    differences.append(f"libraries.{library}: recorded {was}, now {now}")
+        elif getattr(recorded, field) != getattr(current, field):
+            differences.append(
+                f"{field}: recorded {getattr(recorded, field)}, now {getattr(current, field)}"
+            )
+    if differences:
+        raise ValueError(
+            f"firm record trial {trial_dir.name} was started under another numerical "
+            f"environment ({'; '.join(differences)}); resume it under the recorded one, or "
+            "remove the trial and its checkpoint and record again"
+        )
 
 
 class _RecordPausedError(Exception):
@@ -331,7 +379,13 @@ def run_firm_record(
     among them); `ValueError` when the engine checkpoint is ahead of the
     store, so the pass cannot resume. A registry file that is not a YAML
     mapping, or whose `expected_availability` is malformed, raises
-    `LedgerError` before anything is written.
+    `LedgerError` before anything is written. A resume, a call whose store
+    or engine checkpoint already holds days, raises `ValueError` before
+    writing anything when the trial's agentic_meta.json records no
+    environment, or one whose numerical libraries, quantcore commit,
+    Python version or machine architecture differ from
+    `runtime_environment()`; the OS release and the BLAS report may
+    differ, so a minor OS update does not block a resume.
     `HoldoutReadError` and the store's refusals propagate with the day
     unwritten; a `LedgerError` from registering or recording propagates."""
     data_end = settings.stage_a.data_end
@@ -423,6 +477,8 @@ def run_firm_record(
         store.open()
         last = store.last_completed()
         checkpointed = _checkpoint_last_day(checkpoint_path)
+        if last is not None or checkpointed is not None:
+            _require_resume_environment(store.trial_dir, runtime_environment())
         if checkpointed is not None and (last is None or checkpointed > last):
             raise ValueError(
                 f"the engine checkpoint {checkpoint_path.name} ends on {checkpointed} but the "
