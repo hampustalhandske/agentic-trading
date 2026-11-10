@@ -14,15 +14,8 @@ import pytest
 
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 _PINS = {
-    "edgelab_decision_file_v1.json": (
-        "4c87c72531fd68314926e41e9408c414e9224f9c769dd8a1768ea97bd5d6759e"
-    ),
-    "edgelab_grading_spec.json": "01151817bbe77012a3637ea12373c7fabc6a1f66c4189ba7c3ca5618dee6cbfb",
     "edgelab_replay_strategy.yaml": (
         "1a56d539098a33b0e3e7525696dce5cfe1325f9ceb0a0209a9c868bdb530a7f2"
-    ),
-    "edgelab_submission_v1.json": (
-        "1283fa42a5dffdabc4e41adfec2ec36c7e094e5ebcaec964c4df7e82d6c2075e"
     ),
 }
 _PINNED_ELSEWHERE = {"edgelab_grading_golden"}

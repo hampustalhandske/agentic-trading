@@ -9,7 +9,9 @@ relative path: `SHA256SUMS` and the seven schemas it lists (`bundle.v1`, `decisi
 `golden/<schema stem>/accept/*.json` and `.../refuse/*.json`. Beside it, `SOURCE` names the
 commit and `GOLDEN_SHA256SUMS` lists the sha256 of each golden case, which edgelab's
 `SHA256SUMS` does not cover. Both sum files are pinned by sha256 here, so every vendored byte is
-pinned.
+pinned. When an edgelab checkout is reachable, each schema and `SHA256SUMS` must equal the file
+at the same path in it (marked `edgelab_live`), so a schema change on either side fails until
+the slot is refreshed from edgelab.
 
 Every accept case validates against its schema and every refuse case fails it, under the
 `jsonschema` Draft 2020-12 validator with format checking, so the validator is shown to refuse.
@@ -38,6 +40,7 @@ from agentic_trading.firm_record.submission import (
     write_submission_folder,
 )
 from agentic_trading.stage_a.spec import FirmSpecRecord
+from edgelab_live import edgelab_path
 from unit.firm_record.test_firm_store import _DAYS, _SOURCES, _day_rows, _json_rows, _open, _record
 
 _SLOT = Path(__file__).resolve().parents[2] / "fixtures" / "edgelab_grading_golden"
@@ -196,6 +199,17 @@ def test_every_vendored_file_matches_its_sum() -> None:
         f"docs/schema/{name}" for name in listed
     }
     assert {name: _sha256(_SCHEMAS / name) for name in listed} == listed
+
+
+@pytest.mark.edgelab_live
+@pytest.mark.parametrize("name", sorted(_SCHEMA_FILES | {"SHA256SUMS"}))
+def test_vendored_schema_matches_edgelab(name: str) -> None:
+    """When an edgelab checkout is reachable, its `docs/schema/<name>` is byte-identical to the
+    vendored copy."""
+    source = edgelab_path(Path("docs") / "schema" / name)
+    assert source.read_bytes() == (_SCHEMAS / name).read_bytes(), (
+        f"edgelab's docs/schema/{name} changed; refresh the slot from it"
+    )
 
 
 # Golden cases

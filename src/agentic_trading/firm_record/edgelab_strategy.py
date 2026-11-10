@@ -6,8 +6,8 @@
 
 `REPLAY_STRATEGY_YAML` is the scaffold with its comment lines removed (the
 scaffold itself is vendored as `tests/fixtures/edgelab_replay_strategy.yaml`
-and its grading block's JSON schema as
-`tests/fixtures/edgelab_grading_spec.json`); its
+and its grading block's JSON schema as `grading_spec.v1.json` in
+`tests/fixtures/edgelab_grading_golden/docs/schema/`); its
 `<...>` placeholders, `strategy`, universe, data block, capital, seed and
 replication are replaced by `firm_record.submission.strategy_config`. The
 files are written as text, so edgelab is never imported here."""

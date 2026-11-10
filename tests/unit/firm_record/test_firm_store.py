@@ -27,7 +27,14 @@ from agentic_trading.stage_a.store import (
     StoreOrderError,
 )
 
-_SCHEMA = Path(__file__).resolve().parents[2] / "fixtures" / "edgelab_decision_file_v1.json"
+_SCHEMA = (
+    Path(__file__).resolve().parents[2]
+    / "fixtures"
+    / "edgelab_grading_golden"
+    / "docs"
+    / "schema"
+    / "decision_file.v1.json"
+)
 _T = datetime(2026, 11, 6, tzinfo=UTC)
 _DAYS = [date(2016, 1, 4), date(2016, 1, 5), date(2016, 1, 6)]
 _SOURCES: list[dict[str, str | bool]] = [

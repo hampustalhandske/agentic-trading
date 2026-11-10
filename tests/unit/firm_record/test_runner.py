@@ -629,8 +629,15 @@ def test_holdout_read_refuses_the_day(tmp_path: Path) -> None:
     assert progress == []
 
 
-# edgelab's Submission schema, vendored (source in test_submission_schema_fixture.py).
-_SUBMISSION_SCHEMA = Path(__file__).resolve().parents[2] / "fixtures" / "edgelab_submission_v1.json"
+# edgelab's Submission schema, vendored (source in test_edgelab_grading_golden.py).
+_SUBMISSION_SCHEMA = (
+    Path(__file__).resolve().parents[2]
+    / "fixtures"
+    / "edgelab_grading_golden"
+    / "docs"
+    / "schema"
+    / "submission.v1.json"
+)
 
 
 def _submission(trial: Path) -> dict[str, Any]:

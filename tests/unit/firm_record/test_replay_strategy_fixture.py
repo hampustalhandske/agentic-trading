@@ -3,25 +3,25 @@
 """`REPLAY_STRATEGY_YAML` is edgelab's replay scaffold, and its grading block is one edgelab's
 `GradingSpec` accepts.
 
-Two copies from edgelab commit 62a7151 are vendored and pinned by sha256:
-`tests/fixtures/edgelab_replay_strategy.yaml`, the text `edgelab strategy init <slug>
---asset-class replay` scaffolds from (its template `strategy.yaml` with `@KIND@\\n` replaced by
-`kinds/replay.yaml`), and `tests/fixtures/edgelab_grading_spec.json`, edgelab's
-`GradingSpec.model_json_schema()` written as `json.dumps(schema, indent=2, sort_keys=True)` plus
-a newline. Without edgelab, `REPLAY_STRATEGY_YAML` must equal the vendored scaffold with its
+`tests/fixtures/edgelab_replay_strategy.yaml`, vendored from edgelab commit 62a7151 and pinned
+by sha256, is the text `edgelab strategy init <slug> --asset-class replay` scaffolds from (its
+template `strategy.yaml` with `@KIND@\\n` replaced by `kinds/replay.yaml`). The grading block's
+schema is edgelab's `grading_spec.v1.json` from the slot `tests/fixtures/edgelab_grading_golden/`
+(pinned in `test_edgelab_grading_golden.py`): `GradingSpec.model_json_schema()` with a top-level
+`$id`. Without edgelab, `REPLAY_STRATEGY_YAML` must equal the vendored scaffold with its
 comment lines removed, and the grading block a firm record writes must validate against the
 vendored schema. When an edgelab checkout is reachable (`EDGELAB_DIR`, or `edgelab` beside this
 repo's parent directory), its templates must compose to the vendored scaffold; when that
-checkout also has a `.venv`, its `GradingSpec` must produce the vendored schema and measure the
-block as `edgelab-2026.11.0`; these live checks are marked `edgelab_live` (`tests/edgelab_live.py`).
-A change on either side fails here until the copies are refreshed.
+checkout also has a `.venv`, its `GradingSpec` must produce the vendored schema without its
+`$id` and measure the block as `edgelab-2026.11.0`; these live checks are marked
+`edgelab_live` (`tests/edgelab_live.py`). A change on either side fails here until the copies
+are refreshed.
 
 The grading block of `REPLAY_STRATEGY_YAML`, and its cost table on its own, are pinned by
 canonical sha256 (`_canonical_sha256`), and a firm record's strategy.yaml carries that block
 unchanged, so an edit to the block fails here even when the vendored scaffold is changed with it.
-edgelab's golden accept/refuse cases and pinned schemas (EL-75), vendored at
-`tests/fixtures/edgelab_grading_golden/`, are checked against a firm record's outputs in
-`test_edgelab_grading_golden.py`."""
+edgelab's golden accept/refuse cases and pinned schemas (EL-75) in the same slot are checked
+against a firm record's outputs in `test_edgelab_grading_golden.py`."""
 
 import copy
 import hashlib
@@ -42,8 +42,7 @@ from unit.firm_record.test_firm_store import _record
 _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
 _SCAFFOLD = _FIXTURES / "edgelab_replay_strategy.yaml"
 _SCAFFOLD_SHA256 = "1a56d539098a33b0e3e7525696dce5cfe1325f9ceb0a0209a9c868bdb530a7f2"
-_GRADING_SCHEMA = _FIXTURES / "edgelab_grading_spec.json"
-_GRADING_SCHEMA_SHA256 = "01151817bbe77012a3637ea12373c7fabc6a1f66c4189ba7c3ca5618dee6cbfb"
+_GRADING_SCHEMA = _FIXTURES / "edgelab_grading_golden" / "docs" / "schema" / "grading_spec.v1.json"
 _TEMPLATES = Path("src") / "edgelab" / "templates" / "strategy"
 _MEASUREMENT = "edgelab-2026.11.0"
 # The canonical sha256 of the grading block edgelab 62a7151 scaffolds and measures as
@@ -72,10 +71,9 @@ def validate_grading_block(grading: dict[str, Any]) -> None:
     jsonschema.validate(grading, json.loads(_GRADING_SCHEMA.read_text()))
 
 
-def test_vendored_files_are_the_pinned_copies() -> None:
-    """The vendored scaffold and grading schema hash to their pinned sha256."""
+def test_vendored_scaffold_is_the_pinned_copy() -> None:
+    """The vendored scaffold hashes to its pinned sha256."""
     assert hashlib.sha256(_SCAFFOLD.read_bytes()).hexdigest() == _SCAFFOLD_SHA256
-    assert hashlib.sha256(_GRADING_SCHEMA.read_bytes()).hexdigest() == _GRADING_SCHEMA_SHA256
 
 
 def test_replay_yaml_is_the_scaffold_without_comment_lines() -> None:
@@ -137,8 +135,8 @@ def test_edgelab_templates_compose_to_the_vendored_scaffold() -> None:
 @pytest.mark.edgelab_live
 def test_edgelab_grading_spec_matches_and_measures_the_block() -> None:
     """When an edgelab checkout with a `.venv` is reachable, its `GradingSpec` schema equals the
-    vendored one and it measures the grading block of `REPLAY_STRATEGY_YAML` as
-    `edgelab-2026.11.0`."""
+    vendored one without its top-level `$id`, and it measures the grading block of
+    `REPLAY_STRATEGY_YAML` as `edgelab-2026.11.0`."""
     python = edgelab_path(Path(".venv") / "bin" / "python")
     edgelab = python.parents[2]
     program = (
@@ -161,7 +159,9 @@ def test_edgelab_grading_spec_matches_and_measures_the_block() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     found = json.loads(completed.stdout)
-    assert found["schema"] == json.loads(_GRADING_SCHEMA.read_text()), (
+    vendored = json.loads(_GRADING_SCHEMA.read_text())
+    vendored.pop("$id")
+    assert found["schema"] == vendored, (
         f"edgelab's GradingSpec changed; refresh {_GRADING_SCHEMA.name}"
     )
     assert found["measurement"] == _MEASUREMENT
