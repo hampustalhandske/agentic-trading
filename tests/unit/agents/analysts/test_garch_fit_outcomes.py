@@ -21,8 +21,10 @@ from scipy.optimize import minimize
 
 from agentic_trading.agents.analysts.macro_rates_pod._garch_checks import (
     SLSQP_SUCCESS_MESSAGE,
+    fit_or_convergence_error,
 )
 from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.config import settings
 
 PACKAGE = "agentic_trading.agents.analysts.macro_rates_pod"
 _ANALYSTS = {
@@ -178,13 +180,24 @@ def _integrating_returns() -> np.ndarray:
 
 @pytest.mark.parametrize("name", ["egarch", "gjr"])
 def test_real_integrating_series_converges_non_stationary_and_abstains(name: str) -> None:
-    """On a real series with steadily growing vol, quantcore's fit converges (SLSQP status 0)
-    outside the stationary region, and the analyst abstains on it."""
+    """On a real series with steadily growing vol, quantcore's fit converges outside the
+    stationary region on one of two paths, which one depending on the platform's floating
+    point: it raises `ConvergenceError` carrying SLSQP's success message, or it returns the fit
+    with a persistence above `max_garch_persistence`. The analyst abstains either way and its
+    rationale names the path taken; any other outcome fails."""
     returns = _integrating_returns()
     fit = egarch_fit if name == "egarch" else gjr_garch_fit
-    with pytest.raises(ConvergenceError) as raised:
-        fit(returns)
-    assert raised.value.optimizer_message == SLSQP_SUCCESS_MESSAGE
+    outcome = fit_or_convergence_error(fit, returns)
+    if isinstance(outcome, ConvergenceError):
+        assert outcome.optimizer_message == SLSQP_SUCCESS_MESSAGE
+        path = "converged fit is non-stationary"
+    else:
+        persistence = (
+            outcome.beta if name == "egarch" else outcome.alpha + outcome.beta + 0.5 * outcome.gamma
+        )
+        assert persistence > settings.analysts.max_garch_persistence
+        path = f"{_LABEL[name]} parameters rejected: "
+        path += "beta" if name == "egarch" else "persistence"
 
     market_data, dates = _market_data(returns)
     signal = getattr(_module(name), _ANALYSTS[name][1])().generate_signal(
@@ -193,4 +206,6 @@ def test_real_integrating_series_converges_non_stationary_and_abstains(name: str
 
     assert signal.status == "active"
     assert signal.direction == "flat" and signal.confidence == 0.0
-    assert "converged fit is non-stationary" in signal.rationale
+    assert path in signal.rationale
+    if not isinstance(outcome, ConvergenceError):
+        assert "above max" in signal.rationale
