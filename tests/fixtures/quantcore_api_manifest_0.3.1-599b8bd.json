@@ -1,0 +1,809 @@
+{
+ "modules": {
+  "quantcore": {
+   "names": {
+    "__version__": {
+     "kind": "value",
+     "value": "str"
+    }
+   }
+  },
+  "quantcore.core": {
+   "exports": {
+    "CIRNoMeanReversionError": "quantcore.core.stochastic",
+    "CIRParams": "quantcore.core.stochastic",
+    "cir_fit": "quantcore.core.stochastic",
+    "simulate_cir_paths": "quantcore.core.stochastic",
+    "simulate_garch_t_price_paths": "quantcore.core.price_paths",
+    "simulate_gbm_paths": "quantcore.core.sde_solver",
+    "simulate_gbm_price_paths": "quantcore.core.price_paths",
+    "simulate_heston_price_paths": "quantcore.core.price_paths",
+    "simulate_jump_diffusion_price_paths": "quantcore.core.price_paths",
+    "simulate_ou_paths": "quantcore.core.stochastic"
+   }
+  },
+  "quantcore.core.price_paths": {
+   "names": {
+    "simulate_garch_t_price_paths": {
+     "kind": "function",
+     "signature": "(rng: np.random.Generator, n_paths: int, n_steps: int, dt: float, *, s0: float=100.0, mu: float=0.0, omega: float=1e-05, alpha: float=0.05, beta: float=0.9, nu: float=5.0) -> npt.NDArray[np.float64]"
+    },
+    "simulate_gbm_price_paths": {
+     "kind": "function",
+     "signature": "(rng: np.random.Generator, n_paths: int, n_steps: int, dt: float, *, s0: float=100.0, mu: float=0.05, sigma: float=0.2) -> npt.NDArray[np.float64]"
+    },
+    "simulate_heston_price_paths": {
+     "kind": "function",
+     "signature": "(rng: np.random.Generator, n_paths: int, n_steps: int, dt: float, *, s0: float=100.0, mu: float=0.05, v0: float=0.04, kappa: float=2.0, theta: float=0.04, xi: float=0.3, rho: float=-0.5) -> npt.NDArray[np.float64]"
+    },
+    "simulate_jump_diffusion_price_paths": {
+     "kind": "function",
+     "signature": "(rng: np.random.Generator, n_paths: int, n_steps: int, dt: float, *, s0: float=100.0, mu: float=0.05, sigma: float=0.2, jump_intensity: float=1.0, jump_mean_log: float=0.0, jump_std_log: float=0.1) -> npt.NDArray[np.float64]"
+    }
+   }
+  },
+  "quantcore.core.sde_solver": {
+   "names": {
+    "simulate_gbm_paths": {
+     "kind": "function",
+     "signature": "(spot: float, rate: float, volatility: float, time_to_maturity: float, num_steps: int, num_paths: int, seed: int | None=None) -> npt.NDArray[np.float64]"
+    }
+   }
+  },
+  "quantcore.core.stochastic": {
+   "names": {
+    "CIRNoMeanReversionError": {
+     "bases": [
+      "RuntimeError"
+     ],
+     "decorators": [],
+     "fields": {},
+     "kind": "class",
+     "methods": {}
+    },
+    "CIRParams": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "kappa": "float",
+      "sigma": "float",
+      "theta": "float"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "cir_fit": {
+     "kind": "function",
+     "signature": "(rate_series: npt.NDArray[np.float64], dt: float) -> CIRParams"
+    },
+    "simulate_cir_paths": {
+     "kind": "function",
+     "signature": "(r0: float, kappa: float, theta: float, sigma: float, t: float, n_paths: int, n_steps: int, seed: int | None=None) -> npt.NDArray[np.float64]"
+    },
+    "simulate_ou_paths": {
+     "kind": "function",
+     "signature": "(theta: float, mu: float, sigma: float, x0: float, t: float, n_paths: int, n_steps: int, seed: int | None=None) -> npt.NDArray[np.float64]"
+    }
+   }
+  },
+  "quantcore.execution": {
+   "exports": {
+    "margin_financing_cost": "quantcore.execution.financing",
+    "short_borrow_cost": "quantcore.execution.financing",
+    "square_root_market_impact": "quantcore.execution.market_impact"
+   }
+  },
+  "quantcore.execution.financing": {
+   "names": {
+    "margin_financing_cost": {
+     "kind": "function",
+     "signature": "(notional: float, financing_rate_annual: float, days_held: int) -> float"
+    },
+    "short_borrow_cost": {
+     "kind": "function",
+     "signature": "(notional: float, borrow_rate_annual: float, days_held: int) -> float"
+    }
+   }
+  },
+  "quantcore.execution.market_impact": {
+   "names": {
+    "square_root_market_impact": {
+     "kind": "function",
+     "signature": "(trade_size: float, adv: float, daily_vol: float, impact_coefficient: float=1.0) -> float"
+    }
+   }
+  },
+  "quantcore.filtering": {
+   "exports": {
+    "dynamic_hedge_ratio": "quantcore.filtering.kalman"
+   }
+  },
+  "quantcore.filtering.kalman": {
+   "names": {
+    "dynamic_hedge_ratio": {
+     "kind": "function",
+     "signature": "(y: npt.NDArray[np.float64], x: npt.NDArray[np.float64], obs_var: float=0.001, proc_var: float=1e-05, *, initial_beta: float=0.0) -> npt.NDArray[np.float64]"
+    }
+   }
+  },
+  "quantcore.performance": {
+   "exports": {
+    "DeflatedSharpeResult": "quantcore.performance.sharpe_inference",
+    "SharpeSE": "quantcore.performance.sharpe_inference",
+    "calmar_ratio": "quantcore.performance.metrics",
+    "common_sense_ratio": "quantcore.performance.ratios",
+    "component_var": "quantcore.performance.metrics",
+    "cpc_index": "quantcore.performance.ratios",
+    "deflated_sharpe_ratio": "quantcore.performance.sharpe_inference",
+    "expected_max_sharpe": "quantcore.performance.sharpe_inference",
+    "gain_to_pain_ratio": "quantcore.performance.ratios",
+    "hit_rate": "quantcore.performance.metrics",
+    "information_ratio": "quantcore.performance.metrics",
+    "maximum_drawdown": "quantcore.performance.metrics",
+    "minimum_track_record_length": "quantcore.performance.sharpe_inference",
+    "outlier_loss_ratio": "quantcore.performance.ratios",
+    "outlier_win_ratio": "quantcore.performance.ratios",
+    "probabilistic_sharpe_ratio": "quantcore.performance.sharpe_inference",
+    "profit_factor": "quantcore.performance.metrics",
+    "risk_of_ruin": "quantcore.performance.ratios",
+    "serenity_index": "quantcore.performance.ratios",
+    "sharpe_ratio": "quantcore.performance.metrics",
+    "sharpe_se_mertens": "quantcore.performance.sharpe_inference",
+    "sortino_ratio": "quantcore.performance.metrics",
+    "ulcer_index": "quantcore.performance.ratios",
+    "ulcer_performance_index": "quantcore.performance.ratios"
+   }
+  },
+  "quantcore.performance.metrics": {
+   "names": {
+    "AnnualizedReturnMethod": {
+     "kind": "value",
+     "value": "Literal['cagr', 'arithmetic']"
+    },
+    "HitRateZeroPolicy": {
+     "kind": "value",
+     "value": "Literal['loss', 'win', 'exclude']"
+    },
+    "calmar_ratio": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], periods_per_year: int=252, return_method: AnnualizedReturnMethod='cagr') -> float"
+    },
+    "component_var": {
+     "kind": "function",
+     "signature": "(weights: npt.NDArray[np.float64], cov_matrix: npt.NDArray[np.float64], confidence_level: float) -> npt.NDArray[np.float64]"
+    },
+    "hit_rate": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], zero_policy: HitRateZeroPolicy='loss') -> float"
+    },
+    "information_ratio": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], benchmark_returns: npt.NDArray[np.float64], periods_per_year: int=252) -> float"
+    },
+    "maximum_drawdown": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    },
+    "profit_factor": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    },
+    "sharpe_ratio": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], risk_free_rate: float=0.0, periods_per_year: int=252) -> float"
+    },
+    "sortino_ratio": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], risk_free_rate: float=0.0, periods_per_year: int=252) -> float"
+    }
+   }
+  },
+  "quantcore.performance.ratios": {
+   "names": {
+    "common_sense_ratio": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    },
+    "cpc_index": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    },
+    "gain_to_pain_ratio": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    },
+    "outlier_loss_ratio": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    },
+    "outlier_win_ratio": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    },
+    "risk_of_ruin": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    },
+    "serenity_index": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    },
+    "ulcer_index": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    },
+    "ulcer_performance_index": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    }
+   }
+  },
+  "quantcore.performance.sharpe_inference": {
+   "names": {
+    "DeflatedSharpeResult": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "dsr": "float",
+      "n_effective": "float",
+      "psr_naive": "float",
+      "sr_zero": "float",
+      "var_sharpe": "float"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "SharpeSE": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "n": "int",
+      "se": "float",
+      "sharpe": "float"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "deflated_sharpe_ratio": {
+     "kind": "function",
+     "signature": "(returns_best: npt.NDArray[np.float64], family_sharpes: Sequence[float] | npt.NDArray[np.float64], *, n_effective: float, sr_star_override: float | None=None, trial_variance: Literal['family', 'no_skill']='family') -> DeflatedSharpeResult"
+    },
+    "expected_max_sharpe": {
+     "kind": "function",
+     "signature": "(n_trials: float, var_sharpe: float, *, euler_gamma: float=_EULER_GAMMA) -> float"
+    },
+    "minimum_track_record_length": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], sr_star: float, alpha: float) -> float"
+    },
+    "probabilistic_sharpe_ratio": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], sr_star: float=0.0) -> float"
+    },
+    "sharpe_se_mertens": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], *, periods_per_year: int) -> SharpeSE"
+    }
+   }
+  },
+  "quantcore.portfolio": {
+   "exports": {
+    "black_litterman": "quantcore.portfolio.black_litterman",
+    "ledoit_wolf_shrinkage": "quantcore.portfolio.covariance",
+    "risk_parity_weights": "quantcore.portfolio.optimization",
+    "unconstrained_mean_variance_weights": "quantcore.portfolio.optimization"
+   }
+  },
+  "quantcore.portfolio.black_litterman": {
+   "names": {
+    "black_litterman": {
+     "kind": "function",
+     "signature": "(cov_matrix: npt.NDArray[np.float64], market_weights: npt.NDArray[np.float64], P: npt.NDArray[np.float64], Q: npt.NDArray[np.float64], omega: npt.NDArray[np.float64], risk_aversion: float, tau: float=0.025) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]"
+    }
+   }
+  },
+  "quantcore.portfolio.covariance": {
+   "names": {
+    "ledoit_wolf_shrinkage": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]"
+    }
+   }
+  },
+  "quantcore.portfolio.optimization": {
+   "names": {
+    "risk_parity_weights": {
+     "kind": "function",
+     "signature": "(cov_matrix: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]"
+    },
+    "unconstrained_mean_variance_weights": {
+     "kind": "function",
+     "signature": "(expected_returns: npt.NDArray[np.float64], cov_matrix: npt.NDArray[np.float64], risk_aversion: float) -> npt.NDArray[np.float64]"
+    }
+   }
+  },
+  "quantcore.pricing": {
+   "exports": {
+    "ProtectivePutSizing": "quantcore.pricing.options_positions",
+    "black_scholes_call": "quantcore.pricing.black_scholes",
+    "black_scholes_put": "quantcore.pricing.black_scholes",
+    "bs_delta": "quantcore.pricing.greeks",
+    "bs_gamma": "quantcore.pricing.greeks",
+    "bs_theta": "quantcore.pricing.greeks",
+    "bs_vega": "quantcore.pricing.greeks",
+    "option_roll_schedule": "quantcore.pricing.options_positions",
+    "protective_put_sizing": "quantcore.pricing.options_positions"
+   }
+  },
+  "quantcore.pricing.black_scholes": {
+   "names": {
+    "black_scholes_call": {
+     "kind": "function",
+     "signature": "(spot: float, strike: float, rate: float, volatility: float, time_to_maturity: float, dividend_yield: float=0.0) -> float"
+    },
+    "black_scholes_put": {
+     "kind": "function",
+     "signature": "(spot: float, strike: float, rate: float, volatility: float, time_to_maturity: float, dividend_yield: float=0.0) -> float"
+    }
+   }
+  },
+  "quantcore.pricing.greeks": {
+   "names": {
+    "bs_delta": {
+     "kind": "function",
+     "signature": "(spot: float, strike: float, rate: float, volatility: float, time_to_maturity: float, option_type: str, dividend_yield: float=0.0) -> float"
+    },
+    "bs_gamma": {
+     "kind": "function",
+     "signature": "(spot: float, strike: float, rate: float, volatility: float, time_to_maturity: float, dividend_yield: float=0.0) -> float"
+    },
+    "bs_theta": {
+     "kind": "function",
+     "signature": "(spot: float, strike: float, rate: float, volatility: float, time_to_maturity: float, option_type: str, dividend_yield: float=0.0) -> float"
+    },
+    "bs_vega": {
+     "kind": "function",
+     "signature": "(spot: float, strike: float, rate: float, volatility: float, time_to_maturity: float, dividend_yield: float=0.0) -> float"
+    }
+   }
+  },
+  "quantcore.pricing.options_positions": {
+   "names": {
+    "ProtectivePutSizing": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "breakeven": "float",
+      "contracts": "int",
+      "premium_cost": "float",
+      "protection_pct_achieved": "float"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "option_roll_schedule": {
+     "kind": "function",
+     "signature": "(current_date: date, target_tenor_days: int, listed_expiries: npt.NDArray[np.object_] | Sequence[date]) -> date"
+    },
+    "protective_put_sizing": {
+     "kind": "function",
+     "signature": "(portfolio_value: float, spot: float, strike: float, iv: float, time_to_expiry: float, r: float, target_protection_pct: float, budget_pct: float) -> ProtectivePutSizing"
+    }
+   }
+  },
+  "quantcore.regime": {
+   "exports": {
+    "hmm_decode": "quantcore.regime.hmm",
+    "hmm_fit": "quantcore.regime.hmm",
+    "hmm_predict_proba": "quantcore.regime.hmm"
+   }
+  },
+  "quantcore.regime.hmm": {
+   "names": {
+    "hmm_decode": {
+     "kind": "function",
+     "signature": "(observations: npt.NDArray[np.float64], transition_matrix: npt.NDArray[np.float64], means: npt.NDArray[np.float64], variances: npt.NDArray[np.float64], initial_probs: npt.NDArray[np.float64]) -> npt.NDArray[np.int64]"
+    },
+    "hmm_fit": {
+     "kind": "function",
+     "signature": "(observations: npt.NDArray[np.float64], n_states: int, n_iter: int=100, tol: float=1e-06, seed: int=0) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]"
+    },
+    "hmm_predict_proba": {
+     "kind": "function",
+     "signature": "(observations: npt.NDArray[np.float64], transition_matrix: npt.NDArray[np.float64], means: npt.NDArray[np.float64], variances: npt.NDArray[np.float64], initial_probs: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]"
+    }
+   }
+  },
+  "quantcore.risk": {
+   "exports": {
+    "ConvergenceError": "quantcore.risk.volatility",
+    "EGARCHParams": "quantcore.risk.egarch",
+    "GJRGARCHParams": "quantcore.risk.egarch",
+    "conditional_value_at_risk": "quantcore.risk.var",
+    "egarch_11_variance": "quantcore.risk.egarch",
+    "egarch_fit": "quantcore.risk.egarch",
+    "ewma_variance": "quantcore.risk.egarch",
+    "fit_garch_11": "quantcore.risk.volatility",
+    "garch_11_variance": "quantcore.risk.volatility",
+    "gjr_garch_11_variance": "quantcore.risk.egarch",
+    "gjr_garch_fit": "quantcore.risk.egarch",
+    "value_at_risk": "quantcore.risk.var",
+    "variance_backcast": "quantcore.risk.volatility"
+   }
+  },
+  "quantcore.risk.egarch": {
+   "names": {
+    "EGARCHParams": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "alpha": "float",
+      "beta": "float",
+      "gamma": "float",
+      "log_likelihood": "float",
+      "omega": "float",
+      "presample_variance": "float | None = None"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "GJRGARCHParams": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "alpha": "float",
+      "beta": "float",
+      "gamma": "float",
+      "log_likelihood": "float",
+      "omega": "float",
+      "presample_variance": "float | None = None"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "egarch_11_variance": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], omega: float, alpha: float, gamma: float, beta: float, presample_variance: float | None=None) -> npt.NDArray[np.float64]"
+    },
+    "egarch_fit": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> EGARCHParams"
+    },
+    "ewma_variance": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], lambda_: float) -> npt.NDArray[np.float64]"
+    },
+    "gjr_garch_11_variance": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], omega: float, alpha: float, gamma: float, beta: float, presample_variance: float | None=None) -> npt.NDArray[np.float64]"
+    },
+    "gjr_garch_fit": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> GJRGARCHParams"
+    }
+   }
+  },
+  "quantcore.risk.var": {
+   "names": {
+    "VarMethod": {
+     "kind": "value",
+     "value": "Literal['gaussian', 'historical', 'cornish_fisher']"
+    },
+    "conditional_value_at_risk": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], confidence_level: float, mean: float | None=None, volatility: float | None=None, method: VarMethod='gaussian') -> float"
+    },
+    "value_at_risk": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], confidence_level: float, mean: float | None=None, volatility: float | None=None, method: VarMethod='gaussian') -> float"
+    }
+   }
+  },
+  "quantcore.risk.volatility": {
+   "names": {
+    "ConvergenceError": {
+     "bases": [
+      "RuntimeError"
+     ],
+     "decorators": [],
+     "fields": {},
+     "kind": "class",
+     "methods": {
+      "__init__": "(self, message: str, params: tuple[float, ...] | None, log_likelihood: float | None, optimizer_message: str | None) -> None"
+     }
+    },
+    "fit_garch_11": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> tuple[float, float, float]"
+    },
+    "garch_11_variance": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], omega: float, alpha: float, beta: float, presample_variance: float | None=None) -> npt.NDArray[np.float64]"
+    },
+    "variance_backcast": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    }
+   }
+  },
+  "quantcore.statistics": {
+   "exports": {
+    "BootstrapInterval": "quantcore.statistics.bootstrap",
+    "CscvPbo": "quantcore.statistics.multiple_testing",
+    "FactorLoadingsResult": "quantcore.statistics.regression",
+    "HacTResult": "quantcore.statistics.hac",
+    "SpaPValues": "quantcore.statistics.bootstrap",
+    "adf_test": "quantcore.statistics.cointegration",
+    "arch_lm_test": "quantcore.statistics.diagnostics",
+    "cscv_pbo": "quantcore.statistics.multiple_testing",
+    "effective_n_eigen": "quantcore.statistics.multiple_testing",
+    "engle_granger_test": "quantcore.statistics.cointegration",
+    "factor_loadings": "quantcore.statistics.regression",
+    "fama_macbeth_regression": "quantcore.statistics.regression",
+    "hac_t_test": "quantcore.statistics.hac",
+    "jarque_bera_test": "quantcore.statistics.diagnostics",
+    "kpss_test": "quantcore.statistics.diagnostics",
+    "newey_west_cov": "quantcore.statistics.regression",
+    "newey_west_optimal_lags": "quantcore.statistics.regression",
+    "ols": "quantcore.statistics.regression",
+    "optimal_block_length": "quantcore.statistics.bootstrap",
+    "ou_half_life": "quantcore.statistics.cointegration",
+    "spa_test": "quantcore.statistics.bootstrap",
+    "spread_zscore": "quantcore.statistics.cointegration",
+    "stationary_bootstrap_ci": "quantcore.statistics.bootstrap"
+   }
+  },
+  "quantcore.statistics.bootstrap": {
+   "names": {
+    "BootstrapInterval": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "block_length": "float",
+      "ci_high": "float",
+      "ci_level": "float",
+      "ci_low": "float",
+      "estimate": "float",
+      "n_boot": "int",
+      "n_dropped": "int"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "SpaPValues": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "consistent": "float",
+      "lower": "float",
+      "upper": "float"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "optimal_block_length": {
+     "kind": "function",
+     "signature": "(x: npt.NDArray[np.float64]) -> float"
+    },
+    "spa_test": {
+     "kind": "function",
+     "signature": "(benchmark_losses: npt.NDArray[np.float64], model_losses: npt.NDArray[np.float64], *, rng: np.random.Generator, block_size: int, reps: int, studentize: bool) -> SpaPValues"
+    },
+    "stationary_bootstrap_ci": {
+     "kind": "function",
+     "signature": "(x: npt.NDArray[np.float64], stat: Callable[[npt.NDArray[np.float64]], float], *, rng: np.random.Generator, n_boot: int=2000, ci: float=0.95, method: Literal['percentile', 'bca']='percentile', block_length: float | None=None) -> BootstrapInterval"
+    }
+   }
+  },
+  "quantcore.statistics.cointegration": {
+   "names": {
+    "adf_test": {
+     "kind": "function",
+     "signature": "(series: npt.NDArray[np.float64], max_lags: int=1, trend: str='c', autolag: str | None=None) -> tuple[float, float]"
+    },
+    "engle_granger_test": {
+     "kind": "function",
+     "signature": "(y: npt.NDArray[np.float64], x: npt.NDArray[np.float64]) -> tuple[float, float, float]"
+    },
+    "ou_half_life": {
+     "kind": "function",
+     "signature": "(spread: npt.NDArray[np.float64]) -> float"
+    },
+    "spread_zscore": {
+     "kind": "function",
+     "signature": "(spread: npt.NDArray[np.float64], window: int) -> npt.NDArray[np.float64]"
+    }
+   }
+  },
+  "quantcore.statistics.diagnostics": {
+   "names": {
+    "arch_lm_test": {
+     "kind": "function",
+     "signature": "(residuals: npt.NDArray[np.float64], n_lags: int | None=None) -> tuple[float, float]"
+    },
+    "jarque_bera_test": {
+     "kind": "function",
+     "signature": "(series: npt.NDArray[np.float64]) -> tuple[float, float]"
+    },
+    "kpss_test": {
+     "kind": "function",
+     "signature": "(series: npt.NDArray[np.float64], n_lags: int | None=None, trend: str='c') -> tuple[float, float, bool]"
+    }
+   }
+  },
+  "quantcore.statistics.hac": {
+   "names": {
+    "HacTResult": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "lags": "int",
+      "mean": "float",
+      "n": "int",
+      "p_value": "float",
+      "se": "float",
+      "t": "float"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "hac_t_test": {
+     "kind": "function",
+     "signature": "(x: npt.NDArray[np.float64], *, lags: int | None=None, alternative: Literal['two-sided', 'greater', 'less']='two-sided', null: float=0.0) -> HacTResult"
+    }
+   }
+  },
+  "quantcore.statistics.multiple_testing": {
+   "names": {
+    "CscvPbo": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "n_combinations": "int",
+      "n_rows_dropped": "int",
+      "n_splits": "int",
+      "pbo": "float",
+      "subsampled": "bool"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "cscv_pbo": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], *, n_splits: int=16, evaluate: Callable[[npt.NDArray[np.float64]], float]=_per_period_sharpe, max_combinations: int | None=None, rng: np.random.Generator | None=None) -> CscvPbo"
+    },
+    "effective_n_eigen": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64]) -> float"
+    }
+   }
+  },
+  "quantcore.statistics.regression": {
+   "names": {
+    "FactorLoadingsResult": {
+     "bases": [],
+     "decorators": [
+      "dataclass(frozen=True)"
+     ],
+     "fields": {
+      "loadings": "npt.NDArray[np.float64]",
+      "n_lags_nw": "int",
+      "p_values": "npt.NDArray[np.float64]",
+      "r_squared": "float",
+      "residuals": "npt.NDArray[np.float64]",
+      "standard_errors": "npt.NDArray[np.float64]",
+      "t_stats": "npt.NDArray[np.float64]"
+     },
+     "kind": "class",
+     "methods": {}
+    },
+    "factor_loadings": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], factors: npt.NDArray[np.float64], n_lags_nw: int | None=None) -> FactorLoadingsResult"
+    },
+    "fama_macbeth_regression": {
+     "kind": "function",
+     "signature": "(returns: npt.NDArray[np.float64], betas: npt.NDArray[np.float64], n_lags_nw: int | None=None) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]"
+    },
+    "newey_west_cov": {
+     "kind": "function",
+     "signature": "(x: npt.NDArray[np.float64], residuals: npt.NDArray[np.float64], n_lags: int, small_sample_correction: bool=False) -> npt.NDArray[np.float64]"
+    },
+    "newey_west_optimal_lags": {
+     "kind": "function",
+     "signature": "(residuals: npt.NDArray[np.float64]) -> int"
+    },
+    "ols": {
+     "kind": "function",
+     "signature": "(y: npt.NDArray[np.float64], x: npt.NDArray[np.float64]) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float]"
+    }
+   }
+  },
+  "quantcore.time_series": {
+   "exports": {
+    "arima_fit": "quantcore.time_series.arima",
+    "arima_forecast": "quantcore.time_series.arima",
+    "arima_residuals": "quantcore.time_series.arima",
+    "granger_causality_test": "quantcore.time_series.var_model",
+    "impulse_response": "quantcore.time_series.var_model",
+    "ljung_box_test": "quantcore.time_series.arima",
+    "select_arima_order": "quantcore.time_series.arima",
+    "select_var_lag_order": "quantcore.time_series.var_model",
+    "var_fit": "quantcore.time_series.var_model",
+    "var_forecast": "quantcore.time_series.var_model"
+   }
+  },
+  "quantcore.time_series.arima": {
+   "names": {
+    "arima_fit": {
+     "kind": "function",
+     "signature": "(series: npt.NDArray[np.float64], p: int, d: int, q: int) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float]"
+    },
+    "arima_forecast": {
+     "kind": "function",
+     "signature": "(series: npt.NDArray[np.float64], ar_coefs: npt.NDArray[np.float64], ma_coefs: npt.NDArray[np.float64], d: int, h: int) -> npt.NDArray[np.float64]"
+    },
+    "arima_residuals": {
+     "kind": "function",
+     "signature": "(series: npt.NDArray[np.float64], ar_coefs: npt.NDArray[np.float64], ma_coefs: npt.NDArray[np.float64], d: int) -> npt.NDArray[np.float64]"
+    },
+    "ljung_box_test": {
+     "kind": "function",
+     "signature": "(residuals: npt.NDArray[np.float64], n_lags: int, model_df: int=0) -> tuple[float, float]"
+    },
+    "select_arima_order": {
+     "kind": "function",
+     "signature": "(series: npt.NDArray[np.float64], max_p: int, max_d: int, max_q: int, criterion: str='aic') -> tuple[int, int, int]"
+    }
+   }
+  },
+  "quantcore.time_series.var_model": {
+   "names": {
+    "granger_causality_test": {
+     "kind": "function",
+     "signature": "(y: npt.NDArray[np.float64], x: npt.NDArray[np.float64], n_lags: int) -> tuple[float, float]"
+    },
+    "impulse_response": {
+     "kind": "function",
+     "signature": "(coef_matrix: npt.NDArray[np.float64], sigma_u: npt.NDArray[np.float64], n_lags: int, n_periods: int) -> npt.NDArray[np.float64]"
+    },
+    "select_var_lag_order": {
+     "kind": "function",
+     "signature": "(system: npt.NDArray[np.float64], max_lags: int, criterion: str='aic') -> int"
+    },
+    "var_fit": {
+     "kind": "function",
+     "signature": "(data: npt.NDArray[np.float64], n_lags: int) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]"
+    },
+    "var_forecast": {
+     "kind": "function",
+     "signature": "(data: npt.NDArray[np.float64], coef_matrix: npt.NDArray[np.float64], n_lags: int, h: int) -> npt.NDArray[np.float64]"
+    }
+   }
+  }
+ },
+ "package": "quantcore",
+ "schema": "quantcore-api-manifest/1",
+ "sha256": "040a2f86c986b78717de5d109271693957027aee4d2d920ed18d9d3b5ccfb341",
+ "version": "0.3.1"
+}
