@@ -196,10 +196,21 @@ _ANALYSTS = {
 }
 
 
+def _rates(_series_id: str, _as_of_date: object) -> pd.DataFrame:
+    """A one-row DGS3MO frame in percent, known before `AS_OF`, for the analysts that read r."""
+    known = pd.Timestamp(AS_OF) - pd.Timedelta(days=1)
+    return pd.DataFrame(
+        {"value": [1.5], "realtime_start": [known], "known_at": [known]},
+        index=pd.DatetimeIndex([known], name="date"),
+    )
+
+
 def _signal(monkeypatch: pytest.MonkeyPatch, name: str) -> AgentSignal:
     module, class_name = _ANALYSTS[name]
     if hasattr(module, "real_atm_options_by_expiration"):
         monkeypatch.setattr(module, "real_atm_options_by_expiration", _chain)
+    if hasattr(module, "load_fred_vintages_from_lakehouse"):
+        monkeypatch.setattr(module, "load_fred_vintages_from_lakehouse", _rates)
     return getattr(module, class_name)().generate_signal("AAPL", _market(), AS_OF)
 
 
