@@ -14,8 +14,9 @@ progress.json, the trial directory holds:
 - data/: the Parquet bundle folder, holding only a README line;
 - agentic_meta.json: an `AgenticMeta`, what edgelab's model has no field
   for: whether the record is counted in the trial ledger, whether its
-  `src/` tree was clean, how many orders went unfilled, and which analysts
-  had too few available signals;
+  `src/` tree was clean, how many orders went unfilled, which analysts
+  had too few available signals, and the library versions and platform
+  of the pass that wrote it;
 - unfilled_orders.json: an `UnfilledOrdersRecord`, the orders the engine
   could not fill and their count per reason;
 - analyst_availability.json: an `AnalystAvailability`, each analyst's
@@ -49,6 +50,7 @@ from agentic_trading.firm_record.availability import (
 )
 from agentic_trading.firm_record.edgelab_strategy import REPLAY_STRATEGY_PY, REPLAY_STRATEGY_YAML
 from agentic_trading.firm_record.rows import row_instrument_id
+from agentic_trading.provenance import RuntimeEnvironment, runtime_environment
 from agentic_trading.stage_a.spec import FirmSpecRecord
 from agentic_trading.stage_a.store import _write_text
 from agentic_trading.trials.rows import FIRM_HYPOTHESIS_ID
@@ -241,8 +243,10 @@ class AgenticMeta(BaseModel):
     `settings.firm.low_availability_threshold` or that emitted no signal
     (`low_availability`, in analyst order; analyst_availability.json holds
     every roster analyst's counts),
-    and the registry file's `expected_availability` as it states it, empty
-    without one."""
+    the registry file's `expected_availability` as it states it, empty
+    without one, and the runtime `environment` (library versions and
+    platform) of the pass that wrote it, which the spec hash does not
+    cover."""
 
     model_config = _SPEC
 
@@ -254,6 +258,7 @@ class AgenticMeta(BaseModel):
     short_warmup: tuple[ShortWarmup, ...] = ()
     low_availability: tuple[LowAvailability, ...] = ()
     expected_availability: dict[str, str] = Field(default_factory=dict)
+    environment: RuntimeEnvironment
 
 
 class UnfilledOrdersRecord(BaseModel):
@@ -294,7 +299,8 @@ def submission_for(
     """The `Submission` of the firm record `record` whose sources.json
     holds `sources`, run from `git_sha` with a clean `src/` tree or not
     (`src_tree_clean`), and its `AgenticMeta`, which lists `short_warmup`
-    and `expected_availability` (the registry file's, `None` without one).
+    and `expected_availability` (the registry file's, `None` without one)
+    and the `runtime_environment()` of this process.
 
     `client` is `CLIENT_PROJECT` at `git_sha` under `FIRM_HYPOTHESIS_ID`;
     the family, ledger reference and hypothesis are `FIRM_HYPOTHESIS_ID`;
@@ -343,6 +349,7 @@ def submission_for(
         declared_n_from="registration" if from_registration else "uncounted_default",
         short_warmup=tuple(short_warmup),
         expected_availability=dict(expected_availability or {}),
+        environment=runtime_environment(),
     )
     return submission, meta
 

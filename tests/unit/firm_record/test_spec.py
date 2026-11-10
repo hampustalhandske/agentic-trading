@@ -8,7 +8,7 @@ config_hash."""
 import json
 import sys
 from datetime import UTC, date, datetime, timedelta, timezone
-from importlib import import_module
+from importlib import import_module, metadata
 
 import pytest
 from pydantic import ValidationError
@@ -19,6 +19,7 @@ from agentic_trading.agents.roster import build_default_analysts, build_default_
 from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.config import temporary_overrides
 from agentic_trading.firm_record.spec import FIRM_DECISION_RULE, build_firm_spec
+from agentic_trading.provenance import LibraryVersions, runtime_environment
 from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
 from agentic_trading.stage_a.spec import (
     RUNTIME_SETTINGS_FIELDS,
@@ -145,6 +146,36 @@ def test_unknown_quantcore_commit_is_refused(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(provenance, "quantcore_sha", lambda: None)
     with pytest.raises(ValueError, match="quantcore"):
         build_firm_spec(_commander(), _UNIVERSE, _START, _END, _T)
+
+
+def test_runtime_environment_never_enters_the_spec_hash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The library versions and the platform describe the machine, not the hypothesis: a firm
+    spec built where every one of them differs has the same hash and names none of them."""
+    commander = _commander()
+    spec = build_firm_spec(commander, _UNIVERSE, _START, _END, _T)
+    planted = "0.0.0+planted"
+    installed_version = metadata.version
+
+    def planted_version(name: str) -> str:
+        return planted if name in LibraryVersions.model_fields else installed_version(name)
+
+    other = runtime_environment().model_copy(
+        update={
+            "python_version": planted,
+            "platform_system": planted,
+            "platform_machine": planted,
+            "platform_release": planted,
+            "blas_name": planted,
+            "blas_version": planted,
+            "libraries": LibraryVersions(**dict.fromkeys(LibraryVersions.model_fields, planted)),
+        }
+    )
+    monkeypatch.setattr(metadata, "version", planted_version)
+    monkeypatch.setattr(provenance, "runtime_environment", lambda: other)
+    moved = build_firm_spec(commander, _UNIVERSE, _START, _END, _T)
+
+    assert planted not in canonical_firm_spec_json(moved)
+    assert firm_spec_hash(moved) == firm_spec_hash(spec)
 
 
 def test_every_loaded_module_is_hashed() -> None:

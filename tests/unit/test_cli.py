@@ -33,7 +33,7 @@ from agentic_trading.backtest.preflight import (
 from agentic_trading.cli import app, experiment, experiment_app
 from agentic_trading.config import temporary_overrides
 from agentic_trading.data.loaders.lakehouse_loader import LakeProvenance
-from agentic_trading.provenance import RunProvenance
+from agentic_trading.provenance import RunProvenance, runtime_environment
 
 runner = CliRunner()
 
@@ -253,6 +253,7 @@ def _echoing_provenance(
             status_generated_at=None,
         ),
         lake_contract="lakehouse-contract-v1",
+        environment=runtime_environment(),
     )
 
 
