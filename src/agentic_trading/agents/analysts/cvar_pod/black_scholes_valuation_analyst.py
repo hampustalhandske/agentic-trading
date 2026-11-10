@@ -22,7 +22,7 @@ from agentic_trading.agents.analysts.cvar_pod._options_data import (
     real_atm_options_by_expiration,
 )
 from agentic_trading.agents.base import AnalystAgent, DataRequirement
-from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.agents.schemas import AgentSignal, VolatilityProvenance
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -45,6 +45,10 @@ class BlackScholesValuationAnalyst(AnalystAgent):
     `_refit_cache.refit_interval_days` simulated days per asset — see
     `RefitCache`'s docstring.
 
+    Every priced signal's `volatility_estimator` names the estimator the
+    fitted volatility came from (`_market_math.conditional_daily_volatility`:
+    "garch_11", or "ewma" when the fit is unusable).
+
     Every active signal's `source_as_of` is the date of the chain snapshot
     it priced off (`_options_data.chain_snapshot_date`), the snapshot's own
     date rather than the later decision date the publication lag first
@@ -59,10 +63,15 @@ class BlackScholesValuationAnalyst(AnalystAgent):
     _refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)
 
     def _annualized_garch_volatility(
-        self, returns: np.ndarray, refit_cache: RefitCache, cache_key: str, as_of_date: pd.Timestamp
+        self,
+        returns: np.ndarray,
+        refit_cache: RefitCache,
+        cache_key: str,
+        as_of_date: pd.Timestamp,
+        provenance: VolatilityProvenance,
     ) -> float:
         daily_volatility = conditional_daily_volatility(
-            returns, refit_cache, cache_key, as_of_date, self.agent_id
+            returns, refit_cache, cache_key, as_of_date, self.agent_id, provenance=provenance
         )
         return daily_volatility * float(np.sqrt(TRADING_DAYS_PER_YEAR))
 
@@ -104,8 +113,9 @@ class BlackScholesValuationAnalyst(AnalystAgent):
         )
 
         mean_return = float(np.mean(returns))
+        volatility_read = VolatilityProvenance()
         fitted_volatility = self._annualized_garch_volatility(
-            returns, self._refit_cache, asset, as_of_date
+            returns, self._refit_cache, asset, as_of_date, volatility_read
         )
 
         fitted_call = black_scholes_call(
@@ -156,6 +166,7 @@ class BlackScholesValuationAnalyst(AnalystAgent):
             direction=direction,
             confidence=confidence,
             source_as_of=chain_snapshot_date(real_options),
+            volatility_estimator=volatility_read.estimator,
             rationale=(
                 f"quantcore Black-Scholes edge: {settings.analysts.risk_window_short}d fitted vol="
                 f"{fitted_volatility:.3f} vs {benchmark_label}={benchmark_volatility:.3f}, "

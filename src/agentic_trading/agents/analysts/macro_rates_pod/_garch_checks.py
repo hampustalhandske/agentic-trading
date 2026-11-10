@@ -25,6 +25,12 @@ MIN_EGARCH_BETA = 0.5
 # from a recursion that has blown up, not from a real vol regime.
 MAX_SIGMA_PATH_RANGE_RATIO = 20.0
 FINAL_SIGMA_RATIO_BOUNDS = (0.2, 5.0)
+# The message SciPy's SLSQP, the optimizer `arch` runs for quantcore's
+# GARCH-family fits, gives exactly when it exits with status 0; every
+# other exit status has a message of its own. A `ConvergenceError`
+# carrying it was raised for a converged fit outside the model's region,
+# not for an optimizer failure.
+SLSQP_SUCCESS_MESSAGE = "Optimization terminated successfully"
 
 
 def fit_or_convergence_error[FittedParams: (EGARCHParams, GJRGARCHParams)](
@@ -43,6 +49,59 @@ def fit_or_convergence_error[FittedParams: (EGARCHParams, GJRGARCHParams)](
         if exc.params is None:
             raise
         return exc
+
+
+def _convergence_failure(
+    error: ConvergenceError, admissible: bool, persistence: float, label: str
+) -> "CheckFailure":
+    """The `CheckFailure` of a fit that raised `error`, whose best attempt
+    is `admissible` apart from stationarity and has `persistence` (named
+    `label` in the reason). An optimizer that did not exit with status 0
+    (`error.optimizer_message` is not `SLSQP_SUCCESS_MESSAGE`) is an
+    "error" naming its message. A converged fit is an "abstain" when it
+    is admissible and `persistence >= 1` (non-stationary), and an "error"
+    otherwise."""
+    if error.optimizer_message != SLSQP_SUCCESS_MESSAGE:
+        return CheckFailure(
+            kind="error",
+            reason=f"MLE fit did not converge (optimizer: {error.optimizer_message})",
+        )
+    if admissible and persistence >= 1.0:
+        return CheckFailure(
+            kind="abstain",
+            reason=f"converged fit is non-stationary ({label} {persistence:.6f} >= 1)",
+        )
+    return CheckFailure(
+        kind="error",
+        reason=f"converged fit outside the admissible region (params {error.params})",
+    )
+
+
+def classify_egarch_convergence_error(error: ConvergenceError) -> "CheckFailure":
+    """The `CheckFailure` of an `egarch_fit` that raised `error` with a best
+    attempt `(omega, alpha, gamma, beta)`: an "error" for an optimizer
+    failure or a non-finite parameter, an "abstain" for a converged fit
+    with `|beta| >= 1`."""
+    params: tuple[float, ...] = error.params or ()
+    admissible = len(params) == 4 and all(math.isfinite(value) for value in params)
+    beta = abs(params[3]) if admissible else math.nan
+    return _convergence_failure(error, admissible, beta, "|beta|")
+
+
+def classify_gjr_convergence_error(error: ConvergenceError) -> "CheckFailure":
+    """The `CheckFailure` of a `gjr_garch_fit` that raised `error` with a
+    best attempt `(omega, alpha, gamma, beta)`: an "error" for an optimizer
+    failure or an inadmissible fit (a non-finite parameter, omega <= 0,
+    alpha < 0 or alpha + gamma < 0), an "abstain" for a converged fit with
+    persistence `alpha + beta + gamma/2 >= 1`."""
+    params: tuple[float, ...] = error.params or ()
+    admissible = len(params) == 4 and all(math.isfinite(value) for value in params)
+    persistence = math.nan
+    if admissible:
+        omega, alpha, gamma, beta = params
+        admissible = omega > 0.0 and alpha >= 0.0 and alpha + gamma >= 0.0
+        persistence = alpha + beta + 0.5 * gamma
+    return _convergence_failure(error, admissible, persistence, "persistence")
 
 
 def _ratio_outside(value: float, reference: float, bounds: tuple[float, float]) -> bool:

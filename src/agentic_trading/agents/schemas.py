@@ -16,6 +16,22 @@ from agentic_trading.config import settings
 # `error_signal`.
 SignalStatus = Literal["active", "unavailable", "error"]
 
+# The estimator a signal's volatility input came from: "garch_11" a
+# sanity-checked GARCH(1,1) fit, "ewma" the RiskMetrics EWMA fallback
+# `_market_math.conditional_daily_volatility` uses when that fit is
+# unusable, "realized_std" a plain sample standard deviation of recent
+# returns.
+VolatilityEstimator = Literal["garch_11", "ewma", "realized_std"]
+
+
+class VolatilityProvenance(BaseModel):
+    """Which estimator a volatility read used, filled in by the read it is
+    handed to (`_market_math.conditional_daily_volatility`); `estimator`
+    stays `None` until a read sets it."""
+
+    estimator: VolatilityEstimator | None = None
+
+
 # A pod's state on one day. "unavailable": none of the pod's decisions
 # carries an active signal (its data or analysts produced nothing).
 # "no_position": at least one active signal, yet every decision has weight
@@ -54,6 +70,12 @@ class AgentSignal(BaseModel):
     # read rests on (`sample_count`); managers dampen on both.
     source_as_of: date | None = None
     sample_count: int | None = None
+    # The estimator of the volatility the signal rests on, for an analyst
+    # that reads one; `None` for every other analyst, and then left out of
+    # the signal's dump, so their payloads hold only the fields above.
+    volatility_estimator: VolatilityEstimator | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _zero_confidence_is_flat(self) -> "AgentSignal":
@@ -90,6 +112,11 @@ class ManagerSignal(BaseModel):
     # read rests on (`sample_count`); managers dampen on both.
     source_as_of: date | None = None
     sample_count: int | None = None
+    # The analyst signal's `volatility_estimator`, carried as given, and
+    # left out of the dump when `None`.
+    volatility_estimator: VolatilityEstimator | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 _CONTRACT_ID_PATTERN = re.compile(r"^(\S+) (\d{4}-\d{2}-\d{2}) ([CP]) (\d+(?:\.\d+)?)$")

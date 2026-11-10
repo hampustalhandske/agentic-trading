@@ -20,7 +20,8 @@ progress.json, the trial directory holds:
 - unfilled_orders.json: an `UnfilledOrdersRecord`, the orders the engine
   could not fill and their count per reason;
 - analyst_availability.json: an `AnalystAvailability`, each analyst's
-  signals by status per year and over the record
+  signals by status per year and over the record, and its EWMA
+  volatility fallbacks when it records a volatility estimator
   (`firm_record.availability`).
 
 `submission_for` builds the `Submission` of a record,
