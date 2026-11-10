@@ -25,6 +25,8 @@ from agentic_trading.data.loaders.option_marks import (
     select_expiry,
 )
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 UNDERLYING = "AAPL"
 SNAPSHOT_DATES = [date(2024, 3, 1), date(2024, 3, 5)]
 EXPIRIES = [date(2024, 3, 1), date(2024, 3, 15), date(2024, 4, 5), date(2024, 5, 17)]

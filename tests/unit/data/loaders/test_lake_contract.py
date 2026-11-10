@@ -22,6 +22,8 @@ import pytest
 
 from agentic_trading.data.loaders import lakehouse_loader
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _CONTRACT_PATH = Path(__file__).parents[3] / "fixtures" / "lakehouse_contract_v1.json"
 _CONTRACT = json.loads(_CONTRACT_PATH.read_text())
 _AS_OF = date(2024, 3, 15)

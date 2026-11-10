@@ -15,6 +15,8 @@ import pytest
 from agentic_trading.data.loader import load_price_history_with_fallback
 from agentic_trading.data.loaders import lakehouse_loader as ll
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _T = datetime(2026, 10, 29, tzinfo=UTC)
 _DATA_END = date(2024, 12, 31)
 _PAST_END = _DATA_END + timedelta(days=1)

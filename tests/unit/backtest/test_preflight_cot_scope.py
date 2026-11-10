@@ -11,6 +11,7 @@ from datetime import date
 from typing import Any
 
 import pandas as pd
+import pytest
 
 from agentic_trading.agents.analysts.macro_rates_pod import cot_positioning_analyst
 from agentic_trading.agents.analysts.macro_rates_pod.cot_positioning_analyst import (
@@ -21,6 +22,8 @@ from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.backtest import preflight as preflight_module
 from agentic_trading.backtest.preflight import check_data_availability
 from agentic_trading.data.loaders import lakehouse_loader
+
+pytestmark = pytest.mark.unpinned_lake_reads
 
 START = date(2020, 3, 1)
 END = date(2020, 12, 31)

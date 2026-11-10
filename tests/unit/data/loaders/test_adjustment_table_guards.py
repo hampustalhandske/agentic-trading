@@ -20,6 +20,8 @@ from agentic_trading.data.loaders.lakehouse_loader import (
     unfactored_split_moves,
 )
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _BARS = {
     "ticker": "VARCHAR",
     "date": "DATE",

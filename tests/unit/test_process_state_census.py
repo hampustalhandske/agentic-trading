@@ -127,6 +127,10 @@ _ALLOWED: dict[str, str] = {
         "started with"
     ),
     "agentic_trading.data.loaders.lakehouse_loader:_SESSION_LOCK": _LOCK,
+    "agentic_trading.data.loaders.lakehouse_loader:_UNPINNED_READS": (
+        "count of open unpinned_lake_reads blocks; it only decides whether a read with no "
+        "lake_session raises, and every run path reads inside its lake_session"
+    ),
     "agentic_trading.data.lakehouse_client:Lake._process_lock": (
         _LOCK + "; it guards the count of the process's unfinished lake requests, which is 0 "
         "between sessions and decides only whether a restart may exec, never a result"

@@ -12,6 +12,8 @@ import pytest
 
 from agentic_trading.data.loaders import lakehouse_loader
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 ZN, GC, ZB = "043602", "088691", "020601"
 
 

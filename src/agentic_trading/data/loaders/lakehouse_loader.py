@@ -27,8 +27,11 @@ the table (`Lake.describe`, read once when the session opens):
 - a rebuilt-whole table holds only its current build, so it is read
   unpinned and its build time is recorded in the session.
 
-Outside a session each query reads the lake's current, deduplicated
-views (latest write wins) as the lake stands at that moment.
+Outside a session a read raises `UnpinnedLakeReadError`, naming the
+loader and the table, before any query is sent. A caller that must read
+without a session opts in with `unpinned_lake_reads(reason)`: inside that
+block, with no session open, each query reads the lake's current,
+deduplicated views (latest write wins) as the lake stands at that moment.
 
 This is the only market/alternative-data source a run reads:
 `data/loader.py::load_price_history_with_fallback` raises for any ticker
@@ -581,16 +584,61 @@ def _pinned_table_sql(session: LakeSession, table: str) -> str:
     return f"({_deduplicated_log_sql(table, metadata.key_columns, lake_time, metadata.tie_order)})"
 
 
+class UnpinnedLakeReadError(RuntimeError):
+    """A loader read a lake table with no `lake_session` open and outside
+    `unpinned_lake_reads`, so the read would see the lake's current views
+    rather than one lake time. The message names the loader and the table.
+    Raised before any query is sent."""
+
+
+# How many `unpinned_lake_reads` blocks are open, over every thread.
+_UNPINNED_READS = 0
+
+
+@contextmanager
+def unpinned_lake_reads(reason: str) -> Iterator[None]:
+    """Allows reads with no `lake_session` open while the block runs, in
+    every thread of the process: each such read names its table bare and
+    so reads the lake's current, deduplicated views as they stand at that
+    query, and two reads can see two lake states. Inside an open session
+    every read stays pinned. `reason` says why the caller cannot open a
+    session and is logged when the block opens; an empty one raises
+    `ValueError`. Blocks nest."""
+    global _UNPINNED_READS
+    if not reason.strip():
+        raise ValueError("unpinned_lake_reads needs a reason")
+    logger.info("Lake reads outside a lake session are allowed: %s", reason)
+    with _SESSION_LOCK:
+        _UNPINNED_READS += 1
+    try:
+        yield
+    finally:
+        with _SESSION_LOCK:
+            _UNPINNED_READS -= 1
+
+
 def _table_sql(table: str) -> str:
     """The relation a query reads for `table`, to place after `FROM` or
-    `JOIN`: the bare table name outside a session, and inside one the
-    table as of the session's lake time (see the module docstring for the
-    read shape per table). A pinned relation is a parenthesized subquery,
-    so a caller that qualifies columns gives it an alias. Inside a session
-    the table is recorded as read, for `verify_rebuilt_whole_builds`."""
+    `JOIN`: inside a session the table as of the session's lake time (see
+    the module docstring for the read shape per table), and with no
+    session open inside `unpinned_lake_reads` the bare table name. A
+    pinned relation is a parenthesized subquery, so a caller that
+    qualifies columns gives it an alias. Inside a session the table is
+    recorded as read, for `verify_rebuilt_whole_builds`. With no session
+    and no `unpinned_lake_reads` block open, raises `UnpinnedLakeReadError`
+    naming the public loader in progress and `table`."""
     session = _current_session()
     if session is None:
-        return table
+        with _SESSION_LOCK:
+            allowed = _UNPINNED_READS > 0
+        if allowed:
+            return table
+        call = _LOADER_CALL.get()
+        reader = "a read outside any public loader" if call is None else call.loader
+        raise UnpinnedLakeReadError(
+            f"{reader} read {table} with no lake_session open; open a lake_session to pin the "
+            "read to one lake time, or opt in with unpinned_lake_reads(reason)"
+        )
     relation = _pinned_table_sql(session, table)
     with _SESSION_LOCK:
         session._read_tables.add(table)

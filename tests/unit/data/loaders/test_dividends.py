@@ -9,8 +9,11 @@ from datetime import date
 from typing import Any
 
 import pandas as pd
+import pytest
 
 from agentic_trading.data.loaders import lakehouse_loader
+
+pytestmark = pytest.mark.unpinned_lake_reads
 
 _ROWS = [
     ("AAPL", "2020-05-08", 0.82, 0.205, "regular_cash"),

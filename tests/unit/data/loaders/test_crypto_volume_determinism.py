@@ -22,6 +22,8 @@ import pytest
 
 from agentic_trading.data.loaders import lakehouse_loader
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _TICKERS = ["BTC-USD", "ETH-USD"]
 _START = date(2023, 1, 2)
 _DAYS = 365

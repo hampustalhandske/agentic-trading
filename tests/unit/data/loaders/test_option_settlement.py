@@ -18,6 +18,8 @@ from agentic_trading.agents.schemas import OptionContract
 from agentic_trading.data.loaders import option_marks
 from agentic_trading.data.loaders.option_marks import load_option_mark
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 FRIDAY_EXPIRY = date(2020, 1, 17)
 HOLIDAY_EXPIRY = date(2020, 1, 20)
 AFTER_HOLIDAY = date(2020, 1, 21)

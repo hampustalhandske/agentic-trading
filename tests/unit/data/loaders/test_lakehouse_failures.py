@@ -10,6 +10,8 @@ import pytest
 from agentic_trading.data.lakehouse_client import LakehouseError
 from agentic_trading.data.loaders import lakehouse_loader
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 
 def test_lakehouse_error_propagates_instead_of_becoming_none(fake_lake: Any) -> None:
     fake_lake.error = LakehouseError("HTTP 400: bad column")

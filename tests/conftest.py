@@ -39,11 +39,19 @@ from agentic_trading.data.loaders import lakehouse_loader  # noqa: E402
 from agentic_trading.data.loaders.lakehouse_loader import LakeProvenance  # noqa: E402
 from edgelab_live import configure as configure_edgelab_live  # noqa: E402
 
+_UNPINNED_LAKE_READS_MARKER = "unpinned_lake_reads"
+
 
 def pytest_configure(config: pytest.Config) -> None:
     """Registers the `edgelab_live` marker and the skip guard of `tests/edgelab_live.py`: a run
-    with any skip other than a live edgelab check skipped for an absent checkout fails."""
+    with any skip other than a live edgelab check skipped for an absent checkout fails. Also
+    registers the `unpinned_lake_reads` marker (see `_unpinned_lake_reads`)."""
     configure_edgelab_live(config)
+    config.addinivalue_line(
+        "markers",
+        f"{_UNPINNED_LAKE_READS_MARKER}: the test reads the fake lake's current tables with no "
+        "lake session open, inside lakehouse_loader.unpinned_lake_reads",
+    )
 
 
 _DEFAULT_SCRAPED_AT = "2020-01-01T00:00:00Z"
@@ -311,6 +319,19 @@ def _block_real_lake(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     yield
     monkeypatch.undo()
     _REAL_LAKE_ACCESSOR.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _unpinned_lake_reads(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Runs a test marked `unpinned_lake_reads` inside
+    `lakehouse_loader.unpinned_lake_reads`, so its loader calls with no lake session open read
+    the fake lake's current tables. Every other test keeps the refusal of a read with no
+    session open."""
+    if request.node.get_closest_marker(_UNPINNED_LAKE_READS_MARKER) is None:
+        yield
+        return
+    with lakehouse_loader.unpinned_lake_reads("the test reads the fake lake's current tables"):
+        yield
 
 
 # The test module that specifies the empty-read retry: it checks the real

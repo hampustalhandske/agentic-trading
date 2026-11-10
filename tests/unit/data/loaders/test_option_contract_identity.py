@@ -12,6 +12,8 @@ from agentic_trading.agents.schemas import OptionContract
 from agentic_trading.data.loaders import lakehouse_loader
 from agentic_trading.data.loaders.option_marks import _contract_row
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _EXPIRATION = date(2022, 9, 16)
 
 

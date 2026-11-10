@@ -22,6 +22,8 @@ from agentic_trading.data.loaders.lakehouse_loader import (
     load_sp500_member_count,
 )
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _BARS = {
     "ticker": "VARCHAR",
     "date": "DATE",

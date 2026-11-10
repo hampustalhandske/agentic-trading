@@ -18,6 +18,8 @@ import pytest
 from agentic_trading.data.lakehouse_client import LakehouseError
 from agentic_trading.data.loaders import lakehouse_loader as ll
 
+pytestmark = pytest.mark.unpinned_lake_reads
+
 _T = datetime(2024, 6, 1, 12, tzinfo=UTC)
 _B1, _B2, _AFTER = "2024-04-01T00:00:00Z", "2024-05-01T00:00:00Z", "2024-07-01T00:00:00Z"
 _REBUILT = frozenset(
