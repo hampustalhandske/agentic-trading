@@ -14,15 +14,22 @@ import pytest
 from agentic_trading.agents.analysts.event_credit_pod.short_interest_squeeze_analyst import (
     ShortInterestSqueezeAnalyst,
 )
-from agentic_trading.agents.analysts.macro_rates_pod import arima_forecast_analyst
+from agentic_trading.agents.analysts.macro_rates_pod import (
+    arima_forecast_analyst,
+    macro_var_spillover_analyst,
+)
 from agentic_trading.agents.analysts.macro_rates_pod.arima_forecast_analyst import (
     ARIMAForecastAnalyst,
+)
+from agentic_trading.agents.analysts.macro_rates_pod.macro_var_spillover_analyst import (
+    MacroVarSpilloverAnalyst,
 )
 from agentic_trading.agents.analysts.stat_arb_pod import ou_mean_reversion_analyst
 from agentic_trading.agents.analysts.stat_arb_pod.ou_mean_reversion_analyst import (
     OUMeanReversionAnalyst,
 )
 from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.data.loaders.macro_loader import DGS3MO, DGS10, VIXCLS
 
 _SHORT_INTEREST = "agentic_trading.agents.analysts.event_credit_pod.short_interest_squeeze_analyst"
 AS_OF = pd.Timestamp("2024-06-14")
@@ -216,3 +223,66 @@ def test_arima_real_pretest_passes_the_autocorrelated_fixture() -> None:
     lags = min(arima_forecast_analyst.LJUNG_BOX_MAX_LAGS, returns.size // 5)
     _, p_value = arima_forecast_analyst.ljung_box_test(returns, lags, model_df=0)
     assert p_value < arima_forecast_analyst.LJUNG_BOX_SIGNIFICANCE
+
+
+_VAR_DATES = pd.bdate_range(end=AS_OF, periods=150)
+
+
+def _fred_vintages(values: np.ndarray, index: pd.DatetimeIndex) -> pd.DataFrame:
+    """`values` as FRED vintages on `index`, each known the day after its date."""
+    known = index + pd.Timedelta(days=1)
+    return pd.DataFrame(
+        {"value": np.asarray(values, dtype=np.float64), "realtime_start": known, "known_at": known},
+        index=index,
+    )
+
+
+def _stub_var_macro(monkeypatch: pytest.MonkeyPatch, vix: np.ndarray | None = None) -> None:
+    """VIXCLS (`vix`, else noise around 20), DGS10 and DGS3MO vintages through the day before
+    AS_OF."""
+    index = _VAR_DATES[:-1]
+    frames = {
+        VIXCLS: _fred_vintages(20.0 + _noise(len(index), 0) * 100 if vix is None else vix, index),
+        DGS10: _fred_vintages(4.0 + _noise(len(index), 1) * 100, index),
+        DGS3MO: _fred_vintages(3.0 + _noise(len(index), 2) * 100, index),
+    }
+    monkeypatch.setattr(
+        macro_var_spillover_analyst,
+        "load_fred_vintages_from_lakehouse",
+        lambda series_id, _as_of: frames[series_id],
+    )
+    monkeypatch.setattr(macro_var_spillover_analyst, "select_var_lag_order", lambda *_a: 1)
+
+
+def test_var_non_finite_granger_p_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_var_macro(monkeypatch)
+    monkeypatch.setattr(
+        macro_var_spillover_analyst, "granger_causality_test", lambda *_a: (0.0, float("nan"))
+    )
+
+    signal = MacroVarSpilloverAnalyst().generate_signal("SPY", _market(_noise(150, 8)), AS_OF)
+
+    assert _flat(signal) == ("error", "flat", 0.0)
+
+
+@pytest.mark.parametrize("value", [0.0, 0.01])
+def test_var_constant_asset_returns_are_an_error(
+    monkeypatch: pytest.MonkeyPatch, value: float
+) -> None:
+    """A Granger test on a column with no range is undefined."""
+    _stub_var_macro(monkeypatch)
+
+    signal = MacroVarSpilloverAnalyst().generate_signal("SPY", _market(np.full(150, value)), AS_OF)
+
+    assert _flat(signal) == ("error", "flat", 0.0)
+
+
+@pytest.mark.parametrize("value", [0.0, 20.0])
+def test_var_constant_macro_column_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, value: float
+) -> None:
+    _stub_var_macro(monkeypatch, vix=np.full(len(_VAR_DATES) - 1, value))
+
+    signal = MacroVarSpilloverAnalyst().generate_signal("SPY", _market(_noise(150, 8)), AS_OF)
+
+    assert _flat(signal) == ("error", "flat", 0.0)
