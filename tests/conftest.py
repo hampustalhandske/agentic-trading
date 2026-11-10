@@ -19,6 +19,7 @@ fresh instances despite this session-wide disabling.
 
 import json
 import math
+import sys
 import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -312,6 +313,17 @@ def _stub_run_provenance_lake(monkeypatch: pytest.MonkeyPatch) -> None:
             status_generated_at=None,
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_host_power_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Makes the firm record's power preflight see a host without `pmset`
+    (`cli.read_power_state` returns `None`), so no test depends on whether
+    the machine running it is on battery. Applies when `agentic_trading.cli`
+    is imported, as it is by every test module that invokes a command."""
+    cli = sys.modules.get("agentic_trading.cli")
+    if cli is not None:
+        monkeypatch.setattr(cli, "read_power_state", lambda: None)
 
 
 @pytest.fixture

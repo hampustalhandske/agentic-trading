@@ -467,3 +467,109 @@ def test_set_cannot_move_data_end_past_the_holdout(
     assert result.exit_code == exit_code, result.output
     assert load.called is (exit_code == 0)
     assert record.called is (exit_code == 0)
+
+
+_ON_AC = (
+    "Now drawing from 'AC Power'\n"
+    " -InternalBattery-0 (id=20447331)\t62%; charging; 2:14 remaining present: true\n"
+)
+_ON_BATTERY = (
+    "Now drawing from 'Battery Power'\n"
+    " -InternalBattery-0 (id=20447331)\t80%; discharging; 5:10 remaining present: true\n"
+)
+
+
+def _power_settings(low_power_mode: int) -> str:
+    """`pmset -g` output with Low Power Mode at `low_power_mode`."""
+    return (
+        "System-wide power settings:\nCurrently in use:\n standby              1\n"
+        f" lowpowermode         {low_power_mode}\n womp                 1\n"
+    )
+
+
+# The real power reader, kept before `tests/conftest.py` stubs it for each test.
+_READ_POWER_STATE = getattr(cli, "read_power_state", None)
+
+
+@pytest.fixture
+def pmset(monkeypatch: pytest.MonkeyPatch) -> Callable[[str | None, str | None], None]:
+    """Restores the real power reader over a stubbed `pmset`: `pmset -g batt` prints the first
+    argument and `pmset -g` the second; `None` for both is a host without pmset."""
+
+    def stub(battery_report: str | None, power_settings: str | None) -> None:
+        outputs = {("-g", "batt"): battery_report, ("-g",): power_settings}
+        monkeypatch.setattr(cli, "read_power_state", _READ_POWER_STATE, raising=False)
+        monkeypatch.setattr(cli, "_run_pmset", lambda *args: outputs[args], raising=False)
+
+    return stub
+
+
+@pytest.mark.parametrize(
+    ("battery_report", "power_settings", "extra", "refused"),
+    [
+        (_ON_BATTERY, _power_settings(0), [], True),
+        (_ON_AC, _power_settings(1), [], True),
+        ("no power source here\n", _power_settings(0), [], True),
+        (_ON_AC, "System-wide power settings:\n standby 1\n", [], True),
+        (_ON_AC, _power_settings(0), [], False),
+        (None, None, [], False),
+        (_ON_BATTERY, _power_settings(1), ["--allow-battery"], False),
+    ],
+    ids=[
+        "battery",
+        "low-power",
+        "unparseable-source",
+        "no-low-power-line",
+        "ac",
+        "no-pmset",
+        "allow-battery",
+    ],
+)
+def test_power_preflight(
+    tmp_path: Path,
+    pmset: Callable[[str | None, str | None], None],
+    battery_report: str | None,
+    power_settings: str | None,
+    extra: list[str],
+    refused: bool,
+    preflight_lake: Any,
+) -> None:
+    """The record refuses to start on battery, in Low Power Mode or on pmset output it cannot
+    read, naming --allow-battery and reading nothing; on AC power, on a host without pmset or
+    with --allow-battery it runs."""
+    pmset(battery_report, power_settings)
+    result, load, _, record = _invoke([*_ARGS, "--store-dir", str(tmp_path), *extra])
+
+    if refused:
+        assert result.exit_code == 1, result.output
+        assert "--allow-battery" in result.output
+        load.assert_not_called()
+        record.assert_not_called()
+    else:
+        assert result.exit_code == 0, result.output
+        record.assert_called_once()
+
+
+def test_power_preflight_refuses_when_pmset_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preflight_lake: Any
+) -> None:
+    """An installed pmset that exits non-zero refuses the record."""
+    monkeypatch.setattr(cli, "read_power_state", _READ_POWER_STATE, raising=False)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    failed = MagicMock(return_value=MagicMock(returncode=1, stdout="", stderr="pmset: boom"))
+    monkeypatch.setattr(cli.subprocess, "run", failed)
+    result, _, _, record = _invoke([*_ARGS, "--store-dir", str(tmp_path)])
+
+    assert result.exit_code == 1, result.output
+    assert "pmset: boom" in result.output
+    record.assert_not_called()
+
+
+def test_run_pmset_without_pmset_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Where pmset is not installed (Linux, CI) there is no output to read, and nothing runs."""
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: None)
+    ran = MagicMock()
+    monkeypatch.setattr(cli.subprocess, "run", ran)
+
+    assert cli._run_pmset("-g", "batt") is None
+    ran.assert_not_called()

@@ -4,6 +4,9 @@ import hashlib
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import sys
 from datetime import date, datetime, timedelta
 from importlib import metadata
@@ -11,6 +14,7 @@ from pathlib import Path
 from typing import cast, get_args
 
 import typer
+from pydantic import BaseModel, ConfigDict
 
 from agentic_trading import provenance
 from agentic_trading.agents.base import AnalystAgent
@@ -911,6 +915,105 @@ _EXIT_STOPPED_FOR_RESOURCES = 3
 # record is projected to reach, and well below the 16 GB of the machine it
 # runs on. A fresh process resumed from the checkpoint starts near 0.8 GB.
 _FIRM_RECORD_RESTART_RSS_MB = 4096
+# Seconds `pmset` may take before the firm record's power preflight gives up
+# on it and refuses: it answers in well under a second.
+_PMSET_TIMEOUT_SECONDS = 10.0
+# The `pmset -g batt` power source the firm record runs on without
+# --allow-battery: on battery and in Low Power Mode a record runs about 1.6x
+# slower (AT-170).
+_MAINS_POWER_SOURCE = "AC Power"
+
+
+class PowerState(BaseModel):
+    """The Mac's power as `pmset` reports it: `source`, the name in the
+    `Now drawing from '<source>'` line of `pmset -g batt` ('AC Power',
+    'Battery Power', 'UPS Power'), and `low_power_mode`, whether the
+    `lowpowermode` setting of `pmset -g` is 1."""
+
+    model_config = ConfigDict(frozen=True)
+
+    source: str
+    low_power_mode: bool
+
+
+class PowerCheckError(RuntimeError):
+    """`pmset` is installed but failed, or its output could not be read."""
+
+
+def _run_pmset(*args: str) -> str | None:
+    """The standard output of `pmset <args>`, or `None` when `pmset` is not
+    on the PATH (Linux, CI). Raises `PowerCheckError` when it cannot be
+    run, exits non-zero or takes longer than `_PMSET_TIMEOUT_SECONDS`."""
+    if shutil.which("pmset") is None:
+        return None
+    command = ["pmset", *args]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=_PMSET_TIMEOUT_SECONDS, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PowerCheckError(f"{' '.join(command)} failed: {exc}") from exc
+    if completed.returncode != 0:
+        raise PowerCheckError(
+            f"{' '.join(command)} exited {completed.returncode}: {completed.stderr.strip()}"
+        )
+    return str(completed.stdout)
+
+
+def parse_power_state(battery_report: str, power_settings: str) -> PowerState:
+    """The `PowerState` in `battery_report` (the output of `pmset -g batt`)
+    and `power_settings` (the output of `pmset -g`). Raises
+    `PowerCheckError` when the first has no `Now drawing from '<source>'`
+    line or the second no `lowpowermode 0` or `lowpowermode 1` line."""
+    source = re.search(r"Now drawing from '([^']+)'", battery_report)
+    if source is None:
+        raise PowerCheckError(f"pmset -g batt names no power source: {battery_report!r}")
+    low_power = re.search(r"^\s*lowpowermode\s+([01])\s*$", power_settings, re.MULTILINE)
+    if low_power is None:
+        raise PowerCheckError(f"pmset -g reports no lowpowermode setting: {power_settings!r}")
+    return PowerState(source=source.group(1), low_power_mode=low_power.group(1) == "1")
+
+
+def read_power_state() -> PowerState | None:
+    """This machine's `PowerState`, read from `pmset -g batt` and `pmset -g`
+    (`_run_pmset`, `parse_power_state`); `None` when `pmset` is not
+    installed, as on Linux and in CI, where there is nothing to check.
+    Raises `PowerCheckError` when `pmset` fails or its output cannot be
+    read."""
+    battery_report = _run_pmset("-g", "batt")
+    power_settings = _run_pmset("-g")
+    if battery_report is None or power_settings is None:
+        return None
+    return parse_power_state(battery_report, power_settings)
+
+
+def _require_mains_power(allow_battery: bool) -> None:
+    """Exits with code 1, saying why, unless `allow_battery` or this machine
+    draws from `_MAINS_POWER_SOURCE` with Low Power Mode off
+    (`read_power_state`). A machine without `pmset` passes; a `pmset` that
+    fails or prints what cannot be read refuses."""
+    if allow_battery:
+        return
+    try:
+        state = read_power_state()
+    except PowerCheckError as exc:
+        typer.echo(
+            f"Refusing to start the firm record: the power source cannot be checked ({exc}). "
+            "Pass --allow-battery to run anyway.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    if state is None:
+        return
+    if state.source != _MAINS_POWER_SOURCE or state.low_power_mode:
+        typer.echo(
+            f"Refusing to start the firm record: the Mac draws from {state.source!r} with Low "
+            f"Power Mode {'on' if state.low_power_mode else 'off'}; it needs "
+            f"{_MAINS_POWER_SOURCE!r} with Low Power Mode off. Pass --allow-battery to run "
+            "anyway.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
 
 def _stage_a_analysts(agent_ids: list[str]) -> list[AnalystAgent]:
@@ -1135,6 +1238,12 @@ def firm_record(
         "boundary and resume from the checkpoint in a fresh process; 0 never restarts. Not "
         "part of the spec.",
     ),
+    allow_battery: bool = typer.Option(
+        False,
+        "--allow-battery",
+        help="Start even when the Mac draws from battery, is in Low Power Mode or its power "
+        "cannot be checked; not part of the spec.",
+    ),
 ) -> None:
     """Record the registered firm (agentic-firm-v1) from --start to --end:
     the Commander's daily pod targets written as a `decision_file.v1` trial
@@ -1181,7 +1290,11 @@ def firm_record(
     on a usage error: a reversed window, one ending after
     stage_a.data_end, a --store-dir inside the repository, a naive
     --lake-time or a bad --set. `--set` overrides apply before any setting
-    is read."""
+    is read. After the usage checks and before anything is read, exits 1
+    without --allow-battery when the Mac draws from battery, is in Low
+    Power Mode, or `pmset` fails or prints what cannot be read
+    (`_require_mains_power`); a machine without `pmset` passes. A restart
+    runs the same check."""
     _apply_cli_overrides(set_override)
     requested_lake_time = _parse_lake_time_flag(lake_time)
     data_end = settings.stage_a.data_end
@@ -1201,6 +1314,7 @@ def firm_record(
             f"{store_dir} is inside the repository; give a directory outside it.",
             param_hint="--store-dir",
         )
+    _require_mains_power(allow_battery)
     analysts = build_default_analysts(excluded_analyst_ids=FIRM_V1_EXCLUDED_ANALYST_IDS)
     commander = Commander(
         managers=build_default_managers(analysts),
