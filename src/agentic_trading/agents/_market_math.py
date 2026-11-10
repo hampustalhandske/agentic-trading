@@ -91,6 +91,12 @@ def market_slice(
 
 
 def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    """`value` bounded to [`lower`, `upper`]. Raises `ValueError` on a
+    non-finite `value`: an undefined statistic has no place in the band,
+    so an analyst that reaches here with one reports `error` through
+    `ManagerAgent.collect_signals`."""
+    if not math.isfinite(value):
+        raise ValueError(f"clamp needs a finite value, got {value!r}")
     return float(max(lower, min(upper, value)))
 
 
