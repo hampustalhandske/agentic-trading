@@ -1,5 +1,6 @@
 # cli.py
 
+import hashlib
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystC
 from agentic_trading.backtest.engine import BacktestEngine, CommanderLike
 from agentic_trading.backtest.engine_inputs import load_engine_inputs
 from agentic_trading.backtest.preflight import check_data_availability, check_price_coverage
+from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.config import apply_overrides, parse_override, settings
 from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
@@ -55,11 +57,18 @@ from agentic_trading.data.ticker_catalog import (
     tickers_by_asset_class,
 )
 from agentic_trading.firm_record.runner import run_firm_record
+from agentic_trading.firm_record.spec import _HASHED_ROOTS
 from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.provenance import build_run_provenance
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
 from agentic_trading.stage_a.runner import EXCLUDED_ANALYSTS, run_batch
+from agentic_trading.stage_a.spec import (
+    FirmSpecRecord,
+    _module_hashes,
+    _package_source,
+    firm_spec_hash,
+)
 from agentic_trading.stage_a.store import InstrumentKind
 from agentic_trading.trials.ledger import TrialLedger
 
@@ -1166,7 +1175,9 @@ def firm_record(
     --restart-above-rss-mb, the command then replaces its process with the
     same command line (`_restart_record`), pinned to the lake time it read
     and, with --max-days, to the days still allowed, so the record resumes
-    from its checkpoint in a fresh process under the same pid. Exits 2
+    from its checkpoint in a fresh process under the same pid. It raises
+    `RuntimeError` instead when the source on disk no longer gives the
+    running trial's spec hash (`_require_unchanged_source`). Exits 2
     on a usage error: a reversed window, one ending after
     stage_a.data_end, a --store-dir inside the repository, a naive
     --lake-time or a bad --set. `--set` overrides apply before any setting
@@ -1268,7 +1279,69 @@ def firm_record(
             result.days_written,
             result.last_completed,
         )
+        _require_unchanged_source(store_dir, result.spec_hash, commander)
         _restart_record(extra)
+
+
+def _on_disk_module_hashes(names: list[str], commander: Commander) -> dict[str, str]:
+    """Dotted module name to the sha256 hex digest of its source file as
+    it is on disk now, for each of `names` and for every module
+    `firm_record.spec.build_firm_spec` hashes from `commander`'s agents'
+    modules and `firm_record.spec._HASHED_ROOTS` (`stage_a.spec._module_hashes`,
+    which parses source without importing it). A loaded module's file is
+    its `__file__`, any other's is found under the package directory. A
+    name whose file is gone is left out. Raises `RuntimeError` when a root
+    module's source cannot be read."""
+    hashes: dict[str, str] = {}
+    for name in names:
+        file = getattr(sys.modules.get(name), "__file__", None)
+        path = Path(file) if file is not None else _package_source(name)
+        if path is None or not path.is_file():
+            continue
+        hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    roots = {type(agent).__module__ for agent in roster_agents(commander)} | set(_HASHED_ROOTS)
+    for root in sorted(roots):
+        try:
+            hashes.update(_module_hashes(root))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"cannot read the source of {root}: {exc}") from exc
+    return dict(sorted(hashes.items()))
+
+
+def _require_unchanged_source(store_dir: Path, spec_hash: str, commander: Commander) -> None:
+    """Raises `RuntimeError` unless the source on disk gives the running
+    trial `spec_hash` the same spec hash: a restarted process hashes the
+    files on disk, so changed source would start it on another trial. The
+    running trial's spec is read from `store_dir / spec_hash / spec.json`;
+    its module hashes are recomputed from disk (`_on_disk_module_hashes`)
+    over the modules it records and those `commander` and the record's
+    roots reach, and the spec is hashed again with them. Also raises when
+    that spec.json is missing, unreadable or of another trial."""
+    spec_path = store_dir / spec_hash / "spec.json"
+    try:
+        record = FirmSpecRecord.model_validate_json(spec_path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"the firm record cannot restart: the running trial's {spec_path} "
+            f"cannot be read ({exc})"
+        ) from exc
+    if record.spec_hash != spec_hash:
+        raise RuntimeError(
+            f"the firm record cannot restart: {spec_path} holds trial {record.spec_hash}, "
+            f"not the running trial {spec_hash}"
+        )
+    recorded = record.spec.module_hashes
+    on_disk = _on_disk_module_hashes(list(recorded), commander)
+    on_disk_hash = firm_spec_hash(record.spec.model_copy(update={"module_hashes": on_disk}))
+    if on_disk_hash != spec_hash:
+        changed = sorted(
+            name for name in set(recorded) | set(on_disk) if recorded.get(name) != on_disk.get(name)
+        )
+        raise RuntimeError(
+            f"the firm record cannot restart: the source on disk gives spec hash "
+            f"{on_disk_hash}, not the running trial's {spec_hash}, so a restart would start "
+            f"another trial; changed since the pass began: {', '.join(changed)}"
+        )
 
 
 def _restart_record(extra_args: list[str]) -> None:

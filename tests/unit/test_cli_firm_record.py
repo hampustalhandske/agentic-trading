@@ -6,6 +6,7 @@ prices aligned on `stage_a.session_calendar` with the stage (a) warm-up inside o
 session cut at `stage_a.data_end`, runs `run_firm_record` and prints its result, which holds no
 performance figure."""
 
+import importlib.util
 import inspect
 import sys
 import tomllib
@@ -22,10 +23,13 @@ from click.testing import Result
 from typer.testing import CliRunner
 
 from agentic_trading import cli
+from agentic_trading.agents.commander import Commander
 from agentic_trading.agents.roster import (
     FIRM_V1_EQUITY_SECURITY_IDS,
     FIRM_V1_EXCLUDED_ANALYST_IDS,
     FIRM_V1_UNIVERSE,
+    build_default_analysts,
+    build_default_managers,
 )
 from agentic_trading.agents.schemas import ShortWarmup
 from agentic_trading.backtest.preflight import (
@@ -39,6 +43,9 @@ from agentic_trading.config import settings
 from agentic_trading.data.loader import load_price_history_with_fallback
 from agentic_trading.data.loaders import lakehouse_loader as ll
 from agentic_trading.firm_record.runner import FirmRecordResult, run_firm_record
+from agentic_trading.firm_record.spec import build_firm_spec
+from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
+from agentic_trading.stage_a.spec import FirmSpecRecord, firm_spec_hash
 from agentic_trading.trials.ledger import TrialLedger
 
 runner = CliRunner()
@@ -185,7 +192,10 @@ def test_pass_paused_for_memory_restarts_pinned(
     )
     args = [*_ARGS, "--store-dir", str(tmp_path), "--restart-above-rss-mb", "1500"]
     args += [] if max_days is None else ["--max-days", max_days]
-    with patch("agentic_trading.cli._restart_record") as restart:
+    with (
+        patch("agentic_trading.cli._require_unchanged_source"),
+        patch("agentic_trading.cli._restart_record") as restart,
+    ):
         result, _, _, record = _invoke(args, record_result=paused)
 
     assert result.exit_code == 0, result.output
@@ -203,7 +213,10 @@ def test_restart_pins_the_lake_time_the_session_read(tmp_path: Path, preflight_l
         update={"days_written": 3, "complete": False, "paused_for_memory": True}
     )
     args = ["--start", "2010-01-04", "--end", "2010-01-05", "--store-dir", str(tmp_path)]
-    with patch("agentic_trading.cli._restart_record") as restart:
+    with (
+        patch("agentic_trading.cli._require_unchanged_source"),
+        patch("agentic_trading.cli._restart_record") as restart,
+    ):
         result, _, _, record = _invoke(args, record_result=paused)
 
     assert result.exit_code == 0, result.output
@@ -343,3 +356,96 @@ def test_firm_record_passes_the_policy_rates(
     assert window.start <= date(2010, 1, 4) - timedelta(days=ll.POLICY_RATE_LOOKBACK_DAYS)
     assert window.end == date(2010, 1, 5)
     assert _bound(run_firm_record, record)["inputs"].policy_rates is _POLICY_RATES
+
+
+_PROBE_MODULE = "agentic_trading._restart_source_probe"
+
+
+def _paused_trial(store_dir: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Any]:
+    """Loads a probe `agentic_trading` module from a file under `store_dir`, writes the
+    spec.json of the registered firm's trial (built as the command builds it, the probe among
+    its loaded modules) under `store_dir`, and returns the probe's source file and a result of
+    that trial paused for memory."""
+    probe = store_dir / "probe_source" / "probe.py"
+    probe.parent.mkdir()
+    probe.write_text("VALUE = 1\n")
+    found = importlib.util.spec_from_file_location(_PROBE_MODULE, probe)
+    assert found is not None
+    monkeypatch.setitem(sys.modules, _PROBE_MODULE, importlib.util.module_from_spec(found))
+    analysts = build_default_analysts(excluded_analyst_ids=FIRM_V1_EXCLUDED_ANALYST_IDS)
+    commander = Commander(
+        managers=build_default_managers(analysts), weighting_strategy=ShrinkageWeight(Hedge())
+    )
+    spec = build_firm_spec(
+        commander,
+        list(FIRM_V1_UNIVERSE),
+        date(2010, 1, 4),
+        date(2010, 1, 5),
+        datetime.fromisoformat("2026-11-06T00:00:00+00:00"),
+    )
+    record = FirmSpecRecord(
+        spec=spec,
+        spec_hash=firm_spec_hash(spec),
+        lake_time=spec.lake_time,
+        lake_version="v",
+        quantcore_version="q",
+    )
+    assert _PROBE_MODULE in spec.module_hashes
+    trial_dir = store_dir / record.spec_hash
+    trial_dir.mkdir()
+    (trial_dir / "spec.json").write_text(record.model_dump_json())
+    paused = _RESULT.model_copy(
+        update={
+            "spec_hash": record.spec_hash,
+            "days_written": 3,
+            "complete": False,
+            "paused_for_memory": True,
+        }
+    )
+    return probe, paused
+
+
+def test_restart_proceeds_while_the_source_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preflight_lake: Any
+) -> None:
+    """A pass paused for memory restarts when the source on disk still gives the running
+    trial's spec hash."""
+    _, paused = _paused_trial(tmp_path, monkeypatch)
+    with patch("agentic_trading.cli._restart_record") as restart:
+        result, _, _, _ = _invoke([*_ARGS, "--store-dir", str(tmp_path)], record_result=paused)
+
+    assert result.exit_code == 0, result.output
+    restart.assert_called_once()
+
+
+def test_restart_refuses_when_a_module_changed_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preflight_lake: Any
+) -> None:
+    """A module whose file changed on disk since the pass began, though its loaded code did
+    not, would give the restarted process another spec hash, so the restart is refused."""
+    probe, paused = _paused_trial(tmp_path, monkeypatch)
+    probe.write_text("VALUE = 2\n")
+    with patch("agentic_trading.cli._restart_record") as restart:
+        result, _, _, _ = _invoke([*_ARGS, "--store-dir", str(tmp_path)], record_result=paused)
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, RuntimeError)
+    assert _PROBE_MODULE in str(result.exception)
+    assert paused.spec_hash in str(result.exception)
+    restart.assert_not_called()
+
+
+def test_restart_refuses_without_the_running_trials_spec(
+    tmp_path: Path, preflight_lake: Any
+) -> None:
+    """A pass paused for memory whose trial has no readable spec.json under --store-dir is not
+    restarted."""
+    paused = _RESULT.model_copy(
+        update={"days_written": 3, "complete": False, "paused_for_memory": True}
+    )
+    with patch("agentic_trading.cli._restart_record") as restart:
+        result, _, _, _ = _invoke([*_ARGS, "--store-dir", str(tmp_path)], record_result=paused)
+
+    assert isinstance(result.exception, RuntimeError)
+    assert "spec.json" in str(result.exception)
+    restart.assert_not_called()
