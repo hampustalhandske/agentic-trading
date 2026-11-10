@@ -90,7 +90,11 @@ from agentic_trading.backtest.engine_inputs import EngineInputs, require_policy_
 from agentic_trading.backtest.portfolio import Portfolio
 from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.config import settings
-from agentic_trading.data.loaders.lakehouse_loader import HoldoutReadError, lake_session
+from agentic_trading.data.loaders.lakehouse_loader import (
+    HoldoutReadError,
+    lake_session,
+    require_lake_health,
+)
 from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.firm_record.availability import (
     analyst_availability,
@@ -400,7 +404,10 @@ def run_firm_record(
     `runtime_environment()`; the OS release and the BLAS report may
     differ, so a minor OS update does not block a resume.
     `HoldoutReadError` and the store's refusals propagate with the day
-    unwritten; a `LedgerError` from registering or recording propagates."""
+    unwritten; a `LedgerError` from registering or recording propagates.
+    Once the arguments are checked, and before anything else, the lake's
+    health is checked (`require_lake_health`): a `LakeHealthError` stops
+    the pass with nothing written."""
     data_end = settings.stage_a.data_end
     if window_start > window_end:
         raise ValueError(
@@ -430,6 +437,7 @@ def run_firm_record(
         raise ValueError(
             f"no {calendar} session from {window_start.isoformat()} to {window_end.isoformat()}"
         )
+    require_lake_health()
 
     tickers = list(universe)
     family = settings.trials.firm_family

@@ -88,7 +88,10 @@ class FakeLake:
     `tie_order`, its non-key columns in column order without `scraped_at`,
     `dt` and `table`; `tie_order_overrides` replaces it, and an override of
     `None` serves none.
-    `sql` runs the query against the tables and exposes `version` as
+    `health` answers HTTP 200's body: `version`, `health_status` as `status`
+    ("ok" by default) and `write_times` (table to entry, empty by default)
+    under `write_times.tables`, so a test plants a degraded answer by setting
+    those two. `sql` runs the query against the tables and exposes `version` as
     `last_version`. Setting `fixed_result` makes every query return that
     frame regardless of the SQL (for testing a loader's own guards against
     a result its query should never produce); setting `error` makes every
@@ -106,6 +109,8 @@ class FakeLake:
         self.last_version: str | None = None
         self.last_write_overrides: dict[str, str] = {}
         self.tie_order_overrides: dict[str, list[str] | None] = {}
+        self.health_status: str | None = "ok"
+        self.write_times: dict[str, dict[str, Any]] = {}
         self._meta: dict[str, dict[str, Any]] = {}
         self._date_columns: dict[str, tuple[str, ...]] = {}
 
@@ -262,7 +267,12 @@ class FakeLake:
         return {"generated_at": None, "tables": self.tables()}
 
     def health(self) -> dict[str, Any]:
-        return {"version": self.version}
+        tables = {table: dict(entry) for table, entry in self.write_times.items()}
+        return {
+            "version": self.version,
+            "status": self.health_status,
+            "write_times": {"tables": tables},
+        }
 
     def sql(self, query: str, params: list[Any] | None = None) -> pd.DataFrame:
         self.calls.append((query, list(params or [])))
@@ -286,8 +296,9 @@ _CATALOGUE_LAST_WRITE = "2020-01-01T00:00:00Z"
 class _OfflineLake:
     """The lake a test without `fake_lake` sees: its catalogue (`describe`)
     answers every table as an empty current table last written at
-    `_CATALOGUE_LAST_WRITE`, so a `lake_session` can open, and every other
-    call (any SQL read, `status`, `health`, ...) raises."""
+    `_CATALOGUE_LAST_WRITE`, so a `lake_session` can open, its `health` is
+    an ok status with no table entries, so a firm record's health check
+    passes, and every other call (any SQL read, `status`, ...) raises."""
 
     last_version: str | None = None
 
@@ -298,6 +309,9 @@ class _OfflineLake:
             "rebuilt_whole": False,
             "last_write": _CATALOGUE_LAST_WRITE,
         }
+
+    def health(self) -> dict[str, Any]:
+        return {"status": "ok", "write_times": {"tables": {}}}
 
     def __getattr__(self, name: str) -> Any:
         raise RuntimeError(_NO_NETWORK_MESSAGE)

@@ -753,6 +753,52 @@ def _require_rows(table: str) -> None:
             session._populated_tables.add(table)
 
 
+class LakeHealthError(RuntimeError):
+    """The lake's `/v1/health` answer does not let a run start: its
+    `status` is not "ok", or a table the run reads has a
+    `write_times.tables` entry that is not ok. The message names the
+    status and each such table."""
+
+
+def _health_checked_tables() -> list[str]:
+    """The tables a run reads, for `require_lake_health`: every table of
+    `READ_TABLES` and the log a pinned read of each one that is not a log
+    goes through."""
+    logs = [f"{table}_log" for table in READ_TABLES if not table.endswith("_log")]
+    return sorted({*READ_TABLES, *logs})
+
+
+def require_lake_health() -> None:
+    """Reads the lake's health (`GET /v1/health`) and raises
+    `LakeHealthError` unless its `status` is "ok" and, for every table
+    `_health_checked_tables` names that has an entry under
+    `write_times.tables`, that entry's `ok` is true; a table with no entry
+    needs nothing. The lake answers HTTP 200 when it is degraded too, so
+    only these fields decide. Not a data read: it runs with or without a
+    session, and logs the healthy answer it passed. Returns nothing."""
+    health = _lake().health()
+    status = health.get("status")
+    write_times = health.get("write_times")
+    entries = write_times.get("tables") if isinstance(write_times, dict) else None
+    entries = entries if isinstance(entries, dict) else {}
+    bad = [
+        table
+        for table in _health_checked_tables()
+        if table in entries
+        and not (isinstance(entries[table], dict) and entries[table].get("ok") is True)
+    ]
+    problems = []
+    if status != "ok":
+        problems.append(f"status {status!r}, not 'ok'")
+    if bad:
+        problems.append(f"write times not ok for {', '.join(bad)}")
+    if problems:
+        raise LakeHealthError(
+            f"the lake's health refuses a run: {'; '.join(problems)} (GET /v1/health)"
+        )
+    logger.info("Lake health ok for every table the run reads")
+
+
 def lake_provenance() -> LakeProvenance:
     """The lake's version and the UTC time its status was read, from
     `Lake.status()` and the service's health payload, plus the row count
