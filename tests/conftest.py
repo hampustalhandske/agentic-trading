@@ -37,6 +37,14 @@ configure_logging(disable=True)
 from agentic_trading import provenance  # noqa: E402
 from agentic_trading.data.loaders import lakehouse_loader  # noqa: E402
 from agentic_trading.data.loaders.lakehouse_loader import LakeProvenance  # noqa: E402
+from edgelab_live import configure as configure_edgelab_live  # noqa: E402
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Registers the `edgelab_live` marker and the skip guard of `tests/edgelab_live.py`: a run
+    with any skip other than a live edgelab check skipped for an absent checkout fails."""
+    configure_edgelab_live(config)
+
 
 _DEFAULT_SCRAPED_AT = "2020-01-01T00:00:00Z"
 
