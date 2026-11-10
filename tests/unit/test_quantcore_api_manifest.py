@@ -26,8 +26,6 @@ from importlib import metadata, resources
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 _REPO = Path(__file__).resolve().parents[2]
 _MANIFEST = _REPO / "tests" / "fixtures" / "quantcore_api_manifest_0.3.1-599b8bd.json"
 _MANIFEST_SHA256 = "040a2f86c986b78717de5d109271693957027aee4d2d920ed18d9d3b5ccfb341"
@@ -181,13 +179,20 @@ def test_vendored_manifest_is_the_pinned_release() -> None:
     assert _locked_quantcore_commit().startswith(_PINNED["commit"])
 
 
+# The quantcore releases built before the manifest shipped inside the package.
+_RELEASES_WITHOUT_A_SHIPPED_MANIFEST = ("0.3.1", "0.3.2")
+
+
 def test_installed_quantcore_ships_the_vendored_manifest() -> None:
-    """The installed quantcore's own `api_manifest.json` has the vendored `sha256`."""
+    """The installed quantcore's own `api_manifest.json` has the vendored `sha256`; a release
+    from before the manifest shipped (`_RELEASES_WITHOUT_A_SHIPPED_MANIFEST`) has none, and any
+    later release without one fails."""
     shipped = resources.files("quantcore") / "api_manifest.json"
+    version = metadata.version("quantcore")
     if not shipped.is_file():
-        pytest.skip(
-            f"quantcore {metadata.version('quantcore')} does not ship api_manifest.json; "
-            "releases after 0.3.2 do"
+        assert version in _RELEASES_WITHOUT_A_SHIPPED_MANIFEST, (
+            f"quantcore {version} ships no api_manifest.json"
         )
+        return
     installed = json.loads(shipped.read_text(encoding="utf-8"))
     assert installed["sha256"] == _load(_MANIFEST)["sha256"]
