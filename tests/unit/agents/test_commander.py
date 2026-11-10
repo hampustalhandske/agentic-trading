@@ -528,6 +528,33 @@ def test_apply_firm_limits_scales_the_book_down_to_the_var_limit() -> None:
     assert limited["MSFT"] == pytest.approx(expected_scale)
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+@pytest.mark.parametrize("measure", ["var", "stress"])
+def test_apply_firm_limits_refuses_a_non_finite_risk_measure(
+    monkeypatch: pytest.MonkeyPatch, measure: str, value: float
+) -> None:
+    """A VaR or stressed loss that is not a finite number cannot be held to its limit, so the
+    firm layer raises rather than passing the book through unscaled."""
+    from agentic_trading.agents import commander
+
+    rng = np.random.default_rng(seed=7)
+    market_data = _returns_frame(
+        {"AAPL": list(rng.normal(0.0, 0.02, 300)), "MSFT": list(rng.normal(0.0, 0.01, 300))}
+    )
+    real_value_at_risk = commander.value_at_risk
+    calls: list[int] = []
+
+    def _value_at_risk(*args: object, **kwargs: object) -> float:
+        calls.append(1)
+        failing_call = 1 if measure == "var" else 2
+        return value if len(calls) == failing_call else real_value_at_risk(*args, **kwargs)
+
+    monkeypatch.setattr(commander, "value_at_risk", _value_at_risk)
+
+    with pytest.raises(commander.NonFiniteRiskMeasureError, match=measure):
+        _apply_firm_limits({"AAPL": 1.0, "MSFT": 1.0}, market_data, market_data.index[-1])
+
+
 def test_apply_firm_limits_skips_var_when_history_is_thin() -> None:
     """Fewer than min_observations_for_covariance + n_assets observations:
     the VaR step is skipped rather than acting on a degenerate covariance,
