@@ -24,6 +24,7 @@ from agentic_trading.agents.analysts.macro_rates_pod.arima_forecast_analyst impo
 from agentic_trading.agents.analysts.macro_rates_pod.macro_var_spillover_analyst import (
     MacroVarSpilloverAnalyst,
 )
+from agentic_trading.agents.analysts.risk_pod.gbm_momentum_analyst import GBMMomentumAnalyst
 from agentic_trading.agents.analysts.stat_arb_pod import ou_mean_reversion_analyst
 from agentic_trading.agents.analysts.stat_arb_pod.ou_mean_reversion_analyst import (
     OUMeanReversionAnalyst,
@@ -286,3 +287,21 @@ def test_var_constant_macro_column_is_an_error(
     signal = MacroVarSpilloverAnalyst().generate_signal("SPY", _market(_noise(150, 8)), AS_OF)
 
     assert _flat(signal) == ("error", "flat", 0.0)
+
+
+@pytest.mark.parametrize("value", [0.0, 2.0**-7])
+def test_gbm_zero_volatility_is_unavailable(value: float) -> None:
+    """Returns with zero sample volatility leave no distribution to simulate; a power of two
+    keeps a non-zero constant's sample std exactly 0."""
+    signal = GBMMomentumAnalyst().generate_signal("AAPL", _market(np.full(120, value)), AS_OF)
+
+    assert _flat(signal) == ("unavailable", "flat", 0.0)
+
+
+def test_gbm_non_finite_volatility_is_unavailable() -> None:
+    returns = _noise(120)
+    returns[-3] = np.inf
+
+    signal = GBMMomentumAnalyst().generate_signal("AAPL", _market(returns), AS_OF)
+
+    assert _flat(signal) == ("unavailable", "flat", 0.0)
