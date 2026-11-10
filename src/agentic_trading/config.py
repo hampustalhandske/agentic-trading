@@ -41,7 +41,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _GROUP_CONFIG = ConfigDict(validate_assignment=True, extra="forbid")
 
@@ -478,15 +478,26 @@ class AnalystConfig(BaseModel):
     mc_seed: int = Field(default=42, ge=0)
 
 
+# The latest `stage_a.data_end` any run may use. The owner's ruling: the
+# holdout from 2025-01-02 onward is locked until the owner opens it, so no
+# override may move the cut past this date; opening the holdout means
+# changing this constant in source.
+HOLDOUT_LOCKED_DATA_END = date(2024, 12, 31)
+
+
 class StageAConfig(BaseModel):
     """Stage (a) precompute: the holdout cut, window and warm-up every trial
-    is computed under, and the resource guard of `stage_a.runner.run_batch`."""
+    is computed under, and the resource guard of `stage_a.runner.run_batch`.
+    Raises `ValidationError` when `data_end` is later than
+    `HOLDOUT_LOCKED_DATA_END`, on construction and on assignment, so no
+    override path (`--set`, `apply_overrides`, `temporary_overrides`) can
+    move the cut into the holdout."""
 
     model_config = _GROUP_CONFIG
 
     # Last date the signal compute may know (the `lake_session` data_end):
-    # 2025-01-02 onward is the holdout, locked until the owner opens it.
-    data_end: date = date(2024, 12, 31)
+    # the locked holdout cut, or an earlier date.
+    data_end: date = HOLDOUT_LOCKED_DATA_END
     # First decision date of the stage (a) window: every round-1 instrument
     # has bars before it (AT-110).
     window_start: date = date(2010, 1, 4)
@@ -510,6 +521,17 @@ class StageAConfig(BaseModel):
     # Decision days between resource checks: the slowest round-1 analyst
     # takes about 12 s a day, so a check comes every few minutes at most.
     check_every_days: int = Field(default=20, ge=1)
+
+    @field_validator("data_end")
+    @classmethod
+    def _data_end_before_the_holdout(cls, value: date) -> date:
+        if value > HOLDOUT_LOCKED_DATA_END:
+            raise ValueError(
+                f"stage_a.data_end {value.isoformat()} is after "
+                f"{HOLDOUT_LOCKED_DATA_END.isoformat()}; the holdout stays locked until "
+                "the owner opens it"
+            )
+        return value
 
 
 class TrialsConfig(BaseModel):

@@ -39,7 +39,7 @@ from agentic_trading.backtest.preflight import (
 )
 from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.cli import firm_record_app
-from agentic_trading.config import settings
+from agentic_trading.config import settings, temporary_overrides
 from agentic_trading.data.loader import load_price_history_with_fallback
 from agentic_trading.data.loaders import lakehouse_loader as ll
 from agentic_trading.firm_record.runner import FirmRecordResult, run_firm_record
@@ -449,3 +449,21 @@ def test_restart_refuses_without_the_running_trials_spec(
     assert isinstance(result.exception, RuntimeError)
     assert "spec.json" in str(result.exception)
     restart.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("value", "exit_code"),
+    [((settings.stage_a.data_end + timedelta(days=1)).isoformat(), 2), ("2010-06-30", 0)],
+)
+def test_set_cannot_move_data_end_past_the_holdout(
+    tmp_path: Path, value: str, exit_code: int, preflight_lake: Any
+) -> None:
+    """--set stage_a.data_end later than the locked holdout cut is a usage error before any
+    read; an earlier cut is accepted and the record runs."""
+    args = [*_ARGS, "--store-dir", str(tmp_path), "--set", f"stage_a.data_end={value}"]
+    with temporary_overrides({"stage_a.data_end": settings.stage_a.data_end}):
+        result, load, _, record = _invoke(args)
+
+    assert result.exit_code == exit_code, result.output
+    assert load.called is (exit_code == 0)
+    assert record.called is (exit_code == 0)
