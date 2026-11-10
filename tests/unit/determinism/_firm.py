@@ -9,8 +9,10 @@ instruments with a seeded warm-up and a three-week XNYS window.
 `PLANT_ENV` names a defect planted in the FRED analyst for a negative control, read when the
 firm is built: `random` (an unseeded random draw added to its confidence), `unsaved_state`
 (its confidence depends on a count of its calls kept in a module global, which the engine
-checkpoint, holding only the agents' private attributes, does not carry) or `thread` (its
-confidence depends on whether the main thread asks it)."""
+checkpoint, holding only the agents' private attributes, does not carry), `thread` (its
+confidence depends on whether the main thread asks it) or `hash_order` (its confidence depends
+on where its series falls in the iteration order of a set of strings, which the string-hash
+seed decides)."""
 
 import os
 import random
@@ -39,7 +41,7 @@ from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.scoring.weighting import SharpeWeight, ShrinkageWeight
 
 PLANT_ENV = "AGENTIC_DETERMINISM_PLANT"
-PLANTS = ("random", "unsaved_state", "thread")
+PLANTS = ("random", "unsaved_state", "thread", "hash_order")
 
 LAKE_TIME = datetime(2026, 11, 6, tzinfo=UTC)
 WINDOW_START, WINDOW_END = date(2016, 1, 4), date(2016, 1, 22)
@@ -47,6 +49,9 @@ UNIVERSE = ["SPY", "QQQ", "IWM", "TLT"]
 _WARMUP = pd.DatetimeIndex(sessions_between(date(2015, 3, 2), date(2015, 12, 31)))
 _SESSIONS = pd.DatetimeIndex(sessions_between(WINDOW_START, WINDOW_END))
 _FRED_SERIES = "DGS3MO"
+# Iterated by the `hash_order` defect; the series' place in it differs between string-hash
+# seeds 0 and 1.
+_SERIES_SET = frozenset({"DGS3MO", "DGS10", "DGS2", "DTB3", "T10Y2Y"})
 # Every call of a FRED analyst in this process; the `unsaved_state` defect reads it.
 _PROCESS_CALLS = [0]
 
@@ -138,6 +143,8 @@ class FredTrendAnalyst(AnalystAgent):
         elif self.plant == "thread":
             if threading.current_thread() is not threading.main_thread():
                 confidence = min(1.0, confidence + 0.01)
+        elif self.plant == "hash_order":
+            confidence = min(1.0, confidence + 0.01 * list(_SERIES_SET).index(_FRED_SERIES))
         return AgentSignal(
             agent_id=self.agent_id,
             asset=asset,

@@ -1,7 +1,8 @@
 # test_firm_record_determinism.py
 
 """The firm record and the stage (a) batch are pure functions of their inputs: two passes in
-two processes, with different string-hash seeds, write byte-identical trial folders; a firm
+two processes, one with string-hash seed 0 and one with a seed drawn per test session, write
+byte-identical trial folders; a firm
 pass SIGKILLed after some days are checkpointed and then resumed in a fresh process writes the
 folder of an unbroken pass; and one Commander decides the same bits with one worker as with
 four.
@@ -13,6 +14,7 @@ defect in the firm (`_firm.PLANT_ENV`) and requires the comparison to catch it."
 
 import json
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -37,6 +39,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _PASS_TIMEOUT = 180
 # Days checkpointed before a pass is killed.
 _KILLED_AFTER_DAYS = 4
+# The string-hash seed of the second pass of each comparison: `AGENTIC_DETERMINISM_HASH_SEED`
+# when set, which reproduces a failed session, else drawn once per test session. Every
+# comparison names it in its failure message. The first pass runs with seed 0.
+_HASH_SEED_ENV = "AGENTIC_DETERMINISM_HASH_SEED"
+_OTHER_HASH_SEED = os.environ.get(_HASH_SEED_ENV) or str(random.SystemRandom().randrange(1, 2**32))
+_SEED_NOTE = f"second pass PYTHONHASHSEED={_OTHER_HASH_SEED} (rerun with {_HASH_SEED_ENV})"
 
 # JSON fields that may differ between two passes of the same pipeline, by file (relative to
 # the store directory) and key path, with the reason each is provenance rather than output.
@@ -48,7 +56,7 @@ def _pass(
     store_dir: Path,
     pipeline: str = "firm",
     *,
-    hash_seed: str = "1",
+    hash_seed: str = "0",
     plant: str | None = None,
     kill_at_day: int | None = None,
     kill_point: str = "after",
@@ -145,9 +153,9 @@ def test_the_record_holds_sized_positions_of_every_pod(unbroken: Path) -> None:
 def test_two_processes_write_identical_trial_folders(unbroken: Path, tmp_path: Path) -> None:
     """A second pass in another process, with another string-hash seed, writes the same
     files with the same bytes, provenance fields aside."""
-    again = _completed_pass(tmp_path, hash_seed="2")
+    again = _completed_pass(tmp_path, hash_seed=_OTHER_HASH_SEED)
 
-    assert store_differences(unbroken, again) == []
+    assert store_differences(unbroken, again) == [], _SEED_NOTE
 
 
 def test_an_unseeded_draw_breaks_the_two_process_comparison(tmp_path: Path) -> None:
@@ -155,6 +163,15 @@ def test_an_unseeded_draw_breaks_the_two_process_comparison(tmp_path: Path) -> N
     different decisions."""
     first = _completed_pass(tmp_path / "first", plant="random")
     second = _completed_pass(tmp_path / "second", plant="random", hash_seed="2")
+
+    assert any(path.endswith("decisions.parquet") for path in store_differences(first, second))
+
+
+def test_a_hash_order_dependence_breaks_the_two_process_comparison(tmp_path: Path) -> None:
+    """Negative control: with an analyst whose signal depends on a set's iteration order, passes
+    under string-hash seeds 0 and 1 write different decisions."""
+    first = _completed_pass(tmp_path / "first", plant="hash_order")
+    second = _completed_pass(tmp_path / "second", plant="hash_order", hash_seed="1")
 
     assert any(path.endswith("decisions.parquet") for path in store_differences(first, second))
 
@@ -169,9 +186,9 @@ def test_a_killed_pass_resumes_to_the_unbroken_trial_folder(
     killed = _pass(tmp_path, kill_at_day=_KILLED_AFTER_DAYS, kill_point=kill_point)
     assert killed.returncode == -signal.SIGKILL, killed.stderr[-4000:]
 
-    resumed = _completed_pass(tmp_path, hash_seed="3")
+    resumed = _completed_pass(tmp_path, hash_seed=_OTHER_HASH_SEED)
 
-    assert store_differences(unbroken, resumed) == []
+    assert store_differences(unbroken, resumed) == [], _SEED_NOTE
 
 
 def test_state_outside_the_checkpoint_breaks_the_resume_comparison(tmp_path: Path) -> None:
@@ -200,9 +217,9 @@ def test_two_processes_write_identical_stage_a_trials(tmp_path: Path) -> None:
     """Two stage (a) batches of the firm's analysts in two processes, with different
     string-hash seeds, write the same files with the same bytes."""
     first = _stage_a_batch(tmp_path / "first")
-    second = _stage_a_batch(tmp_path / "second", hash_seed="2")
+    second = _stage_a_batch(tmp_path / "second", hash_seed=_OTHER_HASH_SEED)
 
-    assert store_differences(first, second) == []
+    assert store_differences(first, second) == [], _SEED_NOTE
 
 
 def test_an_unseeded_draw_breaks_the_stage_a_comparison(tmp_path: Path) -> None:
