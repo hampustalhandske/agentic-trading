@@ -11,7 +11,6 @@ progress.json, the trial directory holds:
 - strategy/: `strategy.yaml`, edgelab's replay scaffold set to the record
   (`strategy_config`), and `strategy.py`, whose `Replay` subclasses
   edgelab's `TargetWeightsReplay`;
-- data/: the Parquet bundle folder, holding only a README line;
 - agentic_meta.json: an `AgenticMeta`, what edgelab's model has no field
   for: whether the record is counted in the trial ledger, whether its
   `src/` tree was clean, how many orders went unfilled, which analysts
@@ -24,6 +23,11 @@ progress.json, the trial directory holds:
   volatility fallbacks when it records a volatility estimator
   (`firm_record.availability`).
 
+The folder names the lake as its data source: strategy.yaml's data block
+reads the `lakehouse` provider pinned to the record's lake time and lake
+version, and submission.json's `data` is a lake bundle at the same lake
+time (`lake_time_text`), so the folder holds no data bundle of its own.
+
 `submission_for` builds the `Submission` of a record,
 `write_submission_folder` writes these files but the last two,
 `write_unfilled_orders` writes unfilled_orders.json and the count, and
@@ -35,12 +39,22 @@ import json
 import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from agentic_trading.agents.schemas import ShortWarmup, UnfilledOrder
 from agentic_trading.config import settings
@@ -61,14 +75,11 @@ META_FILE = "agentic_meta.json"
 UNFILLED_ORDERS_FILE = "unfilled_orders.json"
 ANALYST_AVAILABILITY_FILE = "analyst_availability.json"
 STRATEGY_DIR = "strategy"
-DATA_DIR = "data"
 DECISIONS_FILE = "decisions.parquet"
 # The client project name edgelab records the submission under.
 CLIENT_PROJECT = "agentic-trading"
-# The one line data/README.md holds.
-DATA_README = (
-    "The firm record's Parquet data bundle; edgelab's offline check needs only this folder.\n"
-)
+# The edgelab data provider strategy.yaml names: the lake, read through its HTTP API.
+LAKE_PROVIDER = "lakehouse"
 
 _SPEC = ConfigDict(frozen=True, extra="forbid")
 _GIT_SHA = r"^[0-9a-fA-F]{7,40}$"
@@ -185,13 +196,47 @@ class SubmissionTrials(BaseModel):
         return self
 
 
-class SubmissionData(BaseModel):
-    """The Parquet bundle folder in the submission; edgelab's `ParquetBundle`."""
+def lake_time_text(lake_time: datetime) -> str:
+    """The timezone-aware `lake_time` in UTC as ISO-8601 with a `Z` suffix,
+    e.g. `2026-11-10T17:20:50Z`: the one spelling of a record's lake time
+    in its strategy.yaml and submission.json."""
+    return lake_time.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+class SubmissionLakeQuery(BaseModel):
+    """One query against a lake table, its `table` and `sql` text, both
+    non-empty; edgelab's `LakeQuery`."""
 
     model_config = _SPEC
 
-    kind: Literal["parquet"] = "parquet"
-    path: str = Field(min_length=1)
+    table: str = Field(min_length=1)
+    sql: str = Field(min_length=1)
+
+
+class SubmissionData(BaseModel):
+    """The data the submission reads from the lake as of `lake_time`, a
+    UTC timestamp, and its `queries` (possibly none); edgelab's
+    `LakeQueryBundle`. `lake_time` dumps to JSON as `lake_time_text`
+    gives it. Raises `pydantic.ValidationError` for a lake time without a
+    UTC offset of zero."""
+
+    model_config = _SPEC
+
+    kind: Literal["lake"] = "lake"
+    lake_time: AwareDatetime
+    queries: tuple[SubmissionLakeQuery, ...] = ()
+
+    @field_validator("lake_time")
+    @classmethod
+    def _utc(cls, value: datetime) -> datetime:
+        offset = value.utcoffset()
+        if offset is None or offset.total_seconds() != 0:
+            raise ValueError("lake_time must be a UTC timestamp")
+        return value
+
+    @field_serializer("lake_time", when_used="json")
+    def _dump_lake_time(self, value: datetime) -> str:
+        return lake_time_text(value)
 
 
 class ScoreWindow(BaseModel):
@@ -220,7 +265,7 @@ class Submission(BaseModel):
     kind: Literal["replay"] = "replay"
     client: SubmissionClient
     strategy_dir: str = STRATEGY_DIR
-    data: SubmissionData = SubmissionData(path=DATA_DIR)
+    data: SubmissionData
     decisions: SubmissionDecisions
     trials: SubmissionTrials
     groups_path: str | None = None
@@ -304,6 +349,7 @@ def submission_for(
     and the `runtime_environment()` of this process.
 
     `client` is `CLIENT_PROJECT` at `git_sha` under `FIRM_HYPOTHESIS_ID`;
+    `data` is a lake bundle at `record.lake_time` in UTC with no queries;
     the family, ledger reference and hypothesis are `FIRM_HYPOTHESIS_ID`;
     the only test key is `record.spec_hash`; `test_window` is the spec's
     window and `train_end` is null; `seed` is `settings.firm.edgelab_seed`
@@ -330,6 +376,7 @@ def submission_for(
         client=SubmissionClient(
             project=CLIENT_PROJECT, git_sha=git_sha, hypothesis_id=FIRM_HYPOTHESIS_ID
         ),
+        data=SubmissionData(lake_time=record.lake_time.astimezone(UTC)),
         decisions=SubmissionDecisions(path=DECISIONS_FILE, sources=decision_sources(sources)),
         trials=SubmissionTrials(
             family_id=FIRM_HYPOTHESIS_ID,
@@ -362,8 +409,10 @@ def strategy_config(record: FirmSpecRecord) -> dict[str, Any]:
     daily with an empty parameter grid, short sales allowed within the
     firm's gross exposure (`settings.firm.max_gross_exposure`, net alike)
     and the decision file's per-instrument bound
-    (`settings.firm.max_leverage`); the data block reads `../data` over the
-    spec's window, not survivorship-free; the capital is
+    (`settings.firm.max_leverage`); the data block reads the `lakehouse`
+    provider over the spec's window, its params exactly the record's lake
+    time (`lake_time_text`), its lake version and `survivorship_free: true`,
+    the rest of the block as scaffolded; the capital is
     `settings.firm.starting_cash` and the seed `settings.firm.edgelab_seed`;
     there is no replication claim. Settings are read at call time."""
     spec = record.spec
@@ -390,8 +439,12 @@ def strategy_config(record: FirmSpecRecord) -> dict[str, Any]:
         "decided after each close and filled at the next open, earn a positive net excess return."
     )
     config["data"]["range"] = {"start": spec.window_start, "end": spec.window_end}
-    config["data"]["params"]["path"] = f"../{DATA_DIR}"
-    config["data"]["params"]["survivorship_free"] = False
+    config["data"]["provider"] = LAKE_PROVIDER
+    config["data"]["params"] = {
+        "lake_time": lake_time_text(record.lake_time),
+        "lake_version": record.lake_version,
+        "survivorship_free": True,
+    }
     config["capital"] = float(firm.starting_cash)
     config["seed"] = settings.firm.edgelab_seed
     config["replication"] = None
@@ -403,21 +456,18 @@ def write_submission_folder(
 ) -> None:
     """Write `submission` as `trial_dir`'s submission.json, `meta` as its
     agentic_meta.json, `strategy/strategy.yaml` (`strategy_config(record)`)
-    and `strategy/strategy.py`, and `data/README.md`, each atomically and
-    replacing what is there, creating the folders. Each source is written
+    and `strategy/strategy.py`, each atomically and replacing what is
+    there, creating the strategy folder. Each source is written
     with the keys it states, as in sources.json: a dated one as `name` and
     `can_publish_after_close`, an undated one as `name`, `undated` and
     `limitation`."""
     trial_dir = Path(trial_dir)
     strategy_dir = trial_dir / submission.strategy_dir
-    data_dir = trial_dir / submission.data.path
     strategy_dir.mkdir(parents=True, exist_ok=True)
-    data_dir.mkdir(parents=True, exist_ok=True)
     _write_text(
         strategy_dir / "strategy.yaml", yaml.safe_dump(strategy_config(record), sort_keys=False)
     )
     _write_text(strategy_dir / "strategy.py", REPLAY_STRATEGY_PY)
-    _write_text(data_dir / "README.md", DATA_README)
     _write_text(trial_dir / META_FILE, meta.model_dump_json(indent=2) + "\n")
     content = submission.model_dump(mode="json")
     content["decisions"]["sources"] = [
