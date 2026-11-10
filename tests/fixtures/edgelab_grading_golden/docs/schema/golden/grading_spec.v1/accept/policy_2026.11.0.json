@@ -1,0 +1,190 @@
+{
+  "costs": {
+    "crypto": {
+      "borrow_annual_bps": 50.0,
+      "cash_day_count": "act360",
+      "commission_bps": 1.0,
+      "commission_per_contract": 0.0,
+      "exchange_fee_bps": 0.0,
+      "financing_spread_bps": 100.0,
+      "half_spread_bps": 5.0,
+      "hard_to_borrow_rate_bps": null,
+      "impact": {
+        "coefficient": 1.0,
+        "kind": "sqrt"
+      },
+      "liquidation_fee_bps": 50.0,
+      "slippage_bps": 2.0
+    },
+    "equity": {
+      "borrow_annual_bps": 50.0,
+      "cash_day_count": "act360",
+      "commission_bps": 1.0,
+      "commission_per_contract": 0.0,
+      "exchange_fee_bps": 0.0,
+      "financing_spread_bps": 100.0,
+      "half_spread_bps": 5.0,
+      "hard_to_borrow_rate_bps": null,
+      "impact": {
+        "coefficient": 1.0,
+        "kind": "sqrt"
+      },
+      "liquidation_fee_bps": 0.0,
+      "slippage_bps": 2.0
+    },
+    "future": {
+      "borrow_annual_bps": 50.0,
+      "cash_day_count": "act360",
+      "commission_bps": 1.0,
+      "commission_per_contract": 0.0,
+      "exchange_fee_bps": 0.0,
+      "financing_spread_bps": 100.0,
+      "half_spread_bps": 5.0,
+      "hard_to_borrow_rate_bps": null,
+      "impact": {
+        "coefficient": 1.0,
+        "kind": "sqrt"
+      },
+      "liquidation_fee_bps": 0.0,
+      "slippage_bps": 2.0
+    },
+    "fx": {
+      "borrow_annual_bps": 50.0,
+      "cash_day_count": "act360",
+      "commission_bps": 1.0,
+      "commission_per_contract": 0.0,
+      "exchange_fee_bps": 0.0,
+      "financing_spread_bps": 100.0,
+      "half_spread_bps": 5.0,
+      "hard_to_borrow_rate_bps": null,
+      "impact": {
+        "coefficient": 1.0,
+        "kind": "sqrt"
+      },
+      "liquidation_fee_bps": 0.0,
+      "slippage_bps": 2.0
+    },
+    "option": {
+      "borrow_annual_bps": 50.0,
+      "cash_day_count": "act360",
+      "commission_bps": 1.0,
+      "commission_per_contract": 0.0,
+      "exchange_fee_bps": 0.0,
+      "financing_spread_bps": 100.0,
+      "half_spread_bps": 5.0,
+      "hard_to_borrow_rate_bps": null,
+      "impact": {
+        "coefficient": 1.0,
+        "kind": "sqrt"
+      },
+      "liquidation_fee_bps": 0.0,
+      "slippage_bps": 2.0
+    },
+    "prediction_market": {
+      "borrow_annual_bps": 50.0,
+      "cash_day_count": "act360",
+      "commission_bps": 1.0,
+      "commission_per_contract": 0.0,
+      "exchange_fee_bps": 0.0,
+      "financing_spread_bps": 100.0,
+      "half_spread_bps": 5.0,
+      "hard_to_borrow_rate_bps": null,
+      "impact": {
+        "coefficient": 1.0,
+        "kind": "sqrt"
+      },
+      "liquidation_fee_bps": 0.0,
+      "slippage_bps": 2.0
+    }
+  },
+  "data_fit": {
+    "edge_tolerance_sessions": 5,
+    "max_min_detectable_sharpe": 3.0,
+    "min_decisions_base": 30,
+    "min_density": 0.9,
+    "power_calibration_constant": 5.222516970368799,
+    "power_table_reference": "edgelab-power-table-v1"
+  },
+  "execution": {
+    "decision_delay_bars": 1,
+    "decision_delay_trading_days": 1,
+    "max_adv_participation": 0.05,
+    "option_fill_fraction": 0.75,
+    "option_max_iv_age_bars": 5,
+    "option_max_quote_age_bars": 0,
+    "option_min_half_spread_bps": 0.0,
+    "prediction_market_fee_scale": 1.0,
+    "prediction_market_max_participation_frac": 1.0,
+    "prediction_market_max_quote_age_bars": 0
+  },
+  "gates": {
+    "amber_band": 0.1,
+    "cpcv_percentile": 5.0,
+    "dsr_trial_variance": "no_skill",
+    "max_calibration_p": 0.05,
+    "max_pbo_green": 0.2,
+    "max_pbo_red": 0.5,
+    "max_random_entry_p": 0.05,
+    "min_active_bars": 30,
+    "min_breakeven_cost_multiple": 2.0,
+    "min_cpcv_percentile_sharpe": 0.0,
+    "min_delay_sharpe_retention": 0.5,
+    "min_dsr": 0.95,
+    "min_factor_alpha_t": 2.0,
+    "min_hac_t_multiple": 2.5,
+    "min_hac_t_single": 2.0,
+    "min_psr": 0.95,
+    "min_round_trips": 30,
+    "min_survivorship_coverage": 0.95,
+    "require_holdout_positive": true,
+    "require_min_trl": true
+  },
+  "margin": {
+    "crypto_perpetual_initial_margin_rate": 0.1,
+    "crypto_perpetual_maintenance_margin_rate": 0.05,
+    "crypto_spot_maintenance_margin_pct": 0.25,
+    "initial_margin_short_pct": 1.5,
+    "liquidation_order": "largest_loss_first",
+    "maintenance_margin_long_pct": 0.25,
+    "maintenance_margin_short_pct": 0.3
+  },
+  "robustness": {
+    "cost_multipliers": [
+      0.5,
+      1.0,
+      1.5,
+      2.0,
+      3.0
+    ],
+    "extra_delay": [],
+    "extra_delay_bars": [
+      1,
+      2
+    ],
+    "n_noise_draws": 20,
+    "n_start_date_shifts": 5,
+    "n_subperiods": 3,
+    "noise_bps": 5.0,
+    "remove_best_k": [
+      1,
+      5,
+      10
+    ]
+  },
+  "validation": {
+    "cpcv": {
+      "k_test": 3,
+      "min_paths": 10,
+      "n_groups": 8
+    },
+    "embargo_bars": 0,
+    "holdout": {
+      "fraction": 0.2,
+      "kind": "fraction"
+    },
+    "kfold_splits": 5,
+    "purge_bars": 1,
+    "search_window": null,
+    "walk_forward": null
+  }
+}

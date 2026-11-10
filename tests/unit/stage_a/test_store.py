@@ -43,8 +43,15 @@ _SIGNAL_COLUMNS = [
     "sample_count",
 ]
 _DECISION_COLUMNS = [*_REQUIRED, "status", "source", "source_as_of"]
-# edgelab's decision_file.v1 schema, vendored (source in test_decision_schema_fixture.py).
-_SCHEMA = Path(__file__).resolve().parents[2] / "fixtures" / "edgelab_decision_file_v1.json"
+# edgelab's decision_file.v1 schema, vendored (source in test_edgelab_grading_golden.py).
+_SCHEMA = (
+    Path(__file__).resolve().parents[2]
+    / "fixtures"
+    / "edgelab_grading_golden"
+    / "docs"
+    / "schema"
+    / "decision_file.v1.json"
+)
 _PACKAGE = "agentic_trading.stage_a"
 
 

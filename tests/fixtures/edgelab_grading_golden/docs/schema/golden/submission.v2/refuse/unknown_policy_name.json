@@ -1,0 +1,26 @@
+{
+  "client": {
+    "git_sha": "abc1234def",
+    "hypothesis_id": "hyp-1",
+    "project": "pitch-edge"
+  },
+  "data": {
+    "kind": "parquet",
+    "path": "data"
+  },
+  "kind": "code",
+  "policy": "edgelab-2099.01.0",
+  "profile": "fast",
+  "schema_version": 2,
+  "seed": 5,
+  "strategy_dir": "strategy",
+  "trials": {
+    "declared_n": 3,
+    "family_id": "family-a",
+    "test_keys": [
+      "k1",
+      "k2",
+      "k3"
+    ]
+  }
+}

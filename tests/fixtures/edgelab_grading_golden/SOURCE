@@ -1,0 +1,6 @@
+repository: edgelab
+sha: afdca2a
+full_sha: afdca2a7dec35060719d691de9f9352c25a50b7d
+subject: Policy 2026.11.1 cost table, submission v2 and upgrade, pinned schemas, replay label, Not assessable (M2 part 1)
+copied: docs/schema/ at that commit, byte for byte, to docs/schema/ here
+golden_sums: GOLDEN_SHA256SUMS holds the sha256 of each golden case, which edgelab's SHA256SUMS does not list
