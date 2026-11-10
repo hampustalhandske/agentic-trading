@@ -29,11 +29,14 @@ Scenarios, each run on both sides:
   without a history horizon, unbroken and stopped after six days then resumed.
 
 Every file the head side writes under a scenario's store directory must equal
-the base side's byte for byte, the engine checkpoint aside, except the commit
-fields that name the commit each side ran from (`PROVENANCE_FIELDS`). A
-killed-and-resumed head pass is compared with the base side's unbroken pass.
-Prints one line per scenario, the differing files, and `OVERALL PASS|FAIL`;
-exits 1 on FAIL.
+the base side's byte for byte, the engine checkpoint aside, except the fields
+that name the code each side ran (`PROVENANCE_FIELDS`): the commit, and the
+source hashes of the firm's modules with the spec hash they give. A trial
+directory is named by its spec hash, so a firm store's only trial directory
+is matched with the other side's whatever its name. A killed-and-resumed head pass
+is compared with the base side's unbroken pass. Prints one line per
+scenario, the differing files, the modules whose source hash differs, and
+`OVERALL PASS|FAIL`; exits 1 on FAIL.
 
     uv run python scripts/at193_ab.py --base 583a50f [--keep DIR]
 """
@@ -41,6 +44,7 @@ exits 1 on FAIL.
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -50,12 +54,16 @@ from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
-# The JSON fields that name the commit a side ran from, by file name: the only
-# fields that may differ between the base and the head side.
+# The JSON fields that name the code a side ran, by file name: its commit, and
+# a firm spec's source hash per module with the spec hash (the trial's key)
+# they give. The only fields that may differ between the base and the head side.
 PROVENANCE_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
-    "submission.json": (("client", "git_sha"),),
+    "submission.json": (("client", "git_sha"), ("trials", "test_keys")),
     "agentic_meta.json": (("git_sha",),),
+    "spec.json": (("spec", "module_hashes"), ("spec_hash",)),
 }
+# A trial directory's name: its spec hash.
+_TRIAL_DIR = re.compile(r"^[0-9a-f]{64}$")
 _ENV = {"PYTHONHASHSEED": "0", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
 _TIMEOUT = 600
 _KILL_AT_DAY = 4
@@ -227,7 +235,7 @@ def _scenarios(side: Path, out: Path) -> None:
 
 
 def _comparable(path: Path) -> bytes:
-    """`path`'s bytes, with the `PROVENANCE_FIELDS` of its file name removed."""
+    """`path`'s bytes, with the `PROVENANCE_FIELDS` of its file name it holds removed."""
     content = path.read_bytes()
     fields = PROVENANCE_FIELDS.get(path.name)
     if not fields:
@@ -236,27 +244,52 @@ def _comparable(path: Path) -> bytes:
     for field in fields:
         holder: Any = document
         for key in field[:-1]:
-            holder = holder[key]
-        holder.pop(field[-1])
+            holder = holder.get(key, {}) if isinstance(holder, dict) else {}
+        if isinstance(holder, dict):
+            holder.pop(field[-1], None)
     return json.dumps(document, sort_keys=True).encode()
 
 
-def _files(store: Path) -> set[str]:
-    return {
-        path.relative_to(store).as_posix()
-        for path in store.rglob("*")
-        if path.is_file() and not path.name.endswith(".checkpoint.sqlite")
-    }
+def _files(store: Path) -> dict[str, Path]:
+    """Each file under `store` but an engine checkpoint, by its path relative to `store`; the
+    name of a store's only trial directory is written `<trial>`."""
+    trials = [
+        path.name for path in store.iterdir() if path.is_dir() and _TRIAL_DIR.match(path.name)
+    ]
+    only = trials[0] if len(trials) == 1 else None
+    files = {}
+    for path in store.rglob("*"):
+        if not path.is_file() or path.name.endswith(".checkpoint.sqlite"):
+            continue
+        parts = path.relative_to(store).parts
+        named = [
+            "<trial>" if index == 0 and part == only else part for index, part in enumerate(parts)
+        ]
+        files["/".join(named)] = path
+    return files
 
 
 def differences(expected: Path, actual: Path) -> list[str]:
     """Each file only one of two directories holds, then each whose comparable bytes differ."""
     expected_files, actual_files = _files(expected), _files(actual)
-    found = sorted(expected_files ^ actual_files)
-    for relative in sorted(expected_files & actual_files):
-        if _comparable(expected / relative) != _comparable(actual / relative):
+    found = sorted(expected_files.keys() ^ actual_files.keys())
+    for relative in sorted(expected_files.keys() & actual_files.keys()):
+        if _comparable(expected_files[relative]) != _comparable(actual_files[relative]):
             found.append(relative)
     return found
+
+
+def changed_modules(expected: Path, actual: Path) -> list[str]:
+    """The modules whose source hash differs between the two stores' firm spec.json."""
+    hashes = [
+        json.loads(next(store.glob("*/spec.json")).read_text())["spec"]["module_hashes"]
+        for store in (expected, actual)
+    ]
+    return sorted(
+        name
+        for name in hashes[0].keys() | hashes[1].keys()
+        if hashes[0].get(name) != hashes[1].get(name)
+    )
 
 
 def main() -> None:
@@ -287,6 +320,8 @@ def main() -> None:
             for relative in found:
                 print(f"  differs: {relative}")
             failed = failed or bool(found)
+        modules = changed_modules(outputs["base"] / "firm", outputs["head"] / "firm")
+        print(f"firm modules whose source hash differs: {', '.join(modules) or 'none'}")
         engine = outputs["head"] / "engine"
         resumed_equal = (engine / "resumed.json").read_bytes() == (
             engine / "unbroken_comparable.json"
