@@ -5,7 +5,10 @@
 Each simulated day appends exactly that day's new rows to eight tables
 (`track_record`, `decisions`, `trades`, `unfilled_orders`, `capital_usage`,
 `sizing_diagnostics`, `pod_returns`, `pod_cost_days`) via `INSERT` — O(1) per day, O(n)
-total for a run of length n — and overwrites two things each day: a single
+total for a run of length n — with the track record's day row
+(`track_record_days`) and any source or asset it sees for the first time
+(`track_record_sources`, `track_record_assets`), and overwrites two things
+each day: a single
 `cursor` row (next day index, portfolio state, signal health, the
 pending decisions when they are not the day's own, the Commander's
 serialized risk state, the previous close mid
@@ -39,7 +42,7 @@ import hashlib
 import json
 import sqlite3
 import zlib
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -57,7 +60,7 @@ from agentic_trading.agents.schemas import (
 # The layout version this module writes into SQLite's `user_version`; a
 # file of any other version (0 for a checkpoint written before versions
 # were recorded) is refused for a resume.
-CHECKPOINT_FORMAT_VERSION = 3
+CHECKPOINT_FORMAT_VERSION = 4
 # zlib level of each day's stored decisions: level 6 compresses a firm
 # record's day of decisions about 14x in about 10 ms; the higher levels
 # shrink it little more for several times the time.
@@ -69,16 +72,55 @@ class CheckpointFormatError(ValueError):
     `CHECKPOINT_FORMAT_VERSION`, which this module cannot resume from."""
 
 
+# The track record, one row per active signal of a day: the analyst's
+# record and the manager's record of that signal share every field but
+# their source, so a row carries both source ids (`track_record_sources`
+# ids; either NULL when the record has no partner) and is read back as the
+# analyst's record followed by the manager's, the order they were appended
+# in. `asset` is a `track_record_assets` id and `as_of_date` the date's
+# proleptic Gregorian ordinal (`date.toordinal`). `id` is the row's
+# position: every row of an append has a larger id than every row before.
 _CREATE_TRACK_RECORD = """
 CREATE TABLE IF NOT EXISTS track_record (
-    source_id TEXT NOT NULL,
-    source_type TEXT NOT NULL,
-    asset TEXT NOT NULL,
-    as_of_date TEXT NOT NULL,
+    id INTEGER PRIMARY KEY,
+    analyst_source INTEGER,
+    manager_source INTEGER,
+    asset INTEGER NOT NULL,
+    as_of_date INTEGER NOT NULL,
     attributable_return REAL NOT NULL,
     raw_attributable_return REAL NOT NULL,
-    signal_score REAL NOT NULL DEFAULT 0.0,
-    realized_return REAL NOT NULL DEFAULT 0.0
+    signal_score REAL NOT NULL,
+    realized_return REAL NOT NULL,
+    CHECK (analyst_source IS NOT NULL OR manager_source IS NOT NULL)
+)
+"""
+# Each source_id of the track record with its integer id and the ordinal of
+# its earliest record's date.
+_CREATE_TRACK_RECORD_SOURCES = """
+CREATE TABLE IF NOT EXISTS track_record_sources (
+    id INTEGER PRIMARY KEY,
+    source_id TEXT NOT NULL UNIQUE,
+    first_date INTEGER NOT NULL
+)
+"""
+# Each asset of the track record with its integer id.
+_CREATE_TRACK_RECORD_ASSETS = """
+CREATE TABLE IF NOT EXISTS track_record_assets (
+    id INTEGER PRIMARY KEY,
+    asset TEXT NOT NULL UNIQUE
+)
+"""
+# One row per `append_day` that added track-record rows: the ids of its
+# first and last row, the ordinals of the earliest and latest date among
+# them and the number of records they hold, so a read by date seeks to the
+# ids it needs instead of scanning the table.
+_CREATE_TRACK_RECORD_DAYS = """
+CREATE TABLE IF NOT EXISTS track_record_days (
+    first_id INTEGER NOT NULL,
+    last_id INTEGER NOT NULL,
+    min_date INTEGER NOT NULL,
+    max_date INTEGER NOT NULL,
+    records INTEGER NOT NULL
 )
 """
 _CREATE_DECISIONS = """
@@ -163,8 +205,6 @@ CREATE TABLE IF NOT EXISTS carried_state (
 # TABLE` on connect so a checkpoint file created by an older schema can
 # still be resumed. Each entry is (table, column, column definition).
 _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
-    ("track_record", "signal_score", "REAL NOT NULL DEFAULT 0.0"),
-    ("track_record", "realized_return", "REAL NOT NULL DEFAULT 0.0"),
     ("cursor", "commander_risk_state", "TEXT"),
     ("cursor", "total_financing_cost", "REAL NOT NULL DEFAULT 0.0"),
     ("cursor", "total_option_premium_paid", "REAL NOT NULL DEFAULT 0.0"),
@@ -185,6 +225,9 @@ def _add_missing_columns(connection: sqlite3.Connection) -> None:
 # Every table this module creates, in creation order.
 _TABLES: tuple[tuple[str, str], ...] = (
     ("track_record", _CREATE_TRACK_RECORD),
+    ("track_record_sources", _CREATE_TRACK_RECORD_SOURCES),
+    ("track_record_assets", _CREATE_TRACK_RECORD_ASSETS),
+    ("track_record_days", _CREATE_TRACK_RECORD_DAYS),
     ("decisions", _CREATE_DECISIONS),
     ("trades", _CREATE_TRADES),
     ("unfilled_orders", _CREATE_UNFILLED_ORDERS),
@@ -309,24 +352,7 @@ def append_day(
             "INSERT INTO portfolio_value (as_of_date, value) VALUES (?, ?)",
             (as_of_date.isoformat(), portfolio_value),
         )
-        connection.executemany(
-            "INSERT INTO track_record (source_id, source_type, asset, as_of_date, "
-            "attributable_return, raw_attributable_return, signal_score, realized_return) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    entry.source_id,
-                    entry.source_type,
-                    entry.asset,
-                    entry.as_of_date.isoformat(),
-                    entry.attributable_return,
-                    entry.raw_attributable_return,
-                    entry.signal_score,
-                    entry.realized_return,
-                )
-                for entry in new_track_record
-            ],
-        )
+        _append_track_record(connection, new_track_record)
         connection.execute(
             "INSERT INTO decisions (as_of_date, payload) VALUES (?, ?)",
             (
@@ -463,28 +489,144 @@ def _decompressed(stored: bytes) -> str:
     return zlib.decompress(stored).decode("utf-8")
 
 
+def _outcome(entry: PerformanceRecord) -> tuple[Any, ...]:
+    """Every field of `entry` but its source."""
+    return (
+        entry.asset,
+        entry.as_of_date,
+        entry.attributable_return,
+        entry.raw_attributable_return,
+        entry.signal_score,
+        entry.realized_return,
+    )
+
+
+def _append_track_record(
+    connection: sqlite3.Connection, records: Sequence[PerformanceRecord]
+) -> None:
+    """Appends `records`, in order, inside the caller's transaction: an
+    analyst record directly followed by a manager record of the same
+    outcome (`_outcome`) as one row carrying both sources, every other
+    record as a row of its own source; then the append's
+    `track_record_days` row."""
+    if not records:
+        return
+    first_dates: dict[str, int] = {}
+    for entry in records:
+        ordinal = entry.as_of_date.toordinal()
+        first_dates[entry.source_id] = min(first_dates.get(entry.source_id, ordinal), ordinal)
+    connection.executemany(
+        "INSERT INTO track_record_sources (source_id, first_date) VALUES (?, ?) "
+        "ON CONFLICT(source_id) DO UPDATE SET first_date = MIN(first_date, excluded.first_date)",
+        sorted(first_dates.items()),
+    )
+    connection.executemany(
+        "INSERT INTO track_record_assets (asset) VALUES (?) ON CONFLICT(asset) DO NOTHING",
+        [(asset,) for asset in sorted({entry.asset for entry in records})],
+    )
+    sources: dict[str, int] = dict(
+        connection.execute("SELECT source_id, id FROM track_record_sources")
+    )
+    assets: dict[str, int] = dict(connection.execute("SELECT asset, id FROM track_record_assets"))
+    (last_id,) = connection.execute("SELECT COALESCE(MAX(id), 0) FROM track_record").fetchone()
+    rows: list[tuple[Any, ...]] = []
+    index = 0
+    while index < len(records):
+        entry = records[index]
+        partner = records[index + 1] if index + 1 < len(records) else None
+        analyst: int | None = None
+        manager: int | None = None
+        if (
+            entry.source_type == "analyst"
+            and partner is not None
+            and partner.source_type == "manager"
+            and _outcome(partner) == _outcome(entry)
+        ):
+            analyst, manager = sources[entry.source_id], sources[partner.source_id]
+            index += 2
+        elif entry.source_type == "analyst":
+            analyst = sources[entry.source_id]
+            index += 1
+        else:
+            manager = sources[entry.source_id]
+            index += 1
+        rows.append(
+            (
+                last_id + 1 + len(rows),
+                analyst,
+                manager,
+                assets[entry.asset],
+                entry.as_of_date.toordinal(),
+                entry.attributable_return,
+                entry.raw_attributable_return,
+                entry.signal_score,
+                entry.realized_return,
+            )
+        )
+    connection.executemany(
+        "INSERT INTO track_record (id, analyst_source, manager_source, asset, as_of_date, "
+        "attributable_return, raw_attributable_return, signal_score, realized_return) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    ordinals = [entry.as_of_date.toordinal() for entry in records]
+    connection.execute(
+        "INSERT INTO track_record_days (first_id, last_id, min_date, max_date, records) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (last_id + 1, last_id + len(rows), min(ordinals), max(ordinals), len(records)),
+    )
+
+
+# The `track_record` columns `_track_record_rows` reads, in its order.
 _TRACK_RECORD_COLUMNS = (
-    "source_id, source_type, asset, as_of_date, attributable_return, "
+    "analyst_source, manager_source, asset, as_of_date, attributable_return, "
     "raw_attributable_return, signal_score, realized_return"
 )
 
 
-def _track_record_rows(rows: Iterable[tuple[Any, ...]]) -> list[dict[str, Any]]:
+def _track_record_rows(
+    connection: sqlite3.Connection, rows: Iterable[tuple[Any, ...]]
+) -> list[dict[str, Any]]:
     """`track_record` rows of `_TRACK_RECORD_COLUMNS` as `PerformanceRecord`
-    payload dicts."""
-    return [
-        {
-            "source_id": row[0],
-            "source_type": row[1],
-            "asset": row[2],
-            "as_of_date": row[3],
-            "attributable_return": row[4],
-            "raw_attributable_return": row[5],
-            "signal_score": row[6],
-            "realized_return": row[7],
-        }
-        for row in rows
-    ]
+    payload dicts, each row as its analyst's record then its manager's,
+    the ones it carries."""
+    sources = _source_names(connection)
+    assets: dict[int, str] = {
+        asset_id: asset
+        for asset_id, asset in connection.execute("SELECT id, asset FROM track_record_assets")
+    }
+    dates: dict[int, str] = {}
+    records: list[dict[str, Any]] = []
+    for analyst, manager, asset, ordinal, attributable, raw, score, realized in rows:
+        day = dates.get(ordinal)
+        if day is None:
+            day = dates[ordinal] = date.fromordinal(ordinal).isoformat()
+        for source, source_type in ((analyst, "analyst"), (manager, "manager")):
+            if source is None:
+                continue
+            records.append(
+                {
+                    "source_id": sources[source],
+                    "source_type": source_type,
+                    "asset": assets[asset],
+                    "as_of_date": day,
+                    "attributable_return": attributable,
+                    "raw_attributable_return": raw,
+                    "signal_score": score,
+                    "realized_return": realized,
+                }
+            )
+    return records
+
+
+def _source_names(connection: sqlite3.Connection) -> dict[int, str]:
+    """Each `track_record_sources` id to its source_id."""
+    return {
+        source: source_id
+        for source, source_id in connection.execute(
+            "SELECT id, source_id FROM track_record_sources"
+        )
+    }
 
 
 def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
@@ -502,9 +644,10 @@ def read_all(connection: sqlite3.Connection) -> dict[str, Any] | None:
     if payload is None:
         return None
     payload["track_record"] = _track_record_rows(
+        connection,
         connection.execute(
-            f"SELECT {_TRACK_RECORD_COLUMNS} FROM track_record ORDER BY as_of_date, rowid"
-        )
+            f"SELECT {_TRACK_RECORD_COLUMNS} FROM track_record ORDER BY as_of_date, id"
+        ),
     )
     payload["decisions_by_day"] = {
         as_of_date_str: json.loads(payload_json)
@@ -520,45 +663,59 @@ def read_recent(
     engine holds in memory: `track_record` is the rows dated on or after
     `track_record_from`, in the order they were appended, and
     `decisions_by_day` the last `decision_days` days of decisions. Two
-    keys describe the rows left out: `track_record_count`, the number of
-    rows the table holds, and `track_record_dropped_first_dates`, each
-    source_id's earliest ISO date among the rows dated before
-    `track_record_from`. Every other key is as `read_all` gives it.
+    keys describe the records left out: `track_record_count`, the number
+    of records the track record holds, and
+    `track_record_dropped_first_dates`, each source_id's earliest ISO date
+    among the records dated before `track_record_from`. Every other key is as `read_all` gives it.
     Returns `None` when there is no cursor row yet. Raises `ValueError`
     when a row dated before `track_record_from` was appended after one
     dated on or after it, since the rows read would then not be the last
-    ones appended."""
+    ones appended. Reads only the track-record rows appended from the
+    first day that holds one dated on or after `track_record_from`
+    (`track_record_days`)."""
     payload = _read_state(connection)
     if payload is None:
         return None
-    cutoff = track_record_from.isoformat()
-    (interleaved,) = connection.execute(
-        "SELECT COUNT(*) FROM track_record WHERE as_of_date < ? AND rowid > "
-        "(SELECT MIN(rowid) FROM track_record WHERE as_of_date >= ?)",
-        (cutoff, cutoff),
+    cutoff = track_record_from.toordinal()
+    (start,) = connection.execute(
+        "SELECT MIN(first_id) FROM track_record_days WHERE max_date >= ?", (cutoff,)
     ).fetchone()
+    interleaved = 0
+    if start is not None:
+        (interleaved,) = connection.execute(
+            "SELECT COALESCE(SUM((analyst_source IS NOT NULL) + (manager_source IS NOT NULL)), 0) "
+            "FROM track_record WHERE as_of_date < ? AND id > "
+            "(SELECT MIN(id) FROM track_record WHERE id >= ? AND as_of_date >= ?)",
+            (cutoff, start, cutoff),
+        ).fetchone()
     if interleaved:
         raise ValueError(
-            f"the checkpoint's track record has {interleaved} row(s) dated before {cutoff} "
-            "appended after a row dated on or after it"
+            f"the checkpoint's track record has {interleaved} row(s) dated before "
+            f"{track_record_from.isoformat()} appended after a row dated on or after it"
         )
-    payload["track_record"] = _track_record_rows(
-        connection.execute(
-            f"SELECT {_TRACK_RECORD_COLUMNS} FROM track_record WHERE as_of_date >= ? "
-            "ORDER BY rowid",
-            (cutoff,),
+    payload["track_record"] = (
+        []
+        if start is None
+        else _track_record_rows(
+            connection,
+            connection.execute(
+                f"SELECT {_TRACK_RECORD_COLUMNS} FROM track_record "
+                "WHERE id >= ? AND as_of_date >= ? ORDER BY id",
+                (start, cutoff),
+            ),
         )
     )
     (payload["track_record_count"],) = connection.execute(
-        "SELECT COUNT(*) FROM track_record"
+        "SELECT COALESCE(SUM(records), 0) FROM track_record_days"
     ).fetchone()
-    payload["track_record_dropped_first_dates"] = dict(
-        connection.execute(
-            "SELECT source_id, MIN(as_of_date) FROM track_record WHERE as_of_date < ? "
-            "GROUP BY source_id ORDER BY source_id",
+    payload["track_record_dropped_first_dates"] = {
+        source_id: date.fromordinal(first_date).isoformat()
+        for source_id, first_date in connection.execute(
+            "SELECT source_id, first_date FROM track_record_sources WHERE first_date < ? "
+            "ORDER BY source_id",
             (cutoff,),
         )
-    )
+    }
     payload["decisions_by_day"] = {
         as_of_date_str: json.loads(_decompressed(stored))
         for as_of_date_str, stored in connection.execute(
@@ -722,13 +879,27 @@ def iter_source_returns(
     connection: sqlite3.Connection, start_date: date, end_date: date
 ) -> Iterator[tuple[str, float, float]]:
     """`(source_id, attributable_return, raw_attributable_return)` of each
-    track-record row dated from `start_date` to `end_date` inclusive, in
-    the order the rows were appended, read one row at a time."""
-    yield from connection.execute(
-        "SELECT source_id, attributable_return, raw_attributable_return FROM track_record "
-        "WHERE as_of_date BETWEEN ? AND ? ORDER BY rowid",
-        (start_date.isoformat(), end_date.isoformat()),
-    )
+    track-record record dated from `start_date` to `end_date` inclusive, in
+    the order the records were appended, read one row at a time from the
+    rows of the days whose dates overlap that window (`track_record_days`)."""
+    start, end = start_date.toordinal(), end_date.toordinal()
+    (low, high) = connection.execute(
+        "SELECT MIN(first_id), MAX(last_id) FROM track_record_days "
+        "WHERE max_date >= ? AND min_date <= ?",
+        (start, end),
+    ).fetchone()
+    if low is None:
+        return
+    sources = _source_names(connection)
+    for analyst, manager, attributable, raw in connection.execute(
+        "SELECT analyst_source, manager_source, attributable_return, raw_attributable_return "
+        "FROM track_record WHERE id BETWEEN ? AND ? AND as_of_date BETWEEN ? AND ? ORDER BY id",
+        (low, high, start, end),
+    ):
+        if analyst is not None:
+            yield sources[analyst], attributable, raw
+        if manager is not None:
+            yield sources[manager], attributable, raw
 
 
 def read_lake_time(db_path: Path) -> datetime | None:
