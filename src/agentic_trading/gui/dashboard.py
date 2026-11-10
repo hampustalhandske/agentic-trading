@@ -1069,6 +1069,7 @@ def _trust_panel_frame(desk_run: DeskRun, source_ids: list[str], as_of_date: dat
     weights = Hedge().get_weights(desk_run.scoreboard, source_ids, as_of_date)
     rows = []
     for source_id in source_ids:
+        sharpe: float | None
         try:
             sharpe = desk_run.scoreboard.sharpe_ratio(source_id, as_of_date, 30)
         except ValueError:

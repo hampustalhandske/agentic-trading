@@ -67,6 +67,24 @@ def test_sharpe_ratio_matches_hand_computed_annualized_formula() -> None:
     assert result == pytest.approx(expected)
 
 
+@pytest.mark.parametrize("value", [0.0, 0.01])
+def test_sharpe_ratio_is_none_when_returns_have_zero_stdev(value: float) -> None:
+    """A constant attributable return has no volatility to scale by: the Sharpe is undefined."""
+    start = date(2024, 1, 1)
+    scoreboard = _seed("analyst-a", start, [value] * 5)
+
+    assert scoreboard.sharpe_ratio("analyst-a", start + timedelta(days=4), lookback_days=10) is None
+
+
+def test_summary_reports_an_undefined_sharpe_as_none() -> None:
+    start = date(2024, 1, 1)
+    scoreboard = _seed("analyst-a", start, [0.0] * 5)
+
+    summary = scoreboard.summary(start + timedelta(days=4))
+
+    assert summary["analyst-a"]["sharpe_ratio"] is None
+
+
 def test_sharpe_ratio_raises_on_a_single_data_point() -> None:
     """A single-observation window has undefined sample stdev, so sharpe_ratio raises ValueError."""
     start = date(2024, 1, 1)
