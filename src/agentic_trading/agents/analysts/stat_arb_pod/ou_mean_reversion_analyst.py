@@ -55,10 +55,13 @@ class OUMeanReversionAnalyst(AnalystAgent):
     A spread under 10 points is unavailable, and so is one whose
     half-life is undefined: a non-finite estimate (a straight-line spread
     gives one) or quantcore's `UndefinedResultError`. A spread that is not
-    mean-reverting (`ou_half_life`'s phi >= 0 `ValueError`), or whose
-    simulated OU paths do not revert in the trade's direction, abstains
-    (active, flat, confidence 0). Any other `ou_half_life` failure is an
-    error. Every non-signal branch clears the asset's open direction."""
+    mean-reverting (`ou_half_life`'s phi >= 0 `ValueError`), whose finite
+    half-life exceeds `settings.analysts.ou_max_half_life_windows` times the
+    fitted spread's length (the data shows less than that many half-lives
+    of reversion), or whose simulated OU paths do not revert in the trade's
+    direction, abstains (active, flat, confidence 0). Any other
+    `ou_half_life` failure is an error. Every non-signal branch clears the
+    asset's open direction."""
 
     agent_id: str = "ou_mean_reversion_analyst"
 
@@ -130,6 +133,15 @@ class OUMeanReversionAnalyst(AnalystAgent):
                 asset,
                 as_of_date,
                 f"OU half-life undefined on this spread (estimate {raw_half_life})",
+            )
+        max_half_life = settings.analysts.ou_max_half_life_windows * spread.size
+        if raw_half_life > max_half_life:
+            self._open_direction_by_asset.pop(asset, None)
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                f"OU half-life {raw_half_life:.1f}d exceeds the {spread.size}-session fitted "
+                "window — not mean-reverting on a holdable horizon — holding",
             )
         half_life = max(raw_half_life, MIN_HALF_LIFE_DAYS)
         z_window = int(min(max(round(4 * half_life), 5), MAX_ZSCORE_WINDOW, spread.size))

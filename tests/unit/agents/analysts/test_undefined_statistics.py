@@ -30,6 +30,7 @@ from agentic_trading.agents.analysts.stat_arb_pod.ou_mean_reversion_analyst impo
     OUMeanReversionAnalyst,
 )
 from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.config import temporary_overrides
 from agentic_trading.data.loaders.macro_loader import DGS3MO, DGS10, VIXCLS
 
 _SHORT_INTEREST = "agentic_trading.agents.analysts.event_credit_pod.short_interest_squeeze_analyst"
@@ -146,6 +147,114 @@ def test_ou_any_other_fit_failure_is_an_error(monkeypatch: pytest.MonkeyPatch) -
     signal = OUMeanReversionAnalyst().generate_signal("AAPL", _market(_noise(120)), AS_OF)
 
     assert _flat(signal) == ("error", "flat", 0.0)
+
+
+def _stub_half_life(monkeypatch: pytest.MonkeyPatch, half_life: float) -> list[int]:
+    """Stub `ou_half_life` to return `half_life`; the returned list collects the size of
+    every spread it is fitted on."""
+    sizes: list[int] = []
+
+    def _fit(spread: np.ndarray) -> float:
+        sizes.append(int(spread.size))
+        return half_life
+
+    monkeypatch.setattr(ou_mean_reversion_analyst, "ou_half_life", _fit)
+    return sizes
+
+
+def _spy_zscore(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Wrap the real `spread_zscore`; the returned list collects every window it is called
+    with, so a test can tell the normal z-score path ran."""
+    windows: list[int] = []
+    real = ou_mean_reversion_analyst.spread_zscore
+
+    def _zscore(spread: np.ndarray, window: int) -> np.ndarray:
+        windows.append(window)
+        return real(spread, window)
+
+    monkeypatch.setattr(ou_mean_reversion_analyst, "spread_zscore", _zscore)
+    return windows
+
+
+@pytest.mark.parametrize("half_life", [1e8, 251.0])
+def test_ou_half_life_beyond_the_fitted_window_abstains(
+    monkeypatch: pytest.MonkeyPatch, half_life: float
+) -> None:
+    """A finite half-life longer than the 250-session fitted spread has not shown one
+    half-life of reversion in the data: the analyst declines to trade it."""
+    sizes = _stub_half_life(monkeypatch, half_life)
+    windows = _spy_zscore(monkeypatch)
+    analyst = OUMeanReversionAnalyst()
+    analyst._open_direction_by_asset["AAPL"] = "long"
+
+    signal = analyst.generate_signal("AAPL", _market(_noise(400)), AS_OF)
+
+    assert sizes == [250]
+    assert _flat(signal) == ("active", "flat", 0.0)
+    assert f"{half_life:.1f}d" in signal.rationale
+    assert "250-session fitted window" in signal.rationale
+    assert "AAPL" not in analyst._open_direction_by_asset
+    assert windows == []
+
+
+def test_ou_half_life_inside_the_fitted_window_runs_the_normal_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sizes = _stub_half_life(monkeypatch, 249.0)
+    windows = _spy_zscore(monkeypatch)
+
+    signal = OUMeanReversionAnalyst().generate_signal("AAPL", _market(_noise(400)), AS_OF)
+
+    assert sizes == [250]
+    assert windows == [250]
+    assert "fitted window" not in signal.rationale
+
+
+@pytest.mark.parametrize(
+    ("windows_allowed", "half_life", "abstains"),
+    [(2.0, 499.0, False), (2.0, 501.0, True), (0.5, 124.0, False), (0.5, 126.0, True)],
+)
+def test_ou_half_life_bound_scales_with_max_half_life_windows(
+    monkeypatch: pytest.MonkeyPatch, windows_allowed: float, half_life: float, abstains: bool
+) -> None:
+    _stub_half_life(monkeypatch, half_life)
+    windows = _spy_zscore(monkeypatch)
+
+    with temporary_overrides({"analysts.ou_max_half_life_windows": windows_allowed}):
+        signal = OUMeanReversionAnalyst().generate_signal("AAPL", _market(_noise(400)), AS_OF)
+
+    assert ("fitted window" in signal.rationale) is abstains
+    assert (windows == []) is abstains
+    if abstains:
+        assert _flat(signal) == ("active", "flat", 0.0)
+
+
+def test_ou_half_life_bound_uses_the_spread_length_on_short_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With less history than `risk_window_long`, the fitted window is the spread itself."""
+    sizes = _stub_half_life(monkeypatch, 150.0)
+    windows = _spy_zscore(monkeypatch)
+
+    signal = OUMeanReversionAnalyst().generate_signal("AAPL", _market(_noise(120)), AS_OF)
+
+    assert len(sizes) == 1 and sizes[0] < 150
+    assert _flat(signal) == ("active", "flat", 0.0)
+    assert f"{sizes[0]}-session fitted window" in signal.rationale
+    assert windows == []
+
+
+def test_ou_half_life_inside_a_short_spread_runs_the_normal_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sizes = _stub_half_life(monkeypatch, 100.0)
+    windows = _spy_zscore(monkeypatch)
+
+    signal = OUMeanReversionAnalyst().generate_signal("AAPL", _market(_noise(120)), AS_OF)
+
+    assert len(sizes) == 1 and 100 < sizes[0] < 150
+    assert len(windows) == 1
+    assert "fitted window" not in signal.rationale
 
 
 def _autocorrelated(size: int, seed: int = 11, phi: float = 0.6) -> np.ndarray:
