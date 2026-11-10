@@ -260,3 +260,71 @@ def test_a_checkpoint_of_another_format_is_refused_for_resume(tmp_path: Path, ve
     assert fresh.execute("PRAGMA user_version").fetchone() == (
         checkpoint_store.CHECKPOINT_FORMAT_VERSION,
     )
+
+
+def _append_with_pending(
+    connection: sqlite3.Connection,
+    as_of_date: date,
+    next_day_index: int,
+    pending: list[PortfolioDecision] | None,
+    decisions: list[PortfolioDecision] | None = None,
+) -> None:
+    checkpoint_store.append_day(
+        connection,
+        as_of_date=as_of_date,
+        portfolio_value=100_000.0,
+        new_track_record=[],
+        decisions=[_decision(as_of_date)] if decisions is None else decisions,
+        new_trades=[],
+        next_day_index=next_day_index,
+        start_date=DAY_ONE,
+        end_date=DAY_TWO,
+        assets=["AAPL"],
+        portfolio={"cash": 100_000.0},
+        signal_health={},
+        pending_decisions=pending,
+    )
+
+
+@pytest.mark.parametrize("pending", ["none", "same object", "equal copy"])
+def test_pending_decisions_equal_to_the_days_are_read_from_the_decisions_table(
+    tmp_path: Path, pending: str
+) -> None:
+    """Pending decisions that are the day's own decisions (not given, the same list or an equal
+    one) leave the cursor's column NULL, and every reader gives back the last day's decisions in
+    their place."""
+    connection = checkpoint_store.connect(tmp_path / "checkpoint.db")
+    _append(connection, DAY_ONE, next_day_index=1)
+    decisions = [_decision(DAY_TWO, asset="MSFT")]
+    given = {
+        "none": None,
+        "same object": decisions,
+        "equal copy": [decision.model_copy() for decision in decisions],
+    }[pending]
+    _append_with_pending(connection, DAY_TWO, 2, given, decisions)
+
+    assert connection.execute("SELECT pending_decisions FROM cursor").fetchone() == (None,)
+    expected = [decision.model_dump(mode="json") for decision in decisions]
+    for payload in (
+        checkpoint_store.read_all(connection),
+        checkpoint_store.read_recent(connection, DAY_ONE, decision_days=1),
+    ):
+        assert payload is not None
+        assert payload["pending_decisions"] == expected
+
+
+def test_pending_decisions_other_than_the_days_round_trip_through_the_cursor(
+    tmp_path: Path,
+) -> None:
+    """Pending decisions other than the day's own are stored in the cursor and read back."""
+    connection = checkpoint_store.connect(tmp_path / "checkpoint.db")
+    pending = [_decision(DAY_ONE, asset="MSFT")]
+    _append_with_pending(connection, DAY_ONE, 1, pending)
+
+    payload = checkpoint_store.read_all(connection)
+
+    assert payload is not None
+    assert payload["pending_decisions"] == [pending[0].model_dump(mode="json")]
+    assert payload["decisions_by_day"][DAY_ONE.isoformat()] == [
+        _decision(DAY_ONE).model_dump(mode="json")
+    ]

@@ -6,8 +6,9 @@ Each simulated day appends exactly that day's new rows to eight tables
 (`track_record`, `decisions`, `trades`, `unfilled_orders`, `capital_usage`,
 `sizing_diagnostics`, `pod_returns`, `pod_cost_days`) via `INSERT` — O(1) per day, O(n)
 total for a run of length n — and overwrites two things each day: a single
-`cursor` row (next day index, portfolio state, signal health, pending
-decisions, the Commander's serialized risk state, the previous close mid
+`cursor` row (next day index, portfolio state, signal health, the
+pending decisions when they are not the day's own, the Commander's
+serialized risk state, the previous close mid
 of every option contract the run has marked, the lake time the run reads
 at, and the run's own config for `_restore_checkpoint`'s match-check:
 dates, assets, settings fingerprint and roster fingerprint), and the
@@ -53,7 +54,7 @@ from agentic_trading.agents.schemas import (
 # The layout version this module writes into SQLite's `user_version`; a
 # file of any other version (0 for a checkpoint written before versions
 # were recorded) is refused for a resume.
-CHECKPOINT_FORMAT_VERSION = 2
+CHECKPOINT_FORMAT_VERSION = 3
 # zlib level of each day's stored decisions: level 6 compresses a firm
 # record's day of decisions about 14x in about 10 ms; the higher levels
 # shrink it little more for several times the time.
@@ -137,7 +138,7 @@ CREATE TABLE IF NOT EXISTS cursor (
     assets TEXT NOT NULL,
     portfolio TEXT NOT NULL,
     signal_health TEXT NOT NULL,
-    pending_decisions TEXT NOT NULL,
+    pending_decisions TEXT,
     commander_risk_state TEXT,
     total_financing_cost REAL NOT NULL DEFAULT 0.0,
     total_option_premium_paid REAL NOT NULL DEFAULT 0.0,
@@ -242,7 +243,7 @@ def append_day(
     assets: list[str],
     portfolio: dict[str, Any],
     signal_health: dict[str, dict[str, int]],
-    pending_decisions: list[PortfolioDecision],
+    pending_decisions: list[PortfolioDecision] | None = None,
     commander_risk_state: dict[str, Any] | None = None,
     total_financing_cost: float = 0.0,
     total_option_premium_paid: float = 0.0,
@@ -273,7 +274,16 @@ def append_day(
     `carried_state()` keyed by agent_id; when given it replaces every stored
     snapshot, and when `None` the stored snapshots are left as they are.
     `option_last_mid` is the engine's previous close mid per option
-    contract, stored as JSON (`None` stores none)."""
+    contract, stored as JSON (`None` stores none). `pending_decisions` are
+    the decisions still to execute; `None`, or a list whose JSON is that of
+    `decisions`, stores none in the cursor, and a read gives back the
+    decisions of the last day appended in their place."""
+    decisions_json = json.dumps([decision.model_dump(mode="json") for decision in decisions])
+    pending_json = None
+    if pending_decisions is not None and pending_decisions is not decisions:
+        pending_json = json.dumps([d.model_dump(mode="json") for d in pending_decisions])
+        if pending_json == decisions_json:
+            pending_json = None
     with connection:
         connection.execute(
             "INSERT INTO portfolio_value (as_of_date, value) VALUES (?, ?)",
@@ -301,9 +311,7 @@ def append_day(
             "INSERT INTO decisions (as_of_date, payload) VALUES (?, ?)",
             (
                 as_of_date.isoformat(),
-                _compressed(
-                    json.dumps([decision.model_dump(mode="json") for decision in decisions])
-                ),
+                _compressed(decisions_json),
             ),
         )
         connection.executemany(
@@ -370,7 +378,7 @@ def append_day(
                 json.dumps(assets),
                 json.dumps(portfolio),
                 json.dumps(signal_health),
-                json.dumps([d.model_dump(mode="json") for d in pending_decisions]),
+                pending_json,
                 None if commander_risk_state is None else json.dumps(commander_risk_state),
                 total_financing_cost,
                 total_option_premium_paid,
@@ -590,7 +598,11 @@ def _read_state(connection: sqlite3.Connection) -> dict[str, Any] | None:
         },
         "portfolio": json.loads(portfolio_json),
         "signal_health": json.loads(signal_health_json),
-        "pending_decisions": json.loads(pending_decisions_json),
+        "pending_decisions": json.loads(
+            _last_decisions_json(connection)
+            if pending_decisions_json is None
+            else pending_decisions_json
+        ),
         "commander_risk_state": (
             None if commander_risk_state_json is None else json.loads(commander_risk_state_json)
         ),
@@ -609,6 +621,14 @@ def _read_state(connection: sqlite3.Connection) -> dict[str, Any] | None:
         "portfolio_value_history": portfolio_value_history,
         "carried_states": carried_states,
     }
+
+
+def _last_decisions_json(connection: sqlite3.Connection) -> str:
+    """The decisions JSON of the last day appended, `"[]"` when none is."""
+    row = connection.execute(
+        "SELECT payload FROM decisions WHERE rowid = (SELECT MAX(rowid) FROM decisions)"
+    ).fetchone()
+    return "[]" if row is None else _decompressed(row[0])
 
 
 def read_last_day(connection: sqlite3.Connection) -> date | None:
