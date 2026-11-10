@@ -165,7 +165,8 @@ def _required_env(name: str) -> str:
     value = _env_value(name)
     if not value:
         raise RuntimeError(
-            f"{name} is not set; add it to the process environment or the repo-root .env"
+            f"{name} is not set; add it to the process environment, the repo-root .env, "
+            "or the env file AGENTIC_ENV_FILE names"
         )
     return value
 

@@ -18,7 +18,9 @@ Three ways to override without editing source:
 
 The lakehouse API location and token are not strategy constants: the
 loader reads `LAKEHOUSE_API_URL` and `LAKEHOUSE_API_TOKEN` from the
-process environment or the repo-root `.env` through `_env_value`.
+process environment, else from the env file through `_env_value`: the file
+`AGENTIC_ENV_FILE` names when that variable is set (so a worktree can use
+the main checkout's file by its path), else the repo-root `.env`.
 
 Keys are dotted paths: `<group>.<field>`, or
 `pod_sizing.<manager_agent_id>.<field>` for the per-pod table. Values
@@ -46,6 +48,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 _GROUP_CONFIG = ConfigDict(validate_assignment=True, extra="forbid")
 
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+# Names an env file to read in place of the repo-root `.env`.
+ENV_FILE_VARIABLE = "AGENTIC_ENV_FILE"
+
+
+class EnvFileMissingError(FileNotFoundError):
+    """`AGENTIC_ENV_FILE` names a file that does not exist."""
+
 
 # The first date the lake holds a single-name option chain (DoltHub's
 # `dolthub_option_chain`; before it only SPY, QQQ and IWM have chains).
@@ -57,15 +66,34 @@ _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 SINGLE_NAME_OPTION_CHAINS_START = date(2019, 2, 1)
 
 
+def _env_file() -> Path | None:
+    """The env file `_env_value` reads: the path `AGENTIC_ENV_FILE` names
+    when it is set and non-empty, else the repo-root `.env`; `None` when
+    that `.env` does not exist. Raises `EnvFileMissingError` when
+    `AGENTIC_ENV_FILE` names a missing file, so a wrong path never falls
+    back to another file."""
+    named = os.environ.get(ENV_FILE_VARIABLE)
+    if named:
+        path = Path(named).expanduser()
+        if not path.is_file():
+            raise EnvFileMissingError(
+                f"{ENV_FILE_VARIABLE} names {path}, which is not a file; set it to the path "
+                "of an existing env file or unset it"
+            )
+        return path
+    return _ENV_FILE if _ENV_FILE.exists() else None
+
+
 def _env_value(name: str) -> str | None:
     """`name` from the process environment, else from a `KEY=VALUE` line in
-    the repo-root `.env` file (comments and blank lines ignored); `None`
-    when neither has it."""
+    the env file `_env_file` picks (comments and blank lines ignored);
+    `None` when neither has it."""
     if name in os.environ:
         return os.environ[name]
-    if not _ENV_FILE.exists():
+    env_file = _env_file()
+    if env_file is None:
         return None
-    for line in _ENV_FILE.read_text().splitlines():
+    for line in env_file.read_text().splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
