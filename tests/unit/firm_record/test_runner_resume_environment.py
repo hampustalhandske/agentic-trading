@@ -93,6 +93,29 @@ def test_resume_under_another_interpreter_or_machine_is_refused(
         _run(tmp_path)
 
 
+def test_resume_under_other_blas_thread_settings_is_refused(tmp_path: Path) -> None:
+    """A trial recorded under other BLAS or OpenMP thread settings refuses to resume, naming
+    the field, and nothing in the trial changes."""
+    trial = _paused(tmp_path)
+    _edit_environment(
+        trial,
+        lambda meta: meta["environment"].update(
+            blas_threads={
+                "openblas_num_threads": "7",
+                "omp_num_threads": "7",
+                "mkl_num_threads": None,
+                "veclib_maximum_threads": None,
+            }
+        ),
+    )
+    before = _snapshot(trial)
+
+    with pytest.raises(ValueError, match="blas_threads"):
+        _run(tmp_path)
+
+    assert _snapshot(trial) == before
+
+
 def test_trial_without_a_recorded_environment_is_refused(tmp_path: Path) -> None:
     """A trial whose agentic_meta.json has no environment key is refused, not adopted."""
     trial = _paused(tmp_path)

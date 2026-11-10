@@ -167,6 +167,12 @@ def test_runtime_environment_never_enters_the_spec_hash(monkeypatch: pytest.Monk
             "platform_release": planted,
             "blas_name": planted,
             "blas_version": planted,
+            "blas_threads": provenance.BlasThreads(
+                openblas_num_threads=planted,
+                omp_num_threads=planted,
+                mkl_num_threads=planted,
+                veclib_maximum_threads=planted,
+            ),
             "libraries": LibraryVersions(**dict.fromkeys(LibraryVersions.model_fields, planted)),
         }
     )

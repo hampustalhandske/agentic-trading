@@ -152,6 +152,32 @@ def test_runtime_environment_records_installed_versions_and_platform() -> None:
     assert environment.blas_name is None or environment.blas_name
 
 
+def test_blas_threads_record_the_thread_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The environment records each BLAS and OpenMP thread variable as set, null when unset."""
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "1")
+    monkeypatch.setenv("OMP_NUM_THREADS", "2")
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    monkeypatch.delenv("VECLIB_MAXIMUM_THREADS", raising=False)
+
+    threads = provenance.runtime_environment().blas_threads
+
+    assert threads == provenance.BlasThreads(
+        openblas_num_threads="1",
+        omp_num_threads="2",
+        mkl_num_threads=None,
+        veclib_maximum_threads=None,
+    )
+
+
+def test_an_environment_recorded_without_blas_threads_still_loads() -> None:
+    """An environment recorded before thread settings were part of it validates, with
+    `blas_threads` null."""
+    payload = provenance.runtime_environment().model_dump(mode="json")
+    payload.pop("blas_threads")
+
+    assert provenance.RuntimeEnvironment.model_validate(payload).blas_threads is None
+
+
 def test_missing_library_is_recorded_as_null(monkeypatch: pytest.MonkeyPatch) -> None:
     """A library that is not installed is null; the others keep their versions."""
     installed_version = metadata.version

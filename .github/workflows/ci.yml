@@ -8,6 +8,11 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Single-threaded OpenBLAS and OpenMP, so GARCH-family fits give the
+    # same bits on every run.
+    env:
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
 

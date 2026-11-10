@@ -18,5 +18,5 @@ commit=$(git -C "$repo" rev-parse --verify --quiet "$2^{commit}") \
   || { echo "container ci: $2 is not a commit of $repo" >&2; exit 2; }
 exec docker run --rm --memory=4g --platform "${PLATFORM:-linux/arm64}" \
   -v "$repo:/repo:ro" -v "$here:/ci:ro" \
-  -e CI=true -e UV_PYTHON=3.12 -e UV_LINK_MODE=copy -e SHA="$commit" \
+  -e CI=true -e OPENBLAS_NUM_THREADS=1 -e OMP_NUM_THREADS=1 -e UV_PYTHON=3.12 -e UV_LINK_MODE=copy -e SHA="$commit" \
   python:3.12-slim bash /ci/container_check.sh

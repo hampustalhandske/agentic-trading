@@ -1,6 +1,7 @@
 # provenance.py
 
 import json
+import os
 import platform
 import subprocess
 from importlib import metadata
@@ -41,14 +42,29 @@ class LibraryVersions(BaseModel):
     quantcore: str | None
 
 
+class BlasThreads(BaseModel):
+    """The environment variables that set how many threads the BLAS and
+    OpenMP libraries use, as this process saw them at start (`None` when
+    unset). Multi-threaded OpenBLAS reduces in a thread-dependent order, so
+    its results can differ in the last bits from a single-threaded run."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    openblas_num_threads: str | None
+    omp_num_threads: str | None
+    mkl_num_threads: str | None
+    veclib_maximum_threads: str | None
+
+
 class RuntimeEnvironment(BaseModel):
     """The machine a run computed on: the Python version, the operating
     system (`platform_system`, `platform_machine`, `platform_release`, as
     `platform` reports them), the BLAS numpy was built against
     (`blas_name`, `blas_version`, as numpy reports them; `None` when it
-    reports none), the
-    numerical `libraries` installed and the commit quantcore was installed
-    from (`quantcore_sha`, `None` when unknown). It describes the machine,
+    reports none), the BLAS and OpenMP thread settings (`blas_threads`;
+    `None` in an environment recorded without them), the numerical
+    `libraries` installed and the commit quantcore was installed from
+    (`quantcore_sha`, `None` when unknown). It describes the machine,
     not the hypothesis, so no spec hash covers it."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -61,6 +77,7 @@ class RuntimeEnvironment(BaseModel):
     blas_version: str | None
     libraries: LibraryVersions
     quantcore_sha: str | None
+    blas_threads: BlasThreads | None = None
 
 
 class RunProvenance(BaseModel):
@@ -159,10 +176,20 @@ def _numpy_blas() -> tuple[str | None, str | None]:
     return (str(name) if name else None, str(version) if version else None)
 
 
+def blas_threads() -> BlasThreads:
+    """This process's `BlasThreads`, read from its environment."""
+    return BlasThreads(
+        openblas_num_threads=os.environ.get("OPENBLAS_NUM_THREADS"),
+        omp_num_threads=os.environ.get("OMP_NUM_THREADS"),
+        mkl_num_threads=os.environ.get("MKL_NUM_THREADS"),
+        veclib_maximum_threads=os.environ.get("VECLIB_MAXIMUM_THREADS"),
+    )
+
+
 def runtime_environment() -> RuntimeEnvironment:
     """The `RuntimeEnvironment` of this process: Python and platform, numpy's
-    BLAS, each `LibraryVersions` library's installed version and the
-    installed quantcore's commit."""
+    BLAS and its thread settings, each `LibraryVersions` library's installed
+    version and the installed quantcore's commit."""
     blas_name, blas_version = _numpy_blas()
     return RuntimeEnvironment(
         python_version=platform.python_version(),
@@ -175,6 +202,7 @@ def runtime_environment() -> RuntimeEnvironment:
             **{name: installed_version(name) for name in LibraryVersions.model_fields}
         ),
         quantcore_sha=quantcore_sha(),
+        blas_threads=blas_threads(),
     )
 
 

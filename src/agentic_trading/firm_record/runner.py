@@ -158,10 +158,16 @@ _RESTART_MIN_DAYS = 20
 
 # The `RuntimeEnvironment` fields a resume must share with the environment
 # its trial's agentic_meta.json records: the numerical libraries, the
-# quantcore commit, the interpreter and the machine architecture. The OS
-# release and the BLAS report are left out, so a minor OS update does not
-# block a resume.
-_RESUME_ENVIRONMENT_FIELDS = ("libraries", "quantcore_sha", "python_version", "platform_machine")
+# quantcore commit, the interpreter, the machine architecture and the BLAS
+# and OpenMP thread settings. The OS release and the BLAS report are left
+# out, so a minor OS update does not block a resume.
+_RESUME_ENVIRONMENT_FIELDS = (
+    "libraries",
+    "quantcore_sha",
+    "python_version",
+    "platform_machine",
+    "blas_threads",
+)
 
 
 def _require_resume_environment(trial_dir: Path, current: RuntimeEnvironment) -> None:

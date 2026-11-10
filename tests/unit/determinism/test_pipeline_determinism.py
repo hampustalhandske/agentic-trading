@@ -44,6 +44,10 @@ _KILLED_AFTER_DAYS = 4
 # comparison names it in its failure message. The first pass runs with seed 0.
 _HASH_SEED_ENV = "AGENTIC_DETERMINISM_HASH_SEED"
 _OTHER_HASH_SEED = os.environ.get(_HASH_SEED_ENV) or str(random.SystemRandom().randrange(1, 2**32))
+# Every pass runs single-threaded BLAS and OpenMP: multi-threaded OpenBLAS
+# reduces in a thread-dependent order, which can change GARCH-family fits in
+# the last bits on Linux.
+_BLAS_THREAD_ENV = {"OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
 _SEED_NOTE = f"second pass PYTHONHASHSEED={_OTHER_HASH_SEED} (rerun with {_HASH_SEED_ENV})"
 
 # JSON fields that may differ between two passes of the same pipeline, by file (relative to
@@ -62,10 +66,11 @@ def _pass(
     kill_point: str = "after",
 ) -> subprocess.CompletedProcess[str]:
     """One pass of `pipeline` (`firm` or `stage_a`) under `store_dir` in a fresh interpreter
-    with `PYTHONHASHSEED` `hash_seed` and the planted defect `plant`, killed per
+    with `PYTHONHASHSEED` `hash_seed`, `_BLAS_THREAD_ENV` and the planted defect `plant`, killed per
     `kill_at_day`/`kill_point` (see `pipeline_entry.py`)."""
     env = {key: value for key, value in os.environ.items() if key != _firm.PLANT_ENV}
     env["PYTHONHASHSEED"] = hash_seed
+    env.update(_BLAS_THREAD_ENV)
     if plant is not None:
         env[_firm.PLANT_ENV] = plant
     command = [sys.executable, str(_ENTRY), pipeline, str(store_dir)]
