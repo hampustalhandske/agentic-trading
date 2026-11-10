@@ -64,13 +64,15 @@ _EXPECTED_AVAILABILITY_FORMS = ("from YYYY-MM-DD", "none in window", "full")
 class TrialProvenance(BaseModel):
     """The code a trial ran: this repository's HEAD sha (`agentic_sha`), whether its working
     tree was dirty (`agentic_dirty`), and the commit quantcore was installed from
-    (`quantcore_sha`). Each is None when unknown."""
+    (`quantcore_sha`), and the machine it ran on (`environment`: library versions and
+    platform). Each is None when unknown."""
 
     model_config = ConfigDict(frozen=True)
 
     agentic_sha: str | None
     agentic_dirty: bool | None
     quantcore_sha: str | None
+    environment: code_provenance.RuntimeEnvironment | None = None
 
 
 class ExposureWindow(BaseModel):
@@ -201,16 +203,22 @@ def ensure_stage_a_registration(
 
 def current_trial_provenance() -> TrialProvenance:
     """The code running now: this repository's git state (`provenance`'s HEAD sha and dirty
-    flag, None outside a git checkout) and the installed quantcore commit."""
+    flag, None outside a git checkout), the installed quantcore commit and the runtime
+    environment (`provenance.runtime_environment`)."""
     sha, dirty = code_provenance._git_state()
     return TrialProvenance(
-        agentic_sha=sha, agentic_dirty=dirty, quantcore_sha=code_provenance.quantcore_sha()
+        agentic_sha=sha,
+        agentic_dirty=dirty,
+        quantcore_sha=code_provenance.quantcore_sha(),
+        environment=code_provenance.runtime_environment(),
     )
 
 
 def _extra_json(provenance: TrialProvenance, **fields: Any) -> str:
-    """`provenance`'s fields and `fields` as one JSON object with sorted keys."""
-    return json.dumps(provenance.model_dump() | fields, sort_keys=True)
+    """`provenance`'s fields and `fields` as one JSON object with sorted keys; `environment`
+    only when it is known."""
+    exclude = {"environment"} if provenance.environment is None else set()
+    return json.dumps(provenance.model_dump(mode="json", exclude=exclude) | fields, sort_keys=True)
 
 
 def stage_a_trial_row(
@@ -229,9 +237,9 @@ def stage_a_trial_row(
     and `config_hash` is `record.spec_hash`. `git_sha` is `provenance.agentic_sha` (`"unknown"`
     when None), `data_snapshot` is `"<lake_time ISO>|<lake_version>"`, `n` is `n_days` (the
     trial's decision days stored), the metric is `"submitted"` with no value, interval or p
-    value, and the direction two-sided. `extra_json` holds `provenance`'s fields and
-    `"imported": false`. `run_at` defaults to now; `trial_id` is fresh, so a rerun is another
-    row under the same key."""
+    value, and the direction two-sided. `extra_json` holds `provenance`'s fields (its
+    `environment` only when known) and `"imported": false`. `run_at` defaults to now;
+    `trial_id` is fresh, so a rerun is another row under the same key."""
     fields: dict[str, Any] = {} if run_at is None else {"run_at": run_at}
     return TrialRow(
         hypothesis_id=hypothesis_id,

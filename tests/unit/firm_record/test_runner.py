@@ -37,6 +37,7 @@ from agentic_trading.data.loaders.lakehouse_loader import HoldoutReadError
 from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.firm_record import runner as runner_module
 from agentic_trading.firm_record.runner import FirmRecordResult, run_firm_record
+from agentic_trading.provenance import runtime_environment
 from agentic_trading.scoring.weighting import EqualWeight
 from agentic_trading.stage_a.decisions import check_source_as_of
 from agentic_trading.stage_a.store import DecisionRow
@@ -650,8 +651,8 @@ def test_uncounted_record_writes_a_valid_submission_folder(
     """An uncounted record's trial directory is an edgelab replay folder: submission.json
     validates against edgelab's schema, names the HEAD commit, declares one trial keyed by the
     spec hash with no prior exposure, scores the record's window and is a fast profile;
-    agentic_meta.json marks it uncounted with the src/ tree's state; strategy/ holds the
-    replay shim and data/ exists."""
+    agentic_meta.json marks it uncounted with the src/ tree's state and records the runtime
+    environment; strategy/ holds the replay shim and data/ exists."""
     monkeypatch.setattr(runner_module, "source_tree_state", lambda: ("a" * 40, True))
     result = _run(tmp_path)
     trial = tmp_path / result.spec_hash
@@ -683,6 +684,7 @@ def test_uncounted_record_writes_a_valid_submission_folder(
         "short_warmup": [],
         "low_availability": [],
         "expected_availability": {},
+        "environment": runtime_environment().model_dump(mode="json"),
     }
     strategy = yaml.safe_load((trial / "strategy" / "strategy.yaml").read_text())
     assert strategy["strategy"] == "strategy.py:Replay"

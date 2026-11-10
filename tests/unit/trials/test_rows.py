@@ -20,6 +20,7 @@ from agentic_trading import provenance
 from agentic_trading.agents import roster
 from agentic_trading.config import settings, temporary_overrides
 from agentic_trading.data.trading_calendar import sessions_between
+from agentic_trading.provenance import runtime_environment
 from agentic_trading.stage_a.spec import DECISION_RULE, SpecRecord, StageASpec, spec_hash
 from agentic_trading.trials.ledger import LedgerError, Registration, TrialLedger, TrialRow
 from agentic_trading.trials.registry import config_hash_of, file_registration
@@ -234,9 +235,15 @@ def test_ensure_stage_a_registration(tmp_path: Path) -> None:
 
 def test_current_trial_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
     """current_trial_provenance returns a TrialProvenance, with null git fields without git."""
-    assert set(TrialProvenance.model_fields) == {"agentic_sha", "agentic_dirty", "quantcore_sha"}
+    assert set(TrialProvenance.model_fields) == {
+        "agentic_sha",
+        "agentic_dirty",
+        "quantcore_sha",
+        "environment",
+    }
     current = current_trial_provenance()
     assert isinstance(current, TrialProvenance)
+    assert current.environment == runtime_environment()
     assert current.agentic_dirty is None or isinstance(current.agentic_dirty, bool)
 
     monkeypatch.setattr(provenance, "_git_output", lambda *args: None)
@@ -296,6 +303,20 @@ def test_stage_a_trial_row(tmp_path: Path) -> None:
     ledger.record_trial(row)
     ledger.record_trial(rerun)
     assert ledger.verify_chain().ok
+
+
+def test_stage_a_trial_row_records_a_known_environment() -> None:
+    """A row's extra_json holds its provenance's runtime environment when it is known, and no
+    environment key when it is not."""
+    environment = runtime_environment()
+    known = _PROVENANCE.model_copy(update={"environment": environment})
+    hypothesis_id = stage_a_hypothesis_id(_AGENT)
+    row = stage_a_trial_row(_RECORD, hypothesis_id, _FAMILY, n_days=7, provenance=known)
+    bare = stage_a_trial_row(_RECORD, hypothesis_id, _FAMILY, n_days=7, provenance=_PROVENANCE)
+
+    assert json.loads(row.extra_json)["environment"] == environment.model_dump(mode="json")
+    assert "environment" not in json.loads(bare.extra_json)
+    assert row.config_hash == bare.config_hash == _RECORD.spec_hash
 
 
 def test_imported_trial_rows(prior_exposure: dict[str, Any]) -> None:
