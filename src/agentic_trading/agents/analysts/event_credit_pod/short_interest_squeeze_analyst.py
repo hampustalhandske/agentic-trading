@@ -86,7 +86,8 @@ class ShortInterestSqueezeAnalyst(AnalystAgent):
                 status="unavailable",
             )
 
-        sorted_history = history.sort_values("settlement_date")
+        # Stable, so a settlement's unrevised row stays before its revised one as loaded.
+        sorted_history = history.sort_values("settlement_date", kind="stable")
         days_to_cover = sorted_history["days_to_cover"].to_numpy(dtype=np.float64)
         current_z = float(spread_zscore(days_to_cover, min(self.z_window, days_to_cover.size))[-1])
         latest_dissemination = sorted_history["dissemination_date"].max().date()

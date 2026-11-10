@@ -321,6 +321,11 @@ _ALLOWED: dict[str, str] = {
     ),
     f"{_EVENT_CREDIT}.sec_fundamentals_analyst:SecFundamentalsAnalyst.generate_signal"
     ":pandas.tail#1": "keys unique: discrete_quarters returns one row per period_end, sorted",
+    f"{_EVENT_CREDIT}.short_interest_squeeze_analyst:ShortInterestSqueezeAnalyst"
+    ".generate_signal:pandas.sort_values(stable)#1": (
+        "stable sort on settlement_date of rows in a total order: _fetch_short_interest orders "
+        "by settlement_date, revision_flag NULLS FIRST and every other column it returns"
+    ),
     f"{_HMM}:RegimeHMMAnalyst.generate_signal:numpy.argmin#1": (
         "picks between the two fitted HMM states, in hmm_fit's order, not between rows; reached "
         "only when the variances are equal"
@@ -428,11 +433,6 @@ _ALLOWED: dict[str, str] = {
 # "<module>:<qualname>:<kind>#<n>": the issue tracking a pick whose result can depend on the order
 # tied rows arrive in, and what can tie.
 KNOWN_UNTIED: dict[str, str] = {
-    f"{_EVENT_CREDIT}.short_interest_squeeze_analyst:ShortInterestSqueezeAnalyst"
-    ".generate_signal:pandas.sort_values#1": (
-        "AT-176: a settlement's unrevised and revised rows tie on settlement_date, and the "
-        "quicksort keeps no order between them"
-    ),
     f"{_LOADER}:_fetch_security_bars:sql.asof_join#1": (
         "AT-176: two equity_adjustment_factors rows of one security_id on one effective_date "
         "tie for a bar"
