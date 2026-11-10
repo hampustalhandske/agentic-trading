@@ -3,7 +3,7 @@
 `checkpoint_store` stores an analyst record and the manager record that follows it with the same
 outcome as one row, with integer-coded sources, assets and dates and a per-append index. Each
 test appends the same records to a checkpoint and to `_OneRowPerRecord`, a reference holding one
-row per record in the layout and with the queries of a checkpoint of format 3, and requires
+row per record, with text ids and ISO dates, read by plain date-filtered queries, and requires
 `read_all`, `read_recent` and `iter_source_returns` to give what the reference gives, value for
 value and in the same order, with the same error when the dates interleave."""
 
@@ -29,8 +29,8 @@ _VALUES = (0.0, 1.0, -2.0, 5e-324, 1.7976931348623157e308, -0.013, 0.1 + 0.2, 3.
 
 
 class _OneRowPerRecord:
-    """The track record as a checkpoint of format 3 stored and read it: one row per record, in
-    the table and with the queries of that format."""
+    """A reference track-record store: one row per record, with text ids and ISO dates, read by
+    plain date-filtered queries."""
 
     _COLUMNS = (
         "source_id, source_type, asset, as_of_date, attributable_return, "

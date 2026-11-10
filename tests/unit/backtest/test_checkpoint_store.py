@@ -88,6 +88,28 @@ def test_connect_without_resume_clears_a_stale_file_from_an_earlier_run(
     assert checkpoint_store.read_all(second_run) is None
 
 
+def test_a_fresh_reset_that_fails_part_way_leaves_the_file_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drop and re-create of a fresh run's `connect` is one transaction: a reset that
+    fails after dropping the tables leaves the earlier run's checkpoint whole, so a later
+    resume reads that run and not empty tables under its cursor."""
+    db_path = tmp_path / "checkpoint.db"
+    first_run = checkpoint_store.connect(db_path)
+    _append(first_run, DAY_ONE, next_day_index=1)
+    before = checkpoint_store.read_all(first_run)
+    first_run.close()
+    broken = [*checkpoint_store._TABLES, ("zzz_broken", "CREATE TABLE zzz_broken (")]
+    monkeypatch.setattr(checkpoint_store, "_TABLES", broken)
+
+    with pytest.raises(sqlite3.OperationalError):
+        checkpoint_store.connect(db_path, resume=False)
+    monkeypatch.undo()
+
+    resumed = checkpoint_store.connect(db_path, resume=True)
+    assert checkpoint_store.read_all(resumed) == before
+
+
 def test_connect_with_resume_preserves_existing_rows(tmp_path: Path) -> None:
     db_path = tmp_path / "checkpoint.db"
     first_run = checkpoint_store.connect(db_path)

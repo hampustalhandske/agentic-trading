@@ -62,8 +62,7 @@ from agentic_trading.agents.schemas import (
 from agentic_trading.firm_record.availability import day_signal_counts
 
 # The layout version this module writes into SQLite's `user_version`; a
-# file of any other version (0 for a checkpoint written before versions
-# were recorded) is refused for a resume.
+# file of any other version, 0 included, is refused for a resume.
 CHECKPOINT_FORMAT_VERSION = 5
 # zlib level of each day's stored decisions: level 6 compresses a firm
 # record's day of decisions about 14x in about 10 ms; the higher levels
@@ -283,7 +282,10 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
     state. When `resume` is `True`, a file that already holds tables must
     be of `CHECKPOINT_FORMAT_VERSION`; one of another version raises
     `CheckpointFormatError`, naming the file and both versions, before
-    anything in it changes."""
+    anything in it changes. The drops, creates and version stamp run in
+    one explicit transaction (SQLite's DDL is transactional, and Python's
+    sqlite3 opens no transaction of its own before DDL), so a reset that
+    fails or is killed part way leaves the file as it was."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_path, factory=CheckpointConnection)
     (version,) = connection.execute("PRAGMA user_version").fetchone()
@@ -298,6 +300,7 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
             "and the trial it belongs to, and start the run over"
         )
     with connection:
+        connection.execute("BEGIN")
         if not resume:
             for name, _ in _TABLES:
                 connection.execute(f"DROP TABLE IF EXISTS {name}")

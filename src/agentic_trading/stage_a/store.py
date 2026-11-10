@@ -21,8 +21,10 @@ rows (`FirmDecisionStore`).
   `instrument_kind`, `instrument_id`, `target_weight` (from
   `decisions.decision_weights`), plus `status`, `source` and
   `source_as_of`;
-- progress.json: `{"last_completed": "<ISO date>"}`, the last day both
-  Parquet files hold;
+- progress.json: `{"last_completed": "<ISO date>"}`, the last day written
+  in full: the last day both Parquet files hold, or, inside `appending()`,
+  the last day whose part files are written, ahead of the Parquet files
+  until the block ends;
 - counts.json: per-instrument status day counts and annual turnover
   (`SignalStore.counts`), written on request.
 
@@ -291,7 +293,9 @@ class _TrialStore:
             table = _append(self._tables[name], pd.concat(frames, ignore_index=True), columns)
             _write_parquet(self.trial_dir / name, table, columns)
             self._tables[name] = table
-        shutil.rmtree(self.trial_dir / PARTS_DIR, ignore_errors=True)
+        parts = self.trial_dir / PARTS_DIR
+        if parts.exists():
+            shutil.rmtree(parts)
 
     def _merge_parts_left(self) -> None:
         """Merge the part files a killed pass left (see the module

@@ -302,6 +302,19 @@ def test_uncompressed_decisions_break_the_budget(
     assert any("every table" in breach for breach in breaches)
 
 
+def test_one_row_per_record_breaks_the_track_record_budget(
+    run: _Run, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative control: the run's checkpoint writes made again with no analyst record paired
+    with the manager record that follows it, one track-record row per record, break the track
+    record budget."""
+    monkeypatch.setattr(checkpoint_store, "_outcome", lambda entry: object())
+
+    breaches = _breaches(run, _replay(run, tmp_path / "unpaired.sqlite"))
+
+    assert any("track_record" in breach for breach in breaches)
+
+
 def test_the_replay_measures_what_the_run_wrote(run: _Run, tmp_path: Path) -> None:
     """The negative control's replay, made without its change, writes the bytes the run did."""
     assert _replay(run, tmp_path / "replay.sqlite") == run.sizes
