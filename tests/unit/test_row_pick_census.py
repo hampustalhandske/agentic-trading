@@ -294,6 +294,9 @@ _PIVOT_INDEX = "keys unique: the index is the row index of a pivot, one row per 
 # arrive in.
 _ALLOWED: dict[str, str] = {
     f"{_CVAR}._options_data:real_atm_options_by_expiration:pandas.idxmin#1": _CHAIN_ORDER,
+    f"{_CVAR}._options_data:real_atm_options_by_expiration:pandas.sort_values(stable)#1": (
+        "sorted on days_to_expiration then expiration: one row per expiration, so the key is unique"
+    ),
     f"{_CVAR}.heston_vol_surface_analyst:_interpolated_atm_iv:numpy.argmin#1": (
         "a tie cannot occur: this branch runs only with every expiry on one side of the target, "
         "and the expiries it gets are distinct and at least MIN_NEAREST_DTE days out, so their "
@@ -425,10 +428,6 @@ _ALLOWED: dict[str, str] = {
 # "<module>:<qualname>:<kind>#<n>": the issue tracking a pick whose result can depend on the order
 # tied rows arrive in, and what can tie.
 KNOWN_UNTIED: dict[str, str] = {
-    f"{_CVAR}._options_data:real_atm_options_by_expiration:pandas.sort_values#1": (
-        "AT-176: expirations on or one day after the snapshot both clamp to "
-        "days_to_expiration 1, and the quicksort keeps no order between them"
-    ),
     f"{_EVENT_CREDIT}.short_interest_squeeze_analyst:ShortInterestSqueezeAnalyst"
     ".generate_signal:pandas.sort_values#1": (
         "AT-176: a settlement's unrevised and revised rows tie on settlement_date, and the "

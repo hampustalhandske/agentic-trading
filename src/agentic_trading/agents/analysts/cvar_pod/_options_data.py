@@ -89,7 +89,9 @@ def real_atm_options_by_expiration(
     `option_marks.published_chain_date(as_of_date)`. `days_to_expiration` is
     measured from the snapshot's own date, not `as_of_date` (they differ
     by at least the publication lag and up to the lag plus the loader's
-    `lookback_days`, since coverage isn't daily-dense).
+    `lookback_days`, since coverage isn't daily-dense), floored at 1, so an
+    expiration on or before the day after the snapshot counts as 1. Rows
+    are sorted by `days_to_expiration`, then `expiration`.
 
     Returns `None` if `asset` has no real snapshot for this date; every
     CVaR-pod analyst calling this then reports flat with zero confidence
@@ -126,7 +128,11 @@ def real_atm_options_by_expiration(
         )
     if not rows:
         return None
-    return pd.DataFrame(rows).sort_values("days_to_expiration").reset_index(drop=True)
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["days_to_expiration", "expiration"], kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 def chain_snapshot_date(options: pd.DataFrame) -> date:
