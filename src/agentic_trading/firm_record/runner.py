@@ -39,8 +39,8 @@ checkpoint drops the store's days past the checkpoint and computes them
 again. The checkpoint holds the book's value and stays outside the trial
 directory, which holds only the submission: the store's spec.json,
 sources.json, decisions.parquet and progress.json, and the edgelab replay
-folder around them (`firm_record.submission`: submission.json, strategy/,
-data/ and agentic_meta.json), written at each start of the pass for the
+folder around them (`firm_record.submission`: submission.json, strategy/
+and agentic_meta.json), written at each start of the pass for the
 commit it runs from. unfilled_orders.json lists the orders the engine
 could not fill, and agentic_meta.json their number; analyst_availability.json
 counts the signals of every analyst of the roster by status per year and

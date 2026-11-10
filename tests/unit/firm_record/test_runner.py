@@ -305,7 +305,6 @@ def test_trial_dir_holds_the_submission_only(tmp_path: Path) -> None:
     assert sorted(path.name for path in trial.iterdir()) == [
         "agentic_meta.json",
         "analyst_availability.json",
-        "data",
         "decisions.parquet",
         "progress.json",
         "sources.json",
@@ -659,7 +658,8 @@ def test_uncounted_record_writes_a_valid_submission_folder(
     validates against edgelab's schema, names the HEAD commit, declares one trial keyed by the
     spec hash with no prior exposure, scores the record's window and is a fast profile;
     agentic_meta.json marks it uncounted with the src/ tree's state and records the runtime
-    environment; strategy/ holds the replay shim and data/ exists."""
+    environment; strategy/ holds the replay shim, whose data block reads the lake at the
+    record's lake time, and there is no data/ bundle folder."""
     monkeypatch.setattr(runner_module, "source_tree_state", lambda: ("a" * 40, True))
     result = _run(tmp_path)
     trial = tmp_path / result.spec_hash
@@ -695,11 +695,12 @@ def test_uncounted_record_writes_a_valid_submission_folder(
     }
     strategy = yaml.safe_load((trial / "strategy" / "strategy.yaml").read_text())
     assert strategy["strategy"] == "strategy.py:Replay"
-    assert strategy["data"]["params"]["path"] == "../data"
+    assert strategy["data"]["provider"] == "lakehouse"
+    assert strategy["data"]["params"]["lake_time"] == submission["data"]["lake_time"]
     assert strategy["params"]["universe"]["symbols"] == _UNIVERSE
     validate_grading_block(strategy["grading"])
     assert "class Replay(TargetWeightsReplay):" in (trial / "strategy" / "strategy.py").read_text()
-    assert (trial / "data").is_dir()
+    assert not (trial / "data").exists()
 
 
 def test_submission_sources_are_unique_and_cover_every_row_source(tmp_path: Path) -> None:
