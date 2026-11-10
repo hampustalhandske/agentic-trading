@@ -13,8 +13,10 @@ of every option contract the run has marked, the lake time the run reads
 at, and the run's own config for `_restore_checkpoint`'s match-check:
 dates, assets, settings fingerprint and roster fingerprint), and the
 `carried_state` table, one row per agent holding its `carried_state()`
-snapshot. Both hold one day's state; the cursor grows only with the
-number of option contracts the run has marked. Mirrors the append-only idiom `data/db.py` uses
+snapshot, of which only the rows whose bytes changed since the last write
+through the same connection are rewritten. Both hold one day's state; the
+cursor grows only with the number of option contracts the run has marked.
+Mirrors the append-only idiom `data/db.py` uses
 for the fetch log.
 
 `read_all` reads the whole state back; `read_recent` reads it with only
@@ -33,6 +35,7 @@ layout this module writes.
 A `carried_state` blob is a pickle: open with `connect` only checkpoint
 files this program wrote, never one from an untrusted source."""
 
+import hashlib
 import json
 import sqlite3
 import zlib
@@ -148,8 +151,8 @@ CREATE TABLE IF NOT EXISTS cursor (
     roster_fingerprint TEXT
 )
 """
-# One row per agent, rewritten each day: the agent's `carried_state()`
-# snapshot (a pickle) keyed by its agent_id.
+# One row per agent: the agent's `carried_state()` snapshot (a pickle) keyed
+# by its agent_id, rewritten on a day its bytes change.
 _CREATE_CARRIED_STATE = """
 CREATE TABLE IF NOT EXISTS carried_state (
     agent_id TEXT PRIMARY KEY,
@@ -195,6 +198,20 @@ _TABLES: tuple[tuple[str, str], ...] = (
 )
 
 
+class CheckpointConnection(sqlite3.Connection):
+    """The connection `connect` returns: a `sqlite3.Connection` that also
+    remembers the SHA-256 digest of each `carried_state` row this
+    connection last wrote (`carried_state_digests`, `None` until its first
+    write, or after a write that failed), so `append_day` rewrites only the
+    snapshots that changed. A new connection knows no digest and rewrites
+    every snapshot on its first write, so what a resume reads never depends
+    on a digest held in memory."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.carried_state_digests: dict[str, bytes] | None = None
+
+
 def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
     """Opens (creating tables if needed) the checkpoint database at
     `db_path`. When `resume` is `False`, every table of this module already
@@ -207,7 +224,7 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
     `CheckpointFormatError`, naming the file and both versions, before
     anything in it changes."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path)
+    connection = sqlite3.connect(db_path, factory=CheckpointConnection)
     (version,) = connection.execute("PRAGMA user_version").fetchone()
     (tables,) = connection.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
@@ -271,8 +288,11 @@ def append_day(
     costs charged to each pod. `settings_fingerprint` and `roster_fingerprint`
     are recorded with the dates and assets as the run's config, on the day
     the cursor row is first written. `carried_states` is each agent's
-    `carried_state()` keyed by agent_id; when given it replaces every stored
-    snapshot, and when `None` the stored snapshots are left as they are.
+    `carried_state()` keyed by agent_id; when given, the stored snapshots
+    become exactly these, and when `None` they are left as they are. On a
+    `CheckpointConnection` that wrote the snapshots before, only the rows
+    whose bytes changed are rewritten and those of agents no longer given
+    deleted; otherwise every row is replaced.
     `option_last_mid` is the engine's previous close mid per option
     contract, stored as JSON (`None` stores none). `pending_decisions` are
     the decisions still to execute; `None`, or a list whose JSON is that of
@@ -388,12 +408,49 @@ def append_day(
                 roster_fingerprint,
             ),
         )
-        if carried_states is not None:
-            connection.execute("DELETE FROM carried_state")
-            connection.executemany(
-                "INSERT INTO carried_state (agent_id, state) VALUES (?, ?)",
-                sorted(carried_states.items()),
-            )
+        digests = (
+            None if carried_states is None else _write_carried_states(connection, carried_states)
+        )
+    if digests is not None and isinstance(connection, CheckpointConnection):
+        connection.carried_state_digests = digests
+
+
+def _write_carried_states(
+    connection: sqlite3.Connection, carried_states: dict[str, bytes]
+) -> dict[str, bytes]:
+    """Makes the `carried_state` rows exactly `carried_states`, inside the
+    caller's transaction, writing only what changed since the digests a
+    `CheckpointConnection` holds (see `append_day`), and returns the
+    digests of `carried_states` for the caller to record once the
+    transaction commits. A `CheckpointConnection`'s digests are forgotten
+    here, so a transaction that fails leaves it knowing none."""
+    digests = {
+        agent_id: hashlib.sha256(state).digest() for agent_id, state in carried_states.items()
+    }
+    known = (
+        connection.carried_state_digests if isinstance(connection, CheckpointConnection) else None
+    )
+    if isinstance(connection, CheckpointConnection):
+        connection.carried_state_digests = None
+    if known is None:
+        connection.execute("DELETE FROM carried_state")
+        changed = sorted(carried_states.items())
+    else:
+        connection.executemany(
+            "DELETE FROM carried_state WHERE agent_id = ?",
+            [(agent_id,) for agent_id in sorted(known.keys() - digests.keys())],
+        )
+        changed = [
+            (agent_id, state)
+            for agent_id, state in sorted(carried_states.items())
+            if known.get(agent_id) != digests[agent_id]
+        ]
+    connection.executemany(
+        "INSERT INTO carried_state (agent_id, state) VALUES (?, ?) "
+        "ON CONFLICT(agent_id) DO UPDATE SET state = excluded.state",
+        changed,
+    )
+    return digests
 
 
 def _compressed(payload_json: str) -> bytes:

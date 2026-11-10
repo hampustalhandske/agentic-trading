@@ -328,3 +328,106 @@ def test_pending_decisions_other_than_the_days_round_trip_through_the_cursor(
     assert payload["decisions_by_day"][DAY_ONE.isoformat()] == [
         _decision(DAY_ONE).model_dump(mode="json")
     ]
+
+
+def _append_states(
+    connection: sqlite3.Connection, as_of_date: date, next_day_index: int, states: dict[str, bytes]
+) -> list[str]:
+    """Appends a day carrying `states` and returns the SQL statements that touched the
+    `carried_state` table."""
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    try:
+        checkpoint_store.append_day(
+            connection,
+            as_of_date=as_of_date,
+            portfolio_value=100_000.0,
+            new_track_record=[],
+            decisions=[],
+            new_trades=[],
+            next_day_index=next_day_index,
+            start_date=DAY_ONE,
+            end_date=date(2024, 1, 10),
+            assets=["AAPL"],
+            portfolio={"cash": 100_000.0},
+            signal_health={},
+            carried_states=states,
+        )
+    finally:
+        connection.set_trace_callback(None)
+    return [statement for statement in statements if "carried_state" in statement]
+
+
+def _stored_states(connection: sqlite3.Connection) -> dict[str, bytes]:
+    payload = checkpoint_store.read_all(connection)
+    assert payload is not None
+    return dict(payload["carried_states"])
+
+
+def test_carried_state_rows_are_rewritten_only_when_their_bytes_change(tmp_path: Path) -> None:
+    """Through one connection, a day with the same snapshots writes no `carried_state` row, a
+    changed snapshot rewrites only its own row, and an agent no longer given loses its row; the
+    stored snapshots always equal the last ones given."""
+    connection = checkpoint_store.connect(tmp_path / "checkpoint.db")
+    first = {"a_agent": b"one", "b_agent": b"two", "c_agent": b"three"}
+    assert _append_states(connection, DAY_ONE, 1, first)
+    assert _stored_states(connection) == first
+
+    assert _append_states(connection, DAY_TWO, 2, dict(first)) == []
+    assert _stored_states(connection) == first
+
+    changed = {**first, "b_agent": b"two, changed"}
+    written = _append_states(connection, date(2024, 1, 4), 3, changed)
+    assert len(written) == 1 and "INSERT" in written[0] and "b_agent" in written[0]
+    assert _stored_states(connection) == changed
+
+    dropped = {"a_agent": b"one", "b_agent": b"two, changed"}
+    written = _append_states(connection, date(2024, 1, 5), 4, dropped)
+    assert any("DELETE" in statement and "c_agent" in statement for statement in written)
+    assert _stored_states(connection) == dropped
+
+
+def test_a_new_connection_rewrites_every_carried_state_row_on_its_first_write(
+    tmp_path: Path,
+) -> None:
+    """A resumed connection knows no digest: its first day rewrites every snapshot, even rows
+    changed behind the writer's back, so the stored snapshots never rest on memory of an earlier
+    process."""
+    path = tmp_path / "checkpoint.db"
+    states = {"a_agent": b"one", "b_agent": b"two"}
+    first = checkpoint_store.connect(path)
+    _append_states(first, DAY_ONE, 1, states)
+    first.close()
+    raw = sqlite3.connect(path)
+    with raw:
+        raw.execute("UPDATE carried_state SET state = x'00' WHERE agent_id = 'a_agent'")
+    raw.close()
+
+    resumed = checkpoint_store.connect(path, resume=True)
+    written = _append_states(resumed, DAY_TWO, 2, states)
+
+    assert any("DELETE FROM carried_state" in statement for statement in written)
+    assert _stored_states(resumed) == states
+
+
+def test_a_failed_day_leaves_the_connection_rewriting_every_carried_state_row(
+    tmp_path: Path,
+) -> None:
+    """A day whose transaction fails after its snapshots were written rolls them back and leaves
+    the connection without digests, so the next day rewrites every row."""
+    connection = checkpoint_store.connect(tmp_path / "checkpoint.db")
+    states = {"a_agent": b"one"}
+    _append_states(connection, DAY_ONE, 1, states)
+    with connection:
+        connection.execute(
+            "CREATE TRIGGER fail AFTER UPDATE ON carried_state BEGIN SELECT RAISE(ABORT, 'x'); END"
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        _append_states(connection, DAY_TWO, 2, {"a_agent": b"changed"})
+    with connection:
+        connection.execute("DROP TRIGGER fail")
+
+    assert _stored_states(connection) == states
+    written = _append_states(connection, DAY_TWO, 2, states)
+    assert any("DELETE FROM carried_state" in statement for statement in written)
+    assert _stored_states(connection) == states
