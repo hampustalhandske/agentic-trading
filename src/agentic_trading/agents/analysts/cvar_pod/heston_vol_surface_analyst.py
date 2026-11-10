@@ -14,7 +14,12 @@ from agentic_trading.agents.analysts.cvar_pod._options_data import (
     real_atm_options_by_expiration,
 )
 from agentic_trading.agents.base import AnalystAgent, DataRequirement
-from agentic_trading.agents.schemas import AgentSignal, SignalStatus
+from agentic_trading.agents.schemas import (
+    AgentSignal,
+    SignalStatus,
+    VolatilityEstimator,
+    VolatilityProvenance,
+)
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -87,6 +92,12 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
     fewer than two usable expiries exist for the date. The agent id is
     kept so scoreboard history stays continuous.
 
+    Every signal read off the model volatility, an abstention included,
+    carries its `volatility_estimator`: "garch_11" or "ewma" from
+    `_market_math.conditional_daily_volatility`, or "realized_std" when
+    that read raises and the annualized sample std of the last
+    `REALIZED_FALLBACK_WINDOW` returns stands in.
+
     Every active signal's `source_as_of`, an abstention included, is the
     date of the chain snapshot the surface was read from
     (`_options_data.chain_snapshot_date`), the snapshot's own date rather
@@ -105,6 +116,7 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
         as_of_date: pd.Timestamp,
         rationale: str,
         status: SignalStatus = "active",
+        volatility_estimator: VolatilityEstimator | None = None,
     ) -> AgentSignal:
         return AgentSignal(
             agent_id=self.agent_id,
@@ -114,6 +126,7 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
             confidence=0.0,
             rationale=rationale,
             status=status,
+            volatility_estimator=volatility_estimator,
         )
 
     def generate_signal(
@@ -151,14 +164,17 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
         ivs = usable["implied_volatility"].to_numpy(dtype=np.float64)
 
         iv_30 = _interpolated_atm_iv(days, ivs, TARGET_DTE)
+        volatility_read = VolatilityProvenance()
         try:
             model_vol = annualized_garch_volatility(
-                returns, self._refit_cache, self.agent_id, asset, as_of_date
+                returns, self._refit_cache, self.agent_id, asset, as_of_date, volatility_read
             )
+            estimator = volatility_read.estimator
         except (RuntimeError, ValueError):
             model_vol = float(np.std(returns[-REALIZED_FALLBACK_WINDOW:], ddof=1)) * np.sqrt(
                 settings.firm.trading_days_per_year
             )
+            estimator = "realized_std"
         vrp = iv_30 - model_vol
         if abs(vrp) > MAX_ABS_VRP:
             return self._flat(
@@ -166,6 +182,7 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
                 as_of_date,
                 f"variance risk premium {vrp:.3f} outside plausible range",
                 "unavailable",
+                estimator,
             )
         slope = float(ivs[-1] - ivs[0]) if days[-1] - days[0] >= MIN_SLOPE_SPAN_DAYS else 0.0
 
@@ -181,7 +198,13 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
         elif vrp <= -threshold or slope <= BACKWARDATION_SLOPE:
             direction = "short"
         else:
-            return self.abstain_signal(asset, as_of_date, rationale, source_as_of=source_as_of)
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                rationale,
+                source_as_of=source_as_of,
+                volatility_estimator=estimator,
+            )
 
         premium_strength = clamp(
             (abs(vrp) - threshold) / settings.analysts.vrp_full_confidence_span
@@ -197,4 +220,5 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
             confidence=confidence,
             rationale=rationale,
             source_as_of=source_as_of,
+            volatility_estimator=estimator,
         )

@@ -16,6 +16,22 @@ from agentic_trading.config import settings
 # `error_signal`.
 SignalStatus = Literal["active", "unavailable", "error"]
 
+# The estimator a signal's volatility input came from: "garch_11" a
+# sanity-checked GARCH(1,1) fit, "ewma" the RiskMetrics EWMA fallback
+# `_market_math.conditional_daily_volatility` uses when that fit is
+# unusable, "realized_std" a plain sample standard deviation of recent
+# returns.
+VolatilityEstimator = Literal["garch_11", "ewma", "realized_std"]
+
+
+class VolatilityProvenance(BaseModel):
+    """Which estimator a volatility read used, filled in by the read it is
+    handed to (`_market_math.conditional_daily_volatility`); `estimator`
+    stays `None` until a read sets it."""
+
+    estimator: VolatilityEstimator | None = None
+
+
 # A pod's state on one day. "unavailable": none of the pod's decisions
 # carries an active signal (its data or analysts produced nothing).
 # "no_position": at least one active signal, yet every decision has weight
@@ -54,6 +70,12 @@ class AgentSignal(BaseModel):
     # read rests on (`sample_count`); managers dampen on both.
     source_as_of: date | None = None
     sample_count: int | None = None
+    # The estimator of the volatility the signal rests on, for an analyst
+    # that reads one; `None` for every other analyst, and then left out of
+    # the signal's dump, so their payloads hold only the fields above.
+    volatility_estimator: VolatilityEstimator | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _zero_confidence_is_flat(self) -> "AgentSignal":
@@ -90,6 +112,11 @@ class ManagerSignal(BaseModel):
     # read rests on (`sample_count`); managers dampen on both.
     source_as_of: date | None = None
     sample_count: int | None = None
+    # The analyst signal's `volatility_estimator`, carried as given, and
+    # left out of the dump when `None`.
+    volatility_estimator: VolatilityEstimator | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 _CONTRACT_ID_PATTERN = re.compile(r"^(\S+) (\d{4}-\d{2}-\d{2}) ([CP]) (\d+(?:\.\d+)?)$")
@@ -258,7 +285,14 @@ class TradeRecord(BaseModel):
     instead; see `data/instruments.unit_value_usd`); `spread_cost` is an option fill's
     |contracts| x |price - reference_price| x the contract multiplier.
     Every cost is in currency, already in the fill's cash flow, and 0 on
-    a hold or expiry."""
+    a hold or expiry.
+
+    `fill_basis` names the session price `reference_price` was taken
+    from. `prev_close` marks a spot FX fill (`data/instruments.currency_pair`)
+    whose fill-day open was missing or not positive and that filled at
+    the previous session's close instead, with the same costs; `open`
+    is every other record, the engine's own fill price for the day (the
+    open with a one-day execution lag, the close without)."""
 
     as_of_date: date
     asset: str
@@ -280,6 +314,7 @@ class TradeRecord(BaseModel):
     instrument: OptionContract | None = None
     contracts: float = 0.0
     premium: float = 0.0
+    fill_basis: Literal["open", "prev_close"] = "open"
 
     @model_validator(mode="after")
     def _instrument_matches_asset(self) -> "TradeRecord":
@@ -465,8 +500,10 @@ class UnfilledOrder(BaseModel):
     """A decision the backtest engine could not execute on `as_of_date`, the
     day the order failed to fill.
 
-    `reason` is `no_fill_price` (an equity whose fill price was missing,
-    NaN or non-positive; `price` is the value seen), `no_option_mark` (an
+    `reason` is `no_fill_price` (a non-option asset whose fill price was
+    missing, NaN or non-positive, and for spot FX with a one-day execution
+    lag whose previous session close was too; `price` is the fill-day
+    value seen), `no_option_mark` (an
     option with no mark that day; `price` is None) or
     `untradeable_option_mark` (an option whose mark was not tradeable while
     the target differed from the held position; `price` is the mark's mid).

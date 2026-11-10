@@ -13,6 +13,7 @@ from agentic_trading.agents._market_math import RefitCache, clamp, market_slice
 from agentic_trading.agents.analysts.macro_rates_pod._garch_checks import (
     check_egarch_params,
     check_sigma_path,
+    classify_egarch_convergence_error,
     fit_or_convergence_error,
     rejection_signal,
 )
@@ -42,8 +43,12 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
 
     Stays flat at confidence 0, with the failing check named in the
     rationale, whenever the window is shorter than `min_garch_observations`
-    (unavailable); the fit or variance recursion raises, or the fit does
-    not converge (`ConvergenceError`) (error); or the parameters fail
+    (unavailable); the fit or variance recursion raises, or the optimizer
+    does not converge (`ConvergenceError` without SciPy's success message,
+    named in the rationale) (error); the fit converges outside the
+    stationary region (`classify_egarch_convergence_error`: an
+    abstention giving |beta|, an error for a non-finite parameter); or
+    the parameters fail
     `check_egarch_params` or the computed path fails `check_sigma_path`
     (the status the check's `CheckFailure.kind` gives: error for an
     inadmissible fit or a broken path, an abstention otherwise)."""
@@ -81,14 +86,15 @@ class EGARCHAsymmetricVolAnalyst(AnalystAgent):
             return self.error_signal(asset, as_of_date, "EGARCH MLE fit failed")
 
         if isinstance(fitted, ConvergenceError):
+            failure = classify_egarch_convergence_error(fitted)
             logger.debug(
-                "%s: EGARCH MLE fit did not converge for %s (%s) — returning flat.",
+                "%s: EGARCH fit for %s raised ConvergenceError (%s) — returning flat.",
                 self.agent_id,
                 asset,
-                fitted.optimizer_message,
+                failure.reason,
             )
-            return self.error_signal(
-                asset, as_of_date, "EGARCH parameters rejected: MLE fit did not converge"
+            return rejection_signal(
+                self, asset, as_of_date, f"EGARCH parameters rejected: {failure.reason}", failure
             )
 
         sample_std = float(np.std(returns, ddof=1))

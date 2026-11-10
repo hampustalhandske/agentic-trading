@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
+from agentic_trading.agents.schemas import VolatilityProvenance
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -254,6 +256,7 @@ def conditional_daily_volatility(
     cache_key: str,
     as_of_date: pd.Timestamp,
     agent_id: str,
+    provenance: VolatilityProvenance | None = None,
 ) -> float:
     """One-step-ahead daily conditional volatility of `returns`: a
     GARCH(1,1) fit (`quantcore.risk.fit_garch_11`, refit through
@@ -261,7 +264,13 @@ def conditional_daily_volatility(
     persistence `alpha + beta` in (0, `settings.analysts.max_garch_persistence`],
     and unconditional vol within 0.3x-3x of the sample vol — otherwise
     the RiskMetrics EWMA (`settings.managers.ewma_lambda`) volatility,
-    which needs no estimation and cannot degenerate."""
+    which needs no estimation and cannot degenerate.
+
+    `provenance`, when given, has its `estimator` set to "garch_11" or
+    "ewma", whichever gave the value. A fallback on a call that ran the
+    fit (the refit day, and every call while the fit raises, since a
+    raising fit is not cached) logs a WARNING naming `agent_id` and
+    `cache_key`; a call that reuses a cached unusable fit logs at DEBUG."""
     from quantcore.risk import fit_garch_11, garch_11_variance, variance_backcast
     from quantcore.risk.egarch import ewma_variance
 
@@ -272,10 +281,15 @@ def conditional_daily_volatility(
     ewma_volatility = float(
         np.sqrt(max(float(ewma_variance(centered, settings.managers.ewma_lambda)[-1]), 0.0))
     )
+    refitted = False
+
+    def _refit() -> Any:
+        nonlocal refitted
+        refitted = True
+        return fit_garch_11(returns)
+
     try:
-        omega, alpha, beta = refit_cache.get_or_refit(
-            cache_key, as_of_date, lambda: fit_garch_11(returns)
-        )
+        omega, alpha, beta = refit_cache.get_or_refit(cache_key, as_of_date, _refit)
         persistence = alpha + beta
         if not 0.0 < persistence <= settings.analysts.max_garch_persistence:
             raise ValueError(f"persistence {persistence:.4f} outside (0, max]")
@@ -286,9 +300,12 @@ def conditional_daily_volatility(
         variance_path = garch_11_variance(
             centered, omega, alpha, beta, presample_variance=variance_backcast(returns)
         )
+        if provenance is not None:
+            provenance.estimator = "garch_11"
         return float(np.sqrt(max(float(variance_path[-1]), 0.0)))
     except (RuntimeError, ValueError) as exc:
-        logger.debug(
+        logger.log(
+            logging.WARNING if refitted else logging.DEBUG,
             "%s: GARCH(1,1) unusable for %s on %s (%s) — using EWMA volatility %.4f.",
             agent_id,
             cache_key,
@@ -296,6 +313,8 @@ def conditional_daily_volatility(
             exc,
             ewma_volatility,
         )
+        if provenance is not None:
+            provenance.estimator = "ewma"
         return ewma_volatility
 
 

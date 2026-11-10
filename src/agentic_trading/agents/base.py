@@ -26,6 +26,7 @@ from agentic_trading.agents.schemas import (
     PortfolioDecision,
     SignalStatus,
     SizingDiagnostics,
+    VolatilityEstimator,
 )
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
@@ -235,6 +236,7 @@ class AnalystAgent(Agent):
         rationale: str,
         source_as_of: date | None,
         sample_count: int | None,
+        volatility_estimator: VolatilityEstimator | None = None,
     ) -> AgentSignal:
         return AgentSignal(
             agent_id=self.agent_id,
@@ -246,6 +248,7 @@ class AnalystAgent(Agent):
             status=status,
             source_as_of=source_as_of,
             sample_count=sample_count,
+            volatility_estimator=volatility_estimator,
         )
 
     def unavailable_signal(
@@ -273,14 +276,21 @@ class AnalystAgent(Agent):
         *,
         source_as_of: date | None = None,
         sample_count: int | None = None,
+        volatility_estimator: VolatilityEstimator | None = None,
     ) -> AgentSignal:
         """A flat, 0-confidence signal with status "active", for when the model
         has the data and declines to bet on it: no serial dependence, a
         degenerate or misspecified fit, a signal under its threshold.
-        `source_as_of` and `sample_count` are the provenance of the data the
-        model declined on."""
+        `source_as_of`, `sample_count` and `volatility_estimator` are the
+        provenance of the data and volatility read the model declined on."""
         return self._status_signal(
-            "active", asset, as_of_date, rationale, source_as_of, sample_count
+            "active",
+            asset,
+            as_of_date,
+            rationale,
+            source_as_of,
+            sample_count,
+            volatility_estimator,
         )
 
     def error_signal(
@@ -448,6 +458,7 @@ class ManagerAgent(Agent):
                     status=status,
                     source_as_of=signal.source_as_of,
                     sample_count=signal.sample_count,
+                    volatility_estimator=signal.volatility_estimator,
                 )
             )
         return scaled

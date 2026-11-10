@@ -24,6 +24,7 @@ import pandas as pd
 
 from agentic_trading.agents._market_math import RefitCache, conditional_daily_volatility
 from agentic_trading.agents.base import DataRequirement
+from agentic_trading.agents.schemas import VolatilityProvenance
 from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import (
     DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS,
@@ -43,16 +44,18 @@ def annualized_garch_volatility(
     agent_id: str,
     asset: str,
     as_of_date: pd.Timestamp,
+    provenance: VolatilityProvenance | None = None,
 ) -> float:
     """Annualized (sqrt 252) one-step-ahead conditional volatility from
     `_market_math.conditional_daily_volatility` (a sanity-checked
-    GARCH(1,1), EWMA when the fit is unusable). The fit is kept in the
+    GARCH(1,1), EWMA when the fit is unusable), which sets `provenance`'s
+    estimator when one is given. The fit is kept in the
     caller's `refit_cache` under `"<agent_id>:<asset>"` and refit at most
     once every `refit_cache.refit_interval_days` simulated days. Pass a
     cache the analyst holds as a private attribute, so a checkpoint
     carries it."""
     daily_volatility = conditional_daily_volatility(
-        returns, refit_cache, f"{agent_id}:{asset}", as_of_date, agent_id
+        returns, refit_cache, f"{agent_id}:{asset}", as_of_date, agent_id, provenance=provenance
     )
     return daily_volatility * float(np.sqrt(TRADING_DAYS_PER_YEAR))
 
