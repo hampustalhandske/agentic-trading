@@ -113,10 +113,21 @@ def _serve(monkeypatch: pytest.MonkeyPatch, chain: pd.DataFrame | None) -> None:
     monkeypatch.setattr(_options_data, "load_options_snapshot_from_lakehouse", _load)
 
 
+def _dgs3mo_before_snapshot() -> pd.DataFrame:
+    """One DGS3MO vintage of 5.3% known the day before SNAPSHOT, so the snapshot is the newest
+    data a Black-Scholes signal rests on."""
+    known = pd.DatetimeIndex([pd.Timestamp(SNAPSHOT) - pd.Timedelta(days=1)])
+    return pd.DataFrame({"value": [5.3], "realtime_start": known, "known_at": known}, index=known)
+
+
 def _black_scholes(monkeypatch: pytest.MonkeyPatch, chain: pd.DataFrame | None) -> AgentSignal:
-    """BlackScholesValuationAnalyst on AAPL at AS_OF off `chain`, GARCH leg fixed at 1% a day."""
+    """BlackScholesValuationAnalyst on AAPL at AS_OF off `chain`, GARCH leg fixed at 1% a day,
+    priced at a DGS3MO rate known before the snapshot."""
     module = black_scholes_valuation_analyst
     monkeypatch.setattr(module, "conditional_daily_volatility", _returning(0.01))
+    monkeypatch.setattr(
+        module, "load_fred_vintages_from_lakehouse", _returning(_dgs3mo_before_snapshot())
+    )
     _serve(monkeypatch, chain)
     return module.BlackScholesValuationAnalyst().generate_signal("AAPL", _market(), AS_OF)
 
@@ -266,7 +277,7 @@ def test_store_accepts_the_analysts_own_active_rows(
     cases: list[tuple[AnalystAgent, str, AgentSignal]] = [
         (
             black_scholes_valuation_analyst.BlackScholesValuationAnalyst(),
-            "options_chain",
+            "fred",
             _black_scholes(monkeypatch, _chain(SNAPSHOT, (0.60, 0.60))),
         ),
         (

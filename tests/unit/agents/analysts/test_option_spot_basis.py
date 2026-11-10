@@ -31,6 +31,12 @@ def _market_data() -> pd.DataFrame:
     return pd.concat({ASSET: frame}, axis=1)
 
 
+def _dgs3mo(*_args) -> pd.DataFrame:
+    """One DGS3MO vintage of 1.5% observed and known the session before AS_OF."""
+    known = pd.DatetimeIndex([AS_OF - pd.offsets.BDay(1)])
+    return pd.DataFrame({"value": [1.5], "realtime_start": known, "known_at": known}, index=known)
+
+
 def _snapshot(asset: str, as_of) -> pd.DataFrame:
     """Call and put quotes for strikes 50..75 in steps of 2.5 across three expiries."""
     rows = []
@@ -62,6 +68,7 @@ def test_options_analysts_pick_atm_strike_on_raw_close(monkeypatch, module_name:
     monkeypatch.setattr(
         mod, "conditional_daily_volatility", lambda r, *_a, **_k: float(np.std(r)), raising=False
     )
+    monkeypatch.setattr(mod, "load_fred_vintages_from_lakehouse", _dgs3mo, raising=False)
     calls: list[tuple[float, pd.DataFrame]] = []
 
     def _recording(asset, as_of_date, spot):
@@ -88,6 +95,7 @@ def test_black_scholes_prices_off_raw_close(monkeypatch) -> None:
 
     monkeypatch.setattr(_options_data, "load_options_snapshot_from_lakehouse", _snapshot)
     monkeypatch.setattr(mod, "conditional_daily_volatility", lambda r, *_a, **_k: 0.01)
+    monkeypatch.setattr(mod, "load_fred_vintages_from_lakehouse", _dgs3mo)
     priced: list[tuple[float, float]] = []
 
     def _record(spot, strike, *_args, **_kwargs):

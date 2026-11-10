@@ -612,6 +612,15 @@ def test_greeks_delta_hedge_reaches_both_pinning_and_momentum_branches(monkeypat
     assert missing_signal.confidence == 0.0
 
 
+def _dgs3mo_known_before(as_of: pd.Timestamp) -> pd.DataFrame:
+    """One DGS3MO vintage of 5% observed and known the day before `as_of`."""
+    known = pd.DatetimeIndex([as_of - pd.Timedelta(days=1)])
+    return pd.DataFrame(
+        {"value": [5.0], "realtime_start": known, "known_at": known},
+        index=known,
+    )
+
+
 def test_black_scholes_valuation_edge_is_not_identically_zero(monkeypatch) -> None:
     """An ATM call-minus-put spread cancels to zero by put-call parity
     regardless of volatility — the edge must come from the call price
@@ -634,6 +643,9 @@ def test_black_scholes_valuation_edge_is_not_identically_zero(monkeypatch) -> No
         mod,
         "real_atm_options_by_expiration",
         lambda *_a, **_k: _real_options_frame([0.6, 0.55], [0.01, 0.01]),
+    )
+    monkeypatch.setattr(
+        mod, "load_fred_vintages_from_lakehouse", lambda *_a: _dgs3mo_known_before(dates[-1])
     )
     signal = mod.BlackScholesValuationAnalyst().generate_signal("AAPL", market_data, dates[-1])
     assert signal.confidence > 1e-6
