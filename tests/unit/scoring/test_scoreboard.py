@@ -10,6 +10,7 @@ from datetime import date, timedelta
 
 import numpy as np
 import pytest
+from quantcore.errors import UndefinedResultError
 from quantcore.performance.metrics import calmar_ratio, sortino_ratio
 
 from agentic_trading.agents.schemas import PerformanceRecord
@@ -115,6 +116,16 @@ def test_sortino_ratio_raises_on_a_single_data_point() -> None:
         scoreboard.sortino_ratio("analyst-a", start, lookback_days=10)
 
 
+def test_sortino_ratio_raises_when_no_return_falls_below_zero() -> None:
+    """With no downside the downside deviation is 0 and the Sortino ratio is undefined:
+    quantcore's `UndefinedResultError`, a `ValueError`, reaches the caller."""
+    start = date(2024, 1, 1)
+    scoreboard = _seed("analyst-a", start, [0.01, 0.03, 0.0, 0.02, 0.01])
+
+    with pytest.raises(UndefinedResultError):
+        scoreboard.sortino_ratio("analyst-a", start + timedelta(days=4), lookback_days=10)
+
+
 def test_calmar_ratio_matches_quantcore_directly() -> None:
     start = date(2024, 1, 1)
     returns = [0.05, 0.03, -0.10, -0.02, 0.04]
@@ -132,6 +143,16 @@ def test_calmar_ratio_raises_on_a_single_data_point() -> None:
 
     with pytest.raises(ValueError):
         scoreboard.calmar_ratio("analyst-a", start, lookback_days=10)
+
+
+def test_calmar_ratio_raises_on_a_path_with_no_drawdown() -> None:
+    """A path that never falls below its running peak has maximum drawdown 0 and an undefined
+    Calmar ratio: quantcore's `UndefinedResultError`, a `ValueError`, reaches the caller."""
+    start = date(2024, 1, 1)
+    scoreboard = _seed("analyst-a", start, [0.01, 0.03, 0.0, 0.02, 0.01])
+
+    with pytest.raises(UndefinedResultError):
+        scoreboard.calmar_ratio("analyst-a", start + timedelta(days=4), lookback_days=10)
 
 
 def test_max_drawdown_matches_known_peak_to_trough_decline() -> None:

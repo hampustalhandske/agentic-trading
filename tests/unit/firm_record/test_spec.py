@@ -174,6 +174,7 @@ def test_runtime_environment_never_enters_the_spec_hash(monkeypatch: pytest.Monk
                 veclib_maximum_threads=planted,
             ),
             "libraries": LibraryVersions(**dict.fromkeys(LibraryVersions.model_fields, planted)),
+            "linked_blas": (provenance.LinkedBlas(vendor="mkl", library=planted, version=planted),),
         }
     )
     monkeypatch.setattr(metadata, "version", planted_version)

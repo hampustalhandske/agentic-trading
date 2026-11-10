@@ -1,6 +1,9 @@
 {
  "modules": {
   "quantcore": {
+   "exports": {
+    "UndefinedResultError": "quantcore.errors"
+   },
    "names": {
     "__version__": {
      "kind": "value",
@@ -46,7 +49,7 @@
    "names": {
     "simulate_gbm_paths": {
      "kind": "function",
-     "signature": "(spot: float, rate: float, volatility: float, time_to_maturity: float, num_steps: int, num_paths: int, seed: int | None=None) -> npt.NDArray[np.float64]"
+     "signature": "(spot: float, rate: float, volatility: float, time_to_maturity: float, num_steps: int, num_paths: int, seed: int) -> npt.NDArray[np.float64]"
     }
    }
   },
@@ -80,11 +83,24 @@
     },
     "simulate_cir_paths": {
      "kind": "function",
-     "signature": "(r0: float, kappa: float, theta: float, sigma: float, t: float, n_paths: int, n_steps: int, seed: int | None=None) -> npt.NDArray[np.float64]"
+     "signature": "(r0: float, kappa: float, theta: float, sigma: float, t: float, n_paths: int, n_steps: int, seed: int) -> npt.NDArray[np.float64]"
     },
     "simulate_ou_paths": {
      "kind": "function",
-     "signature": "(theta: float, mu: float, sigma: float, x0: float, t: float, n_paths: int, n_steps: int, seed: int | None=None) -> npt.NDArray[np.float64]"
+     "signature": "(theta: float, mu: float, sigma: float, x0: float, t: float, n_paths: int, n_steps: int, seed: int) -> npt.NDArray[np.float64]"
+    }
+   }
+  },
+  "quantcore.errors": {
+   "names": {
+    "UndefinedResultError": {
+     "bases": [
+      "ValueError"
+     ],
+     "decorators": [],
+     "fields": {},
+     "kind": "class",
+     "methods": {}
     }
    }
   },
@@ -521,7 +537,8 @@
      "fields": {},
      "kind": "class",
      "methods": {
-      "__init__": "(self, message: str, params: tuple[float, ...] | None, log_likelihood: float | None, optimizer_message: str | None) -> None"
+      "__init__": "(self, message: str, params: tuple[float, ...] | None, log_likelihood: float | None, optimizer_message: str | None) -> None",
+      "__reduce__": "(self) -> tuple[Any, ...]"
      }
     },
     "fit_garch_11": {
@@ -804,6 +821,6 @@
  },
  "package": "quantcore",
  "schema": "quantcore-api-manifest/1",
- "sha256": "040a2f86c986b78717de5d109271693957027aee4d2d920ed18d9d3b5ccfb341",
- "version": "0.3.1"
+ "sha256": "f896e52c6a85acb836bd4a1d6830b637eccd650dedadbfc6425a8b77032aecb2",
+ "version": "0.3.2"
 }

@@ -2,8 +2,9 @@
 
 """A firm record resumes only under the numerical environment its trial was started in: the
 environment its agentic_meta.json records must match `runtime_environment()` in `libraries`,
-`quantcore_sha`, `python_version` and `platform_machine`, or the resume is refused before
-anything is written. `platform_release` and the BLAS fields may differ. A trial whose
+`quantcore_sha`, `python_version`, `platform_machine`, `blas_threads` and `linked_blas`, or the
+resume is refused before anything is written. `platform_release` and the BLAS build report
+(`blas_name`, `blas_version`) may differ. A trial whose
 agentic_meta.json records no environment is refused too; a fresh trial records the
 environment of the pass that starts it."""
 
@@ -113,6 +114,25 @@ def test_resume_under_other_blas_thread_settings_is_refused(tmp_path: Path) -> N
     with pytest.raises(ValueError, match="blas_threads"):
         _run(tmp_path)
 
+    assert _snapshot(trial) == before
+
+
+def test_resume_under_another_linked_blas_is_refused(tmp_path: Path) -> None:
+    """A trial recorded with other BLAS libraries loaded refuses to resume, naming the field,
+    and nothing in the trial changes."""
+    trial = _paused(tmp_path)
+    _edit_environment(
+        trial,
+        lambda meta: meta["environment"].update(
+            linked_blas=[{"vendor": "mkl", "library": "libmkl_rt.so.2", "version": "2099.0"}]
+        ),
+    )
+    before = _snapshot(trial)
+
+    with pytest.raises(ValueError, match="linked_blas") as refused:
+        _run(tmp_path)
+
+    assert "libmkl_rt.so.2" in str(refused.value)
     assert _snapshot(trial) == before
 
 

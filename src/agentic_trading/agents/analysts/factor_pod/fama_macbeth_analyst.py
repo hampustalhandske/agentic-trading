@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 import numpy as np
 import pandas as pd
 from pydantic import Field, PrivateAttr
+from quantcore.errors import UndefinedResultError
 from quantcore.statistics.regression import factor_loadings, fama_macbeth_regression
 
 from agentic_trading.agents._market_math import RefitCache, balanced_panel, clamp
@@ -211,7 +212,10 @@ class FamaMacbethAnalyst(AnalystAgent):
     lake, or fewer than `_MIN_UNIVERSE_SIZE` members with enough
     history, is unavailable. A lake request that raises propagates to
     `ManagerAgent.collect_signals`, which records an error signal;
-    missing names, factors or history are unavailable.
+    missing names, factors or history are unavailable, and so is a
+    cross-section on which quantcore finds either stage undefined
+    (`UndefinedResultError`: a factor column with no range, or a factor
+    whose betas are all zero).
 
     An active signal's `source_as_of` is the public date
     (`ken_french_public_date`) of the newest factor row the regression
@@ -301,16 +305,24 @@ class FamaMacbethAnalyst(AnalystAgent):
         if len(reference) < _MIN_JOINED_OBSERVATIONS:
             return self._insufficient_history(asset, as_of_date)
         cached_tickers, cached_returns = broad_universe_result
-        if universe is cached_tickers and universe_returns is cached_returns:
-            stage = self._cross_section_cache.get_or_compute(
+        try:
+            if universe is cached_tickers and universe_returns is cached_returns:
+                stage = self._cross_section_cache.get_or_compute(
+                    as_of_date,
+                    _cross_section_key(universe, universe_returns, reference, factor_columns),
+                    universe,
+                    universe_returns,
+                    lambda: _cross_section(universe, universe_returns, reference, factor_columns),
+                )
+            else:
+                stage = _cross_section(universe, universe_returns, reference, factor_columns)
+        except UndefinedResultError as exc:
+            return self.unavailable_signal(
+                asset,
                 as_of_date,
-                _cross_section_key(universe, universe_returns, reference, factor_columns),
-                universe,
-                universe_returns,
-                lambda: _cross_section(universe, universe_returns, reference, factor_columns),
+                f"Fama-MacBeth regression undefined on this cross-section: {exc}",
+                sample_count=len(reference),
             )
-        else:
-            stage = _cross_section(universe, universe_returns, reference, factor_columns)
         if stage is None:
             return self._insufficient_history(asset, as_of_date)
         kept = stage.kept

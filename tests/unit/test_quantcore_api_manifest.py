@@ -2,20 +2,19 @@
 
 """Every quantcore name this project uses is part of the quantcore API it pins.
 
-`tests/fixtures/quantcore_api_manifest_0.3.1-599b8bd.json` is quantcore's API manifest of
-release 0.3.1 at commit 599b8bd, the commit `uv.lock` pins. It is a byte-for-byte copy of
-`docs/api_manifests/quantcore-0.3.1-599b8bd.json` at quantcore commit c8b7218 (file sha256
-9b7aabc448cddbe02445aaad86a3f10124144002790b73945d75c435ffa9610e); its own `sha256` field is
-040a2f86c986b78717de5d109271693957027aee4d2d920ed18d9d3b5ccfb341. quantcore's
+`tests/fixtures/quantcore_api_manifest_0.3.2-4ddac16.json` is quantcore's API manifest of
+release 0.3.2 at commit 4ddac16, the commit `uv.lock` pins. It is a byte-for-byte copy of
+`src/quantcore/api_manifest.json` at that commit (file sha256
+ba7343f5d9e19f2a38fc1670532b2eb26ad82bd80719ccedc5e3c63edd4df763); its own `sha256` field is
+f896e52c6a85acb836bd4a1d6830b637eccd650dedadbfc6425a8b77032aecb2. quantcore's
 `docs/API_MANIFEST.md` at that commit defines the manifest, its hash and the reference check
 ported here.
 
 With no quantcore checkout present, the tests check that the vendored manifest's `sha256`
 matches its canonical content, that every quantcore import and attribute use under `src/` and
-`tests/` resolves in it, and that the installed quantcore and the `uv.lock` pin are the version
-and commit the vendored file names, so a re-pin without re-vendoring fails. Once the installed
-quantcore ships its own `api_manifest.json`, its `sha256` must equal the vendored one; until
-then that test is skipped."""
+`tests/` resolves in it, that the installed quantcore and the `uv.lock` pin are the version and
+commit the vendored file names, and that the installed quantcore ships its own
+`api_manifest.json` with the vendored `sha256`. A re-pin without re-vendoring fails."""
 
 import ast
 import hashlib
@@ -27,8 +26,8 @@ from pathlib import Path
 from typing import Any
 
 _REPO = Path(__file__).resolve().parents[2]
-_MANIFEST = _REPO / "tests" / "fixtures" / "quantcore_api_manifest_0.3.1-599b8bd.json"
-_MANIFEST_SHA256 = "040a2f86c986b78717de5d109271693957027aee4d2d920ed18d9d3b5ccfb341"
+_MANIFEST = _REPO / "tests" / "fixtures" / "quantcore_api_manifest_0.3.2-4ddac16.json"
+_MANIFEST_SHA256 = "f896e52c6a85acb836bd4a1d6830b637eccd650dedadbfc6425a8b77032aecb2"
 # The version and commit the vendored file is named after.
 _PINNED = re.fullmatch(
     r"quantcore_api_manifest_(?P<version>[^-]+)-(?P<commit>[0-9a-f]{7,40})\.json", _MANIFEST.name
@@ -168,31 +167,33 @@ def test_unknown_quantcore_names_are_reported(tmp_path: Path) -> None:
     ]
 
 
+def _installed_quantcore_commit() -> str:
+    """The commit the installed quantcore was built from: `vcs_info.commit_id` of its
+    `direct_url.json`."""
+    raw = metadata.distribution("quantcore").read_text("direct_url.json")
+    assert raw is not None, "installed quantcore has no direct_url.json"
+    return str(json.loads(raw)["vcs_info"]["commit_id"])
+
+
 def test_vendored_manifest_is_the_pinned_release() -> None:
     """The vendored manifest's version is the installed quantcore's, and the commit `uv.lock`
-    pins is the one its file is named after, so a re-pin without re-vendoring fails."""
+    pins and the installed quantcore's commit are the one its file is named after, so a re-pin
+    without re-vendoring fails."""
     assert _PINNED is not None
     manifest = _load(_MANIFEST)
     assert manifest["package"] == "quantcore"
     assert manifest["version"] == _PINNED["version"]
     assert metadata.version("quantcore") == manifest["version"]
     assert _locked_quantcore_commit().startswith(_PINNED["commit"])
-
-
-# The quantcore releases built before the manifest shipped inside the package.
-_RELEASES_WITHOUT_A_SHIPPED_MANIFEST = ("0.3.1", "0.3.2")
+    assert _installed_quantcore_commit().startswith(_PINNED["commit"])
 
 
 def test_installed_quantcore_ships_the_vendored_manifest() -> None:
-    """The installed quantcore's own `api_manifest.json` has the vendored `sha256`; a release
-    from before the manifest shipped (`_RELEASES_WITHOUT_A_SHIPPED_MANIFEST`) has none, and any
-    later release without one fails."""
+    """The installed quantcore ships its own `api_manifest.json`, whose `sha256` is the hash of
+    its content and equals the vendored manifest's."""
     shipped = resources.files("quantcore") / "api_manifest.json"
     version = metadata.version("quantcore")
-    if not shipped.is_file():
-        assert version in _RELEASES_WITHOUT_A_SHIPPED_MANIFEST, (
-            f"quantcore {version} ships no api_manifest.json"
-        )
-        return
+    assert shipped.is_file(), f"quantcore {version} ships no api_manifest.json"
     installed = json.loads(shipped.read_text(encoding="utf-8"))
+    assert manifest_sha256(installed) == installed["sha256"]
     assert installed["sha256"] == _load(_MANIFEST)["sha256"]

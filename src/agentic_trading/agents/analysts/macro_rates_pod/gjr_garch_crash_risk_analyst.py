@@ -5,6 +5,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from pydantic import PrivateAttr
+from quantcore.errors import UndefinedResultError
 from quantcore.risk import ConvergenceError, variance_backcast
 from quantcore.risk.egarch import GJRGARCHParams, gjr_garch_11_variance, gjr_garch_fit
 
@@ -40,7 +41,9 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
 
     Stays flat at confidence 0, with the failing check named in the
     rationale, whenever the window is shorter than `min_garch_observations`
-    (unavailable); the fit or variance recursion raises, or the optimizer
+    or the fit is undefined on it (quantcore's `UndefinedResultError`:
+    returns with no range) (unavailable); the fit or variance recursion
+    raises otherwise, or the optimizer
     does not converge (`ConvergenceError` without SciPy's success message,
     named in the rationale) (error); the fit converges outside the
     stationary region (`classify_gjr_convergence_error`: an
@@ -74,6 +77,10 @@ class GJRGARCHCrashRiskAnalyst(AnalystAgent):
         try:
             fitted: GJRGARCHParams | ConvergenceError = self._refit_cache.get_or_refit(
                 asset, as_of_date, lambda: fit_or_convergence_error(gjr_garch_fit, returns)
+            )
+        except UndefinedResultError as exc:
+            return self.unavailable_signal(
+                asset, as_of_date, f"GJR-GARCH fit undefined on these returns: {exc}"
             )
         except (RuntimeError, ValueError) as exc:
             logger.debug(

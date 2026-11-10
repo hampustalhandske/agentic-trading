@@ -178,6 +178,82 @@ def test_an_environment_recorded_without_blas_threads_still_loads() -> None:
     assert provenance.RuntimeEnvironment.model_validate(payload).blas_threads is None
 
 
+@pytest.mark.parametrize(
+    ("path", "vendor"),
+    [
+        (
+            "/System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/"
+            "vecLib.framework/Versions/A/libBLAS.dylib",
+            "accelerate",
+        ),
+        (
+            "/venv/lib/python3.12/site-packages/numpy.libs/libscipy_openblas64_-6bb31eeb.so",
+            "openblas",
+        ),
+        ("/usr/lib/x86_64-linux-gnu/libopenblas.so.0", "openblas"),
+        ("/opt/intel/oneapi/mkl/latest/lib/libmkl_rt.so.2", "mkl"),
+        ("/usr/lib/libblis.so.4", "blis"),
+        (
+            "/System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/"
+            "vecLib.framework/Versions/A/libLAPACK.dylib",
+            None,
+        ),
+        ("/venv/lib/python3.12/site-packages/scipy/linalg/_fblas.cpython-312-darwin.so", None),
+        ("/usr/lib/libSystem.B.dylib", None),
+    ],
+)
+def test_blas_vendor_of_names_the_vendor_of_a_blas_library(path: str, vendor: str | None) -> None:
+    assert provenance.blas_vendor_of(path) == vendor
+
+
+@pytest.mark.parametrize(
+    ("config", "version"),
+    [
+        ("OpenBLAS 0.3.29  USE64BITINT DYNAMIC_ARCH NO_AFFINITY Haswell MAX_THREADS=64", "0.3.29"),
+        ("OpenBLAS 0.3.21 NO_LAPACKE DYNAMIC_ARCH NO_AFFINITY neoversen1 MAX_THREADS=64", "0.3.21"),
+        ("DYNAMIC_ARCH NO_AFFINITY", None),
+    ],
+)
+def test_openblas_version_is_read_from_its_config_string(config: str, version: str | None) -> None:
+    assert provenance.openblas_version(config) == version
+
+
+def _vendor_named(blas_name: str | None) -> str | None:
+    """The vendor numpy's build-time BLAS name refers to."""
+    lowered = (blas_name or "").lower()
+    for vendor in ("accelerate", "openblas", "mkl", "blis"):
+        if vendor in lowered:
+            return vendor
+    return None
+
+
+def test_linked_blas_includes_the_blas_numpy_was_built_against() -> None:
+    """The BLAS libraries loaded in this process include one of the vendor numpy's build
+    configuration names; each entry names its library file without a directory."""
+    linked = provenance.linked_blas()
+    built_against = _vendor_named(runtime_environment().blas_name)
+
+    assert linked
+    assert built_against is None or built_against in {entry.vendor for entry in linked}
+    for entry in linked:
+        assert entry.library and "/" not in entry.library
+        assert entry.version is None or entry.version
+    assert list(linked) == sorted(linked, key=lambda entry: (entry.vendor, entry.library))
+
+
+def test_runtime_environment_records_the_linked_blas() -> None:
+    assert runtime_environment().linked_blas == provenance.linked_blas()
+
+
+def test_an_environment_recorded_without_linked_blas_still_loads() -> None:
+    """An environment recorded before the loaded BLAS was part of it validates, with
+    `linked_blas` null."""
+    payload = provenance.runtime_environment().model_dump(mode="json")
+    payload.pop("linked_blas")
+
+    assert provenance.RuntimeEnvironment.model_validate(payload).linked_blas is None
+
+
 def test_missing_library_is_recorded_as_null(monkeypatch: pytest.MonkeyPatch) -> None:
     """A library that is not installed is null; the others keep their versions."""
     installed_version = metadata.version

@@ -79,7 +79,9 @@ class PerformanceScoreboard:
     ) -> float:
         """Trailing Sortino ratio for `source_id` over the lookback window
         ending at `as_of_date`, via quantcore.performance.metrics — same
-        undefined-on-fewer-than-two-observations behavior as sharpe_ratio."""
+        undefined-on-fewer-than-two-observations behavior as sharpe_ratio.
+        Raises quantcore's `UndefinedResultError` (a `ValueError`) when the
+        ratio is undefined: no return below zero."""
         history = self.track_record.history_for(source_id, as_of_date, lookback_days)
         returns = [entry.attributable_return for entry in history]
         if len(returns) < 2:
@@ -94,7 +96,9 @@ class PerformanceScoreboard:
     ) -> float:
         """Trailing Calmar ratio for `source_id` over the lookback window
         ending at `as_of_date`, via quantcore.performance.metrics — same
-        undefined-on-fewer-than-two-observations behavior as sharpe_ratio."""
+        undefined-on-fewer-than-two-observations behavior as sharpe_ratio.
+        Raises quantcore's `UndefinedResultError` (a `ValueError`) when the
+        ratio is undefined: a maximum drawdown of 0."""
         history = self.track_record.history_for(source_id, as_of_date, lookback_days)
         returns = [entry.attributable_return for entry in history]
         if len(returns) < 2:

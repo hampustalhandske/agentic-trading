@@ -6,6 +6,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from pydantic import PrivateAttr
+from quantcore.errors import UndefinedResultError
 from quantcore.time_series.arima import (
     arima_fit,
     arima_forecast,
@@ -51,9 +52,11 @@ class ARIMAForecastAnalyst(AnalystAgent):
     not trusted); failing either gate abstains (active, flat, confidence
     0). Too little history or no close is unavailable, and so is a pretest
     window with no range or a non-finite pretest p-value: Ljung-Box is
-    undefined there, giving NaN on zeros and a spuriously tiny p on a
-    non-zero constant. A failed order selection or fit, a non-converged one
-    included, is an error, and so are residuals with no range or a
+    undefined there. An order selection or fit quantcore finds undefined
+    on the series (`UndefinedResultError`: every differenced series it
+    would fit has no range) is unavailable too. Any other failed order
+    selection or fit, a non-converged one included, is an error, and so are
+    residuals with no range or a
     non-finite residual p-value. The order is re-identified every
     `settings.analysts.arima_order_reselect_days` on the return series
     with d fixed at 1 (log price is I(1) by construction) and p, q in
@@ -117,6 +120,10 @@ class ARIMAForecastAnalyst(AnalystAgent):
             )
             ar_coefs, ma_coefs, _sigma2 = self._refit_cache.get_or_refit(
                 asset, as_of_date, lambda: arima_fit(log_prices, p, d, q)
+            )
+        except UndefinedResultError as exc:
+            return self.unavailable_signal(
+                asset, as_of_date, f"ARIMA order selection/fit undefined on this series: {exc}"
             )
         except (RuntimeError, ValueError) as exc:
             logger.debug(
