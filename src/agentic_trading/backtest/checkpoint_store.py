@@ -7,8 +7,8 @@ Each simulated day appends exactly that day's new rows to eight tables
 `sizing_diagnostics`, `pod_returns`, `pod_cost_days`) via `INSERT` — O(1) per day, O(n)
 total for a run of length n — with the track record's day row
 (`track_record_days`) and any source or asset it sees for the first time
-(`track_record_sources`, `track_record_assets`), and overwrites two things
-each day: a single
+(`track_record_sources`, `track_record_assets`), and the day's signal
+tally (`signal_tally`), and overwrites two things each day: a single
 `cursor` row (next day index, portfolio state, signal health, the
 pending decisions when they are not the day's own, the Commander's
 serialized risk state, the previous close mid
@@ -24,8 +24,9 @@ for the fetch log.
 
 `read_all` reads the whole state back; `read_recent` reads it with only
 the recent track record and decisions a horizon-bounded engine holds;
-`read_last_day`, `read_unfilled_orders`, `iter_decision_payloads` and
-`iter_source_returns` read single columns of one table each.
+`read_last_day`, `read_unfilled_orders`, `iter_decision_payloads`,
+`iter_source_returns`, `decision_days` and `iter_signal_tally` read single
+columns of one table each.
 
 Each day's decisions are stored as their JSON text, UTF-8 encoded and
 zlib-compressed (`DECISIONS_COMPRESSION_LEVEL`); every reader gives back
@@ -45,22 +46,25 @@ import zlib
 from collections.abc import Iterable, Iterator, Sequence
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from agentic_trading.agents.schemas import (
     CapitalUsage,
     PerformanceRecord,
     PodCostDay,
     PortfolioDecision,
+    SignalStatus,
     SizingDiagnostics,
     TradeRecord,
     UnfilledOrder,
+    VolatilityEstimator,
 )
+from agentic_trading.firm_record.availability import day_signal_counts
 
 # The layout version this module writes into SQLite's `user_version`; a
 # file of any other version (0 for a checkpoint written before versions
 # were recorded) is refused for a resume.
-CHECKPOINT_FORMAT_VERSION = 4
+CHECKPOINT_FORMAT_VERSION = 5
 # zlib level of each day's stored decisions: level 6 compresses a firm
 # record's day of decisions about 14x in about 10 ms; the higher levels
 # shrink it little more for several times the time.
@@ -121,6 +125,19 @@ CREATE TABLE IF NOT EXISTS track_record_days (
     min_date INTEGER NOT NULL,
     max_date INTEGER NOT NULL,
     records INTEGER NOT NULL
+)
+"""
+# Each day's signals as the firm record's availability report counts them
+# (`firm_record.availability.day_signal_counts` of the day's decisions):
+# one row per analyst id, status and volatility estimator (NULL for none)
+# with its number of signals, written with the day's decisions.
+_CREATE_SIGNAL_TALLY = """
+CREATE TABLE IF NOT EXISTS signal_tally (
+    as_of_date TEXT NOT NULL,
+    analyst_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    volatility_estimator TEXT,
+    signals INTEGER NOT NULL
 )
 """
 _CREATE_DECISIONS = """
@@ -229,6 +246,7 @@ _TABLES: tuple[tuple[str, str], ...] = (
     ("track_record_assets", _CREATE_TRACK_RECORD_ASSETS),
     ("track_record_days", _CREATE_TRACK_RECORD_DAYS),
     ("decisions", _CREATE_DECISIONS),
+    ("signal_tally", _CREATE_SIGNAL_TALLY),
     ("trades", _CREATE_TRADES),
     ("unfilled_orders", _CREATE_UNFILLED_ORDERS),
     ("capital_usage", _CREATE_CAPITAL_USAGE),
@@ -359,6 +377,17 @@ def append_day(
                 as_of_date.isoformat(),
                 _compressed(decisions_json),
             ),
+        )
+        connection.executemany(
+            "INSERT INTO signal_tally (as_of_date, analyst_id, status, volatility_estimator, "
+            "signals) VALUES (?, ?, ?, ?, ?)",
+            [
+                (as_of_date.isoformat(), analyst_id, status, estimator, signals)
+                for (analyst_id, status, estimator), signals in sorted(
+                    day_signal_counts(as_of_date, decisions).items(),
+                    key=lambda item: (item[0][0], item[0][1], item[0][2] or ""),
+                )
+            ],
         )
         connection.executemany(
             "INSERT INTO trades (as_of_date, payload) VALUES (?, ?)",
@@ -873,6 +902,30 @@ def iter_decision_payloads(connection: sqlite3.Connection) -> Iterator[tuple[str
         "SELECT as_of_date, payload FROM decisions ORDER BY as_of_date, rowid"
     ):
         yield as_of_date_str, _decompressed(stored)
+
+
+def decision_days(connection: sqlite3.Connection) -> list[str]:
+    """The ISO date of each stored day of decisions, in day order; reads
+    the date column only."""
+    return [
+        as_of_date_str
+        for (as_of_date_str,) in connection.execute(
+            "SELECT as_of_date FROM decisions ORDER BY as_of_date, rowid"
+        )
+    ]
+
+
+def iter_signal_tally(
+    connection: sqlite3.Connection,
+) -> Iterator[tuple[str, str, SignalStatus, VolatilityEstimator | None, int]]:
+    """Each stored `signal_tally` row, `(ISO date, analyst id, status,
+    volatility estimator or None, signals)`, in day order and, within a
+    day, in the order written."""
+    for row in connection.execute(
+        "SELECT as_of_date, analyst_id, status, volatility_estimator, signals FROM signal_tally "
+        "ORDER BY as_of_date, rowid"
+    ):
+        yield cast(tuple[str, str, SignalStatus, VolatilityEstimator | None, int], row)
 
 
 def iter_source_returns(
