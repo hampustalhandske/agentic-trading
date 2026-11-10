@@ -13,9 +13,8 @@ The fixture decides on 16 signals a session. Each budget is a number of bytes pe
 session, applied to the growth from session 10 to 30, and was set a fifth to a third above what
 the fixture measured with `dbstat` when it was set (in brackets, then without `dbstat`):
 
-- decisions: 80 B (63 B, 67 B; firm-v1's days, whose 921 signals repeat one another far more
-  than the fixture's 16, compress to 40 B a signal);
-- track_record: 45 B (34 B, 42 B), at most 40 KB a session for firm-v1's 921 signals;
+- decisions: 80 B (63 B, 67 B);
+- track_record: 45 B (34 B, 42 B);
 - every table together: 500 B (419 B, 477 B), most of it the trades, sizing diagnostics, pod
   costs and capital usage the fixture's instruments and pods write every session whatever
   their signal count.

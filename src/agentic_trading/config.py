@@ -452,9 +452,8 @@ class AnalystConfig(BaseModel):
     pair_min_correlation: float = Field(default=0.5, ge=-1.0, le=1.0)
     max_pairs: int = Field(default=5, ge=1)
     # OU analyst: a half-life beyond the fitted window is not identified by
-    # the data (the spread showed less than one half-life of reversion);
-    # firm-v1 measured 5.2% of directional OU signals above 250 d. The bound
-    # is this many fitted-spread lengths.
+    # the data (the spread showed less than one half-life of reversion).
+    # The bound is this many fitted-spread lengths.
     ou_max_half_life_windows: float = Field(default=1.0, gt=0.0)
     # Regime HMM: two Hamilton states on three years (a one-year window
     # rarely contains two regimes), monthly refit, act above 70% posterior.
