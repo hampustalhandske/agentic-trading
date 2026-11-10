@@ -5,13 +5,16 @@ risk-free-rate report, plus the risk-free rate series itself, read from
 the lakehouse's `fred_vintages` table, and the BIS policy rates the
 backtest accrues spot FX carry from."""
 
+import heapq
+import math
 from datetime import date
 
 import pandas as pd
 
 from agentic_trading.data.instruments import currency_pair
 from agentic_trading.data.loaders.lakehouse_loader import (
-    load_fred_series_from_lakehouse,
+    _FRED_VERSIONS,
+    _guard_data_end,
     load_policy_rates_from_lakehouse,
 )
 
@@ -43,34 +46,75 @@ def load_risk_free_rate_series(start_date: date, end_date: date) -> pd.Series:
     as stored in the lakehouse.
 
     Returned as a decimal daily rate (`annualized_percent / 100 / 252`),
-    indexed by calendar date from `start_date` to `end_date` and
-    forward-filled across non-publishing days (weekends/holidays) so
-    callers can align it against any trading-day index without gaps. It
-    is never filled backwards: every day carries a rate observed on or
-    before it. This is a backtest's own after-the-fact performance report,
-    not a trading signal `generate_signal` reads live — the rate in force
-    on a given day is that day's real rate, so the series is read as
-    known before `end_date` (`load_fred_series_from_lakehouse`).
+    indexed by every calendar date from `start_date` to `end_date`. Each
+    day d carries the DGS3MO value as known on d: the value of the latest
+    observation with a value, among the versions known strictly before d
+    (`lakehouse_loader._select_fred_vintages`, the selection
+    `load_fred_vintages_from_lakehouse` makes), so a revision published
+    after d never reaches d, and a day without a new observation
+    (a weekend, a holiday, the same-day H.15 release published after the
+    close) keeps the previous value. Never filled backwards. The versions
+    are fetched once, as known before `end_date`, through the FRED window
+    store source.
 
-    Raises `ValueError` if the lakehouse has no `DGS3MO` observations, or
-    if `start_date` precedes the first observation (the message names
-    that observation's date)."""
-    annualized_percent = load_fred_series_from_lakehouse(DGS3MO, end_date)
-    if annualized_percent is None or annualized_percent.empty:
+    Raises `ValueError` if the lakehouse has no `DGS3MO` observations
+    known before `end_date`, or if no value is known on `start_date` (the
+    message names the first observation's date)."""
+    _guard_data_end(end_date, "load_risk_free_rate_series")
+    versions = _FRED_VERSIONS.read([DGS3MO], end_date, end_date)[DGS3MO]
+    if versions["value"].isna().all():
         raise ValueError(
             f"lakehouse has no FRED {DGS3MO} observations up to {end_date.isoformat()}; "
             "the risk-free rate series cannot be built without it"
         )
-    first_observation = annualized_percent.index.min()
-    if pd.Timestamp(start_date) < first_observation:
-        raise ValueError(
-            f"start date {start_date.isoformat()} precedes the first FRED {DGS3MO} "
-            f"observation on {first_observation.date().isoformat()}; the risk-free rate "
-            "is never filled backwards, so the window must start on or after that date"
-        )
-    daily_rate = annualized_percent / 100.0 / TRADING_DAYS_PER_YEAR
     calendar = pd.date_range(start_date, end_date, freq="D")
-    return daily_rate.reindex(calendar).ffill()
+    annualized_percent = known_value_by_day(versions, calendar)
+    if annualized_percent[0] is None:
+        first_observation = pd.Timestamp(versions["date"].min()).date()
+        raise ValueError(
+            f"start date {start_date.isoformat()} precedes the first day a FRED {DGS3MO} "
+            f"value is known (observation {first_observation.isoformat()}); the "
+            "risk-free rate is never filled backwards, so the window must start after it"
+        )
+    return pd.Series(annualized_percent, index=calendar) / 100.0 / TRADING_DAYS_PER_YEAR
+
+
+def known_value_by_day(versions: pd.DataFrame, days: pd.DatetimeIndex) -> list[float | None]:
+    """For each of `days` (ascending), the value of the latest observation
+    with a value in `lakehouse_loader._select_fred_vintages(versions, day)`,
+    or `None` when it holds none: one ordered pass over `versions`, the
+    `_fetch_fred_versions` rows (`date`, `value`, `known_at`, in that
+    fetch's order), instead of one selection per day.
+
+    A version is in force for its observation date from the first day
+    after its `known_at` until a later version of the date is; of versions
+    becoming known together, the last in `versions`' order is. An
+    observation whose version in force has no value is skipped, so the
+    previous observation's value carries."""
+    observed = pd.to_datetime(versions["date"]).tolist()
+    known_at = pd.to_datetime(versions["known_at"]).tolist()
+    values = versions["value"].astype("float64").tolist()
+    # Positions by known_at; the sort is stable, so versions becoming known
+    # on the same date stay in `versions`' order.
+    arrival = sorted(range(len(versions)), key=known_at.__getitem__)
+    in_force: dict[pd.Timestamp, float] = {}
+    # Max-heap (by negated nanoseconds) of observation dates whose version in
+    # force had a value when pushed; an entry whose date has since lost it is
+    # discarded on reaching the top.
+    dated: list[tuple[int, pd.Timestamp]] = []
+    result: list[float | None] = []
+    next_arrival = 0
+    for day in days:
+        while next_arrival < len(arrival) and known_at[arrival[next_arrival]] < day:
+            position = arrival[next_arrival]
+            in_force[observed[position]] = values[position]
+            if not math.isnan(values[position]):
+                heapq.heappush(dated, (-observed[position].value, observed[position]))
+            next_arrival += 1
+        while dated and math.isnan(in_force[dated[0][1]]):
+            heapq.heappop(dated)
+        result.append(in_force[dated[0][1]] if dated else None)
+    return result
 
 
 def load_fx_policy_rates(
