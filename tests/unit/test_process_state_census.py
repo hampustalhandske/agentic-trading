@@ -127,6 +127,10 @@ _ALLOWED: dict[str, str] = {
         "started with"
     ),
     "agentic_trading.data.loaders.lakehouse_loader:_SESSION_LOCK": _LOCK,
+    "agentic_trading.data.lakehouse_client:Lake._process_lock": (
+        _LOCK + "; it guards the count of the process's unfinished lake requests, which is 0 "
+        "between sessions and decides only whether a restart may exec, never a result"
+    ),
     "agentic_trading.data.loaders.lakehouse_loader:_STORE": (
         "the session's window store; a resumed process re-fetches from the lake pinned at the "
         "same lake time, and every stored query orders by every column it returns, by the "

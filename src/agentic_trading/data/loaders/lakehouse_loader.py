@@ -178,6 +178,14 @@ def _lake() -> Lake:
     return Lake(base_url=_required_env(_URL_ENV_VAR), token=_required_env(_TOKEN_ENV_VAR))
 
 
+def lake_requests_in_flight() -> int:
+    """The number of lake requests this process has sent and not finished,
+    over every `Lake` client. The lake holds the query slot of a request
+    whose client went away until the request's deadline, so a process must
+    not exit or exec while this is above 0."""
+    return Lake.in_flight_in_process()
+
+
 # Every table the loader's queries read.
 READ_TABLES: tuple[str, ...] = (
     "bis_observations",

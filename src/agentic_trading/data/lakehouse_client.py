@@ -18,6 +18,14 @@ environment (`LAKEHOUSE_API_URL`, `LAKEHOUSE_API_TOKEN`) unless given explicitly
 Dates come back as dates and timestamps as UTC timestamps. A query that fails part-way raises
 instead of returning a partial result. `lake.last_version` holds the `X-Lakehouse-Version` header
 of the most recent response (`None` before the first request or when the header is absent).
+
+An HTTP 503 whose detail says the lake's query slots are busy is sent again after each of
+`BUSY_RETRY_DELAYS`, each scaled by a random factor within `BUSY_RETRY_JITTER` and never shorter
+than the response's `Retry-After` seconds. The lake itself waits up to 30 s for a slot before it
+answers busy, and holds the slot of a request whose client went away until the request's 300 s
+deadline, so the seven sends span at least about six and a half minutes. Each retry is logged as
+a warning, and the answer to the last send raises like any other. Every other refusal or failure
+raises at once.
 """
 
 from __future__ import annotations
@@ -25,15 +33,31 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-from collections.abc import Iterator
+import random
+import threading
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pyarrow as pa
 
+from agentic_trading.logging_config import get_logger
+
+logger = get_logger(__name__)
+
 DEFAULT_URL = "http://localhost:8600"
 VERSION_HEADER = "X-Lakehouse-Version"
+
+# Seconds to wait before each new send of a request the lake answered with busy query slots: seven
+# sends in all, four minutes of waiting before the last (see the module docstring).
+BUSY_RETRY_DELAYS: tuple[float, ...] = (10.0, 20.0, 30.0, 60.0, 60.0, 60.0)
+# Each delay is scaled by a factor drawn uniformly from [1 - jitter, 1 + jitter].
+BUSY_RETRY_JITTER = 0.2
+# The status and the text of its detail that mean the lake's query slots are all in use.
+_BUSY_STATUS = 503
+_BUSY_DETAIL = "query slots are busy"
 
 
 class LakehouseError(RuntimeError):
@@ -68,15 +92,57 @@ class _ByteStream(io.RawIOBase):
 
 
 class Lake:
-    def __init__(self, base_url: str | None = None, token: str | None = None, timeout: float = 600.0) -> None:
+    """A client of the lakehouse API at `base_url` with `token`. `transport` replaces the HTTP
+    transport (tests), `busy_retry_delays` the waits before each new send of a busy-slots answer
+    (see the module docstring) and `sleep` the function that waits. `in_flight` counts this
+    client's requests sent and not yet finished, over every thread, and
+    `Lake.in_flight_in_process()` those of every client in the process."""
+
+    _process_in_flight = 0
+    _process_lock = threading.Lock()
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        token: str | None = None,
+        timeout: float = 600.0,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        busy_retry_delays: tuple[float, ...] = BUSY_RETRY_DELAYS,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.base_url = (base_url or os.getenv("LAKEHOUSE_API_URL", DEFAULT_URL)).rstrip("/")
         token = token or os.getenv("LAKEHOUSE_API_TOKEN", "")
         self._http = httpx.Client(
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {token}"},
             timeout=httpx.Timeout(timeout, connect=10.0),
+            transport=transport,
         )
+        self._busy_retry_delays = busy_retry_delays
+        self._sleep = sleep
+        self._in_flight = 0
+        self._in_flight_lock = threading.Lock()
         self.last_version: str | None = None
+
+    @property
+    def in_flight(self) -> int:
+        """The number of requests sent and not yet finished (their responses not yet fully read
+        or closed), over every thread."""
+        with self._in_flight_lock:
+            return self._in_flight
+
+    @classmethod
+    def in_flight_in_process(cls) -> int:
+        """The number of requests every `Lake` of this process has sent and not yet finished."""
+        with cls._process_lock:
+            return cls._process_in_flight
+
+    def _count_in_flight(self, change: int) -> None:
+        with self._in_flight_lock:
+            self._in_flight += change
+        with Lake._process_lock:
+            Lake._process_in_flight += change
 
     # -- data -----------------------------------------------------------------------
 
@@ -97,9 +163,7 @@ class Lake:
     @contextlib.contextmanager
     def _arrow_reader(self, query: str, params: list[Any] | None) -> Iterator[pa.RecordBatchStreamReader]:
         body = {"sql": query, "params": params or [], "format": "arrow"}
-        with self._http.stream("POST", "/v1/sql", json=body) as resp:
-            self._record_version(resp)
-            self._raise_for(resp)
+        with self._response("POST", "/v1/sql", json=body) as resp:
             yield pa.ipc.open_stream(io.BufferedReader(_ByteStream(resp.iter_bytes())))
 
     def to_parquet(self, query: str, path: str | Path, params: list[Any] | None = None) -> Path:
@@ -107,9 +171,7 @@ class Lake:
         path = Path(path)
         body = {"sql": query, "params": params or [], "format": "parquet"}
         tmp = path.with_suffix(path.suffix + ".partial")
-        with self._http.stream("POST", "/v1/sql", json=body) as resp:
-            self._record_version(resp)
-            self._raise_for(resp)
+        with self._response("POST", "/v1/sql", json=body) as resp:
             with tmp.open("wb") as fh:
                 for chunk in resp.iter_bytes():
                     fh.write(chunk)
@@ -130,10 +192,10 @@ class Lake:
 
     def ask(self, question: str, as_of: str | None = None, include_evidence: bool = False) -> dict[str, Any]:
         """A natural-language answer with the SQL it rests on (needs the `ask` scope)."""
-        resp = self._http.post("/v1/ask", json={"question": question, "as_of": as_of, "include_evidence": include_evidence})
-        self._record_version(resp)
-        self._raise_for(resp)
-        return resp.json()
+        body = {"question": question, "as_of": as_of, "include_evidence": include_evidence}
+        with self._response("POST", "/v1/ask", json=body) as resp:
+            resp.read()
+            return resp.json()
 
     def health(self) -> dict[str, Any]:
         return self._get("/v1/health")
@@ -141,10 +203,56 @@ class Lake:
     # -- helpers ----------------------------------------------------------------------
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        resp = self._http.get(path, params=params)
-        self._record_version(resp)
-        self._raise_for(resp)
-        return resp.json()
+        with self._response("GET", path, params=params) as resp:
+            resp.read()
+            return resp.json()
+
+    @contextlib.contextmanager
+    def _response(self, method: str, path: str, **kwargs: Any) -> Iterator[httpx.Response]:
+        """The streamed response to `method` `path`, after recording its version and raising
+        `LakehouseError` for a refusal. A busy-slots answer is sent again after each of the busy
+        retry delays, each logged; the answer after the last delay raises like any other."""
+        delays = self._busy_retry_delays
+        for attempt in range(len(delays) + 1):
+            self._count_in_flight(1)
+            try:
+                with self._http.stream(method, path, **kwargs) as resp:
+                    self._record_version(resp)
+                    if attempt == len(delays) or not self._is_busy(resp):
+                        self._raise_for(resp)
+                        yield resp
+                        return
+            finally:
+                self._count_in_flight(-1)
+            wait = max(
+                delays[attempt] * random.uniform(1.0 - BUSY_RETRY_JITTER, 1.0 + BUSY_RETRY_JITTER),
+                self._retry_after(resp),
+            )
+            logger.warning(
+                "Lakehouse query slots busy (HTTP 503) on %s %s; send %d of %d in %.1f s",
+                method,
+                path,
+                attempt + 2,
+                len(delays) + 1,
+                wait,
+            )
+            self._sleep(wait)
+
+    @staticmethod
+    def _retry_after(resp: httpx.Response) -> float:
+        """The response's `Retry-After` header in seconds, 0 when it is absent or not a number."""
+        try:
+            return max(float(resp.headers.get("Retry-After", "0")), 0.0)
+        except ValueError:
+            return 0.0
+
+    @staticmethod
+    def _is_busy(resp: httpx.Response) -> bool:
+        """Whether `resp` is the lake's answer that every query slot is in use."""
+        if resp.status_code != _BUSY_STATUS:
+            return False
+        resp.read()
+        return _BUSY_DETAIL in resp.text
 
     def _record_version(self, resp: httpx.Response) -> None:
         """Sets `last_version` from `resp`'s `X-Lakehouse-Version` header (header names are

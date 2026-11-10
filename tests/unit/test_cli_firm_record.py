@@ -238,6 +238,23 @@ def test_restart_record_execs_the_same_command(monkeypatch: pytest.MonkeyPatch) 
     )
 
 
+def test_restart_record_refuses_with_a_lake_request_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restart raises, without exec, while a lake request is in flight, and execs when none
+    is."""
+    monkeypatch.setattr(sys, "orig_argv", ["python3", "/venv/bin/record"])
+    monkeypatch.setattr(cli, "lake_requests_in_flight", lambda: 1)
+    with patch("agentic_trading.cli.os.execv") as execv:
+        with pytest.raises(RuntimeError, match="1 lake request"):
+            cli._restart_record([])
+    execv.assert_not_called()
+    monkeypatch.setattr(cli, "lake_requests_in_flight", lambda: 0)
+    with patch("agentic_trading.cli.os.execv") as execv:
+        cli._restart_record([])
+    execv.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("start", "end", "store_dir"),
     [

@@ -37,6 +37,7 @@ from agentic_trading.data.loader import (
 )
 from agentic_trading.data.loaders.lakehouse_loader import (
     declare_loader_window,
+    lake_requests_in_flight,
     lake_session,
     loader_query_counts,
     loader_store_usage,
@@ -1274,7 +1275,15 @@ def _restart_record(extra_args: list[str]) -> None:
     """Replaces this process with the command line it was started with
     (`sys.orig_argv`) plus `extra_args`, whose options override earlier
     ones of the same name, after flushing the standard streams and the log
-    handlers. The pid stays the same."""
+    handlers. The pid stays the same. Raises `RuntimeError` instead when a
+    lake request is still in flight (`lake_requests_in_flight`), since the
+    exec would abandon it and the lake would hold its query slot."""
+    in_flight = lake_requests_in_flight()
+    if in_flight:
+        raise RuntimeError(
+            f"the firm record cannot restart with {in_flight} lake request(s) in flight; "
+            "the lake would hold their query slots until their deadline"
+        )
     sys.stdout.flush()
     sys.stderr.flush()
     logging.shutdown()
