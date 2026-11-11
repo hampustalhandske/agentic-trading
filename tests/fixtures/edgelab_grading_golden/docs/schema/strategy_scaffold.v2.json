@@ -1,0 +1,1568 @@
+{
+  "$defs": {
+    "CPCVSpec": {
+      "additionalProperties": false,
+      "description": "Combinatorial purged cross-validation configuration.\n\n`k_test` must be below `n_groups`, and `C(n_groups - 1, k_test - 1)` must be at least\n`min_paths`.",
+      "properties": {
+        "k_test": {
+          "description": "Number of groups held out as test in each combination.",
+          "minimum": 1,
+          "title": "K Test",
+          "type": "integer"
+        },
+        "min_paths": {
+          "description": "Minimum number of AFML paths (phi) a configuration must produce.",
+          "minimum": 1,
+          "title": "Min Paths",
+          "type": "integer"
+        },
+        "n_groups": {
+          "description": "Number of contiguous groups the data is split into.",
+          "minimum": 2,
+          "title": "N Groups",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "n_groups",
+        "k_test",
+        "min_paths"
+      ],
+      "title": "CPCVSpec",
+      "type": "object"
+    },
+    "CostPolicy": {
+      "additionalProperties": false,
+      "description": "The cost schedule, priced separately for every instrument kind a strategy may trade.",
+      "properties": {
+        "crypto": {
+          "$ref": "#/$defs/CostRates",
+          "description": "Cost rates applied to crypto spot/perpetual fills."
+        },
+        "equity": {
+          "$ref": "#/$defs/CostRates",
+          "description": "Cost rates applied to equity fills."
+        },
+        "future": {
+          "$ref": "#/$defs/CostRates",
+          "description": "Cost rates applied to futures fills."
+        },
+        "fx": {
+          "$ref": "#/$defs/CostRates",
+          "description": "Cost rates applied to spot FX fills."
+        },
+        "option": {
+          "$ref": "#/$defs/CostRates",
+          "description": "Cost rates applied to option fills."
+        },
+        "prediction_market": {
+          "$ref": "#/$defs/CostRates",
+          "description": "Cost rates applied to prediction-market fills."
+        }
+      },
+      "required": [
+        "equity",
+        "future",
+        "option",
+        "fx",
+        "crypto",
+        "prediction_market"
+      ],
+      "title": "CostPolicy",
+      "type": "object"
+    },
+    "CostRates": {
+      "additionalProperties": false,
+      "description": "Trading and financing cost assumptions for one instrument kind.\n\nAttributes:\n    borrow_annual_bps: Annualised cost of borrowing shares or coins for a short, in bps of\n        notional; `0.0` for a kind never shorted this way (e.g. a crypto perpetual).\n    hard_to_borrow_rate_bps: Annualised rate replacing `borrow_annual_bps` for hard-to-borrow\n        names; `None` disables the override.\n    liquidation_fee_bps: Fee on the notional of a forced liquidation close, in bps; `0.0` for a\n        kind with no forced liquidation.",
+      "properties": {
+        "borrow_annual_bps": {
+          "description": "General-collateral short-borrow rate, in annualised bps on notional.",
+          "minimum": 0,
+          "title": "Borrow Annual Bps",
+          "type": "number"
+        },
+        "cash_day_count": {
+          "description": "Day-count convention for idle-cash interest and margin financing.",
+          "enum": [
+            "act360",
+            "act365"
+          ],
+          "title": "Cash Day Count",
+          "type": "string"
+        },
+        "commission_bps": {
+          "description": "Broker commission, in bps of notional.",
+          "minimum": 0,
+          "title": "Commission Bps",
+          "type": "number"
+        },
+        "commission_per_contract": {
+          "description": "Broker commission, as a flat amount per contract.",
+          "minimum": 0,
+          "title": "Commission Per Contract",
+          "type": "number"
+        },
+        "exchange_fee_bps": {
+          "description": "Exchange or regulatory fee, in bps of traded notional.",
+          "minimum": 0,
+          "title": "Exchange Fee Bps",
+          "type": "number"
+        },
+        "financing_spread_bps": {
+          "description": "Spread over the risk-free rate on borrowed cash/margin, annualised bps.",
+          "minimum": 0,
+          "title": "Financing Spread Bps",
+          "type": "number"
+        },
+        "half_spread_bps": {
+          "description": "Half the quoted bid/ask spread paid per fill, in bps of notional.",
+          "minimum": 0,
+          "title": "Half Spread Bps",
+          "type": "number"
+        },
+        "hard_to_borrow_rate_bps": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Elevated borrow rate when hard-to-borrow, in bps; None disables it.",
+          "title": "Hard To Borrow Rate Bps"
+        },
+        "impact": {
+          "description": "Market-impact cost model applied per fill.",
+          "discriminator": {
+            "mapping": {
+              "none": "#/$defs/GradingNoImpact",
+              "sqrt": "#/$defs/GradingSqrtImpact"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GradingSqrtImpact"
+            },
+            {
+              "$ref": "#/$defs/GradingNoImpact"
+            }
+          ],
+          "title": "Impact"
+        },
+        "liquidation_fee_bps": {
+          "description": "Fee on the notional of a forced margin-call liquidation close, in bps.",
+          "minimum": 0,
+          "title": "Liquidation Fee Bps",
+          "type": "number"
+        },
+        "slippage_bps": {
+          "description": "Additional slippage beyond the quoted spread, in bps of notional.",
+          "minimum": 0,
+          "title": "Slippage Bps",
+          "type": "number"
+        }
+      },
+      "required": [
+        "commission_bps",
+        "commission_per_contract",
+        "half_spread_bps",
+        "slippage_bps",
+        "impact",
+        "financing_spread_bps",
+        "exchange_fee_bps",
+        "cash_day_count",
+        "borrow_annual_bps",
+        "hard_to_borrow_rate_bps",
+        "liquidation_fee_bps"
+      ],
+      "title": "CostRates",
+      "type": "object"
+    },
+    "CryptoPairCosts": {
+      "additionalProperties": false,
+      "description": "Costs of one crypto pair, replacing the crypto kind's commission and half spread.",
+      "properties": {
+        "half_spread_bps": {
+          "description": "Half the quoted bid/ask spread paid per fill, in bps of notional.",
+          "minimum": 0,
+          "title": "Half Spread Bps",
+          "type": "number"
+        },
+        "taker_fee_bps": {
+          "description": "Venue taker fee charged as commission, in bps of notional.",
+          "minimum": 0,
+          "title": "Taker Fee Bps",
+          "type": "number"
+        }
+      },
+      "required": [
+        "taker_fee_bps",
+        "half_spread_bps"
+      ],
+      "title": "CryptoPairCosts",
+      "type": "object"
+    },
+    "DataFitPolicy": {
+      "additionalProperties": false,
+      "description": "Thresholds the data-fit check applies before a strategy is allowed to run.\n\nAttributes:\n    min_decisions_base: The `30` in the sample-minimum rule `max(30, 30 / (1 -\n        holdout_fraction))`.\n    edge_tolerance_sessions: Matches the data audit's `edge_gap.max_edge_gap_sessions`; for a\n        prediction market the count is calendar days against the window's first and last event.\n    power_calibration_constant: The `z_power + z_alpha` of the power rule\n        (`edgelab.data.fit._min_detectable_sharpe`).\n    max_min_detectable_sharpe: The only power-based failure: if the window's bars, bars per year\n        and trial count imply a minimum detectable annual Sharpe above this, the run is refused;\n        below it the report discloses the number.",
+      "properties": {
+        "edge_tolerance_sessions": {
+          "description": "Expected sessions (or, for a prediction market, calendar days) an instrument's data may start late or end early before the span rule fails.",
+          "minimum": 0,
+          "title": "Edge Tolerance Sessions",
+          "type": "integer"
+        },
+        "max_min_detectable_sharpe": {
+          "description": "Ceiling on the minimum annual Sharpe ratio the tested window could actually detect; above it, the run is refused as pointless.",
+          "exclusiveMinimum": 0,
+          "title": "Max Min Detectable Sharpe",
+          "type": "number"
+        },
+        "min_decisions_base": {
+          "description": "The constant used on both sides of max(30, 30 / (1 - holdout_fraction)): an absolute floor on tested decisions and the numerator scaled by holdout fraction.",
+          "minimum": 1,
+          "title": "Min Decisions Base",
+          "type": "integer"
+        },
+        "min_density": {
+          "description": "Minimum ratio of distinct trading dates to expected sessions.",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Min Density",
+          "type": "number"
+        },
+        "power_calibration_constant": {
+          "description": "The power rule's calibration constant (z_power + z_alpha).",
+          "title": "Power Calibration Constant",
+          "type": "number"
+        },
+        "power_table_reference": {
+          "description": "Identifier of the power table the minimum-detectable-Sharpe reads from.",
+          "minLength": 1,
+          "title": "Power Table Reference",
+          "type": "string"
+        }
+      },
+      "required": [
+        "min_density",
+        "min_decisions_base",
+        "edge_tolerance_sessions",
+        "power_table_reference",
+        "power_calibration_constant",
+        "max_min_detectable_sharpe"
+      ],
+      "title": "DataFitPolicy",
+      "type": "object"
+    },
+    "DataSpec": {
+      "additionalProperties": false,
+      "description": "Where the strategy's data comes from and over what window.\n\nAttributes:\n    provider: Identifier of the data provider, e.g. ``\"yfinance_demo\"`` or ``\"synthetic\"``.\n    range: Calendar date range of data pulled for the run.\n    frequency: Finest bar frequency the provider supplies for this run.\n    snapshot_id: Content hash of the frozen data snapshot used, for reproducibility. ``None``\n        if the run has not been snapshotted yet. When given, must be 64 lowercase hex\n        characters, the shape of a `edgelab.data.snapshot.bundle_hash` digest.\n    params: Provider-specific settings, e.g. the synthetic process and its parameters, or a\n        file path for a file-based provider. Stored as an immutable mapping and part of the\n        spec hash like every other field.",
+      "properties": {
+        "frequency": {
+          "$ref": "#/$defs/Frequency",
+          "description": "Finest bar frequency the provider supplies for this run."
+        },
+        "params": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ParamValue"
+          },
+          "description": "Provider-specific settings, e.g. the synthetic process and its parameters.",
+          "title": "Params",
+          "type": "object"
+        },
+        "provider": {
+          "description": "Data provider identifier, e.g. \"yfinance_demo\" or \"synthetic\".",
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        },
+        "range": {
+          "$ref": "#/$defs/DateRange",
+          "description": "Calendar date range of data pulled for the run."
+        },
+        "snapshot_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Content hash of the frozen data snapshot used: 64 lowercase hex characters.",
+          "title": "Snapshot Id"
+        }
+      },
+      "required": [
+        "provider",
+        "range",
+        "frequency"
+      ],
+      "title": "DataSpec",
+      "type": "object"
+    },
+    "DateRange": {
+      "additionalProperties": false,
+      "description": "An inclusive calendar date range used for data windows and search windows.\n\nAttributes:\n    start: First date included in the range.\n    end: Last date included in the range.",
+      "properties": {
+        "end": {
+          "description": "Last date included in the range.",
+          "format": "date",
+          "title": "End",
+          "type": "string"
+        },
+        "start": {
+          "description": "First date included in the range.",
+          "format": "date",
+          "title": "Start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "title": "DateRange",
+      "type": "object"
+    },
+    "EtfCosts": {
+      "additionalProperties": false,
+      "description": "Costs of one ETF ticker, replacing the equity kind's commission and half spread.",
+      "properties": {
+        "commission_bps": {
+          "description": "Broker commission, in bps of notional.",
+          "minimum": 0,
+          "title": "Commission Bps",
+          "type": "number"
+        },
+        "half_spread_bps": {
+          "description": "Half the quoted bid/ask spread paid per fill, in bps of notional.",
+          "minimum": 0,
+          "title": "Half Spread Bps",
+          "type": "number"
+        }
+      },
+      "required": [
+        "half_spread_bps",
+        "commission_bps"
+      ],
+      "title": "EtfCosts",
+      "type": "object"
+    },
+    "ExecutionPolicy": {
+      "additionalProperties": false,
+      "description": "How a decision becomes a fill, and the frictions applied on top.\n\nAttributes:\n    option_fill_fraction: Fraction of the half-spread an option order pays from the mid toward\n        the adverse quote (`1.0` fills at the full bid/ask).\n    option_max_quote_age_bars: Maximum age of the option-chain snapshot an order may fill\n        against;\n        `0` allows only the fill bar's own snapshot, `None` places no limit.\n    option_max_iv_age_bars: A data-quality tolerance, not a strategy choice.\n    prediction_market_max_quote_age_bars: As `option_max_quote_age_bars`, for order books.\n    prediction_market_max_participation_frac: Largest share of each order-book level's quoted\n        size one prediction-market order may take; the rest of the order walks deeper levels\n        and what no level gives stays unfilled. `1.0` takes whole levels.\n    prediction_market_fee_scale: Multiplier on every prediction-market fee, whatever the\n        market's fee formula; `1.0` charges the formula as it stands.\n    max_adv_participation: Fill-time cap, not a strategy choice.\n    successor_wait_sessions: Sessions after its effective date a successor conversion waits\n        for the successor's first bar; with none by then the holding ends as an unexplained\n        end at its mark.",
+      "properties": {
+        "decision_delay_bars": {
+          "description": "Bars between the decision bar and the earliest fillable bar, for a schedule whose bar is the decision unit. Must be at least 1.",
+          "title": "Decision Delay Bars",
+          "type": "integer"
+        },
+        "decision_delay_trading_days": {
+          "description": "Trading days between the decision and the earliest fillable bar, used instead of decision_delay_bars for a coarse (weekly/monthly/quarterly) schedule. Must be at least 1.",
+          "title": "Decision Delay Trading Days",
+          "type": "integer"
+        },
+        "max_adv_participation": {
+          "description": "Maximum order size, as a fraction of the instrument's average daily volume.",
+          "exclusiveMinimum": 0,
+          "title": "Max Adv Participation",
+          "type": "number"
+        },
+        "option_fill_fraction": {
+          "description": "Fraction of the half-spread an option order pays away from the mid.",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Option Fill Fraction",
+          "type": "number"
+        },
+        "option_max_iv_age_bars": {
+          "description": "Maximum consecutive bars an open option position is marked from a frozen last-observed IV before the mark itself is frozen too.",
+          "minimum": 0,
+          "title": "Option Max Iv Age Bars",
+          "type": "integer"
+        },
+        "option_max_quote_age_bars": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum age, in whole bars, of the option-chain snapshot an order fills against.",
+          "title": "Option Max Quote Age Bars"
+        },
+        "option_min_half_spread_bps": {
+          "description": "Floor on the half-spread used for an option fill, in bps of spot.",
+          "minimum": 0,
+          "title": "Option Min Half Spread Bps",
+          "type": "number"
+        },
+        "prediction_market_fee_scale": {
+          "default": 1.0,
+          "description": "Multiplier applied to every prediction-market fee.",
+          "minimum": 0,
+          "title": "Prediction Market Fee Scale",
+          "type": "number"
+        },
+        "prediction_market_max_participation_frac": {
+          "default": 1.0,
+          "description": "Largest fraction of each order-book level's size a prediction-market order may take.",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Prediction Market Max Participation Frac",
+          "type": "number"
+        },
+        "prediction_market_max_quote_age_bars": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum age, in whole bars, of the order-book snapshot an order fills against.",
+          "title": "Prediction Market Max Quote Age Bars"
+        },
+        "successor_wait_sessions": {
+          "default": 5,
+          "description": "Sessions after the effective date a successor conversion waits for the successor's first bar before the holding ends as an unexplained end.",
+          "minimum": 0,
+          "title": "Successor Wait Sessions",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "decision_delay_bars",
+        "decision_delay_trading_days",
+        "option_fill_fraction",
+        "option_min_half_spread_bps",
+        "option_max_quote_age_bars",
+        "option_max_iv_age_bars",
+        "prediction_market_max_quote_age_bars",
+        "max_adv_participation"
+      ],
+      "title": "ExecutionPolicy",
+      "type": "object"
+    },
+    "Frequency": {
+      "description": "Bar frequency at which a schedule decides or data is sampled.\n\nMembers are ordered from finest to coarsest. The string value (e.g. ``\"1d\"``) is what appears in\nYAML/JSON specs and in the JSON Schema.",
+      "enum": [
+        "1min",
+        "5min",
+        "15min",
+        "30min",
+        "1h",
+        "1d",
+        "1w",
+        "1M"
+      ],
+      "title": "Frequency",
+      "type": "string"
+    },
+    "FuturesRootCosts": {
+      "additionalProperties": false,
+      "description": "Costs of one futures root, charged per contract and side.\n\nAttributes:\n    exchange: The listing exchange.\n    tick_size: Minimum price increment, in price units.\n    point_value_usd: USD value of one price unit for one contract.\n    commission_per_contract_usd: Broker commission per contract and side, in USD.\n    exchange_fee_per_contract_usd: Exchange, clearing and regulatory fees per contract and\n        side, in USD.\n    half_spread_ticks: Half the quoted spread paid per fill, in ticks.\n    slippage_ticks: Slippage beyond the spread per fill, in ticks.",
+      "properties": {
+        "commission_per_contract_usd": {
+          "description": "Broker commission per contract and side, in USD.",
+          "minimum": 0,
+          "title": "Commission Per Contract Usd",
+          "type": "number"
+        },
+        "exchange": {
+          "description": "Listing exchange.",
+          "minLength": 1,
+          "title": "Exchange",
+          "type": "string"
+        },
+        "exchange_fee_per_contract_usd": {
+          "description": "Exchange and regulatory fees per contract and side, in USD.",
+          "minimum": 0,
+          "title": "Exchange Fee Per Contract Usd",
+          "type": "number"
+        },
+        "half_spread_ticks": {
+          "description": "Half the quoted spread paid per fill, in ticks.",
+          "minimum": 0,
+          "title": "Half Spread Ticks",
+          "type": "number"
+        },
+        "point_value_usd": {
+          "description": "USD value of one price unit for one contract.",
+          "exclusiveMinimum": 0,
+          "title": "Point Value Usd",
+          "type": "number"
+        },
+        "slippage_ticks": {
+          "description": "Slippage beyond the spread per fill, in ticks.",
+          "minimum": 0,
+          "title": "Slippage Ticks",
+          "type": "number"
+        },
+        "tick_size": {
+          "description": "Minimum price increment, in price units.",
+          "exclusiveMinimum": 0,
+          "title": "Tick Size",
+          "type": "number"
+        }
+      },
+      "required": [
+        "exchange",
+        "tick_size",
+        "point_value_usd",
+        "commission_per_contract_usd",
+        "exchange_fee_per_contract_usd",
+        "half_spread_ticks",
+        "slippage_ticks"
+      ],
+      "title": "FuturesRootCosts",
+      "type": "object"
+    },
+    "FxPairCosts": {
+      "additionalProperties": false,
+      "description": "Costs of one FX pair, replacing the fx kind's commission and half spread.",
+      "properties": {
+        "commission_bps": {
+          "description": "Broker commission, in bps of notional.",
+          "minimum": 0,
+          "title": "Commission Bps",
+          "type": "number"
+        },
+        "half_spread_bps": {
+          "description": "Half the quoted bid/ask spread paid per fill, in bps of notional.",
+          "minimum": 0,
+          "title": "Half Spread Bps",
+          "type": "number"
+        }
+      },
+      "required": [
+        "half_spread_bps",
+        "commission_bps"
+      ],
+      "title": "FxPairCosts",
+      "type": "object"
+    },
+    "GatePolicy": {
+      "additionalProperties": false,
+      "description": "Thresholds for the evidence scorecard that produces the final verdict.\n\nAttributes:\n    max_pbo_red: Must be at least `max_pbo_green`.\n    amber_band: Fraction of a threshold's magnitude a failing value may fall within and still be\n        amber rather than red.\n    min_survivorship_coverage: Below this the verdict caps the label at Insufficient evidence.\n    dsr_trial_variance: Which variance scales the Deflated Sharpe hurdle: `\"family\"` (the\n        sample variance of the searched trials' Sharpe ratios) or `\"no_skill\"` (the sampling\n        variance of a Sharpe ratio under no skill, `1 / (T - 1)`). The family dispersion\n        includes the tested trial, so a trial with a real edge raises its own hurdle.\n        Optional: a block may omit it and takes `DEFAULT_DSR_TRIAL_VARIANCE`, and a block\n        holding the default dumps without it, so a block that omits it and one that states\n        the default are the same values.\n    min_worthwhile_sharpe: Smallest annual Sharpe ratio worth trading. A run whose Sharpe\n        ratio is bounded above by less than this, with 95% confidence, has no edge worth\n        trading. Optional like `dsr_trial_variance`: a block holding\n        `DEFAULT_MIN_WORTHWHILE_SHARPE` dumps without it.\n    min_factor_coverage: Smallest share of the live window's calendar periods that the factor\n        data must cover for the factor regression to run; below it factor attribution is not\n        evaluated. Optional like `dsr_trial_variance`: a block holding\n        `DEFAULT_MIN_FACTOR_COVERAGE` dumps without it.\n    min_beta_bars: Live bars for which an `alpha` hypothesis deducts a symbol or universe\n        benchmark whole before it scales it by the past-only beta (the OLS slope of net on\n        benchmark over the live bars before the bar). Optional like `dsr_trial_variance`: a\n        block holding `DEFAULT_MIN_BETA_BARS` dumps without it.",
+      "properties": {
+        "amber_band": {
+          "description": "Fraction of a threshold's magnitude a failing value may still fall within and be amber.",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Amber Band",
+          "type": "number"
+        },
+        "cpcv_percentile": {
+          "description": "Percentile of the CPCV OOS Sharpe distribution that must be positive.",
+          "exclusiveMaximum": 50,
+          "exclusiveMinimum": 0,
+          "title": "Cpcv Percentile",
+          "type": "number"
+        },
+        "dsr_trial_variance": {
+          "default": "family",
+          "description": "Variance that scales the Deflated Sharpe hurdle: 'family' is the dispersion of the searched trials' Sharpe ratios; 'no_skill' is the sampling variance of a Sharpe ratio under no skill, 1 / (T - 1), which a real edge in the family cannot raise.",
+          "enum": [
+            "family",
+            "no_skill"
+          ],
+          "title": "Dsr Trial Variance",
+          "type": "string"
+        },
+        "max_calibration_p": {
+          "description": "Maximum bootstrap p-value for a prediction-market model's Brier score to count as significantly below the market's.",
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "title": "Max Calibration P",
+          "type": "number"
+        },
+        "max_pbo_green": {
+          "description": "PBO below which the gate is green.",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Max Pbo Green",
+          "type": "number"
+        },
+        "max_pbo_red": {
+          "description": "PBO above which the gate is red.",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Max Pbo Red",
+          "type": "number"
+        },
+        "max_random_entry_p": {
+          "description": "Maximum acceptable p-value from the random-entry placebo test.",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Max Random Entry P",
+          "type": "number"
+        },
+        "min_active_bars": {
+          "description": "Minimum live bars with a non-zero gross return before any inference gate reports a number.",
+          "minimum": 2,
+          "title": "Min Active Bars",
+          "type": "integer"
+        },
+        "min_beta_bars": {
+          "default": 63,
+          "description": "Live bars for which an alpha hypothesis deducts a market benchmark whole before scaling it by the past-only beta.",
+          "minimum": 2,
+          "title": "Min Beta Bars",
+          "type": "integer"
+        },
+        "min_breakeven_cost_multiple": {
+          "description": "Minimum multiple of assumed costs the strategy must withstand.",
+          "title": "Min Breakeven Cost Multiple",
+          "type": "number"
+        },
+        "min_cpcv_percentile_sharpe": {
+          "description": "Minimum Sharpe required at cpcv_percentile.",
+          "title": "Min Cpcv Percentile Sharpe",
+          "type": "number"
+        },
+        "min_delay_sharpe_retention": {
+          "description": "Minimum fraction of base-case Sharpe retained after +1 bar delay.",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Min Delay Sharpe Retention",
+          "type": "number"
+        },
+        "min_dsr": {
+          "description": "Minimum Deflated Sharpe Ratio.",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Min Dsr",
+          "type": "number"
+        },
+        "min_factor_alpha_t": {
+          "description": "Minimum HAC t-statistic of the factor-model alpha.",
+          "title": "Min Factor Alpha T",
+          "type": "number"
+        },
+        "min_factor_coverage": {
+          "default": 0.9,
+          "description": "Smallest share of the live window's calendar periods the factor data must cover for the factor regression to run; below it factor attribution is not evaluated.",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Min Factor Coverage",
+          "type": "number"
+        },
+        "min_hac_t_multiple": {
+          "description": "Minimum HAC t-statistic of mean net excess return when trials > 1.",
+          "title": "Min Hac T Multiple",
+          "type": "number"
+        },
+        "min_hac_t_single": {
+          "description": "Minimum HAC t-statistic for a genuinely single pre-registered trial.",
+          "title": "Min Hac T Single",
+          "type": "number"
+        },
+        "min_psr": {
+          "description": "Minimum Probabilistic Sharpe Ratio against SR* = 0.",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Min Psr",
+          "type": "number"
+        },
+        "min_round_trips": {
+          "description": "Minimum bets before any inference gate reports a number.",
+          "minimum": 1,
+          "title": "Min Round Trips",
+          "type": "integer"
+        },
+        "min_survivorship_coverage": {
+          "description": "Minimum share of an index universe's ex-members with prices through their removal.",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Min Survivorship Coverage",
+          "type": "number"
+        },
+        "min_worthwhile_sharpe": {
+          "default": 0.3,
+          "description": "Smallest annual Sharpe ratio worth trading; a run whose 95% upper bound on the Sharpe ratio is below it shows no edge worth trading.",
+          "exclusiveMinimum": 0,
+          "title": "Min Worthwhile Sharpe",
+          "type": "number"
+        },
+        "require_holdout_positive": {
+          "description": "Whether the locked holdout return must be positive.",
+          "title": "Require Holdout Positive",
+          "type": "boolean"
+        },
+        "require_min_trl": {
+          "description": "Whether the track record must reach the implied Minimum Track Record Length.",
+          "title": "Require Min Trl",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "min_hac_t_multiple",
+        "min_hac_t_single",
+        "min_psr",
+        "min_dsr",
+        "max_pbo_green",
+        "max_pbo_red",
+        "require_min_trl",
+        "cpcv_percentile",
+        "min_cpcv_percentile_sharpe",
+        "require_holdout_positive",
+        "min_breakeven_cost_multiple",
+        "min_delay_sharpe_retention",
+        "min_factor_alpha_t",
+        "max_random_entry_p",
+        "max_calibration_p",
+        "min_round_trips",
+        "min_active_bars",
+        "amber_band",
+        "min_survivorship_coverage"
+      ],
+      "title": "GatePolicy",
+      "type": "object"
+    },
+    "GradingDateHoldout": {
+      "additionalProperties": false,
+      "description": "Reserve everything from `start` onward as the final locked holdout.",
+      "properties": {
+        "kind": {
+          "const": "date",
+          "description": "Discriminator selecting a fixed-start-date holdout.",
+          "title": "Kind",
+          "type": "string"
+        },
+        "start": {
+          "description": "First date included in the holdout.",
+          "format": "date",
+          "title": "Start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "start"
+      ],
+      "title": "GradingDateHoldout",
+      "type": "object"
+    },
+    "GradingFractionHoldout": {
+      "additionalProperties": false,
+      "description": "Reserve a trailing fraction of the data range, in `(0, 0.5]`, as the locked holdout.",
+      "properties": {
+        "fraction": {
+          "description": "Fraction of the data range reserved for the holdout.",
+          "exclusiveMinimum": 0,
+          "maximum": 0.5,
+          "title": "Fraction",
+          "type": "number"
+        },
+        "kind": {
+          "const": "fraction",
+          "description": "Discriminator selecting a trailing-fraction holdout.",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "fraction"
+      ],
+      "title": "GradingFractionHoldout",
+      "type": "object"
+    },
+    "GradingNoImpact": {
+      "additionalProperties": false,
+      "description": "No market-impact cost is modelled.",
+      "properties": {
+        "kind": {
+          "const": "none",
+          "description": "Discriminator selecting no market-impact cost.",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "GradingNoImpact",
+      "type": "object"
+    },
+    "GradingSpec": {
+      "additionalProperties": false,
+      "description": "A strategy's full grading policy: every value edgelab applies when judging its backtest.\n\nEvery field is required except `instrument_costs`, so a grading block with a missing field is\nrefused (`edgelab.grading.write.render_grading_yaml` writes every value out).",
+      "properties": {
+        "costs": {
+          "$ref": "#/$defs/CostPolicy",
+          "description": "The cost schedule, per instrument kind."
+        },
+        "data_fit": {
+          "$ref": "#/$defs/DataFitPolicy",
+          "description": "Thresholds the data-fit check applies before a strategy is allowed to run."
+        },
+        "execution": {
+          "$ref": "#/$defs/ExecutionPolicy",
+          "description": "Fill delay, participation cap and option/prediction-market fill frictions."
+        },
+        "gates": {
+          "$ref": "#/$defs/GatePolicy",
+          "description": "Thresholds for the evidence scorecard."
+        },
+        "instrument_costs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstrumentCosts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-instrument cost sections that replace the kind-level rates; None charges every instrument its kind's rates."
+        },
+        "margin": {
+          "$ref": "#/$defs/MarginPolicy",
+          "description": "Margin requirements and the liquidation order applied on a margin call."
+        },
+        "robustness": {
+          "$ref": "#/$defs/RobustnessPolicy",
+          "description": "Sensitivity checks run around the primary result."
+        },
+        "validation": {
+          "$ref": "#/$defs/ValidationPolicy",
+          "description": "Out-of-sample validation design."
+        }
+      },
+      "required": [
+        "execution",
+        "costs",
+        "validation",
+        "robustness",
+        "gates",
+        "data_fit",
+        "margin"
+      ],
+      "title": "GradingSpec",
+      "type": "object"
+    },
+    "GradingSqrtImpact": {
+      "additionalProperties": false,
+      "description": "Square-root market impact: cost `coefficient * sigma * sqrt(quantity / ADV)`.",
+      "properties": {
+        "coefficient": {
+          "description": "Impact coefficient k in k * sigma * sqrt(quantity / ADV).",
+          "minimum": 0,
+          "title": "Coefficient",
+          "type": "number"
+        },
+        "kind": {
+          "const": "sqrt",
+          "description": "Discriminator selecting the square-root impact model.",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "coefficient"
+      ],
+      "title": "GradingSqrtImpact",
+      "type": "object"
+    },
+    "GradingWalkForwardSpec": {
+      "additionalProperties": false,
+      "description": "Rolling or anchored walk-forward re-fitting configuration.\n\nAttributes:\n    mode: `\"anchored\"` grows the training window from a fixed start; `\"rolling\"` slides a\n        fixed-length one.\n    train_bars: Bars in each training window.\n    test_bars: Bars in each out-of-sample test window.\n    step_bars: Bars the window advances between folds.",
+      "properties": {
+        "mode": {
+          "description": "Walk-forward window mode.",
+          "enum": [
+            "anchored",
+            "rolling"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "step_bars": {
+          "description": "Bars the window advances between folds.",
+          "minimum": 1,
+          "title": "Step Bars",
+          "type": "integer"
+        },
+        "test_bars": {
+          "description": "Number of bars in each out-of-sample test window.",
+          "minimum": 1,
+          "title": "Test Bars",
+          "type": "integer"
+        },
+        "train_bars": {
+          "description": "Number of bars in each training window.",
+          "minimum": 1,
+          "title": "Train Bars",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mode",
+        "train_bars",
+        "test_bars",
+        "step_bars"
+      ],
+      "title": "GradingWalkForwardSpec",
+      "type": "object"
+    },
+    "InstrumentCosts": {
+      "additionalProperties": false,
+      "description": "Per-instrument cost sections that replace the kind-level rates of `CostPolicy`.\n\nAn instrument with no section is charged its kind's rates.\n\nAttributes:\n    etf: ETF sections by ticker, for equity fills.\n    futures_roots: Futures sections by root, for future fills.\n    fx_pairs: FX sections by pair, for fx fills.\n    crypto_pairs: Crypto sections by pair, for crypto fills.\n    options: Option sections by underlying, for option fills.\n    aliases: Decision-file instrument ids mapped to the keys above (`EURUSD=X` to `EURUSD`).",
+      "properties": {
+        "aliases": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Decision-file instrument ids mapped to section keys.",
+          "title": "Aliases",
+          "type": "object"
+        },
+        "crypto_pairs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/CryptoPairCosts"
+          },
+          "description": "Crypto sections by pair.",
+          "title": "Crypto Pairs",
+          "type": "object"
+        },
+        "etf": {
+          "additionalProperties": {
+            "$ref": "#/$defs/EtfCosts"
+          },
+          "description": "ETF sections by ticker.",
+          "title": "Etf",
+          "type": "object"
+        },
+        "futures_roots": {
+          "additionalProperties": {
+            "$ref": "#/$defs/FuturesRootCosts"
+          },
+          "description": "Futures sections by root.",
+          "title": "Futures Roots",
+          "type": "object"
+        },
+        "fx_pairs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/FxPairCosts"
+          },
+          "description": "FX sections by pair.",
+          "title": "Fx Pairs",
+          "type": "object"
+        },
+        "options": {
+          "additionalProperties": {
+            "$ref": "#/$defs/OptionUnderlyingCosts"
+          },
+          "description": "Option sections by underlying.",
+          "title": "Options",
+          "type": "object"
+        }
+      },
+      "required": [
+        "etf",
+        "futures_roots",
+        "fx_pairs",
+        "crypto_pairs",
+        "options",
+        "aliases"
+      ],
+      "title": "InstrumentCosts",
+      "type": "object"
+    },
+    "MarginPolicy": {
+      "additionalProperties": false,
+      "description": "Margin requirements and the liquidation order applied when a margin call forces a sale.\n\nAttributes:\n    liquidation_order: `\"largest_loss_first\"` closes the position with the largest unrealised\n        loss first.\n    initial_margin_short_pct: Reg T initial margin as a fraction of the short's market value\n        (`1.5` = 150%); `maintenance_margin_short_pct` must be below it minus `1.0`.\n    crypto_perpetual_maintenance_margin_rate: Must be below the initial rate.",
+      "properties": {
+        "crypto_perpetual_initial_margin_rate": {
+          "description": "Fraction of notional posted as margin on a perpetual position.",
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "title": "Crypto Perpetual Initial Margin Rate",
+          "type": "number"
+        },
+        "crypto_perpetual_maintenance_margin_rate": {
+          "description": "Fraction of notional below which a perpetual position is liquidated.",
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "title": "Crypto Perpetual Maintenance Margin Rate",
+          "type": "number"
+        },
+        "crypto_spot_maintenance_margin_pct": {
+          "description": "Equity required, as a fraction of current short market value, before a crypto spot short is forced to cover.",
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "title": "Crypto Spot Maintenance Margin Pct",
+          "type": "number"
+        },
+        "initial_margin_short_pct": {
+          "description": "Reg T initial margin for a new short, as a fraction of market value.",
+          "exclusiveMinimum": 1.0,
+          "title": "Initial Margin Short Pct",
+          "type": "number"
+        },
+        "liquidation_order": {
+          "const": "largest_loss_first",
+          "description": "Which open position a forced sale closes first.",
+          "title": "Liquidation Order",
+          "type": "string"
+        },
+        "maintenance_margin_long_pct": {
+          "description": "Equity required, as a fraction of margin-funded long market value, before the book is forced to sell.",
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "title": "Maintenance Margin Long Pct",
+          "type": "number"
+        },
+        "maintenance_margin_short_pct": {
+          "description": "Equity required, as a fraction of current short market value, before an equity book is forced to cover.",
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "title": "Maintenance Margin Short Pct",
+          "type": "number"
+        }
+      },
+      "required": [
+        "liquidation_order",
+        "initial_margin_short_pct",
+        "maintenance_margin_short_pct",
+        "maintenance_margin_long_pct",
+        "crypto_spot_maintenance_margin_pct",
+        "crypto_perpetual_initial_margin_rate",
+        "crypto_perpetual_maintenance_margin_rate"
+      ],
+      "title": "MarginPolicy",
+      "type": "object"
+    },
+    "OptionUnderlyingCosts": {
+      "additionalProperties": false,
+      "description": "Costs of the options on one underlying, charged per contract and side.\n\nAttributes:\n    commission_per_contract_usd: Broker commission per contract and side, in USD.\n    exchange_fee_per_contract_usd: Exchange and clearing fee per contract and side, in USD.\n    regulatory_fee_per_contract_usd: Regulatory fee per contract and side, in USD.\n    spread_fraction_paid: Fraction of the quoted spread an order pays away from the mid\n        (replaces `execution.option_fill_fraction` for this underlying).",
+      "properties": {
+        "commission_per_contract_usd": {
+          "description": "Broker commission per contract and side, in USD.",
+          "minimum": 0,
+          "title": "Commission Per Contract Usd",
+          "type": "number"
+        },
+        "exchange_fee_per_contract_usd": {
+          "description": "Exchange and clearing fee per contract and side, in USD.",
+          "minimum": 0,
+          "title": "Exchange Fee Per Contract Usd",
+          "type": "number"
+        },
+        "regulatory_fee_per_contract_usd": {
+          "description": "Regulatory fee per contract and side, in USD.",
+          "minimum": 0,
+          "title": "Regulatory Fee Per Contract Usd",
+          "type": "number"
+        },
+        "spread_fraction_paid": {
+          "description": "Fraction of the quoted spread an order pays away from the mid.",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Spread Fraction Paid",
+          "type": "number"
+        }
+      },
+      "required": [
+        "commission_per_contract_usd",
+        "exchange_fee_per_contract_usd",
+        "regulatory_fee_per_contract_usd",
+        "spread_fraction_paid"
+      ],
+      "title": "OptionUnderlyingCosts",
+      "type": "object"
+    },
+    "ParamValue": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
+    "ParametersBlock": {
+      "additionalProperties": false,
+      "description": "A strategy's parameter grid and its pre-registered selection.\n\nAttributes:\n    grid: Strategy-class field name to the values to sweep (`strategy.grid.expand_grid`); empty\n        for a single trial.\n    selected: The pre-registered combination, one value per swept field; required when `grid`\n        expands to more than one trial.",
+      "properties": {
+        "grid": {
+          "additionalProperties": {
+            "items": {
+              "$ref": "#/$defs/ParamValue"
+            },
+            "type": "array"
+          },
+          "description": "Field name to the list of values to sweep it over.",
+          "title": "Grid",
+          "type": "object"
+        },
+        "selected": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/ParamValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The pre-registered choice among the grid's combinations.",
+          "title": "Selected"
+        }
+      },
+      "title": "ParametersBlock",
+      "type": "object"
+    },
+    "RiskFreeBenchmark": {
+      "additionalProperties": false,
+      "description": "Benchmark returns from the risk-free rate, so the hypothesis is about excess returns.\n\nAttributes:\n    kind: Discriminator for :data:`BenchmarkSpec`.\n    annual_rate: A constant annual risk-free rate, e.g. `0.02`. `None` takes the rate from\n        the data's `RATES` frame for the book's base currency, bar by bar: the return over\n        each bar is the rate in force at the previous bar, accrued as simple interest over the\n        calendar days since that bar on the day count the engine credits idle cash on.",
+      "properties": {
+        "annual_rate": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": -1.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Constant annual risk-free rate. None reads the rate per bar from the data's RATES frame for the book's base currency.",
+          "title": "Annual Rate"
+        },
+        "kind": {
+          "const": "risk_free",
+          "default": "risk_free",
+          "description": "Discriminator selecting the risk-free-rate benchmark.",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "title": "RiskFreeBenchmark",
+      "type": "object"
+    },
+    "RobustnessPolicy": {
+      "additionalProperties": false,
+      "description": "Sensitivity checks run around the primary result.\n\nAttributes:\n    extra_delay: Extra execution lags as durations (e.g. `\"1D\"`), tested with\n        `extra_delay_bars`.",
+      "properties": {
+        "cost_multipliers": {
+          "description": "Multipliers applied to every cost component to trace a break-even cost curve.",
+          "items": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "title": "Cost Multipliers",
+          "type": "array"
+        },
+        "extra_delay": {
+          "description": "Additional execution-lag values as clock-time durations.",
+          "items": {
+            "pattern": "^[1-9][0-9]*(min|h|D)$",
+            "type": "string"
+          },
+          "title": "Extra Delay",
+          "type": "array"
+        },
+        "extra_delay_bars": {
+          "description": "Additional execution-lag values, in bars, tested for Sharpe retention.",
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "title": "Extra Delay Bars",
+          "type": "array"
+        },
+        "n_noise_draws": {
+          "description": "Independent noise draws averaged in the noise check.",
+          "minimum": 0,
+          "title": "N Noise Draws",
+          "type": "integer"
+        },
+        "n_start_date_shifts": {
+          "description": "Alternative sample start dates tested for start-date sensitivity.",
+          "minimum": 0,
+          "title": "N Start Date Shifts",
+          "type": "integer"
+        },
+        "n_subperiods": {
+          "description": "Contiguous subperiods the sample is split into.",
+          "minimum": 1,
+          "title": "N Subperiods",
+          "type": "integer"
+        },
+        "noise_bps": {
+          "description": "Standard deviation of synthetic price noise injected per bar, in bps.",
+          "minimum": 0,
+          "title": "Noise Bps",
+          "type": "number"
+        },
+        "remove_best_k": {
+          "description": "Counts of the best individual trades removed to test concentration.",
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "title": "Remove Best K",
+          "type": "array"
+        }
+      },
+      "required": [
+        "cost_multipliers",
+        "extra_delay_bars",
+        "extra_delay",
+        "noise_bps",
+        "n_noise_draws",
+        "remove_best_k",
+        "n_subperiods",
+        "n_start_date_shifts"
+      ],
+      "title": "RobustnessPolicy",
+      "type": "object"
+    },
+    "StrategyHypothesis": {
+      "additionalProperties": false,
+      "description": "`Hypothesis` with every default removed: `threshold`, `sided` and `benchmark` must be stated.\n\nAll other fields and cross-field checks are inherited. `benchmark` may be `None` (no benchmark).",
+      "properties": {
+        "alpha": {
+          "default": 0.05,
+          "description": "Significance level for the primary test, in (0, 0.5].",
+          "exclusiveMinimum": 0,
+          "maximum": 0.5,
+          "title": "Alpha",
+          "type": "number"
+        },
+        "alternative_hypothesis": {
+          "description": "The alternative hypothesis H1.",
+          "minLength": 1,
+          "title": "Alternative Hypothesis",
+          "type": "string"
+        },
+        "benchmark": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "risk_free": "#/$defs/RiskFreeBenchmark",
+                  "symbol": "#/$defs/SymbolBenchmark",
+                  "universe_equal_weight": "#/$defs/UniverseBenchmark"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/SymbolBenchmark"
+                },
+                {
+                  "$ref": "#/$defs/RiskFreeBenchmark"
+                },
+                {
+                  "$ref": "#/$defs/UniverseBenchmark"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Reference return series every evidence gate is computed relative to, or None for no benchmark at all.",
+          "title": "Benchmark"
+        },
+        "null_hypothesis": {
+          "description": "The null hypothesis H0, e.g. \"mean excess net return <= 0\".",
+          "title": "Null Hypothesis",
+          "type": "string"
+        },
+        "primary_metric": {
+          "description": "The single statistic the verdict is based on.",
+          "enum": [
+            "sharpe",
+            "mean_return",
+            "alpha",
+            "information_ratio"
+          ],
+          "title": "Primary Metric",
+          "type": "string"
+        },
+        "rationale": {
+          "description": "Economic story for the edge: who is on the other side of the trade and why the mispricing should persist. At least 20 characters after stripping whitespace.",
+          "title": "Rationale",
+          "type": "string"
+        },
+        "sided": {
+          "description": "Whether the alternative is one-sided (edge in the stated direction) or two-sided.",
+          "enum": [
+            "one",
+            "two"
+          ],
+          "title": "Sided",
+          "type": "string"
+        },
+        "threshold": {
+          "description": "Value of the primary metric under H0, e.g. SR* for a Sharpe test.",
+          "title": "Threshold",
+          "type": "number"
+        }
+      },
+      "required": [
+        "rationale",
+        "null_hypothesis",
+        "alternative_hypothesis",
+        "primary_metric",
+        "threshold",
+        "sided",
+        "benchmark"
+      ],
+      "title": "StrategyHypothesis",
+      "type": "object"
+    },
+    "SymbolBenchmark": {
+      "additionalProperties": false,
+      "description": "Benchmark returns taken from one symbol's bars, e.g. an index ETF or a market index.\n\nThe symbol's bars are loaded from the same data source as the strategy's universe but the\nsymbol is never traded and adds no bar to the run. The benchmark return on a bar is the growth\nof the symbol's close since the previous bar of the run (its latest close at or before each).\n\nAttributes:\n    kind: Discriminator for :data:`BenchmarkSpec`.\n    symbol: Symbol whose bars supply the benchmark. Must not be in the traded universe.",
+      "properties": {
+        "kind": {
+          "const": "symbol",
+          "default": "symbol",
+          "description": "Discriminator selecting a traded-symbol benchmark.",
+          "title": "Kind",
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Ticker of the benchmark instrument.",
+          "minLength": 1,
+          "title": "Symbol",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol"
+      ],
+      "title": "SymbolBenchmark",
+      "type": "object"
+    },
+    "UniverseBenchmark": {
+      "additionalProperties": false,
+      "description": "Benchmark returns of an equal-weighted, every-bar-rebalanced portfolio of the universe.\n\nThe benchmark return on a bar is the average close-to-close return of every universe symbol\nthat has a close on that bar and on the run's previous bar (an index universe's members as of\nthe previous bar; a futures root's front contract). A paper that claims \"the top sectors beat\nholding all sectors\" tests exactly this difference.\n\nAttributes:\n    kind: Discriminator for :data:`BenchmarkSpec`.",
+      "properties": {
+        "kind": {
+          "const": "universe_equal_weight",
+          "default": "universe_equal_weight",
+          "description": "Discriminator selecting the equal-weighted universe benchmark.",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "title": "UniverseBenchmark",
+      "type": "object"
+    },
+    "ValidationPolicy": {
+      "additionalProperties": false,
+      "description": "Out-of-sample validation configuration: holdout, walk-forward, CPCV and purged k-fold.\n\nAttributes:\n    search_window: Date range parameter search may look within; `None` is unrestricted.\n    walk_forward: Walk-forward configuration; `None` disables it.\n    purge_bars: Bars removed around each test fold boundary to prevent label leakage.\n    embargo_bars: Further bars removed after each test fold.",
+      "properties": {
+        "cpcv": {
+          "$ref": "#/$defs/CPCVSpec",
+          "description": "Combinatorial purged cross-validation configuration."
+        },
+        "embargo_bars": {
+          "description": "Additional bars removed after each test fold, beyond purging.",
+          "minimum": 0,
+          "title": "Embargo Bars",
+          "type": "integer"
+        },
+        "holdout": {
+          "description": "How the final locked holdout is carved out.",
+          "discriminator": {
+            "mapping": {
+              "date": "#/$defs/GradingDateHoldout",
+              "fraction": "#/$defs/GradingFractionHoldout"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GradingFractionHoldout"
+            },
+            {
+              "$ref": "#/$defs/GradingDateHoldout"
+            }
+          ],
+          "title": "Holdout"
+        },
+        "kfold_splits": {
+          "description": "Number of folds for purged k-fold cross-validation.",
+          "minimum": 2,
+          "title": "Kfold Splits",
+          "type": "integer"
+        },
+        "purge_bars": {
+          "description": "Bars removed around each test fold boundary to prevent label leakage.",
+          "minimum": 0,
+          "title": "Purge Bars",
+          "type": "integer"
+        },
+        "search_window": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DateRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Date range parameter search may look within; None if unrestricted."
+        },
+        "walk_forward": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GradingWalkForwardSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Walk-forward re-fitting configuration; None disables walk-forward."
+        }
+      },
+      "required": [
+        "holdout",
+        "search_window",
+        "walk_forward",
+        "cpcv",
+        "kfold_splits",
+        "purge_bars",
+        "embargo_bars"
+      ],
+      "title": "ValidationPolicy",
+      "type": "object"
+    }
+  },
+  "$id": "urn:edgelab:schema:strategy_scaffold.v2",
+  "additionalProperties": false,
+  "description": "A `strategy.yaml`: a class reference plus every non-strategic run setting.\n\nFrozen, closed to unknown fields. Strategic decisions live on the named class, not here.\n\nAttributes:\n    name: Human-readable strategy name.\n    version: Version identifier of this config (semantic version or date tag).\n    author: Author of the config.\n    created: Date the config was authored.\n    strategy: Class reference `\"path/to/strategy.py:ClassName\"`.\n    params: Values for the class's fields except those swept by `parameters.grid` (ignored if\n        given); nested blocks such as `schedule` are raw mappings until the class is built.\n    parameters: The parameter grid and its pre-registered selection.\n    hypothesis: The pre-registered, falsifiable claim this run tests.\n    data: Where the data comes from and over what window.\n    grading: The grading policy this run is judged under.\n    capital: Starting NAV in the base currency.\n    seed: Random seed for every stochastic step.\n    replication: Path to a `replication.yaml` for a paper replication; `None` otherwise.",
+  "properties": {
+    "author": {
+      "description": "Author of the config.",
+      "minLength": 1,
+      "title": "Author",
+      "type": "string"
+    },
+    "capital": {
+      "description": "Starting NAV, in the book's base currency.",
+      "exclusiveMinimum": 0,
+      "title": "Capital",
+      "type": "number"
+    },
+    "created": {
+      "description": "Date the config was authored.",
+      "format": "date",
+      "title": "Created",
+      "type": "string"
+    },
+    "data": {
+      "$ref": "#/$defs/DataSpec",
+      "description": "Where the strategy's data comes from and over what window."
+    },
+    "grading": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GradingSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The full grading policy this run is judged under."
+    },
+    "hypothesis": {
+      "$ref": "#/$defs/StrategyHypothesis",
+      "description": "The pre-registered claim this run tests."
+    },
+    "name": {
+      "description": "Human-readable name of the strategy.",
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "parameters": {
+      "$ref": "#/$defs/ParametersBlock",
+      "description": "The parameter grid and its pre-registered selection."
+    },
+    "params": {
+      "additionalProperties": true,
+      "description": "Values for every field the named class declares, except any swept by the grid.",
+      "title": "Params",
+      "type": "object"
+    },
+    "replication": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Path to a replication.yaml, or None for no replication claim.",
+      "title": "Replication"
+    },
+    "seed": {
+      "description": "Random seed for every stochastic step in the run.",
+      "minimum": 0,
+      "title": "Seed",
+      "type": "integer"
+    },
+    "strategy": {
+      "description": "The class reference, \"path/to/strategy.py:ClassName\".",
+      "minLength": 1,
+      "title": "Strategy",
+      "type": "string"
+    },
+    "version": {
+      "description": "Version identifier of this config.",
+      "minLength": 1,
+      "title": "Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "version",
+    "author",
+    "created",
+    "strategy",
+    "params",
+    "parameters",
+    "hypothesis",
+    "data",
+    "capital",
+    "seed"
+  ],
+  "title": "StrategyConfig",
+  "type": "object"
+}

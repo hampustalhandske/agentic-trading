@@ -1,0 +1,723 @@
+{
+  "assessment": {
+    "blocking": [
+      "hac_t"
+    ],
+    "grade": "no_edge",
+    "label": "No edge after costs",
+    "legacy_label": "Reject",
+    "next_step": "The estimated edge after costs is not positive on this sample.",
+    "sharpe_upper_95": 0.34201717553756694,
+    "years": 7.849206349206349,
+    "years_needed": null
+  },
+  "attribution": {
+    "alpha_t": null,
+    "exposure_not_edge": null,
+    "factor_set": null,
+    "r_squared": null,
+    "reason": "attribution: not run: the primary test fixed the rung"
+  },
+  "bets_preview": [],
+  "book_fills": null,
+  "calibration": [],
+  "capacity": {
+    "capacity_at_half_sharpe": null,
+    "participation_mean": null,
+    "reason": "capacity: not run: the primary test fixed the rung"
+  },
+  "caveats": [],
+  "class_metrics": [],
+  "costs": [
+    {
+      "bps": 3.5613361779321164,
+      "component": "commission",
+      "currency": 57.89980209420589
+    },
+    {
+      "bps": 0.3561336177932117,
+      "component": "exchange_fee",
+      "currency": 5.789980209420589
+    },
+    {
+      "bps": 0.045157760421691596,
+      "component": "financing",
+      "currency": 0.7341697780835968
+    },
+    {
+      "bps": 1.3108636377733625,
+      "component": "impact",
+      "currency": 21.311873242935174
+    }
+  ],
+  "data_provenance": {
+    "adjustment_verification": "every ticker's adjustment factors are verified.",
+    "adjustment_verification_ok": true,
+    "lake_freshness": "no lakehouse freshness notes on this bundle (not a lakehouse provider, or no guarded table read).",
+    "lake_freshness_ok": true,
+    "survivorship_coverage": null,
+    "truncated_futures_roots": [],
+    "unexplained_ends": 0
+  },
+  "diagnostics": {
+    "classification": "iid_normal",
+    "reasons": [
+      "None of Ljung-Box (returns), ARCH-LM, or Jarque-Bera rejected at alpha=0.05: returns behave as iid normal.",
+      "kpss: p-value clamped at the interpolation table edge; true value is <= 0.01 or >= 0.1"
+    ]
+  },
+  "events": [],
+  "evidence": [
+    {
+      "gates": [
+        {
+          "explanation": "data_audit: no critical failures -> green",
+          "name": "data_audit",
+          "status": "green",
+          "threshold": 0.0,
+          "value": 0.0
+        },
+        {
+          "explanation": "insolvency: NAV never fell to or below zero -> green",
+          "name": "insolvency",
+          "status": "green",
+          "threshold": 0.0,
+          "value": 0.0
+        }
+      ],
+      "headline_label": "Audit score",
+      "headline_unit": "ratio",
+      "headline_value": 95.0,
+      "key": "data",
+      "question": "Is the data sound?",
+      "status": "green"
+    },
+    {
+      "gates": [
+        {
+          "explanation": "hac_t: -0.6868 (need >= 2.5) -> red [tested series: net return minus Equal weight of the universe, rebalanced every bar]",
+          "name": "hac_t",
+          "status": "red",
+          "threshold": 2.5,
+          "value": -0.6867898003299961
+        },
+        {
+          "explanation": "psr: 0.2219 (need >= 0.95) -> red [tested series: net return minus Equal weight of the universe, rebalanced every bar]",
+          "name": "psr",
+          "status": "red",
+          "threshold": 0.95,
+          "value": 0.2218598489823409
+        }
+      ],
+      "headline_label": "HAC t-statistic",
+      "headline_unit": "ratio",
+      "headline_value": -0.6867898003299961,
+      "key": "significance",
+      "question": "Is it statistically significant?",
+      "status": "red"
+    },
+    {
+      "gates": [
+        {
+          "explanation": "dsr: 0.08473 (need >= 0.95) -> red [tested series: net return minus Equal weight of the universe, rebalanced every bar]",
+          "name": "dsr",
+          "status": "red",
+          "threshold": 0.95,
+          "value": 0.08473104787887625
+        },
+        {
+          "explanation": "pbo: 0.8857 (green <= 0.2, red > 0.5) -> red [tested series: net return minus Equal weight of the universe, rebalanced every bar]",
+          "name": "pbo",
+          "status": "red",
+          "threshold": 0.2,
+          "value": 0.8857142857142857
+        },
+        {
+          "explanation": "track_record: 1978 bars (need >= MinTRL=9119) -> red (too short a track record is insufficient evidence, not evidence against the edge; caps the label at Insufficient evidence rather than Reject) [tested series: net return minus Equal weight of the universe, rebalanced every bar]",
+          "name": "track_record",
+          "status": "red",
+          "threshold": 9118.721975787135,
+          "value": 1978.0
+        }
+      ],
+      "headline_label": "Deflated Sharpe ratio",
+      "headline_unit": "ratio",
+      "headline_value": 0.08473104787887625,
+      "key": "search",
+      "question": "Does it survive the search that found it?",
+      "status": "red"
+    },
+    {
+      "gates": [
+        {
+          "explanation": "cpcv: not evaluated (not run: the primary test fixed the rung). [tested series: net return minus Equal weight of the universe, rebalanced every bar]",
+          "name": "cpcv",
+          "status": "not_evaluated",
+          "threshold": 0.0,
+          "value": null
+        },
+        {
+          "explanation": "holdout: not evaluated (not run: the primary test fixed the rung). [tested series: net return minus Equal weight of the universe, rebalanced every bar]",
+          "name": "holdout",
+          "status": "not_evaluated",
+          "threshold": 0.0,
+          "value": null
+        },
+        {
+          "explanation": "random_entry: not evaluated (not run: the primary test fixed the rung).",
+          "name": "random_entry",
+          "status": "not_evaluated",
+          "threshold": 0.05,
+          "value": null
+        }
+      ],
+      "headline_label": "CPCV 5th-percentile Sharpe",
+      "headline_unit": "ratio",
+      "headline_value": null,
+      "key": "out_of_sample",
+      "question": "Does it hold out of sample?",
+      "status": "not_evaluated"
+    }
+  ],
+  "groups": [],
+  "headline": [
+    {
+      "benchmark": 0.13578534328180392,
+      "difference": -0.0020278503724666663,
+      "key": "cagr",
+      "label": "CAGR",
+      "strategy": 0.13375749290933725,
+      "unit": "pct"
+    },
+    {
+      "benchmark": 0.09579204417131434,
+      "difference": -0.00020564659954744324,
+      "key": "annual_vol",
+      "label": "Volatility, annualised",
+      "strategy": 0.0955863975717669,
+      "unit": "pct"
+    },
+    {
+      "benchmark": 1.3773443808408043,
+      "difference": -0.015945161979253886,
+      "key": "sharpe",
+      "label": "Sharpe ratio (net returns, no rf deduction)",
+      "strategy": 1.3613992188615505,
+      "unit": "ratio"
+    },
+    {
+      "benchmark": 0.13812747275251036,
+      "difference": 0.0006926615103866052,
+      "key": "max_drawdown",
+      "label": "Max drawdown",
+      "strategy": 0.13882013426289697,
+      "unit": "pct"
+    }
+  ],
+  "lead": {
+    "capacity": {
+      "reason": "capacity: not run: the primary test fixed the rung"
+    },
+    "caveats": [],
+    "costs": {
+      "breakeven_cost_multiple": null,
+      "gross_annual_return": 0.13048065043871357,
+      "net_annual_return": 0.13013124698799305
+    },
+    "counts": {
+      "declared_used": false,
+      "n_counted": 2,
+      "n_declared": null,
+      "n_effective": 2.0,
+      "n_used": 2.0,
+      "rung_at_n1": "L1 inconclusive",
+      "rung_at_n_used": "L1 inconclusive"
+    },
+    "detectability": {
+      "mde": 3.217066262839432e-05,
+      "sample_needed": null,
+      "years_needed": null
+    },
+    "effect": {
+      "ci_high": 1.3295802273677244e-05,
+      "ci_low": -2.7640141802414235e-05,
+      "estimate": -7.172169764368496e-06
+    },
+    "holdout": {
+      "access_number": 0,
+      "opened": false,
+      "position": null,
+      "reason": "holdout: not run: the primary test fixed the rung",
+      "sharpe": null
+    },
+    "not_measured": [
+      "parameter sensitivity: not measured",
+      "regime dependence: not measured",
+      "literature ceiling: not measured",
+      "attribution: not run: the primary test fixed the rung"
+    ],
+    "risk": {
+      "cvar_1pct": -0.015650773918701715,
+      "max_drawdown": -0.13882013426289697,
+      "max_drawdown_bars": 307,
+      "worst_month": -0.05222433991194675
+    },
+    "stability": {
+      "leave_one_group_out": "not measured",
+      "sign_by_third": [
+        -1,
+        -1,
+        1
+      ],
+      "subperiod_sharpes": "subperiod sharpes: not run: the primary test fixed the rung",
+      "top_bars": 5,
+      "top_bars_share": null
+    }
+  },
+  "meta": {
+    "asset_class": "equity",
+    "bars_per_year": 252,
+    "benchmark": "Equal weight of the universe, rebalanced every bar",
+    "client": null,
+    "cost_rates_charged": {
+      "AAA": {
+        "commission_bps": 1.0,
+        "commission_per_contract": 0.0,
+        "exchange_fee_bps": 0.1,
+        "exchange_fee_per_contract_usd": null,
+        "half_spread_bps": 1.5,
+        "half_spread_per_contract_usd": null,
+        "key": null,
+        "kind": "equity",
+        "section": "kind",
+        "slippage_bps": 2.0,
+        "slippage_per_contract_usd": null,
+        "spread_fraction_paid": null
+      },
+      "BBB": {
+        "commission_bps": 1.0,
+        "commission_per_contract": 0.0,
+        "exchange_fee_bps": 0.1,
+        "exchange_fee_per_contract_usd": null,
+        "half_spread_bps": 1.5,
+        "half_spread_per_contract_usd": null,
+        "key": null,
+        "kind": "equity",
+        "section": "kind",
+        "slippage_bps": 2.0,
+        "slippage_per_contract_usd": null,
+        "spread_fraction_paid": null
+      },
+      "CCC": {
+        "commission_bps": 1.0,
+        "commission_per_contract": 0.0,
+        "exchange_fee_bps": 0.1,
+        "exchange_fee_per_contract_usd": null,
+        "half_spread_bps": 1.5,
+        "half_spread_per_contract_usd": null,
+        "key": null,
+        "kind": "equity",
+        "section": "kind",
+        "slippage_bps": 2.0,
+        "slippage_per_contract_usd": null,
+        "spread_fraction_paid": null
+      }
+    },
+    "cost_table_sha256": "f1490316bda7b089f0e244d15b6ceb713d22537361e5579273d6b9b166703494",
+    "costs": "Costs (equity): commission 1 bps, half spread 1.5 bps, slippage 2 bps, exchange fee 0.1 bps, sqrt market impact, financing 100 bps over the rate on borrowed cash",
+    "data_fit_note": "With 7.3 years of data and 2 trials, this test can confirm only an edge of annual Sharpe >= 2.13; a weaker real edge would come out Insufficient evidence.",
+    "data_provider": "parquet",
+    "edgelab_dirty": true,
+    "edgelab_sha": "f0d7be02a536a2af82a7abb91413f07d13c1fc7a",
+    "edgelab_version": "0.1.0",
+    "evidence_basis": "stated_hypothesis",
+    "frequency": "1d",
+    "grading_custom_fields": [],
+    "grading_diffs": [],
+    "grading_policy_version": "edgelab-2026.11.1",
+    "holdout_evaluated": false,
+    "holdout_start": "2020-12-31T21:00:00+00:00",
+    "lake_current_tables": null,
+    "lake_time": null,
+    "lake_version": null,
+    "live_end": "2020-12-29T21:00:00+00:00",
+    "live_start": "2013-02-22T21:00:00+00:00",
+    "live_validation": false,
+    "n_bars": 1978,
+    "name": "<Author year short title>",
+    "overall": "Reject",
+    "provenance": "unknown",
+    "quantcore_sha": "599b8bd339898cbbafd07c128b36791d4072d811",
+    "run_id": "9d960df4-58df-488f-af90-3f434b8e2561",
+    "schema_version": 5,
+    "seed": 7,
+    "setup": {
+      "bar": "Daily",
+      "execution": "Market order filled at the open 1 bar after the decision bar",
+      "fill_rule": "next_open",
+      "fills_at_decision_close_share": 0.0,
+      "instrument": "equity",
+      "lag_bars": 1,
+      "order_type": "market",
+      "rebalance": "monthly",
+      "signal": "strategy.py:OwnDataProbe",
+      "sizing": "strategy-decided: `decide()` returns native-unit targets directly",
+      "universe": "3 fixed symbols"
+    },
+    "snapshot_id": "c01405e205cbd16998ec458a3db2f13a0e4a5219726bc78fc42409bafe9bdfae",
+    "spec_hash": "f24adf24dbf6ce8c9e158e02c18371cc77716afd6f16c82b5b6e140bcf4a5159",
+    "strategy_class": "strategy.py:OwnDataProbe",
+    "strategy_dirty": null,
+    "strategy_fields": [
+      [
+        "lookback_bars",
+        "252"
+      ],
+      [
+        "on_capacity_shortfall",
+        "\"drop_remainder\""
+      ],
+      [
+        "on_delisting",
+        "\"exit_at_last_price\""
+      ],
+      [
+        "on_missing_data",
+        "\"hold\""
+      ]
+    ],
+    "strategy_files_sha256": "e4b891d9c4e01c7e67043535eced3ba81d82393acee854a9de30e6bd6a9ebb7c",
+    "test_window": null,
+    "train_end": null,
+    "universe": [
+      "AAA",
+      "BBB",
+      "CCC"
+    ]
+  },
+  "metrics": [
+    {
+      "def_name": "alpha_t_stat",
+      "estimate": null,
+      "group": "E",
+      "p_value": null,
+      "reason": "computed by inference/attribution stage",
+      "tier": "headline"
+    },
+    {
+      "def_name": "beta",
+      "estimate": 0.9945981542978573,
+      "group": "E",
+      "p_value": null,
+      "reason": "beta to the hypothesis benchmark",
+      "tier": "headline"
+    },
+    {
+      "def_name": "cost_drag_bps",
+      "estimate": 2.2205754047710196,
+      "group": "G",
+      "p_value": null,
+      "reason": null,
+      "tier": "headline"
+    },
+    {
+      "def_name": "break_even_cost_multiple",
+      "estimate": null,
+      "group": "G",
+      "p_value": null,
+      "reason": "computed by robustness stage",
+      "tier": "full"
+    }
+  ],
+  "multiple_testing": {
+    "data_snapshots": {
+      "5486311c97e9ad3d4772a427f07fb40398f37093fa6ffed9ee4cc52ca00c56a6": [
+        "fcf052655f9b4343a59898863a46ce6d12079fb64133ba45e493d9cd3f8526d2"
+      ],
+      "9632e69afe4338d545c550773973c22b7ad1461a1853348f05726fa36107aa69": [
+        "fcf052655f9b4343a59898863a46ce6d12079fb64133ba45e493d9cd3f8526d2"
+      ]
+    },
+    "discarded": [],
+    "effective_n_clustered": 2.0,
+    "effective_n_eigen": null,
+    "how_chosen": "Every candidate trial recorded under this spec's own parameter-space grid (2 trials), plus every trial recorded under an ancestor or descendant spec reachable by parent_hash lineage (0 trials); robustness re-runs and randomisation replays are excluded (they re-evaluate an already-chosen parameter set rather than searching for one).",
+    "measurement_versions": {
+      "5486311c97e9ad3d4772a427f07fb40398f37093fa6ffed9ee4cc52ca00c56a6": [
+        "edgelab-2026.11.1"
+      ],
+      "9632e69afe4338d545c550773973c22b7ad1461a1853348f05726fa36107aa69": [
+        "edgelab-2026.11.1"
+      ]
+    },
+    "n_failed": 0,
+    "n_grid": 2,
+    "n_lineage": 0,
+    "n_trials": 2,
+    "pre_registration_note": null,
+    "reported_hypothesis": "5486311c97e9ad3d4772a427f07fb40398f37093fa6ffed9ee4cc52ca00c56a6"
+  },
+  "provenance": {
+    "demo_warning": null,
+    "edgelab_dirty": true,
+    "edgelab_sha": "f0d7be02a536a2af82a7abb91413f07d13c1fc7a",
+    "edgelab_version": "0.1.0",
+    "is_demo": false,
+    "provenance": "unknown",
+    "provider": "parquet",
+    "quantcore_sha": "599b8bd339898cbbafd07c128b36791d4072d811",
+    "seed": 7,
+    "snapshot_id": "c01405e205cbd16998ec458a3db2f13a0e4a5219726bc78fc42409bafe9bdfae",
+    "strategy_dirty": null,
+    "strategy_files_sha256": "e4b891d9c4e01c7e67043535eced3ba81d82393acee854a9de30e6bd6a9ebb7c",
+    "yfinance_warning": null
+  },
+  "replay": null,
+  "replication": {
+    "conclusion": {
+      "agree": false,
+      "edgelab": "no_edge",
+      "edgelab_overall": "Reject",
+      "paper": "edge"
+    },
+    "n_differ": 0,
+    "n_match": 0,
+    "n_not_comparable": 1,
+    "notes": "",
+    "rows": [
+      {
+        "diff": null,
+        "edgelab_value": null,
+        "metric": "annual_return",
+        "note": "run does not cover the paper's sample 2000-01-01..2000-12-31",
+        "paper_se": null,
+        "paper_value": 0.0,
+        "rel_diff": null,
+        "status": "not_comparable",
+        "within_tolerance": null
+      }
+    ],
+    "sample_covered": false,
+    "source_table": "<Table N, row ...>",
+    "source_title": "<paper title>"
+  },
+  "robustness": {
+    "backtests": 0,
+    "breakeven_cost_multiple": {
+      "ci_high": null,
+      "ci_level": null,
+      "ci_low": null,
+      "estimate": null,
+      "kind": "insufficient",
+      "method": null,
+      "n_obs": 5,
+      "n_required": null,
+      "name": "breakeven_cost_multiple",
+      "p_value": null,
+      "reason": "no sign change found across the swept multipliers; bracket [0.5, 3.0]",
+      "warnings": []
+    },
+    "cost_sweep": [
+      {
+        "multiplier": 0.5,
+        "net_sharpe_annual": -0.21730922976515954
+      },
+      {
+        "multiplier": 1.0,
+        "net_sharpe_annual": -0.23376237480823092
+      },
+      {
+        "multiplier": 1.5,
+        "net_sharpe_annual": -0.2502465248052974
+      },
+      {
+        "multiplier": 2.0,
+        "net_sharpe_annual": -0.26675270151236063
+      }
+    ],
+    "cost_sweep_note": "trades held fixed: only the per-fill costs are rescaled, no strategy is re-run; the daily financing accrual mixes the risk-free rate with the scaled spread and cannot be split from the stored columns, so it is not scaled",
+    "delay_sharpe_retention_1": null,
+    "delay_sharpe_retention_2": null,
+    "delay_sweep": [],
+    "leave_one_asset_out": [],
+    "noise_sensitivity": [],
+    "remove_best_k": [],
+    "skipped_reason": "not run: the primary test fixed the rung",
+    "start_date_sensitivity": [],
+    "subperiods": [],
+    "universe_subsample": []
+  },
+  "rung": {
+    "label": "inconclusive",
+    "level": "L1",
+    "reasons": [
+      "primary test failed at alpha_N: inconclusive"
+    ],
+    "red_flags": [
+      "dsr",
+      "pbo"
+    ],
+    "years_needed": null
+  },
+  "series": {
+    "annual": [
+      {
+        "benchmark": 0.1916349797353174,
+        "strategy": 0.1673845634499258,
+        "year": 2013
+      },
+      {
+        "benchmark": 0.07459184889072557,
+        "strategy": 0.07282717746395484,
+        "year": 2014
+      },
+      {
+        "benchmark": 0.1314652563525196,
+        "strategy": 0.1376751607942135,
+        "year": 2015
+      },
+      {
+        "benchmark": 0.0447537733275698,
+        "strategy": 0.043139069522291296,
+        "year": 2016
+      }
+    ],
+    "benchmark_drawdown": [
+      0.003617359147317978,
+      0.0,
+      0.004820001032300847,
+      0.0
+    ],
+    "benchmark_growth": [
+      0.996382640852682,
+      1.0011126089510785,
+      0.9962872451424849,
+      1.0067174120442801
+    ],
+    "decades": [
+      {
+        "benchmark_cagr": 0.13757284536429393,
+        "decade": 2010,
+        "difference": -0.0029294341538663726,
+        "n_bars": 1727,
+        "strategy_cagr": 0.13464341121042755
+      },
+      {
+        "benchmark_cagr": 0.12356238768296235,
+        "decade": 2020,
+        "difference": 0.004118288024954175,
+        "n_bars": 251,
+        "strategy_cagr": 0.12768067570791652
+      }
+    ],
+    "monthly": [
+      {
+        "benchmark": 0.022347131283655397,
+        "month": 2,
+        "strategy": 0.0003889444482167992,
+        "year": 2013
+      },
+      {
+        "benchmark": 0.04011058350126584,
+        "month": 3,
+        "strategy": 0.04458816687789735,
+        "year": 2013
+      },
+      {
+        "benchmark": 0.017342983599928363,
+        "month": 4,
+        "strategy": 0.017406855964178902,
+        "year": 2013
+      },
+      {
+        "benchmark": 0.06707316426267629,
+        "month": 5,
+        "strategy": 0.06659896894775463,
+        "year": 2013
+      }
+    ],
+    "rolling_excess_return": [
+      null,
+      null,
+      null,
+      null
+    ],
+    "rolling_sharpe": [
+      null,
+      null,
+      null,
+      null
+    ],
+    "rolling_window_bars": 756,
+    "strategy_drawdown": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "strategy_growth": [
+      1.0000555555555557,
+      1.0002222314814817,
+      1.0002777993832306,
+      1.0003333703720851
+    ],
+    "ts": [
+      "2013-02-22T21:00:00Z",
+      "2013-02-25T21:00:00Z",
+      "2013-02-26T21:00:00Z",
+      "2013-02-27T21:00:00Z"
+    ]
+  },
+  "tables": {
+    "bets": {
+      "path": "bets.parquet",
+      "rows": 0,
+      "sha256": "9086129d6fc5048f6a552fef0353918ed9ff6cda446833bc7090ca72765164ee"
+    },
+    "trades": {
+      "path": "trades.parquet",
+      "rows": 0,
+      "sha256": "347cb6c0cb6e79de27bba64c3fa5e0ec490aefa6fb660c8d927c6366f0cffe84"
+    }
+  },
+  "trades": {
+    "avg_bars_held": null,
+    "avg_return": null,
+    "best_return": null,
+    "n_round_trips": 0,
+    "win_rate": null,
+    "worst_return": null
+  },
+  "trades_preview": [],
+  "trials": {
+    "declared_family": null,
+    "declared_n": null,
+    "declared_status": "none",
+    "edgelab_n": 2,
+    "exposure_overlap": false,
+    "ledger_export_path": null,
+    "ledger_ref": null,
+    "prior_exposure": null,
+    "test_keys": null
+  },
+  "validation": {
+    "backtests": 0,
+    "cpcv_mean_sharpe": null,
+    "cpcv_oos_sharpe_p5": null,
+    "cpcv_oos_sharpes": [],
+    "holdout_access_number": 0,
+    "holdout_cut": null,
+    "holdout_position": null,
+    "holdout_sharpe": null,
+    "holdout_within_ci": null,
+    "not_run_reason": "not run: the primary test fixed the rung",
+    "random_entry_distribution": [],
+    "random_entry_draws": null,
+    "random_entry_p": null,
+    "random_entry_real": null,
+    "random_entry_reason": "not run: the primary test fixed the rung",
+    "walk_forward_degradation": null,
+    "walk_forward_efficiency": null,
+    "walk_forward_reason": "not run: the primary test fixed the rung"
+  }
+}

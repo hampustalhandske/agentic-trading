@@ -1,0 +1,77 @@
+{
+  "$id": "urn:edgelab:schema:frame.bars.v1",
+  "additionalProperties": false,
+  "description": "One row of the BARS frame; the frame is an array of rows.",
+  "properties": {
+    "as_traded_close": {
+      "description": "rule: positive; may be omitted; then equal to close",
+      "exclusiveMinimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    },
+    "as_traded_volume": {
+      "description": "rule: non_negative; may be omitted; then equal to volume",
+      "minimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    },
+    "close": {
+      "description": "rule: positive",
+      "exclusiveMinimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    },
+    "high": {
+      "description": "rule: positive",
+      "exclusiveMinimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    },
+    "low": {
+      "description": "rule: positive",
+      "exclusiveMinimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    },
+    "open": {
+      "description": "rule: positive",
+      "exclusiveMinimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    },
+    "symbol": {
+      "type": "string",
+      "x-dtype": "str"
+    },
+    "ts": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]00:00)$",
+      "type": "string",
+      "x-dtype": "datetime_utc"
+    },
+    "volume": {
+      "description": "rule: non_negative",
+      "minimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    }
+  },
+  "required": [
+    "ts",
+    "symbol",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+  ],
+  "title": "BARS",
+  "type": "object",
+  "x-key": [
+    "symbol",
+    "ts"
+  ],
+  "x-sort-by": [
+    "symbol",
+    "ts"
+  ]
+}

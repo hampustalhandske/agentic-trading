@@ -1,0 +1,24 @@
+[
+  {
+    "as_traded_close": 0.5,
+    "as_traded_volume": 0.5,
+    "close": 0.5,
+    "high": 0.5,
+    "low": 0.5,
+    "open": 0.5,
+    "symbol": "ABC",
+    "ts": "2020-01-02T21:00:00Z",
+    "volume": 0.5
+  },
+  {
+    "as_traded_close": 0.5,
+    "as_traded_volume": 0.5,
+    "close": 0.5,
+    "high": 0.5,
+    "low": 0.5,
+    "open": 0.5,
+    "symbol": "ABD",
+    "ts": "2020-01-03T21:00:00Z",
+    "volume": 0.5
+  }
+]

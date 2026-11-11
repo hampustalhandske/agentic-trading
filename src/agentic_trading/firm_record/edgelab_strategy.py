@@ -1,6 +1,6 @@
 """The text of an edgelab replay strategy folder: `strategy.yaml` as
 `edgelab strategy init <slug> --asset-class replay` scaffolds it at edgelab
-62a7151, whose grading block measures as edgelab-2026.11.0, and the
+04d7c5c, and the
 `strategy.py` shim whose `Replay` subclasses edgelab's built-in
 `TargetWeightsReplay`.
 
@@ -9,7 +9,8 @@ scaffold itself is vendored as `tests/fixtures/edgelab_replay_strategy.yaml`
 and its grading block's JSON schema as `grading_spec.v1.json` in
 `tests/fixtures/edgelab_grading_golden/docs/schema/`); its
 `<...>` placeholders, `strategy`, universe, data block, capital, seed and
-replication are replaced by `firm_record.submission.strategy_config`. The
+replication are replaced by `firm_record.submission.strategy_config`, which
+also drops the grading block. The
 files are written as text, so edgelab is never imported here."""
 
 REPLAY_STRATEGY_YAML = """\
