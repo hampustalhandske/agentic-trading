@@ -2,14 +2,16 @@
 
 """Conformance of the lakehouse loaders with the lake's frozen data contract.
 
-`tests/fixtures/lakehouse_contract_v1.json` lists every view the loaders read
-and each view's column names and DuckDB types. Registering those views as
-typed tables and running every loader proves each SQL statement binds
+`tests/fixtures/lakehouse_contract_v2.json` lists every view the loaders read
+(a `<table>_log` read is a read of the table's log, which has the table's columns)
+and each view's column names and DuckDB types, and each table's kind, keys and tie order.
+Registering those views as typed tables and running every loader proves each SQL statement binds
 against the contract's names and types. Every table is empty except the
 always-populated tables (`ALWAYS_POPULATED_TABLES`), which hold one unrelated
 row each because the loaders refuse to read one of them empty.
 """
 
+import hashlib
 import inspect
 import json
 import re
@@ -21,10 +23,11 @@ from typing import Any
 import pytest
 
 from agentic_trading.data.loaders import lakehouse_loader
+from edgelab_live import contract_text_path
 
 pytestmark = pytest.mark.unpinned_lake_reads
 
-_CONTRACT_PATH = Path(__file__).parents[3] / "fixtures" / "lakehouse_contract_v1.json"
+_CONTRACT_PATH = Path(__file__).parents[3] / "fixtures" / "lakehouse_contract_v2.json"
 _CONTRACT = json.loads(_CONTRACT_PATH.read_text())
 _AS_OF = date(2024, 3, 15)
 _START = date(2024, 1, 2)
@@ -156,13 +159,47 @@ def test_every_public_loader_has_a_conformance_case() -> None:
 
 def test_every_table_in_loader_sql_is_a_contract_view() -> None:
     """Each table the loader's SQL names, through `_table_sql` or `READ_TABLES`, is a view in the
-    frozen contract, and every table its SQL names is in `READ_TABLES`."""
-    assert _CONTRACT["contract"] == "lakehouse-contract-v1"
+    frozen contract (a `<table>_log` read is a view's log), and every table its SQL names is in
+    `READ_TABLES`."""
+    assert _CONTRACT["contract"] == "lakehouse-contract-v2"
     source = Path(inspect.getsourcefile(lakehouse_loader) or "").read_text()
     named = set(re.findall(r"_table_sql\(\s*[\"']([A-Za-z_][A-Za-z0-9_]*)[\"']", source))
     read = set(lakehouse_loader.READ_TABLES)
 
     assert named
     assert re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", source) == []
-    assert named | read <= set(_CONTRACT["views"])
+    assert {name.removesuffix("_log") for name in named | read} <= set(_CONTRACT["views"])
     assert named <= read
+
+
+def test_every_read_table_has_the_key_and_tie_order_the_loader_expects() -> None:
+    """Each table the loader reads is in the contract's `tables` with a kind the loader handles;
+    a "current" table serves a `tie_order` (a pinned read of one without it is refused), and its
+    keys and tie order name columns of its view."""
+    bases = {name.removesuffix("_log") for name in lakehouse_loader.READ_TABLES}
+
+    assert bases == set(_CONTRACT["tables"]) == set(_CONTRACT["views"])
+    for table, entry in _CONTRACT["tables"].items():
+        assert entry["kind"] in {"current", "rebuilt_whole", "append_only"}, table
+        columns = set(_CONTRACT["views"][table])
+        if entry["kind"] == "current":
+            assert entry["keys"], table
+            assert isinstance(entry["tie_order"], list), table
+            assert set(entry["keys"]) | set(entry["tie_order"]) <= columns, table
+
+
+@pytest.mark.private_contract
+def test_vendored_subset_matches_the_full_contract_text() -> None:
+    """The served contract text hashes to the vendored `sha256`, re-serialising its parsed
+    document gives the same bytes, and every vendored entry equals the full document's."""
+    raw = contract_text_path().read_bytes()
+    full = json.loads(raw)
+
+    assert hashlib.sha256(raw).hexdigest() == _CONTRACT["sha256"]
+    assert (json.dumps(full, indent=1) + "\n").encode() == raw
+    for key in ("contract", "frozen_on", "supersedes", "schemas", "guarantees"):
+        assert _CONTRACT[key] == full[key], key
+    for section in ("views", "tables"):
+        assert _CONTRACT[section], section
+        for table, entry in _CONTRACT[section].items():
+            assert full[section][table] == entry, (section, table)

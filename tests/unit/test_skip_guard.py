@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from edgelab_live import EDGELAB_ABSENT
+from edgelab_live import CONTRACT_TEXT_ABSENT, EDGELAB_ABSENT
 
 _TESTS = Path(__file__).resolve().parents[1]
 _CONFTEST = """\
@@ -33,6 +33,14 @@ def test_live():
 
 def test_passes():
     pass
+"""
+_PRIVATE_SKIP = f"""\
+import pytest
+
+
+@pytest.mark.private_contract
+def test_private():
+    pytest.skip("{CONTRACT_TEXT_ABSENT}: no contract.text")
 """
 
 
@@ -61,6 +69,16 @@ def test_a_live_check_skipped_for_an_absent_checkout_passes_and_is_counted(
     assert f"edgelab_live: 1 live edgelab check(s) skipped ({EDGELAB_ABSENT})" in done.stdout
 
 
+def test_a_private_contract_check_skipped_for_an_absent_text_passes_and_is_counted(
+    tmp_path: Path,
+) -> None:
+    done = _run_suite(tmp_path, _PRIVATE_SKIP)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"private_contract: 1 private contract check(s) skipped ({CONTRACT_TEXT_ABSENT})" in (
+        done.stdout
+    )
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -70,6 +88,8 @@ def test_a_live_check_skipped_for_an_absent_checkout_passes_and_is_counted(
         "import pytest\n\n\n@pytest.mark.skip(reason='later')\ndef test_x():\n    pass\n",
         # A live check skipped for another reason.
         "import pytest\n\n\n@pytest.mark.edgelab_live\ndef test_x():\n    pytest.skip('flaky')\n",
+        # A private contract check skipped for another reason.
+        "import pytest\n\n\n@pytest.mark.private_contract\ndef test_x():\n    pytest.skip('x')\n",
         # The declared reason on a test that is not a live check.
         f"import pytest\n\n\ndef test_x():\n    pytest.skip('{EDGELAB_ABSENT}: no x')\n",
         # A whole module skipped at collection.

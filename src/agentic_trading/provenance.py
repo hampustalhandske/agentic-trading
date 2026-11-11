@@ -22,8 +22,8 @@ from agentic_trading.data.loaders.lakehouse_loader import lake_provenance as lak
 # reads the lake version through this module.
 
 # The lake's frozen data contract the loaders are written against
-# (tests/fixtures/lakehouse_contract_v1.json checks it).
-LAKE_CONTRACT = "lakehouse-contract-v1"
+# (tests/fixtures/lakehouse_contract_v2.json checks it).
+LAKE_CONTRACT = "lakehouse-contract-v2"
 
 _GIT_TIMEOUT_SECONDS = 5.0
 

@@ -111,7 +111,9 @@ def _sessions(start: date, end: date) -> list[date]:
 
 def _put(lake: Any, table: str, rows: list[dict[str, Any]]) -> None:
     """Inserts `rows` into `table` and into its log, scraped at `_SCRAPED_AT`
-    (a relation without a `scraped_at` column takes the rows without it)."""
+    (a relation without a `scraped_at` column takes the rows without it). A `<t>_log` name
+    stands for table `<t>`."""
+    table = table.removesuffix("_log")
     frame = pd.DataFrame(rows)
     frame["scraped_at"] = _SCRAPED_AT
     connection = lake._connection
