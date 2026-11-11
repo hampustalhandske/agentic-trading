@@ -215,7 +215,9 @@ class TailHedgeManager(ManagerAgent):
             self._commitments.append((day, weight))
 
         option_rows: list[PortfolioDecision] = []
-        if held is not None and held != selected:
+        # A held put at or past its expiry is settled by the engine before
+        # this session's decide, so it gets no close row.
+        if held is not None and held != selected and _days_to_expiry(held, day) > 0:
             option_rows.append(_option_decision(held, day, 0.0, equity.contributing_signals))
         option_rows.append(
             _option_decision(
