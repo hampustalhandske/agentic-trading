@@ -252,7 +252,7 @@ def _echoing_provenance(
             read_at=datetime(2024, 3, 15, tzinfo=UTC),
             status_generated_at=None,
         ),
-        lake_contract="lakehouse-contract-v1",
+        lake_contract="lakehouse-contract-v2",
         environment=runtime_environment(),
     )
 
@@ -283,7 +283,7 @@ def test_run_prints_provenance_alongside_result(
     payload = _json_payload(result.stdout)
     assert set(payload) == {"provenance", "result"}
     assert payload["result"]["final_sharpe_ratio"] == pytest.approx(1.2)
-    assert payload["provenance"]["lake_contract"] == "lakehouse-contract-v1"
+    assert payload["provenance"]["lake_contract"] == "lakehouse-contract-v2"
     cli_args = json.dumps(payload["provenance"]["cli_args"])
     assert "2024-01-02" in cli_args
     assert "2024-01-05" in cli_args

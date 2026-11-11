@@ -78,7 +78,7 @@ def test_build_passes_inputs_and_lake_version_through_unchanged() -> None:
     assert result.manager_ids == ["m1"]
     assert result.lake.lake_version == "abc123-dirty"
     assert result.lake == _LAKE
-    assert result.lake_contract == "lakehouse-contract-v1"
+    assert result.lake_contract == "lakehouse-contract-v2"
 
 
 def test_build_records_empty_inputs() -> None:

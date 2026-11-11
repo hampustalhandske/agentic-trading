@@ -421,7 +421,7 @@ def fake_lake(monkeypatch: pytest.MonkeyPatch) -> FakeLake:
     return lake
 
 
-_CONTRACT_PATH = Path(__file__).parent / "fixtures" / "lakehouse_contract_v1.json"
+_CONTRACT_PATH = Path(__file__).parent / "fixtures" / "lakehouse_contract_v2.json"
 
 # The one row `preflight_lake` puts in each always-populated table
 # (`lakehouse_loader.ALWAYS_POPULATED_TABLES`), by column: it matches no
@@ -437,7 +437,7 @@ _PLACEHOLDER_ROWS: dict[str, dict[str, Any]] = {
 @pytest.fixture
 def preflight_lake(fake_lake: FakeLake) -> FakeLake:
     """A `fake_lake` holding every view of the frozen lake contract
-    (`tests/fixtures/lakehouse_contract_v1.json`) with the contract's
+    (`tests/fixtures/lakehouse_contract_v2.json`) with the contract's
     column types, so the CLI and dashboard run paths (the
     data-availability preflight and the price history) bind their SQL
     against the real schema. Every view is empty except the

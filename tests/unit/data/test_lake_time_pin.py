@@ -32,9 +32,11 @@ _REBUILT = frozenset(
         "yahoo_split_close_basis",
     }
 )
-_CONTRACT = json.loads(
-    (Path(__file__).parents[2] / "fixtures" / "lakehouse_contract_v1.json").read_text()
-)["views"]
+_CONTRACT_DOCUMENT = json.loads(
+    (Path(__file__).parents[2] / "fixtures" / "lakehouse_contract_v2.json").read_text()
+)
+_CONTRACT = _CONTRACT_DOCUMENT["views"]
+_CONTRACT_TABLES = _CONTRACT_DOCUMENT["tables"]
 _SPLIT_COLUMNS = ["ticker", "ex_date", "ratio", "in_close_basis"]
 _FRED_COLUMNS = ["series_id", "date", "realtime_start", "value"]
 _DIST_COLUMNS = ["ticker", "ex_date", "distribution_type", "amount_split_adjusted"]
@@ -453,19 +455,22 @@ def _pin_problems(query: str, params: list[Any]) -> list[str]:
 
 
 def _sweep_lake(lake: Any) -> None:
-    """Every contract view as an empty table with a one-row log, the rebuilt six flagged."""
-    unkeyed = {"scraped_at", "dt", "table", "when"}
+    """Every contract table as an empty table with a one-row log, with the kind, keys and tie
+    order the contract gives, the rebuilt six flagged."""
     for view, columns in _CONTRACT.items():
         typed = {f'"{n}"': ("VARCHAR" if k == '"NULL"' else k) for n, k in columns.items()}
+        entry = _CONTRACT_TABLES[view]
         row_time = view == "crypto_klines_1m"
         lake.add_empty(
             view,
             typed,
-            kind="append-only" if row_time else "current",
-            key_columns=[n for n in columns if n not in unkeyed],
-            rebuilt_whole=view in _REBUILT,
+            kind=entry["kind"].replace("_", "-"),
+            key_columns=entry["keys"],
+            rebuilt_whole=entry["kind"] == "rebuilt_whole",
             pin_column="open_time" if row_time else None,
         )
+        if entry["kind"] == "current":
+            lake.tie_order_overrides[view] = entry["tie_order"]
         if not row_time:
             lake._connection.execute(
                 f"INSERT INTO {view}_log (scraped_at) VALUES (CAST(? AS TIMESTAMPTZ))", [_B1]
