@@ -79,6 +79,18 @@ def _summary_metric(name: str, compute: Callable[[], float]) -> float | None:
     return value
 
 
+class MissingOptionMidError(RuntimeError):
+    """An open option position has no close mark on a simulated day. Its
+    instrument return on that day, and the mid the next day's return runs
+    from, would be unknown, so the run stops."""
+
+
+class ExpiredOptionDecisionError(RuntimeError):
+    """The Commander emitted a decision row on a simulated day for an option
+    contract whose expiry is on or before that day: one the engine has
+    already settled at intrinsic."""
+
+
 # Largest absolute daily excess return still treated as zero. A book that
 # only ever holds cash earns exactly the benchmark accrual, so its excess
 # returns are floating-point residue (around 1e-17); Sharpe and Sortino of
@@ -329,9 +341,12 @@ class BacktestEngine:
         # (a `DecisionWindow`). Filled as `run()` steps through the days.
         self.decisions_by_day: Mapping[date, list[PortfolioDecision]] = {}
         self._checkpoint_connection: sqlite3.Connection | None = None
-        # Previous day's close mark per option contract, for attribution
-        # (log of today's mid over yesterday's); a contract seen for the
-        # first time realizes 0.0. The checkpoint carries it whole.
+        # Latest close mid per option contract: every open position's at the
+        # end of each simulated day, and a closed contract's from the last
+        # day a decision on it executed. A day's option returns (instrument
+        # returns and attribution) are the log of the day's mid over this;
+        # a contract seen for the first time realizes 0.0. The checkpoint
+        # carries it whole.
         self._option_last_mid: dict[str, float] = {}
         self._unpriced_underlyings_warned: set[str] = set()
 
@@ -615,9 +630,20 @@ class BacktestEngine:
             return None
         return load_option_mark(contract, as_of_date.date(), spot)
 
+    def _held_option_mark(
+        self, raw_market_data: pd.DataFrame, contract_id: str, as_of_date: pd.Timestamp
+    ) -> OptionMark:
+        """The close mark of the open position in `contract_id` on
+        `as_of_date`; raises `MissingOptionMidError` without one."""
+        mark = self._option_mark(raw_market_data, contract_id, as_of_date, "close")
+        if mark is None:
+            raise MissingOptionMidError(_missing_mid_message(contract_id, as_of_date.date()))
+        return mark
+
     def _option_realized_return(self, contract_id: str, mark: OptionMark | None) -> float:
-        """Log return of the contract's close mid over the previous day's,
-        0.0 on its first day or without a usable mark."""
+        """Log return of the contract's close mid over its latest recorded
+        one (`_option_last_mid`, the previous day's for a position held
+        overnight), 0.0 on its first day or without a usable mark."""
         previous = self._option_last_mid.get(contract_id, 0.0)
         if mark is None:
             return 0.0
@@ -911,18 +937,29 @@ class BacktestEngine:
                     as_of_timestamp.date() - timedelta(days=self.history_horizon_days)
                 )
             market_data = get_point_in_time_data(raw_market_data, as_of_timestamp)
-            # Today's mark-to-mark log return of every open option position,
-            # so the Commander's pod-return tracker sees option P&L the way
-            # it sees equity returns from `market_data`.
+            trades_before = len(trade_log)
+            unfilled_before = len(unfilled_orders)
+            # Today's close mark of every open option position (one without
+            # raises `MissingOptionMidError`) and its log return over the
+            # previous day's mid, so the Commander's pod-return tracker sees
+            # option P&L the way it sees equity returns from `market_data`.
+            # Positions at or past expiry then settle at intrinsic, before
+            # the Commander decides.
+            held_marks = {
+                contract_id: self._held_option_mark(raw_market_data, contract_id, as_of_timestamp)
+                for contract_id in self.portfolio.option_positions
+            }
             instrument_returns: dict[str, float] = {}
-            for contract_id in list(self.portfolio.option_positions):
-                mark = self._option_mark(raw_market_data, contract_id, as_of_timestamp, "close")
+            for contract_id, held_mark in held_marks.items():
                 previous = self._option_last_mid.get(contract_id, 0.0)
-                if mark is not None and previous > 0.0 and mark.mid > 0.0:
-                    instrument_returns[contract_id] = math.log(mark.mid / previous)
+                if previous > 0.0 and held_mark.mid > 0.0:
+                    instrument_returns[contract_id] = math.log(held_mark.mid / previous)
+            expired = self.portfolio.settle_expired(held_marks, as_of_timestamp.date())
+            trade_log.extend(expired)
             decisions = self.commander.decide(
                 market_data, as_of_timestamp, scoreboard, instrument_returns=instrument_returns
             )
+            _refuse_settled_contract_rows(decisions, as_of_timestamp.date())
             logger.debug(
                 "Day %s: commander.decide across %d assets took %.1fms",
                 as_of_timestamp.date(),
@@ -1009,19 +1046,14 @@ class BacktestEngine:
                     if self.execution_lag_days
                     else prices
                 )
-            # Close marks for every open option position (and every option
-            # decision executing today, for attribution); positions at or
-            # past expiry settle at intrinsic before the day is valued.
-            option_marks: dict[str, OptionMark | None] = {}
-            option_contract_ids = set(self.portfolio.option_positions) | {
-                decision.asset
-                for decision in (pending_decisions if self.execution_lag_days else decisions)
-                if decision.instrument is not None
-            }
-            for contract_id in option_contract_ids:
-                option_marks[contract_id] = self._option_mark(
-                    raw_market_data, contract_id, as_of_timestamp, "close"
-                )
+            # The close marks of the positions held this morning and of every
+            # option decision executing today, for attribution.
+            option_marks: dict[str, OptionMark | None] = dict(held_marks)
+            for decision in pending_decisions if self.execution_lag_days else decisions:
+                if decision.instrument is not None and decision.asset not in option_marks:
+                    option_marks[decision.asset] = self._option_mark(
+                        raw_market_data, decision.asset, as_of_timestamp, "close"
+                    )
             marks = {
                 contract_id: mark for contract_id, mark in option_marks.items() if mark is not None
             }
@@ -1033,14 +1065,10 @@ class BacktestEngine:
                 spot = self._underlying_spot(raw_market_data, underlying, as_of_timestamp, "close")
                 if spot is not None:
                     underlying_prices[underlying] = spot
-            trades_before = len(trade_log)
-            unfilled_before = len(unfilled_orders)
             # Futures and spot FX settle the day's move into cash at the
             # close, before the day is valued.
             if trades_marked:
                 self.portfolio.settle_marked_positions(prices)
-            expired = self.portfolio.settle_expired(marks, as_of_timestamp.date())
-            trade_log.extend(expired)
             for trade in expired:
                 _charge(day_pod_costs.transaction_cost, trade.transaction_cost, None)
             # An asset without a close today (no bar on this session) is
@@ -1121,12 +1149,27 @@ class BacktestEngine:
             decisions_to_execute = pending_decisions if self.execution_lag_days else decisions
             for decision in decisions_to_execute:
                 if decision.instrument is not None:
-                    fill_mark = (
-                        self._option_mark(raw_market_data, decision.asset, as_of_timestamp, "open")
-                        if self.execution_lag_days
-                        else option_marks.get(decision.asset)
-                    )
-                    if fill_mark is None:
+                    # A row decided the session before its contract settled
+                    # (with a one-day lag) has nothing left to fill: the
+                    # position was settled at intrinsic before today's decide.
+                    settled = decision.instrument.expiry <= as_of_timestamp.date()
+                    fill_mark: OptionMark | None = None
+                    if not settled:
+                        fill_mark = (
+                            self._option_mark(
+                                raw_market_data, decision.asset, as_of_timestamp, "open"
+                            )
+                            if self.execution_lag_days
+                            else option_marks.get(decision.asset)
+                        )
+                    if settled:
+                        logger.info(
+                            "Day %s: %s settled at expiry — its %s decision is not filled.",
+                            as_of_timestamp.date(),
+                            decision.asset,
+                            decision.as_of_date,
+                        )
+                    elif fill_mark is None:
                         logger.warning(
                             "Day %s: no mark for %s — option decision not executed.",
                             as_of_timestamp.date(),
@@ -1290,6 +1333,17 @@ class BacktestEngine:
                             realized_return=realized_return,
                         )
                     )
+
+            # Every option position still open records today's close mid, so
+            # tomorrow's returns on it run from today's mid whether or not a
+            # decision on it executed today.
+            for contract_id in self.portfolio.option_positions:
+                close_mark = option_marks.get(contract_id)
+                if close_mark is None:
+                    raise MissingOptionMidError(
+                        _missing_mid_message(contract_id, as_of_timestamp.date())
+                    )
+                self._option_last_mid[contract_id] = close_mark.mid
 
             pending_decisions = decisions
             idle_pod_share_fn = getattr(self.commander, "idle_pod_share", None)
@@ -1518,6 +1572,30 @@ def _checkpoint_traded_options(connection: sqlite3.Connection, payload: dict[str
             ):
                 return True
     return False
+
+
+def _missing_mid_message(contract_id: str, day: date) -> str:
+    """The `MissingOptionMidError` message for `contract_id` on `day`."""
+    return (
+        f"{day}: the open option position {contract_id} has no close mark; its return "
+        "cannot be measured without a mid for the day"
+    )
+
+
+def _refuse_settled_contract_rows(decisions: list[PortfolioDecision], day: date) -> None:
+    """Raises `ExpiredOptionDecisionError` when `decisions`, the Commander's
+    rows for `day`, include one for an option contract expiring on or
+    before `day`."""
+    settled = [
+        decision.asset
+        for decision in decisions
+        if decision.instrument is not None and decision.instrument.expiry <= day
+    ]
+    if settled:
+        raise ExpiredOptionDecisionError(
+            f"{day}: the Commander emitted rows for option contracts settled at expiry: "
+            + ", ".join(settled)
+        )
 
 
 def _frame_field(
