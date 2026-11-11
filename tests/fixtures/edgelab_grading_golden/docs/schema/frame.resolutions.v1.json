@@ -1,0 +1,39 @@
+{
+  "$id": "urn:edgelab:schema:frame.resolutions.v1",
+  "additionalProperties": false,
+  "description": "One row of the RESOLUTIONS frame; the frame is an array of rows.",
+  "properties": {
+    "market": {
+      "type": "string",
+      "x-dtype": "str"
+    },
+    "outcome": {
+      "type": "integer",
+      "x-dtype": "int"
+    },
+    "resolution_source": {
+      "type": "string",
+      "x-dtype": "str"
+    },
+    "resolved_at": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]00:00)$",
+      "type": "string",
+      "x-dtype": "datetime_utc"
+    }
+  },
+  "required": [
+    "market",
+    "resolved_at",
+    "outcome",
+    "resolution_source"
+  ],
+  "title": "RESOLUTIONS",
+  "type": "object",
+  "x-key": [
+    "market"
+  ],
+  "x-sort-by": [
+    "market",
+    "resolved_at"
+  ]
+}

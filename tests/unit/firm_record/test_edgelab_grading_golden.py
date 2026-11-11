@@ -3,9 +3,10 @@
 """edgelab's pinned JSON schemas and golden cases, vendored at `tests/fixtures/
 edgelab_grading_golden/`, and the firm record's outputs checked against them.
 
-The slot holds edgelab's `docs/schema/` at commit afdca2a, byte for byte, under the same
-relative path: `SHA256SUMS` and the seven schemas it lists (`bundle.v1`, `decision_file.v1`,
-`grading_spec.v1`, `result.v4`, `strategy_scaffold.v1`, `submission.v1`, `submission.v2`), and
+The slot holds edgelab's `docs/schema/` at commit 04d7c5c, byte for byte, under the same
+relative path: `SHA256SUMS` and the thirteen schemas it lists (`bundle.v1`, `decision_file.v1`,
+the four `frame.*.v1`, `grading_spec.v1`, `result.v4`, `result.v5`, `strategy_scaffold.v1`,
+`strategy_scaffold.v2`, `submission.v1`, `submission.v2`), and
 `golden/<schema stem>/accept/*.json` and `.../refuse/*.json`. Beside it, `SOURCE` names the
 commit and `GOLDEN_SHA256SUMS` lists the sha256 of each golden case, which edgelab's
 `SHA256SUMS` does not cover. Both sum files are pinned by sha256 here, so every vendored byte is
@@ -15,12 +16,12 @@ the slot is refreshed from edgelab.
 
 Every accept case validates against its schema and every refuse case fails it, under the
 `jsonschema` Draft 2020-12 validator with format checking, so the validator is shown to refuse.
-A firm record's `submission.json` validates against `submission.v1`, the version it writes; with
-`schema_version` set to 2 it validates against `submission.v2`. Its `strategy/strategy.yaml`
-validates against `strategy_scaffold.v1`, and its grading block is edgelab's golden
-`policy_2026.11.0` case. Its decision rows validate against `decision_file.v1`. Each output with
-an unknown field planted in it is refused by its schema. The outputs are built from fake data
-with the helpers of `test_firm_store.py`; nothing reads the lake."""
+A firm record's `submission.json` validates against `submission.v2`, the version it writes, and
+names the policy `edgelab-2026.11.1`; `submission.v1` refuses it. Its `strategy/strategy.yaml`
+validates against `strategy_scaffold.v2` and has no `grading:` block. Its decision rows
+validate against `decision_file.v1`. Each output with an unknown field planted in it is refused
+by its schema. The outputs are built from fake data with the helpers of `test_firm_store.py`;
+nothing reads the lake."""
 
 import copy
 import hashlib
@@ -34,6 +35,7 @@ import jsonschema
 import pytest
 import yaml
 
+from agentic_trading.firm_record.edgelab_strategy import REPLAY_STRATEGY_YAML
 from agentic_trading.firm_record.submission import (
     SUBMISSION_FILE,
     submission_for,
@@ -49,26 +51,32 @@ _GOLDEN = _SCHEMAS / "golden"
 _SOURCE = _SLOT / "SOURCE"
 _SCHEMA_SUMS = _SCHEMAS / "SHA256SUMS"
 _GOLDEN_SUMS = _SLOT / "GOLDEN_SHA256SUMS"
-_SHA = "afdca2a"
-_FULL_SHA = "afdca2a7dec35060719d691de9f9352c25a50b7d"
+_SHA = "04d7c5c"
+_FULL_SHA = "04d7c5c8869876f7a0b650c98eaea546d067f428"
 _SUBJECT = (
-    "Policy 2026.11.1 cost table, submission v2 and upgrade, pinned schemas, replay label, "
-    "Not assessable (M2 part 1)"
+    "The top pod breaks a tie by pod id; the row-pick allowlist and the lake contract check "
+    "cover the firm-book modules"
 )
-# The sha256 of edgelab's SHA256SUMS at afdca2a, and of GOLDEN_SHA256SUMS.
-_SCHEMA_SUMS_SHA256 = "083a33283271f7ce29c6e4cd48937b8e924dda304da28e0fa98f00a9f8ee3aff"
-_GOLDEN_SUMS_SHA256 = "604f0c9b725e2cd7059dd2b160229bdfdba2c5141249e2508da153b4469c67cd"
+# The sha256 of edgelab's SHA256SUMS at 04d7c5c, and of GOLDEN_SHA256SUMS.
+_SCHEMA_SUMS_SHA256 = "6e83c15ff567e95bcf256f4a36e372a93c4587c8973615e9ebe9a94ccfa6a6a5"
+_GOLDEN_SUMS_SHA256 = "da103dcd8ad4539e8e340cb7817dec2597aaebcf5d54748e9065ad3845a897c3"
 _SCHEMA_FILES = {
     "bundle.v1.json",
     "decision_file.v1.json",
+    "frame.bars.v1.json",
+    "frame.book_snapshots.v1.json",
+    "frame.features.v1.json",
+    "frame.resolutions.v1.json",
     "grading_spec.v1.json",
     "result.v4.json",
+    "result.v5.json",
     "strategy_scaffold.v1.json",
+    "strategy_scaffold.v2.json",
     "submission.v1.json",
     "submission.v2.json",
 }
-# The golden grading block a firm record's strategy.yaml carries.
-_FIRM_GRADING_CASE = _GOLDEN / "grading_spec.v1" / "accept" / "policy_2026.11.0.json"
+# The published grading policy a firm record's submission.json names.
+_POLICY = "edgelab-2026.11.1"
 _PLANTED = "zzz_unknown_field"
 
 
@@ -102,6 +110,14 @@ def _messages(stem: str, value: Any) -> list[str]:
     ]
 
 
+def _messages_for_case(stem: str, value: Any) -> list[str]:
+    """Each error the `stem` schema reports for a golden case `value`. A `frame.*` schema
+    describes one row of an array, so each row of the case is checked."""
+    if stem.startswith("frame."):
+        return [message for row in value for message in _messages(stem, row)]
+    return _messages(stem, value)
+
+
 def _golden_cases() -> list[tuple[str, str, Path]]:
     """Every vendored golden case as (schema stem, `accept` or `refuse`, file)."""
     return [
@@ -117,10 +133,6 @@ def _as_json(value: Any) -> Any:
     return json.loads(
         json.dumps(value, default=lambda item: item.isoformat() if isinstance(item, date) else item)
     )
-
-
-def _canonical(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def _write_folder(tmp_path: Path, record: FirmSpecRecord, *, counted: bool) -> Path:
@@ -171,7 +183,7 @@ def _decision_rows(tmp_path: Path) -> list[dict[str, Any]]:
 
 
 def test_source_names_the_edgelab_commit() -> None:
-    """SOURCE names edgelab commit afdca2a by short and full sha and by its subject."""
+    """SOURCE names edgelab commit 04d7c5c by short and full sha and by its subject."""
     fields = dict(line.split(": ", 1) for line in _SOURCE.read_text().splitlines() if line.strip())
     assert fields["repository"] == "edgelab"
     assert fields["sha"] == _SHA
@@ -186,7 +198,7 @@ def test_sum_files_are_the_pinned_copies() -> None:
 
 
 def test_every_vendored_file_matches_its_sum() -> None:
-    """SHA256SUMS lists the seven schemas and GOLDEN_SHA256SUMS the golden cases; the slot
+    """SHA256SUMS lists the thirteen schemas and GOLDEN_SHA256SUMS the golden cases; the slot
     holds exactly those files, SOURCE and the two sum files, each at its listed sha256."""
     schema_sums = _sums(_SCHEMA_SUMS)
     golden_sums = _sums(_GOLDEN_SUMS)
@@ -216,20 +228,28 @@ def test_vendored_schema_matches_edgelab(name: str) -> None:
 
 
 def test_every_schema_with_golden_cases_has_both_verdicts() -> None:
-    """Each schema folder under golden/ is a vendored schema with at least one accept and one
-    refuse case."""
+    """Each schema folder under golden/ is a vendored schema with at least one accept case and,
+    but for `result.v4`, at least one refuse case."""
     cases = _golden_cases()
     stems = {stem for stem, _, _ in cases}
     assert stems == {
         "bundle.v1",
+        "frame.bars.v1",
+        "frame.book_snapshots.v1",
+        "frame.features.v1",
+        "frame.resolutions.v1",
         "grading_spec.v1",
+        "result.v4",
+        "result.v5",
         "strategy_scaffold.v1",
+        "strategy_scaffold.v2",
         "submission.v1",
         "submission.v2",
     }
     for stem in stems:
         assert (_SCHEMAS / f"{stem}.json").is_file()
-        assert {verdict for found, verdict, _ in cases if found == stem} == {"accept", "refuse"}
+        verdicts = {verdict for found, verdict, _ in cases if found == stem}
+        assert verdicts == ({"accept"} if stem == "result.v4" else {"accept", "refuse"})
 
 
 @pytest.mark.parametrize(
@@ -238,8 +258,9 @@ def test_every_schema_with_golden_cases_has_both_verdicts() -> None:
     ids=lambda value: value.name if isinstance(value, Path) else str(value),
 )
 def test_a_golden_case_gets_its_verdict(stem: str, verdict: str, case: Path) -> None:
-    """An accept case validates against its schema and a refuse case fails it."""
-    messages = _messages(stem, json.loads(case.read_text()))
+    """An accept case validates against its schema and a refuse case fails it; a `frame.*` case
+    is an array of rows, each checked against the row schema."""
+    messages = _messages_for_case(stem, json.loads(case.read_text()))
     if verdict == "accept":
         assert messages == []
     else:
@@ -250,39 +271,45 @@ def test_a_golden_case_gets_its_verdict(stem: str, verdict: str, case: Path) -> 
 
 
 @pytest.mark.parametrize("counted", [False, True], ids=["uncounted", "counted"])
-def test_submission_json_validates_against_submission_v1(tmp_path: Path, counted: bool) -> None:
-    """A firm record's submission.json, uncounted or counted, is a version 1 file that
-    `submission.v1` accepts."""
+def test_submission_json_validates_against_submission_v2(tmp_path: Path, counted: bool) -> None:
+    """A firm record's submission.json, uncounted or counted, is a version 2 file that
+    `submission.v2` accepts and that names the policy `edgelab-2026.11.1`."""
     folder = _write_folder(tmp_path, _record(), counted=counted)
     submission = json.loads((folder / SUBMISSION_FILE).read_text())
 
-    assert submission["schema_version"] == 1
-    assert _messages("submission.v1", submission) == []
+    assert submission["schema_version"] == 2
+    assert submission["policy"] == _POLICY
+    assert _messages("submission.v2", submission) == []
 
 
-def test_submission_json_differs_from_v2_only_in_its_version(tmp_path: Path) -> None:
-    """`submission.v2` refuses a firm record's submission.json only for its `schema_version`,
-    and accepts it with `schema_version` set to 2."""
+def test_submission_v1_and_a_policy_less_or_unknown_policy_file_are_refused(
+    tmp_path: Path,
+) -> None:
+    """Negative controls: `submission.v1` refuses a firm record's submission.json, `submission.v2`
+    refuses it as a version 1 file and with a policy edgelab has not published."""
     submission = _submission(tmp_path)
 
-    assert _messages("submission.v2", submission) == ["schema_version: 2 was expected"]
-    assert _messages("submission.v2", submission | {"schema_version": 2}) == []
+    assert _messages("submission.v1", submission)
+    assert _messages("submission.v2", submission | {"schema_version": 1})
+    assert _messages("submission.v2", submission | {"policy": "edgelab-2099.01.0"})
 
 
-def test_strategy_yaml_validates_against_strategy_scaffold_v1(tmp_path: Path) -> None:
+def test_strategy_yaml_validates_against_strategy_scaffold_v2(tmp_path: Path) -> None:
     """A firm record's strategy/strategy.yaml, its dates as ISO strings, is a config
-    `strategy_scaffold.v1` accepts, and its grading block one `grading_spec.v1` accepts."""
+    `strategy_scaffold.v2` accepts."""
+    assert _messages("strategy_scaffold.v2", _strategy(tmp_path)) == []
+
+
+def test_strategy_yaml_has_no_grading_block_and_a_planted_one_is_checked(tmp_path: Path) -> None:
+    """The strategy.yaml of a firm record has no `grading:` block, so edgelab grades it under
+    the submission's policy. Negative control: a grading block with a field `grading_spec.v1`
+    does not have is refused by `strategy_scaffold.v2`."""
     strategy = _strategy(tmp_path)
+    assert "grading" not in strategy
 
-    assert _messages("strategy_scaffold.v1", strategy) == []
-    assert _messages("grading_spec.v1", strategy["grading"]) == []
-
-
-def test_strategy_yaml_carries_the_golden_2026_11_0_grading_block(tmp_path: Path) -> None:
-    """The grading block of a firm record's strategy.yaml is edgelab's golden
-    `policy_2026.11.0` accept case."""
-    golden = json.loads(_FIRM_GRADING_CASE.read_text())
-    assert _canonical(_strategy(tmp_path)["grading"]) == _canonical(golden)
+    grading = yaml.safe_load(REPLAY_STRATEGY_YAML)["grading"]
+    grading["gates"]["max_spa_p"] = 0.05
+    assert _messages("strategy_scaffold.v2", strategy | {"grading": grading})
 
 
 def test_decision_rows_validate_against_decision_file_v1(tmp_path: Path) -> None:
@@ -301,17 +328,17 @@ def _plant_top(value: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     ("stem", "build", "plant"),
     [
-        ("submission.v1", _submission, _plant_top),
-        ("submission.v1", _submission, lambda value: value["client"].update({_PLANTED: 1})),
-        ("strategy_scaffold.v1", _strategy, _plant_top),
+        ("submission.v2", _submission, _plant_top),
+        ("submission.v2", _submission, lambda value: value["client"].update({_PLANTED: 1})),
+        ("strategy_scaffold.v2", _strategy, _plant_top),
         (
-            "strategy_scaffold.v1",
+            "strategy_scaffold.v2",
             _strategy,
-            lambda value: value["grading"]["gates"].update({_PLANTED: 1}),
+            lambda value: value["hypothesis"].update({_PLANTED: 1}),
         ),
         ("decision_file.v1", lambda tmp_path: _decision_rows(tmp_path)[0], _plant_top),
     ],
-    ids=["submission", "submission-client", "strategy", "strategy-gates", "decision-row"],
+    ids=["submission", "submission-client", "strategy", "strategy-hypothesis", "decision-row"],
 )
 def test_an_output_with_a_planted_unknown_field_is_refused(
     tmp_path: Path,

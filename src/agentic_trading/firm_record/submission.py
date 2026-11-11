@@ -41,7 +41,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Final, Literal, Self
 
 import yaml
 from pydantic import (
@@ -76,6 +76,9 @@ UNFILLED_ORDERS_FILE = "unfilled_orders.json"
 ANALYST_AVAILABILITY_FILE = "analyst_availability.json"
 STRATEGY_DIR = "strategy"
 DECISIONS_FILE = "decisions.parquet"
+# The published edgelab grading policy submission.json names; strategy.yaml has no
+# `grading:` block, so the run is graded under this policy's registered values.
+GRADING_POLICY: Final = "edgelab-2026.11.1"
 # The client project name edgelab records the submission under.
 CLIENT_PROJECT = "agentic-trading"
 # The edgelab data provider strategy.yaml names: the lake, read through its HTTP API.
@@ -256,12 +259,14 @@ class ScoreWindow(BaseModel):
 
 
 class Submission(BaseModel):
-    """A replay folder's `submission.json`; edgelab's `Submission` with
-    `kind` fixed to `"replay"`."""
+    """A replay folder's `submission.json`; edgelab's `Submission` at
+    schema version 2 with `kind` fixed to `"replay"`. `policy` names the
+    published grading policy the run is graded under (`GRADING_POLICY`), so
+    the strategy folder carries no `grading:` block."""
 
     model_config = _SPEC
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     kind: Literal["replay"] = "replay"
     client: SubmissionClient
     strategy_dir: str = STRATEGY_DIR
@@ -273,6 +278,7 @@ class Submission(BaseModel):
     test_window: ScoreWindow
     seed: StrictInt = Field(ge=0)
     profile: Literal["fast", "full"]
+    policy: Literal["edgelab-2026.11.1"] = GRADING_POLICY
 
 
 class AgenticMeta(BaseModel):
@@ -412,7 +418,8 @@ def strategy_config(record: FirmSpecRecord) -> dict[str, Any]:
     (`settings.firm.max_leverage`); the data block reads the `lakehouse`
     provider over the spec's window, its params exactly the record's lake
     time (`lake_time_text`), its lake version and `survivorship_free: true`,
-    the rest of the block as scaffolded; the capital is
+    the rest of the block as scaffolded; there is no `grading:` block, the
+    submission's policy supplies it; the capital is
     `settings.firm.starting_cash` and the seed `settings.firm.edgelab_seed`;
     there is no replication claim. Settings are read at call time."""
     spec = record.spec
@@ -445,6 +452,7 @@ def strategy_config(record: FirmSpecRecord) -> dict[str, Any]:
         "lake_version": record.lake_version,
         "survivorship_free": True,
     }
+    del config["grading"]
     config["capital"] = float(firm.starting_cash)
     config["seed"] = settings.firm.edgelab_seed
     config["replication"] = None

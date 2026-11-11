@@ -1,0 +1,49 @@
+{
+  "$id": "urn:edgelab:schema:frame.features.v1",
+  "additionalProperties": false,
+  "description": "One row of the FEATURES frame; the frame is an array of rows.",
+  "properties": {
+    "known_at": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]00:00)$",
+      "type": "string",
+      "x-dtype": "datetime_utc"
+    },
+    "name": {
+      "type": "string",
+      "x-dtype": "str"
+    },
+    "symbol": {
+      "type": "string",
+      "x-dtype": "str"
+    },
+    "ts": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]00:00)$",
+      "type": "string",
+      "x-dtype": "datetime_utc"
+    },
+    "value": {
+      "description": "rule: finite",
+      "type": "number",
+      "x-dtype": "float"
+    }
+  },
+  "required": [
+    "ts",
+    "symbol",
+    "known_at",
+    "name",
+    "value"
+  ],
+  "title": "FEATURES",
+  "type": "object",
+  "x-key": [
+    "symbol",
+    "ts",
+    "name"
+  ],
+  "x-sort-by": [
+    "symbol",
+    "ts",
+    "name"
+  ]
+}

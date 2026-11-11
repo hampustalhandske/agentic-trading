@@ -318,11 +318,58 @@
       ],
       "title": "TrialDeclaration",
       "type": "object"
+    },
+    "UpgradedFrom": {
+      "additionalProperties": false,
+      "description": "What `edgelab submission upgrade` records about the folder it made a version 2 one from.\n\nAttributes:\n    src_manifest_sha256: Hash of the source folder's content-set manifest.\n    src_manifest_files: Number of files in the source folder's content set.\n    dropped_grading_sha256: sha256 of the canonical JSON of the `grading:` block the upgrade\n        removed from `strategy.yaml`; `None` when it removed nothing.\n    dest_manifest_sha256: Hash of the new folder's own content-set manifest; it differs from\n        the source's when a block was dropped.\n    dest_manifest_files: Number of files in the new folder's content set.",
+      "properties": {
+        "dest_manifest_files": {
+          "minimum": 0,
+          "title": "Dest Manifest Files",
+          "type": "integer"
+        },
+        "dest_manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Dest Manifest Sha256",
+          "type": "string"
+        },
+        "dropped_grading_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dropped Grading Sha256"
+        },
+        "src_manifest_files": {
+          "minimum": 0,
+          "title": "Src Manifest Files",
+          "type": "integer"
+        },
+        "src_manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Src Manifest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "src_manifest_sha256",
+        "src_manifest_files",
+        "dropped_grading_sha256",
+        "dest_manifest_sha256",
+        "dest_manifest_files"
+      ],
+      "title": "UpgradedFrom",
+      "type": "object"
     }
   },
   "$id": "urn:edgelab:schema:submission.v2",
   "additionalProperties": false,
-  "description": "The content of a submission folder's `submission.json`.\n\nAttributes:\n    schema_version: `1` or `2`. Version 2 adds `policy`; every other field is the same.\n    kind: `\"code\"` (a strategy the pipeline runs) or `\"replay\"` (a decision file replayed by a\n        `TargetWeightsReplay` strategy).\n    client: Which client project and commit this comes from.\n    strategy_dir: The strategy folder, relative to the submission folder; holds\n        `strategy.yaml` for a `code` submission.\n    data: Where the data comes from: a Parquet bundle in the folder, or a lake query bundle\n        (validated but not run yet).\n    decisions: The decision file; required for `replay`, absent for `code`.\n    trials: The client's trial declaration.\n    groups_path: Parquet file with columns `instrument_id` and `group`, or `None`.\n    train_end: The last date the client used to design or fit the strategy; data up to it is\n        warm-up and features only. `None` when not stated.\n    test_window: The window the evidence is scored on, starting after `train_end`; `None`\n        scores the strategy config's data range.\n    seed: Seed of every stochastic step of the run.\n    profile: Sample-size profile of the run.\n    policy: A published grading policy name, version 2 only. The run is graded under that\n        policy's registered values in place of the strategy folder's `grading:` block and\n        records the policy and its cost table hash. `None` grades under the folder's block.",
+  "description": "The content of a submission folder's `submission.json`.\n\nAttributes:\n    schema_version: `1` or `2`. Version 2 adds `policy` and `upgraded_from`; every other field\n        is the same.\n    kind: `\"code\"` (a strategy the pipeline runs) or `\"replay\"` (a decision file replayed by a\n        `TargetWeightsReplay` strategy).\n    client: Which client project and commit this comes from.\n    strategy_dir: The strategy folder, relative to the submission folder; holds\n        `strategy.yaml` for a `code` submission.\n    data: Where the data comes from: a Parquet bundle in the folder, or a lake query bundle\n        (validated but not run yet).\n    decisions: The decision file; required for `replay`, absent for `code`.\n    trials: The client's trial declaration.\n    groups_path: Parquet file with columns `instrument_id` and `group`, or `None`.\n    train_end: The last date the client used to design or fit the strategy; data up to it is\n        warm-up and features only. `None` when not stated.\n    test_window: The window the evidence is scored on, starting after `train_end`; `None`\n        scores the strategy config's data range.\n    seed: Seed of every stochastic step of the run.\n    profile: Sample-size profile of the run.\n    policy: A published grading policy name, version 2 only. The run is graded under that\n        policy's registered values and records the policy and its cost table hash. The\n        strategy folder's `grading:` block is then optional and, when present, must equal\n        them. `None` grades under the folder's block, which is then required.\n    upgraded_from: Set by `submission upgrade`, version 2 only: the manifests of the source\n        and of this folder and the hash of the dropped `grading:` block.",
   "properties": {
     "client": {
       "$ref": "#/$defs/ClientRef"
@@ -443,6 +490,17 @@
     },
     "trials": {
       "$ref": "#/$defs/TrialDeclaration"
+    },
+    "upgraded_from": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UpgradedFrom"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [
