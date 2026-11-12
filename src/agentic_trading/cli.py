@@ -49,7 +49,6 @@ from agentic_trading.data.loaders.lakehouse_loader import (
     loader_store_usage,
     require_lake_health,
     reset_loader_query_counts,
-    verify_rebuilt_whole_builds,
 )
 
 # NOTE: adjust this import to wherever ticker_catalog.py actually lives in the
@@ -562,7 +561,6 @@ def run(
                 parsed_end_date,
             )
             raise
-        verify_rebuilt_whole_builds()
         echo_loader_query_counts()
         echo_loader_store_usage()
         typer.echo(
@@ -877,7 +875,6 @@ def experiment(
                 isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump(
                     mode="json"
                 )
-        verify_rebuilt_whole_builds()
         echo_loader_query_counts()
         echo_loader_store_usage()
         typer.echo(

@@ -21,9 +21,7 @@ totals by kind. Per-pod sizing diagnostics are reduced to each pod's
 binding-stage shares and mean final-to-target vol ratio, and unfactored
 split-sized moves to a count per security (`None` for a resumed run,
 which carries no move list); the per-day and per-move entries are not
-kept. `lake` carries the lake state the run read: its
-lake time, the build of each rebuilt-whole table and the tables pinned on
-their own row time."""
+kept. `lake` carries the lake time the run read at."""
 
 from collections import Counter
 from typing import Any
@@ -130,15 +128,10 @@ def _unfactored_split_move_counts(block: dict[str, Any]) -> dict[str, int] | Non
 
 
 def _lake_reading(experiment_result: dict[str, Any]) -> dict[str, Any]:
-    """`lake_time`, `rebuilt_whole_builds` and `row_time_pinned_tables`
-    from the payload's `provenance.lake`, with `None`, `{}` and `[]` for a
-    payload that does not carry them."""
+    """`lake_time` from the payload's `provenance.lake`, `None` for a
+    payload that does not carry it."""
     lake = (experiment_result.get("provenance") or {}).get("lake") or {}
-    return {
-        "lake_time": lake.get("lake_time"),
-        "rebuilt_whole_builds": lake.get("rebuilt_whole_builds") or {},
-        "row_time_pinned_tables": lake.get("row_time_pinned_tables") or [],
-    }
+    return {"lake_time": lake.get("lake_time")}
 
 
 def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:

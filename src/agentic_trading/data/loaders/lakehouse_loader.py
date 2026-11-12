@@ -19,13 +19,18 @@ the table (`Lake.describe`, read once when the session opens):
   deduplicated on the table's key columns (the latest write at or before
   T wins, ties broken in the table's `tie_order`); the loader's own
   filters apply after that dedupe;
-- an append-only table reads `<table>_log` filtered on `scraped_at <= T`
-  with no dedupe, and `crypto_klines_1m`, which has no `scraped_at`, is
-  filtered on its own row time `open_time <= T`;
+- a rebuilt-whole table and an append-only table (`crypto_klines_1m`)
+  read the lake's table macro `<table>_at(T)`: for a rebuilt-whole table
+  every row of the one build with the greatest `scraped_at` at or before
+  T, for an append-only table the rows written at or before T (rows
+  stored before the table got `scraped_at` count as written at the
+  table's write-time start M). A T with no build kept, or before M, is
+  refused by the lake (HTTP 400), never answered with an empty table;
 - a log view read directly (`sec_company_facts_log`,
-  `sec_insider_transactions_log`) is filtered on `scraped_at <= T`;
-- a rebuilt-whole table holds only its current build, so it is read
-  unpinned and its build time is recorded in the session.
+  `sec_insider_transactions_log`) is filtered on `scraped_at <= T`.
+
+Writes the lake makes after T (appends, new builds) change no read of
+the session.
 
 Outside a session a read raises `UnpinnedLakeReadError`, naming the
 loader and the table, before any query is sent. A caller that must read
@@ -40,7 +45,7 @@ the lake doesn't cover rather than falling back to a live API.
 A loader returns `None` only when its query succeeds and finds no rows. A
 failed request (`LakehouseError`, connection or timeout errors) propagates
 to the caller; inside a session the lake's refusal of a pinned read
-(HTTP 409) and a change of lake version raise `LakeTimeError`.
+(HTTP 409) and a change of the lake's served code raise `LakeTimeError`.
 
 A table in `ALWAYS_POPULATED_TABLES` is rebuilt whole by the lake and
 always holds rows, yet a read landing on a rebuild can find it empty
@@ -134,27 +139,20 @@ class LakeProvenance(BaseModel):
     row count.
 
     When read inside a `lake_session`, `lake_time` is the session's lake
-    time T, `rebuilt_whole_builds` maps each rebuilt-whole table the loader
-    reads to the build time (its `scraped_at`) the run read, and
-    `row_time_pinned_tables` lists the tables pinned on their own row time
-    rather than on `scraped_at`. Outside a session they are `None`, `{}`
-    and `[]`."""
+    time T; outside a session it is `None`."""
 
     lake_version: str
     read_at: datetime
     status_generated_at: datetime | None
     adjustment_table_rows: dict[str, int] = {}
     lake_time: datetime | None = None
-    rebuilt_whole_builds: dict[str, datetime] = {}
-    row_time_pinned_tables: list[str] = []
 
 
 class LakeTimeError(RuntimeError):
     """A read cannot be made at the session's lake time: a conflicting
-    lake time or `data_end` when joining an open session, a lake time
-    before a rebuilt-whole table's build, the lake refusing a pinned read
-    (HTTP 409), a lake version change during the session, or a checkpoint
-    written at another lake time."""
+    lake time or `data_end` when joining an open session, the lake
+    refusing a pinned read (HTTP 409), a change of the lake's served code
+    during the session, or a checkpoint written at another lake time."""
 
 
 class HoldoutReadError(RuntimeError):
@@ -220,10 +218,6 @@ READ_TABLES: tuple[str, ...] = (
     "yahoo_split_close_basis",
 )
 
-# Tables with no `scraped_at`, pinned on their own row-time column (naive
-# UTC) instead.
-_ROW_TIME_PIN_COLUMNS = {"crypto_klines_1m": "open_time"}
-
 # Prefix of the lake client's error text for an HTTP 409, the status the
 # lake answers a pin it cannot serve with.
 _HTTP_409_PREFIX = "HTTP 409:"
@@ -252,31 +246,18 @@ class LakeSession(BaseModel):
     `lake_time` is T (UTC), `data_end` the last knowledge-time date a
     loader may be asked for (`None`: no cut; see `_guard_data_end`),
     `lake_version` the `X-Lakehouse-Version` the session first saw
-    (`None` until a response carries one), `rebuilt_whole_builds` maps
-    each rebuilt-whole table in `READ_TABLES` that holds rows to its build
-    time, and `holdout_violations` lists the message of every read refused
-    past `data_end`, kept even when the caller catches the error. The
-    table metadata the reads are shaped from, the set of tables a query
-    has read, and the always-populated tables `_require_rows` has found
-    holding rows are held privately for the life of the session."""
+    (`None` until a response carries one), and `holdout_violations` lists
+    the message of every read refused past `data_end`, kept even when the
+    caller catches the error. The table metadata the reads are shaped from
+    and the always-populated tables `_require_rows` has found holding rows
+    are held privately for the life of the session."""
 
     lake_time: datetime
     data_end: date | None = None
     lake_version: str | None = None
-    rebuilt_whole_builds: dict[str, datetime] = {}
     holdout_violations: list[str] = []
     _tables: dict[str, LakeTableMetadata] = PrivateAttr(default_factory=dict)
-    _read_tables: set[str] = PrivateAttr(default_factory=set)
     _populated_tables: set[str] = PrivateAttr(default_factory=set)
-
-    def row_time_pinned_tables(self) -> list[str]:
-        """The tables in `READ_TABLES` this session pins on a row-time
-        column instead of `scraped_at`, sorted."""
-        return sorted(
-            table
-            for table in _ROW_TIME_PIN_COLUMNS
-            if table in self._tables and not self._tables[table].rebuilt_whole
-        )
 
 
 # The open session, shared by every thread: analysts read the lake from
@@ -324,68 +305,32 @@ def _guard_data_end(knowledge_time: date, loader: str) -> None:
         raise HoldoutReadError(message)
 
 
-def _utc(value: Any) -> datetime | None:
-    """`value` (a timestamp from a query result; naive means UTC) as an
-    aware UTC `datetime`, or `None` when it is null."""
-    if value is None or pd.isna(value):
-        return None
-    stamp = pd.Timestamp(value)
-    stamp = stamp.tz_localize(UTC) if stamp.tzinfo is None else stamp.tz_convert(UTC)
-    return stamp.to_pydatetime().astimezone(UTC)
-
-
-def _rebuilt_whole_build(lake: Lake, table: str) -> datetime | None:
-    """The build time of rebuilt-whole `table`: the newest `scraped_at` of
-    its current rows, `None` when it holds none."""
-    frame = cast(pd.DataFrame, lake.sql(f"SELECT max(scraped_at) AS build FROM {table}", []))
-    return None if frame.empty else _utc(frame.iloc[0]["build"])
-
-
 def _open_session(lake_time: datetime | None, data_end: date | None) -> LakeSession:
-    """Reads the metadata of every table in `READ_TABLES` and the build of
-    each rebuilt-whole one, then fixes T: `lake_time` when given, else 1 s
-    after the newest of the tables' `last_write` and the builds. The
-    session carries `data_end` as given. Raises
-    `LakeTimeError` when an explicit `lake_time` precedes a build, or when
-    no default can be formed because the lake reports no write for any of
-    the tables."""
+    """Reads the metadata of every table in `READ_TABLES`, then fixes T:
+    `lake_time` when given, else 1 s after the newest of the tables'
+    `last_write`. The session carries `data_end` as given. Raises
+    `LakeTimeError` when no default can be formed because the lake reports
+    no write for any of the tables."""
     lake = _lake()
     tables = {
         table: LakeTableMetadata.model_validate(lake.describe(table)) for table in READ_TABLES
     }
-    builds: dict[str, datetime] = {}
-    for table, metadata in tables.items():
-        if metadata.rebuilt_whole:
-            build = _rebuilt_whole_build(lake, table)
-            if build is not None:
-                builds[table] = build
     if lake_time is None:
-        writes = [
-            metadata.last_write.astimezone(UTC)
-            for metadata in tables.values()
-            if metadata.last_write is not None
-        ]
-        newest = max([*writes, *builds.values()], default=None)
+        newest = max(
+            (
+                metadata.last_write.astimezone(UTC)
+                for metadata in tables.values()
+                if metadata.last_write is not None
+            ),
+            default=None,
+        )
         if newest is None:
             raise LakeTimeError(
                 "cannot choose a default lake time: the lake reports no write for any table the "
                 "loader reads; pass an explicit lake time"
             )
         lake_time = newest + timedelta(seconds=1)
-    else:
-        for table, build in sorted(builds.items()):
-            if lake_time < build:
-                raise LakeTimeError(
-                    f"lake time {lake_time.isoformat()} precedes the build of rebuilt-whole table "
-                    f"{table} ({build.isoformat()}); the lake keeps only that build, so a read at "
-                    "this lake time cannot be reproduced"
-                )
-    session = LakeSession(
-        lake_time=lake_time,
-        data_end=data_end,
-        lake_version=lake.last_version,
-        rebuilt_whole_builds=builds,
-    )
+    session = LakeSession(lake_time=lake_time, data_end=data_end, lake_version=lake.last_version)
     session._tables = tables
     return session
 
@@ -399,8 +344,10 @@ def lake_session(
 
     `lake_time` must be timezone-aware (a naive value raises `ValueError`)
     and is held in UTC; when `None`, T is 1 s after the newest `last_write`
-    of `READ_TABLES` and the newest rebuilt-whole build, so the same lake
-    state gives the same T.
+    of `READ_TABLES`, so the same lake state gives the same T. Every read
+    of the session sees the lake as it stood at T: what the lake writes
+    while the session is open (appends, new builds of rebuilt-whole
+    tables) changes none of them.
 
     `data_end` is a hard cut on knowledge time, a separate axis from T:
     T bounds which writes of the lake are visible, `data_end` bounds which
@@ -420,9 +367,8 @@ def lake_session(
     session's, and one whose `data_end` differs from the open session's
     (including a session opened without one) raises `LakeTimeError`. Only
     the call that opened the session closes it, and when its block ends
-    without an error it first raises `HoldoutReadError` if any read was
-    refused past `data_end` (a caller's `except` cannot hide one), then
-    runs `verify_rebuilt_whole_builds`."""
+    without an error it raises `HoldoutReadError` if any read was refused
+    past `data_end` (a caller's `except` cannot hide one)."""
     global _SESSION
     if lake_time is not None and lake_time.utcoffset() is None:
         raise ValueError(
@@ -455,55 +401,11 @@ def lake_session(
                     f"{len(session.holdout_violations)} read(s) past data_end in this session: "
                     + "; ".join(session.holdout_violations)
                 )
-            verify_rebuilt_whole_builds()
     finally:
         if opened:
             clear_loader_window()
             with _SESSION_LOCK:
                 _SESSION = None
-
-
-def verify_rebuilt_whole_builds() -> None:
-    """Checks that no table a query of the open session read at its
-    current state changed during the session, and raises `LakeTimeError`
-    naming each one that did. Those tables carry no `scraped_at` pin, so a
-    change would otherwise alter the data a run reads without an error: a
-    rebuilt-whole table is compared by its build (re-read from the table),
-    a row-time pinned table (`_ROW_TIME_PIN_COLUMNS`) by the `last_write`
-    the lake reports for it. A table no query read is not checked. Does
-    nothing outside a session. Not subject to the session's `data_end`
-    (`_guard_data_end`): it takes no knowledge-time argument and returns
-    no market data, only checks build and write times."""
-    session = _current_session()
-    if session is None:
-        return
-    with _SESSION_LOCK:
-        read = set(session._read_tables)
-    lake = _lake()
-    changed = []
-    for table, metadata in sorted(session._tables.items()):
-        if table not in read:
-            continue
-        if metadata.rebuilt_whole:
-            recorded = session.rebuilt_whole_builds.get(table)
-            current = _rebuilt_whole_build(lake, table)
-            label = "build"
-        elif table in _ROW_TIME_PIN_COLUMNS:
-            recorded = metadata.last_write
-            current = LakeTableMetadata.model_validate(lake.describe(table)).last_write
-            label = "last write"
-        else:
-            continue
-        if current != recorded:
-            before = "none" if recorded is None else recorded.isoformat()
-            after = "none" if current is None else current.isoformat()
-            changed.append(f"{table} ({label} {before} when the session opened, now {after})")
-    if changed:
-        raise LakeTimeError(
-            f"tables read at their current state changed during the session at "
-            f"{session.lake_time.isoformat()}: {'; '.join(changed)}; the run read more than one "
-            "state of them"
-        )
 
 
 def _quote_identifier(name: str) -> str:
@@ -514,6 +416,12 @@ def _scraped_at_pin(lake_time: datetime) -> str:
     """The `scraped_at <= T` condition, with T as a literal compared
     directly (the form the lake detects as a pin)."""
     return f"scraped_at <= CAST('{lake_time.astimezone(UTC).isoformat()}' AS TIMESTAMPTZ)"
+
+
+def _table_at_sql(table: str, lake_time: datetime) -> str:
+    """`table` as it stood at `lake_time`, read through the lake's table
+    macro `<table>_at(T)` with T as a UTC `TIMESTAMPTZ` literal."""
+    return f"{table}_at(TIMESTAMPTZ '{lake_time.astimezone(UTC).isoformat()}')"
 
 
 class MissingTieOrderError(LakeTimeError):
@@ -570,17 +478,10 @@ def _pinned_table_sql(session: LakeSession, table: str) -> str:
     if table not in session._tables:
         raise KeyError(f"{table} is not in READ_TABLES")
     metadata = session._tables[table]
-    if metadata.rebuilt_whole:
-        return table
-    row_time_column = _ROW_TIME_PIN_COLUMNS.get(table)
-    if row_time_column is not None:
-        naive_utc = lake_time.astimezone(UTC).replace(tzinfo=None).isoformat()
-        pin = f"{row_time_column} <= CAST('{naive_utc}' AS TIMESTAMP)"
-        return f"(SELECT * FROM {table} WHERE {pin})"
+    if metadata.rebuilt_whole or metadata.kind == "append-only":
+        return f"(SELECT * FROM {_table_at_sql(table, lake_time)})"
     if table.endswith("_log"):
         return f"(SELECT * FROM {table} WHERE {_scraped_at_pin(lake_time)})"
-    if metadata.kind == "append-only":
-        return f"(SELECT * FROM {table}_log WHERE {_scraped_at_pin(lake_time)})"
     return f"({_deduplicated_log_sql(table, metadata.key_columns, lake_time, metadata.tie_order)})"
 
 
@@ -623,9 +524,8 @@ def _table_sql(table: str) -> str:
     the module docstring for the read shape per table), and with no
     session open inside `unpinned_lake_reads` the bare table name. A
     pinned relation is a parenthesized subquery, so a caller that
-    qualifies columns gives it an alias. Inside a session the table is
-    recorded as read, for `verify_rebuilt_whole_builds`. With no session
-    and no `unpinned_lake_reads` block open, raises `UnpinnedLakeReadError`
+    qualifies columns gives it an alias. With no session and no
+    `unpinned_lake_reads` block open, raises `UnpinnedLakeReadError`
     naming the public loader in progress and `table`."""
     session = _current_session()
     if session is None:
@@ -639,15 +539,22 @@ def _table_sql(table: str) -> str:
             f"{reader} read {table} with no lake_session open; open a lake_session to pin the "
             "read to one lake time, or opt in with unpinned_lake_reads(reason)"
         )
-    relation = _pinned_table_sql(session, table)
-    with _SESSION_LOCK:
-        session._read_tables.add(table)
-    return relation
+    return _pinned_table_sql(session, table)
+
+
+def _served_code(version: str) -> str:
+    """The `code` part of an `X-Lakehouse-Version` (`<code>.<builds>`):
+    the text before its first `.`, the whole of a version without one."""
+    return version.split(".", 1)[0]
 
 
 def _record_version(session: LakeSession, version: str | None) -> None:
     """Records `version` as the session's lake version when it has none,
-    and raises `LakeTimeError` when it differs from the recorded one."""
+    and raises `LakeTimeError` when its `code` part (`_served_code`)
+    differs from the recorded one's. The `builds` part changes whenever
+    a rebuilt-whole table gets a new build, which no read of the session
+    sees (they read `<table>_at(T)`), so it may differ; the recorded
+    version stays the first one the session saw."""
     if version is None:
         return
     with _SESSION_LOCK:
@@ -655,10 +562,11 @@ def _record_version(session: LakeSession, version: str | None) -> None:
             session.lake_version = version
             return
         recorded = session.lake_version
-    if version != recorded:
+    if _served_code(version) != _served_code(recorded):
         raise LakeTimeError(
-            f"the lake version changed from {recorded} to {version} during the session at "
-            f"{session.lake_time.isoformat()}; its reads no longer come from one lake build"
+            f"the lake's served code changed during the session at "
+            f"{session.lake_time.isoformat()} (version {recorded}, now {version}); its reads no "
+            "longer come from one lake build"
         )
 
 
@@ -803,11 +711,10 @@ def lake_provenance() -> LakeProvenance:
     """The lake's version and the UTC time its status was read, from
     `Lake.status()` and the service's health payload, plus the row count
     of each adjustment table from `adjustment_table_row_count`. Inside a
-    `lake_session` it also carries the session's lake time, rebuilt-whole
-    builds and row-time-pinned tables. Raises `EmptyAdjustmentTableError`
-    when either adjustment table is empty. Not subject to the session's
-    `data_end` (`_guard_data_end`): it takes no knowledge-time argument and
-    returns provenance, not market data."""
+    `lake_session` it also carries the session's lake time. Raises
+    `EmptyAdjustmentTableError` when either adjustment table is empty. Not
+    subject to the session's `data_end` (`_guard_data_end`): it takes no
+    knowledge-time argument and returns provenance, not market data."""
     lake = _lake()
     status = lake.status()
     read_at = datetime.now(UTC)
@@ -821,8 +728,6 @@ def lake_provenance() -> LakeProvenance:
             table: adjustment_table_row_count(table) for table in get_args(AdjustmentTable)
         },
         lake_time=None if session is None else session.lake_time,
-        rebuilt_whole_builds={} if session is None else dict(session.rebuilt_whole_builds),
-        row_time_pinned_tables=[] if session is None else session.row_time_pinned_tables(),
     )
 
 

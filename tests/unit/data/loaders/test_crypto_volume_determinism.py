@@ -72,7 +72,7 @@ def test_crypto_daily_volume_is_bit_identical_across_multithreaded_reads(fake_la
     """`_READS` reads of the same minutes on `_THREADS` DuckDB threads give the same bytes for
     every ticker's daily volumes, and each volume is its session minutes' sum to within 1e-12."""
     klines = _klines()
-    fake_lake.add("crypto_klines_1m", klines, pin_column="open_time", kind="append-only")
+    fake_lake.add("crypto_klines_1m", klines, kind="append-only")
     fake_lake._connection.execute(f"SET threads TO {_THREADS}")
 
     first = _read(fake_lake)
@@ -156,7 +156,7 @@ def _plain_decimal_volumes(fake_lake: Any) -> dict[str, bytes]:
 def test_volumes_below_the_minute_limit_are_the_plain_decimal_sum(fake_lake: Any) -> None:
     """With every session minute volume below 1e24, including one of 9.99e23, each daily volume
     has the same bytes as a plain DECIMAL(38, 10) sum of its session minutes."""
-    fake_lake.add("crypto_klines_1m", _guard_klines(), pin_column="open_time", kind="append-only")
+    fake_lake.add("crypto_klines_1m", _guard_klines(), kind="append-only")
 
     frames = _read_guard_days()
 
@@ -175,7 +175,7 @@ def test_a_session_minute_volume_of_1e24_or_more_raises(fake_lake: Any, volume: 
     symbol and the date."""
     klines = _guard_klines()
     klines.loc[_minute(klines, "ETHUSDT", "2023-06-14 18:00"), "volume"] = volume
-    fake_lake.add("crypto_klines_1m", klines, pin_column="open_time", kind="append-only")
+    fake_lake.add("crypto_klines_1m", klines, kind="append-only")
 
     with pytest.raises(ValueError, match=r"ETHUSDT on 2023-06-14 .* not below 1e\+24"):
         _read_guard_days()
@@ -186,7 +186,7 @@ def test_a_minute_volume_of_1e24_outside_the_session_is_ignored(fake_lake: Any) 
     unchanged."""
     klines = _guard_klines()
     klines.loc[_minute(klines, "ETHUSDT", "2023-06-14 02:00"), "volume"] = 1e24
-    fake_lake.add("crypto_klines_1m", klines, pin_column="open_time", kind="append-only")
+    fake_lake.add("crypto_klines_1m", klines, kind="append-only")
 
     frames = _read_guard_days()
 

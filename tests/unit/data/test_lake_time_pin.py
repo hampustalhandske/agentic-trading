@@ -2,8 +2,8 @@
 
 """AT-106: every lakehouse read inside a `lake_session` sees the lake as it stood at one lake
 time T. Tables read through `<t>_log` filtered on `scraped_at <= T` and deduplicated on their key
-columns, append-only tables filtered only, `crypto_klines_1m` on its own `open_time`, and
-rebuilt-whole tables unpinned with their build recorded."""
+columns, and rebuilt-whole and append-only tables (`crypto_klines_1m`) through the lake's
+`<t>_at(T)` macro."""
 
 import json
 import re
@@ -28,10 +28,14 @@ _REBUILT = frozenset(
         "equity_adjustment_factors",
         "equity_daily_from_bars",
         "equity_distributions",
+        "sp500_member_count",
         "sp500_price_coverage",
         "yahoo_split_close_basis",
     }
 )
+# The tables a pinned read takes through `<t>_at(T)`: the rebuilt-whole ones and the
+# append-only `crypto_klines_1m`.
+_READ_AT = _REBUILT | {"crypto_klines_1m"}
 _CONTRACT_DOCUMENT = json.loads(
     (Path(__file__).parents[2] / "fixtures" / "lakehouse_contract_v2.json").read_text()
 )
@@ -97,10 +101,10 @@ def _seed_fred(lake: Any) -> None:
     )
 
 
-def _seed_klines(lake: Any) -> None:
-    """Two BTCUSDT minutes on 2023-01-17: 09:30 ET (14:30 UTC) and 15:59 ET (20:59 UTC)."""
+def _klines(minutes: tuple[tuple[str, float, float], ...]) -> pd.DataFrame:
+    """BTCUSDT minutes on 2023-01-17, each (UTC time, open, close)."""
     rows = []
-    for minute, open_, close in (("14:30", 21_000.0, 21_010.0), ("20:59", 21_100.0, 21_123.45)):
+    for minute, open_, close in minutes:
         stamp = pd.Timestamp(f"2023-01-17 {minute}")
         rows.append(
             {
@@ -119,12 +123,21 @@ def _seed_klines(lake: Any) -> None:
                 "table": "crypto_klines_1m",
             }
         )
+    return pd.DataFrame(rows)
+
+
+def _seed_klines(lake: Any) -> None:
+    """Two BTCUSDT minutes on 2023-01-17, each written a minute after it closed: 09:30 ET
+    (14:30 UTC) and 15:59 ET (20:59 UTC)."""
     lake.add(
         "crypto_klines_1m",
-        pd.DataFrame(rows),
+        _klines((("14:30", 21_000.0, 21_010.0),)),
         ("dt",),
+        scraped_at="2023-01-17T14:32:00Z",
         kind="append-only",
-        pin_column="open_time",
+    )
+    lake.add_log_rows(
+        "crypto_klines_1m", _klines((("20:59", 21_100.0, 21_123.45),)), "2023-01-17T21:01:00Z"
     )
 
 
@@ -196,21 +209,6 @@ def test_default_lake_time_is_newest_write_plus_one_second(fake_lake: Any) -> No
     with ll.lake_session() as session:
         assert session.lake_time == datetime(2024, 5, 1, 12, 0, 2, tzinfo=UTC)
         assert session.lake_time.utcoffset() == timedelta(0)
-
-
-def test_default_lake_time_never_precedes_a_rebuilt_whole_build(fake_lake: Any) -> None:
-    """A lagging last_write cannot put the default T before a rebuilt-whole table's build."""
-    fred = pd.DataFrame(
-        {"series_id": ["S"], "date": ["2024-01-02"], "realtime_start": ["2024-01-03"]}
-    )
-    fake_lake.add(
-        "fred_vintages", fred, ("date", "realtime_start"), scraped_at="2024-05-01T12:00:00Z"
-    )
-    _seed_splits(fake_lake, [("A", "2024-01-02", 0.5, True)], "2024-05-10T00:00:00Z")
-    fake_lake.last_write_overrides["yahoo_split_close_basis"] = "2024-04-01T00:00:00Z"
-
-    with ll.lake_session() as session:
-        assert session.lake_time == datetime(2024, 5, 10, 0, 0, 1, tzinfo=UTC)
 
 
 def test_current_table_reads_each_key_as_of_t_even_when_the_new_version_fails_the_where(
@@ -381,37 +379,46 @@ def test_company_facts_direct_log_read_is_filtered_without_dedupe(fake_lake: Any
     assert pinned["filed"].tolist() == [pd.Timestamp("2023-05-05")]
 
 
-def test_crypto_klines_are_pinned_on_their_own_row_time(fake_lake: Any) -> None:
-    """A kline opening after T is invisible, so a bar missing its closing minute is absent."""
+def test_crypto_klines_are_pinned_on_when_each_minute_was_written(fake_lake: Any) -> None:
+    """A kline written after T is invisible, so a bar missing its closing minute is absent; the
+    read goes through `crypto_klines_1m_at(T)`."""
     _seed_klines(fake_lake)
     args = (["BTC-USD"], date(2023, 1, 17), date(2023, 1, 17))
 
-    with ll.lake_session(datetime(2023, 1, 17, 20, 0, tzinfo=UTC)):
+    with ll.lake_session(datetime(2023, 1, 17, 21, 0, tzinfo=UTC)):
         early = ll.load_price_history_from_lakehouse(*args)
     with ll.lake_session(datetime(2023, 1, 18, tzinfo=UTC)):
         late = ll.load_price_history_from_lakehouse(*args)
 
     assert early is None
     assert late is not None and late["BTC-USD"]["close"].tolist() == [21_123.45]
+    assert any(
+        "crypto_klines_1m_at(TIMESTAMPTZ '2023-01-17T21:00:00+00:00')" in query
+        for query, _ in fake_lake.calls
+    )
 
 
-def test_rebuilt_whole_table_reads_unpinned_and_records_its_build(fake_lake: Any) -> None:
-    """A rebuilt-whole table is read unpinned and its build recorded; an earlier T raises."""
+def test_rebuilt_whole_table_reads_the_build_of_t_through_its_at_macro(fake_lake: Any) -> None:
+    """A rebuilt-whole table is read through `<t>_at(T)`, which gives the build current at T
+    although a later build has replaced it; neither the table nor its log is read."""
     _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
+    fake_lake.add_build(
+        "yahoo_split_close_basis", _splits([("AAPL", "2024-08-01", 0.5, True)]), _AFTER
+    )
 
-    with ll.lake_session(_T) as session:
+    with ll.lake_session(_T):
         factor = ll.split_adjustment_factor("AAPL", date(2024, 1, 2))
-        builds = dict(session.rebuilt_whole_builds)
-    assert factor == pytest.approx(4.0)
-    assert builds["yahoo_split_close_basis"] == datetime(2024, 5, 20, tzinfo=UTC)
-    assert not any("yahoo_split_close_basis_log" in query for query, _ in fake_lake.calls)
 
-    with (
-        pytest.raises(ll.LakeTimeError, match="yahoo_split_close_basis") as error,
-        ll.lake_session(datetime(2024, 5, 1, tzinfo=UTC)),
-    ):
-        ll.split_adjustment_factor("AAPL", date(2024, 1, 2))
-    assert "2024-05-20" in str(error.value)
+    assert factor == pytest.approx(4.0)
+    queries = [query for query, _ in fake_lake.calls]
+    assert any(
+        "FROM (SELECT * FROM yahoo_split_close_basis_at(TIMESTAMPTZ '2024-06-01T12:00:00+00:00'))"
+        in query
+        for query in queries
+    )
+    assert not any(
+        re.search(r"\byahoo_split_close_basis(_log)?\b(?!_at)", query) for query in queries
+    )
 
 
 def _pin_values(query: str, params: list[Any]) -> list[datetime]:
@@ -424,7 +431,7 @@ def _pin_values(query: str, params: list[Any]) -> list[datetime]:
                 found.append(datetime.fromisoformat(value))
             except ValueError:
                 continue
-    literal = r"(?:scraped_at|open_time)\s*<=\s*(?:CAST\()?\s*'([^']+)'"
+    literal = r"(?:scraped_at\s*<=\s*(?:CAST\()?|_at\(TIMESTAMPTZ)\s*'([^']+)'"
     found.extend(datetime.fromisoformat(text) for text in re.findall(literal, query, re.I))
     return found
 
@@ -437,15 +444,13 @@ def _pin_problems(query: str, params: list[Any]) -> list[str]:
     problems: list[str] = []
     logs = [ref for ref in refs if ref.endswith("_log")]
     for ref in refs:
-        if ref in _REBUILT or ref.endswith("_log"):
+        if ref.endswith("_log"):
             continue
-        if ref != "crypto_klines_1m":
-            problems.append(f"reads the current view {ref}")
+        if ref.endswith("_at") and ref[: -len("_at")] in _READ_AT:
+            if f"{ref}(TIMESTAMPTZ '{_T.isoformat()}')" not in query:
+                problems.append(f"{ref} is not called at T")
             continue
-        if not re.search(r"open_time\s*<=", query, re.I):
-            problems.append("crypto_klines_1m has no open_time <= pin")
-        if _T not in values and _T.replace(tzinfo=None) not in values:
-            problems.append("crypto_klines_1m pin does not carry T")
+        problems.append(f"reads the current view {ref}")
     if logs:
         if len(re.findall(r"scraped_at\s*<=", query, re.I)) < len(logs):
             problems.append(f"a _log reference in {logs} has no scraped_at <= pin")
@@ -456,25 +461,22 @@ def _pin_problems(query: str, params: list[Any]) -> list[str]:
 
 def _sweep_lake(lake: Any) -> None:
     """Every contract table as an empty table with a one-row log, with the kind, keys and tie
-    order the contract gives, the rebuilt six flagged."""
+    order the contract gives, the rebuilt-whole ones flagged."""
     for view, columns in _CONTRACT.items():
         typed = {f'"{n}"': ("VARCHAR" if k == '"NULL"' else k) for n, k in columns.items()}
         entry = _CONTRACT_TABLES[view]
-        row_time = view == "crypto_klines_1m"
         lake.add_empty(
             view,
             typed,
             kind=entry["kind"].replace("_", "-"),
             key_columns=entry["keys"],
             rebuilt_whole=entry["kind"] == "rebuilt_whole",
-            pin_column="open_time" if row_time else None,
         )
         if entry["kind"] == "current":
             lake.tie_order_overrides[view] = entry["tie_order"]
-        if not row_time:
-            lake._connection.execute(
-                f"INSERT INTO {view}_log (scraped_at) VALUES (CAST(? AS TIMESTAMPTZ))", [_B1]
-            )
+        lake._connection.execute(
+            f"INSERT INTO {view}_log (scraped_at) VALUES (CAST(? AS TIMESTAMPTZ))", [_B1]
+        )
     factors = pd.DataFrame(
         {
             "ticker": ["ZZ"],
@@ -502,7 +504,7 @@ def _sweep_lake(lake: Any) -> None:
 
 
 def test_every_public_loader_sql_is_pinned_inside_a_session(fake_lake: Any) -> None:
-    """Every SQL a loader sends in a session reads a pinned _log, a rebuilt table or klines."""
+    """Every SQL a loader sends in a session reads a pinned _log or a `<t>_at(T)` macro."""
     _sweep_lake(fake_lake)
     day, window = date(2024, 3, 15), (date(2024, 3, 1), date(2024, 3, 15))
     calls = {
@@ -595,6 +597,24 @@ def test_lake_version_change_during_a_session_raises(fake_lake: Any) -> None:
             ll.load_fred_series_from_lakehouse("DGS10", date(2024, 1, 20))
 
 
+def test_only_the_code_part_of_the_lake_version_must_hold_during_a_session(
+    fake_lake: Any,
+) -> None:
+    """A version whose `builds` part (after the first `.`) changes mid-session reads on and the
+    session keeps the first version it saw; one whose `code` part changes raises."""
+    _seed_fred(fake_lake)
+    fake_lake.version = "c0de00000000.b01d00000001"
+
+    with ll.lake_session(_T) as session:
+        assert ll.load_fred_series_from_lakehouse("DGS10", date(2024, 1, 20)) is not None
+        fake_lake.version = "c0de00000000.b01d00000002"
+        assert ll.load_fred_series_from_lakehouse("DGS10", date(2024, 1, 20)) is not None
+        assert session.lake_version == "c0de00000000.b01d00000001"
+        fake_lake.version = "c0de00000001.b01d00000002"
+        with pytest.raises(ll.LakeTimeError, match="served code"):
+            ll.load_fred_series_from_lakehouse("DGS10", date(2024, 1, 20))
+
+
 def test_adjustment_row_count_cache_does_not_cross_lake_times(fake_lake: Any) -> None:
     """A row count read outside a session or under one T is re-read under another T."""
 
@@ -672,9 +692,8 @@ def test_first_dolthub_chain_date_cache_does_not_cross_lake_times(fake_lake: Any
     assert (at_t, outside, later) == ([7.0], [1.0], [1.0])
 
 
-def test_lake_provenance_carries_lake_time_builds_and_row_time_tables(fake_lake: Any) -> None:
-    """In a session, lake_provenance records T, the rebuilt builds and the row-time tables."""
-    _seed_klines(fake_lake)
+def test_lake_provenance_carries_the_lake_time(fake_lake: Any) -> None:
+    """In a session, lake_provenance records T; outside one, and by default, it is None."""
     factors = pd.DataFrame({"ticker": ["A"], "security_id": [1]})
     _seed_rebuilt(fake_lake, "equity_adjustment_factors", factors, "2024-05-01T00:00:00Z")
     _seed_splits(fake_lake, [("A", "2024-01-02", 0.5, True)], "2024-05-02T00:00:00Z")
@@ -682,85 +701,7 @@ def test_lake_provenance_carries_lake_time_builds_and_row_time_tables(fake_lake:
 
     outside = ll.lake_provenance()
     with ll.lake_session(_T):
-        ll.load_price_history_from_lakehouse(["BTC-USD"], date(2023, 1, 17), date(2023, 1, 17))
         inside = ll.lake_provenance()
 
-    for bare in (default, outside):
-        assert bare.lake_time is None
-        assert bare.rebuilt_whole_builds == {}
-        assert bare.row_time_pinned_tables == []
+    assert default.lake_time is None and outside.lake_time is None
     assert inside.lake_time == _T
-    assert inside.rebuilt_whole_builds == {
-        "equity_adjustment_factors": datetime(2024, 5, 1, tzinfo=UTC),
-        "yahoo_split_close_basis": datetime(2024, 5, 2, tzinfo=UTC),
-    }
-    assert inside.row_time_pinned_tables == ["crypto_klines_1m"]
-
-
-def test_a_rebuilt_whole_table_rebuilt_during_the_session_raises_at_the_check(
-    fake_lake: Any,
-) -> None:
-    """`verify_rebuilt_whole_builds` re-reads each build and names a table rebuilt since T."""
-    _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
-
-    with ll.lake_session(_T):
-        ll.split_adjustment_factor("AAPL", date(2024, 6, 3))
-        ll.verify_rebuilt_whole_builds()
-        _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.5, True)], "2024-05-25T00:00:00Z")
-        with pytest.raises(ll.LakeTimeError, match="yahoo_split_close_basis") as error:
-            ll.verify_rebuilt_whole_builds()
-        _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
-    assert "2024-05-20" in str(error.value) and "2024-05-25" in str(error.value)
-
-
-def test_closing_a_session_checks_the_builds_and_outside_one_the_check_is_a_no_op(
-    fake_lake: Any,
-) -> None:
-    """The opening `lake_session` call checks the builds when its block ends without an error."""
-    _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
-    ll.verify_rebuilt_whole_builds()
-
-    with pytest.raises(ll.LakeTimeError, match="yahoo_split_close_basis"):
-        with ll.lake_session(_T):
-            ll.split_adjustment_factor("AAPL", date(2024, 6, 3))
-            _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.5, True)], "2024-05-25T00:00:00Z")
-    assert ll.current_lake_time() is None
-
-    with pytest.raises(ZeroDivisionError), ll.lake_session(_T):
-        ll.split_adjustment_factor("AAPL", date(2024, 6, 3))
-        _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.75, True)], "2024-05-30T00:00:00Z")
-        raise ZeroDivisionError
-    assert ll.current_lake_time() is None
-
-
-def test_a_row_time_table_written_during_the_session_raises_at_the_check(fake_lake: Any) -> None:
-    """crypto_klines_1m has no log, so a new `last_write` during the session fails the check."""
-    _seed_klines(fake_lake)
-
-    with ll.lake_session(_T):
-        ll.load_price_history_from_lakehouse(["BTC-USD"], date(2023, 1, 17), date(2023, 1, 17))
-        ll.verify_rebuilt_whole_builds()
-        fake_lake.last_write_overrides["crypto_klines_1m"] = "2024-06-02T00:00:00Z"
-        with pytest.raises(ll.LakeTimeError, match="crypto_klines_1m") as error:
-            ll.verify_rebuilt_whole_builds()
-        fake_lake.last_write_overrides.clear()
-    assert "last write" in str(error.value)
-
-
-def test_the_check_covers_only_tables_the_session_read(fake_lake: Any) -> None:
-    """A table the session never read may change without failing the check; once a query has
-    read a table, a change to it fails the check, naming only that table."""
-    _seed_klines(fake_lake)
-    _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
-
-    with ll.lake_session(_T):
-        ll.split_adjustment_factor("AAPL", date(2024, 6, 3))
-        fake_lake.last_write_overrides["crypto_klines_1m"] = "2024-06-02T00:00:00Z"
-        ll.verify_rebuilt_whole_builds()
-
-        _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.5, True)], "2024-05-25T00:00:00Z")
-        with pytest.raises(ll.LakeTimeError, match="yahoo_split_close_basis") as error:
-            ll.verify_rebuilt_whole_builds()
-        _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], "2024-05-20T00:00:00Z")
-        fake_lake.last_write_overrides.clear()
-    assert "crypto_klines_1m" not in str(error.value)

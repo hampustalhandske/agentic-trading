@@ -41,8 +41,6 @@ _NO_KNOWLEDGE_TIME = frozenset(
         "source_coverage",
         # The lake version and status document; no market data.
         "lake_provenance",
-        # Re-reads the builds and last writes of tables the session read; no market data.
-        "verify_rebuilt_whole_builds",
     }
 )
 _DUMMY_BY_NAME: dict[str, Any] = {"option_type": "call", "series_id": "DGS10"}

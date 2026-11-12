@@ -156,7 +156,6 @@ _ALLOWED: dict[str, str] = {
     ),
     "agentic_trading.data.loaders.lakehouse_loader:_QUERY_COUNTS_LOCK": _LOCK,
     "agentic_trading.data.loaders.lakehouse_loader:_UNFACTORED_SPLIT_MOVES_LOCK": _LOCK,
-    "agentic_trading.data.loaders.lakehouse_loader:_ROW_TIME_PIN_COLUMNS": _CONSTANT,
     "agentic_trading.data.loaders.lakehouse_loader:_COT_DISAGGREGATED_CODES": _CONSTANT,
     "agentic_trading.data.loaders.lakehouse_loader:_COT_TFF_CODES": _CONSTANT,
     "agentic_trading.data.loaders.lakehouse_loader:DEFAULT_COT_TICKER_BY_ASSET": _CONSTANT,
