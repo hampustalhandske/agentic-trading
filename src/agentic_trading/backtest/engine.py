@@ -1657,7 +1657,7 @@ class BacktestEngine:
             total_option_premium_paid=total_option_premium_paid,
             pod_return_history=pod_return_history,
             pod_performance=pod_performance,
-            pod_costs=_pod_cost_attribution(pod_cost_days, len(portfolio_value_history)),
+            pod_costs=pod_cost_attribution(pod_cost_days, len(portfolio_value_history)),
             unfactored_split_moves=(
                 None
                 if checkpoint is not None
@@ -1853,7 +1853,7 @@ def _charge_fill(
     _charge(day.option_premium_paid, -trade.premium, shares)
 
 
-def _pod_cost_attribution(
+def pod_cost_attribution(
     days: list[PodCostDay], observed_days: int
 ) -> dict[str, PodCostAttribution]:
     """Each pod's `PodCostAttribution` over `days`, plus a `"commander"`

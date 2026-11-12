@@ -13,7 +13,7 @@ record read at. `record_result` opens the checkpoint read-only
 (`checkpoint_store.connect_read_only`) and computes the `BacktestResult`
 the engine's run returns from the histories it holds, through the engine's
 own functions (`backtest.engine.run_metrics`, `source_performance_of`,
-`pod_performance_of`, `_pod_cost_attribution`, `execution_cost_totals`):
+`pod_performance_of`, `pod_cost_attribution`, `execution_cost_totals`):
 the same numbers, but for what only the engine's memory held (its last
 decisions, its horizon setting and the split moves its own reads found).
 
@@ -53,8 +53,8 @@ from agentic_trading.agents.schemas import (
 )
 from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.engine import (
-    _pod_cost_attribution,
     execution_cost_totals,
+    pod_cost_attribution,
     pod_performance_of,
     run_metrics,
     source_performance_of,
@@ -188,7 +188,7 @@ def _result_of(
         total_option_premium_paid=state["total_option_premium_paid"],
         pod_return_history=pod_return_history,
         pod_performance=pod_performance_of(pod_return_history),
-        pod_costs=_pod_cost_attribution(pod_cost_days, len(portfolio_value_history)),
+        pod_costs=pod_cost_attribution(pod_cost_days, len(portfolio_value_history)),
         unfactored_split_moves=None,
     )
 
