@@ -42,6 +42,7 @@ from agentic_trading.data.loader import (
     load_price_history_with_fallback,
 )
 from agentic_trading.data.loaders.lakehouse_loader import (
+    check_lake_version_pair,
     declare_loader_window,
     lake_requests_in_flight,
     lake_session,
@@ -61,7 +62,7 @@ from agentic_trading.data.ticker_catalog import (
     tickers_by_asset_class,
 )
 from agentic_trading.firm_record.runner import run_firm_record
-from agentic_trading.firm_record.spec import _HASHED_ROOTS
+from agentic_trading.firm_record.spec import _HASHED_ROOTS, build_firm_spec
 from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.provenance import build_run_provenance
 from agentic_trading.scoring.track_record import TrackRecord
@@ -75,6 +76,7 @@ from agentic_trading.stage_a.spec import (
 )
 from agentic_trading.stage_a.store import InstrumentKind
 from agentic_trading.trials.ledger import TrialLedger
+from agentic_trading.trials.rows import firm_registered_trials
 
 app = typer.Typer()
 experiment_app = typer.Typer()
@@ -217,6 +219,14 @@ _LAKE_TIME_HELP = (
     "write of the tables the run reads."
 )
 
+_LAKE_VERSION_HELP = (
+    "Lake version the record reads at, the X-Lakehouse-Version pair <code>.<builds> "
+    "(e.g. 5941cb993106.989067ad8ba0), pinned the way --lake-time pins T: every response must "
+    "carry its code part, and the record writes this pair. Required with --lake-time for a "
+    "counted record unless the store already holds the trial, whose recorded pair is then "
+    "used. Default: the first version the lake answers with."
+)
+
 _LOADER_STORE_HELP = (
     "Serve the loaders' per-day reads from data read once over the run's window "
     "(the window store); --no-loader-store makes every read query the lake itself. "
@@ -272,6 +282,38 @@ def _parse_lake_time_flag(value: str | None) -> datetime | None:
             f"--lake-time {value!r} has no UTC offset; add one, e.g. {_LAKE_TIME_EXAMPLE}."
         )
     return parsed
+
+
+def _parse_lake_version_flag(value: str | None) -> str | None:
+    """The `--lake-version` value, or `None` when the flag was not given. A
+    value that is not `<code>.<builds>` (`check_lake_version_pair`) is a
+    usage error."""
+    if value is None:
+        return None
+    try:
+        return check_lake_version_pair(value.strip())
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--lake-version") from exc
+
+
+def _recorded_lake_version(
+    store_dir: Path,
+    commander: Commander,
+    tickers: list[str],
+    window_start: date,
+    window_end: date,
+    lake_time: datetime,
+) -> str | None:
+    """The lake version the spec.json under `store_dir` records for the
+    firm trial of `commander` over `tickers` from `window_start` to
+    `window_end` at `lake_time` (its spec built as `run_firm_record` builds
+    it, read from `store_dir / <spec hash> / spec.json`), or `None` when the
+    store holds no spec.json for that trial."""
+    spec = build_firm_spec(commander, tickers, window_start, window_end, lake_time)
+    spec_path = store_dir / firm_spec_hash(spec) / "spec.json"
+    if not spec_path.exists():
+        return None
+    return FirmSpecRecord.model_validate_json(spec_path.read_bytes()).lake_version
 
 
 def _checkpoint_lake_time(checkpoint_paths: list[str | None]) -> datetime | None:
@@ -1216,6 +1258,7 @@ def firm_record(
         help="Write at most this many days in this call; rerun to resume (default: all).",
     ),
     lake_time: str | None = typer.Option(None, "--lake-time", help=_LAKE_TIME_HELP),
+    lake_version: str | None = typer.Option(None, "--lake-version", help=_LAKE_VERSION_HELP),
     parallel_workers: int = typer.Option(
         4,
         min=1,
@@ -1271,7 +1314,14 @@ def firm_record(
     whose bars start inside the warm-up passes, and its `ShortWarmup` goes
     to agentic_meta.json. Then runs `firm_record.runner.run_firm_record`
     on those inputs, all inside one lake session cut
-    at `stage_a.data_end`. With --loader-store (the
+    at `stage_a.data_end` and pinned to the lake version the record
+    writes. That version is --lake-version when given; with --lake-time and
+    no --lake-version, the one the store's spec.json records for this trial
+    when the store holds it (a resume), and otherwise, for a record that
+    would be counted (the firm's registry file exists), a usage error; in
+    every other case the first version the lake answers with. Every lake
+    response must carry the pinned version's code part
+    (`lakehouse_loader.lake_session`). With --loader-store (the
     default) the session's loader window store is declared over the same
     span, --start minus `stage_a.warmup_days` to --end
     (`declare_run_window`); --no-loader-store leaves every loader call
@@ -1284,13 +1334,16 @@ def firm_record(
     figure. When the pass stopped because its resident memory passed
     --restart-above-rss-mb, the command then replaces its process with the
     same command line (`_restart_record`), pinned to the lake time it read
-    and, with --max-days, to the days still allowed, so the record resumes
+    and the lake version it wrote and, with --max-days, to the days still
+    allowed, so the record resumes
     from its checkpoint in a fresh process under the same pid. It raises
     `RuntimeError` instead when the source on disk no longer gives the
     running trial's spec hash (`_require_unchanged_source`). Exits 2
     on a usage error: a reversed window, one ending after
     stage_a.data_end, a --store-dir inside the repository, a naive
-    --lake-time or a bad --set. `--set` overrides apply before any setting
+    --lake-time, a --lake-version not of the form <code>.<builds>, a
+    counted record given --lake-time without --lake-version (above) or a
+    bad --set. `--set` overrides apply before any setting
     is read. The sha256 of every .py file under the package directory
     is taken when the command starts, and a restart raises `RuntimeError`
     when any has changed, been added or been removed since
@@ -1305,6 +1358,7 @@ def firm_record(
     started_sources = _package_sources()
     _apply_cli_overrides(set_override)
     requested_lake_time = _parse_lake_time_flag(lake_time)
+    pinned_lake_version = _parse_lake_version_flag(lake_version)
     data_end = settings.stage_a.data_end
     window_start = _parse_date_flag(start, "--start")
     window_end = _parse_date_flag(end, "--end")
@@ -1330,6 +1384,16 @@ def firm_record(
         parallel_workers=parallel_workers,
     )
     tickers = list(FIRM_V1_UNIVERSE)
+    if requested_lake_time is not None and pinned_lake_version is None:
+        pinned_lake_version = _recorded_lake_version(
+            store_dir, commander, tickers, window_start, window_end, requested_lake_time
+        )
+        if pinned_lake_version is None and firm_registered_trials(_REPO_ROOT) is not None:
+            raise typer.BadParameter(
+                "a counted record pinned to --lake-time needs the lake version it reads at; "
+                "pass the registered <code>.<builds> pair",
+                param_hint="--lake-version",
+            )
 
     configure_logging()
     logger = get_logger(__name__)
@@ -1341,7 +1405,9 @@ def firm_record(
         store_dir,
     )
     require_lake_health()
-    with lake_session(requested_lake_time, data_end=data_end) as session:
+    with lake_session(
+        requested_lake_time, data_end=data_end, lake_version=pinned_lake_version
+    ) as session:
         typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
         declare_run_window(loader_store, window_start, window_end, settings.stage_a.warmup_days)
         inputs = load_engine_inputs(
@@ -1368,7 +1434,7 @@ def firm_record(
             known_gaps=settings.firm.known_price_gaps,
             start_exempt=CRYPTO_ASSETS,
         )
-        lake_version = (
+        recorded_lake_version = (
             session.lake_version
             if session.lake_version is not None
             else provenance.lake_provenance().lake_version
@@ -1381,7 +1447,7 @@ def firm_record(
             store_dir,
             inputs,
             lake_time=session.lake_time,
-            lake_version=lake_version,
+            lake_version=recorded_lake_version,
             quantcore_version=metadata.version("quantcore"),
             max_days=max_days,
             ledger=TrialLedger(_REPO_ROOT / settings.trials.ledger_path, _REPO_ROOT),
@@ -1394,7 +1460,12 @@ def firm_record(
         pinned_lake_time = session.lake_time
     typer.echo(result.model_dump_json(indent=2))
     if result.paused_for_memory:
-        extra = ["--lake-time", pinned_lake_time.isoformat()]
+        extra = [
+            "--lake-time",
+            pinned_lake_time.isoformat(),
+            "--lake-version",
+            recorded_lake_version,
+        ]
         if max_days is not None:
             extra += ["--max-days", str(max_days - result.days_written)]
         logger.info(

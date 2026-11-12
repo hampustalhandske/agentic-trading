@@ -19,8 +19,9 @@ the table (`Lake.describe`, read once when the session opens):
   deduplicated on the table's key columns (the latest write at or before
   T wins, ties broken in the table's `tie_order`); the loader's own
   filters apply after that dedupe;
-- a rebuilt-whole table and an append-only table (`crypto_klines_1m`)
-  read the lake's table macro `<table>_at(T)`: for a rebuilt-whole table
+- a rebuilt-whole table and an append-only table (`_APPEND_ONLY_TABLES`:
+  `crypto_klines_1m`) read the lake's table macro `<table>_at(T)`: for a
+  rebuilt-whole table
   every row of the one build with the greatest `scraped_at` at or before
   T, for an append-only table the rows written at or before T (rows
   stored before the table got `scraped_at` count as written at the
@@ -30,7 +31,12 @@ the table (`Lake.describe`, read once when the session opens):
   `sec_insider_transactions_log`) is filtered on `scraped_at <= T`.
 
 Writes the lake makes after T (appends, new builds) change no read of
-the session.
+the session. `_query` refuses, before sending, a query that names a table
+read through `<table>_at(T)` in any other way (`UnpinnedTableReadError`).
+A pinned read depends only on T and the `code` part of the lake's
+`X-Lakehouse-Version` (`<code>.<builds>`), so a session may pin the whole
+pair (`lake_session(lake_version=...)`) and checks every response on the
+code part alone.
 
 Outside a session a read raises `UnpinnedLakeReadError`, naming the
 loader and the table, before any query is sent. A caller that must read
@@ -101,6 +107,7 @@ starting earlier fetches the key again from there); a source holding a
 key's full history up to `end` passes `ranged=False`."""
 
 import functools
+import re
 import threading
 import time
 from collections.abc import Callable, Hashable, Iterator, Sequence
@@ -150,9 +157,11 @@ class LakeProvenance(BaseModel):
 
 class LakeTimeError(RuntimeError):
     """A read cannot be made at the session's lake time: a conflicting
-    lake time or `data_end` when joining an open session, the lake
-    refusing a pinned read (HTTP 409), a change of the lake's served code
-    during the session, or a checkpoint written at another lake time."""
+    lake time, `data_end` or lake version when joining an open session,
+    the lake refusing a pinned read (HTTP 409), a change of the lake's
+    served code during the session, a query naming a table other than
+    through `<table>_at(T)` (`UnpinnedTableReadError`), or a checkpoint
+    written at another lake time."""
 
 
 class HoldoutReadError(RuntimeError):
@@ -221,6 +230,25 @@ READ_TABLES: tuple[str, ...] = (
 # Prefix of the lake client's error text for an HTTP 409, the status the
 # lake answers a pin it cannot serve with.
 _HTTP_409_PREFIX = "HTTP 409:"
+
+# The append-only tables in `READ_TABLES` (the lake contract's kind
+# `append_only`), read through `<table>_at(T)` inside a session whatever
+# kind the lake's metadata reports.
+_APPEND_ONLY_TABLES: frozenset[str] = frozenset({"crypto_klines_1m"})
+
+# An `X-Lakehouse-Version`: `<code>.<builds>`, each part non-empty.
+_LAKE_VERSION_PATTERN = re.compile(r"[^\s.]+\.[^\s.]+")
+
+
+def check_lake_version_pair(version: str) -> str:
+    """`version` when it has the form of an `X-Lakehouse-Version`,
+    `<code>.<builds>` (two non-empty parts without whitespace or `.`,
+    joined by one `.`); raises `ValueError` naming it otherwise."""
+    if _LAKE_VERSION_PATTERN.fullmatch(version) is None:
+        raise ValueError(
+            f"lake version {version!r} is not <code>.<builds>, e.g. 5941cb993106.989067ad8ba0"
+        )
+    return version
 
 
 class LakeTableMetadata(BaseModel):
@@ -305,12 +333,18 @@ def _guard_data_end(knowledge_time: date, loader: str) -> None:
         raise HoldoutReadError(message)
 
 
-def _open_session(lake_time: datetime | None, data_end: date | None) -> LakeSession:
+def _open_session(
+    lake_time: datetime | None, data_end: date | None, lake_version: str | None
+) -> LakeSession:
     """Reads the metadata of every table in `READ_TABLES`, then fixes T:
     `lake_time` when given, else 1 s after the newest of the tables'
-    `last_write`. The session carries `data_end` as given. Raises
-    `LakeTimeError` when no default can be formed because the lake reports
-    no write for any of the tables."""
+    `last_write`. The session carries `data_end` as given, and as its lake
+    version `lake_version` when given, else the version of the metadata's
+    responses (`None` when they carry none). Raises `LakeTimeError` when no
+    default can be formed because the lake reports no write for any of the
+    tables, or when the metadata's responses carry a version whose `code`
+    part differs from a given `lake_version`'s (`_require_served_code`).
+    Called with `_SESSION_LOCK` held."""
     lake = _lake()
     tables = {
         table: LakeTableMetadata.model_validate(lake.describe(table)) for table in READ_TABLES
@@ -330,14 +364,23 @@ def _open_session(lake_time: datetime | None, data_end: date | None) -> LakeSess
                 "loader reads; pass an explicit lake time"
             )
         lake_time = newest + timedelta(seconds=1)
-    session = LakeSession(lake_time=lake_time, data_end=data_end, lake_version=lake.last_version)
+    session = LakeSession(
+        lake_time=lake_time,
+        data_end=data_end,
+        lake_version=lake.last_version if lake_version is None else lake_version,
+    )
     session._tables = tables
+    if session.lake_version is not None and lake.last_version is not None:
+        _require_served_code(session, session.lake_version, lake.last_version)
     return session
 
 
 @contextmanager
 def lake_session(
-    lake_time: datetime | None = None, *, data_end: date | None = None
+    lake_time: datetime | None = None,
+    *,
+    data_end: date | None = None,
+    lake_version: str | None = None,
 ) -> Iterator[LakeSession]:
     """Opens a process-wide session in which every loader read sees the
     lake as it stood at one lake time T, and yields it.
@@ -348,6 +391,14 @@ def lake_session(
     of the session sees the lake as it stood at T: what the lake writes
     while the session is open (appends, new builds of rebuilt-whole
     tables) changes none of them.
+
+    `lake_version` pins the lake version the way `lake_time` pins T: an
+    `X-Lakehouse-Version` pair `<code>.<builds>` (`check_lake_version_pair`;
+    another form raises `ValueError`), held as the session's
+    `lake_version`. Every response of the session, the metadata read that
+    opens it included, must carry the same `code` part, or the read raises
+    `LakeTimeError`; the `builds` part is never compared. When `None`, the
+    session's lake version is the first one a response carries.
 
     `data_end` is a hard cut on knowledge time, a separate axis from T:
     T bounds which writes of the lake are visible, `data_end` bounds which
@@ -365,7 +416,8 @@ def lake_session(
     A joining call whose `lake_time` differs from the open T raises
     `LakeTimeError`; a joining call without a `data_end` inherits the open
     session's, and one whose `data_end` differs from the open session's
-    (including a session opened without one) raises `LakeTimeError`. Only
+    (including a session opened without one) raises `LakeTimeError`, and
+    so does one whose `lake_version` differs from the open session's. Only
     the call that opened the session closes it, and when its block ends
     without an error it raises `HoldoutReadError` if any read was refused
     past `data_end` (a caller's `except` cannot hide one)."""
@@ -375,12 +427,14 @@ def lake_session(
             f"lake time {lake_time.isoformat()} has no UTC offset; give one, e.g. "
             "2024-06-01T12:00:00+00:00"
         )
+    if lake_version is not None:
+        check_lake_version_pair(lake_version)
     requested = None if lake_time is None else lake_time.astimezone(UTC)
     with _SESSION_LOCK:
         session = _SESSION
         opened = session is None
         if session is None:
-            session = _open_session(requested, data_end)
+            session = _open_session(requested, data_end, lake_version)
             _SESSION = session
         elif requested is not None and requested != session.lake_time:
             raise LakeTimeError(
@@ -392,6 +446,11 @@ def lake_session(
             raise LakeTimeError(
                 f"a lake session with {open_end} is open; cannot join it with data_end "
                 f"{data_end.isoformat()}"
+            )
+        elif lake_version is not None and lake_version != session.lake_version:
+            raise LakeTimeError(
+                f"a lake session at lake version {session.lake_version} is open; cannot join it "
+                f"pinned to {lake_version}"
             )
     try:
         yield session
@@ -472,13 +531,53 @@ def _deduplicated_log_sql(
     )
 
 
+def _tables_read_at(session: LakeSession) -> frozenset[str]:
+    """The tables `session` reads only through `<table>_at(T)`: every
+    rebuilt-whole or append-only table its metadata describes, and
+    `_APPEND_ONLY_TABLES`."""
+    return (
+        frozenset(
+            table
+            for table, metadata in session._tables.items()
+            if metadata.rebuilt_whole or metadata.kind == "append-only"
+        )
+        | _APPEND_ONLY_TABLES
+    )
+
+
+class UnpinnedTableReadError(LakeTimeError):
+    """A query sent inside a `lake_session` names a table the session reads
+    only through `<table>_at(T)` (`_tables_read_at`) as a bare relation or
+    as `<table>_log`, which would read the lake's current build or rows
+    instead of those of T. The message names each such table. Raised before
+    the query is sent."""
+
+
+def _refuse_unpinned_names(session: LakeSession, query: str) -> None:
+    """Raises `UnpinnedTableReadError` when `query` names a table of
+    `_tables_read_at(session)` other than as `<table>_at(`: as the
+    identifier `<table>` or `<table>_log`, matched on word boundaries, so
+    `<table>_at(` itself never matches."""
+    named = sorted(
+        table
+        for table in _tables_read_at(session)
+        if re.search(rf"\b{re.escape(table)}(?:_log)?\b", query)
+    )
+    if named:
+        raise UnpinnedTableReadError(
+            f"a query in the lake session at {session.lake_time.isoformat()} names "
+            f"{', '.join(named)} other than through <table>_at(T); it would read the lake's "
+            "current state, not T's"
+        )
+
+
 def _pinned_table_sql(session: LakeSession, table: str) -> str:
     """The relation `_table_sql` gives for `table` inside `session`."""
     lake_time = session.lake_time
     if table not in session._tables:
         raise KeyError(f"{table} is not in READ_TABLES")
     metadata = session._tables[table]
-    if metadata.rebuilt_whole or metadata.kind == "append-only":
+    if table in _tables_read_at(session):
         return f"(SELECT * FROM {_table_at_sql(table, lake_time)})"
     if table.endswith("_log"):
         return f"(SELECT * FROM {table} WHERE {_scraped_at_pin(lake_time)})"
@@ -551,10 +650,10 @@ def _served_code(version: str) -> str:
 def _record_version(session: LakeSession, version: str | None) -> None:
     """Records `version` as the session's lake version when it has none,
     and raises `LakeTimeError` when its `code` part (`_served_code`)
-    differs from the recorded one's. The `builds` part changes whenever
-    a rebuilt-whole table gets a new build, which no read of the session
-    sees (they read `<table>_at(T)`), so it may differ; the recorded
-    version stays the first one the session saw."""
+    differs from the recorded one's: the lake released other code. The
+    `builds` part changes whenever a rebuilt-whole table gets a new build,
+    which no read of the session sees (they read `<table>_at(T)`), so it
+    is never compared, and the recorded version stays as it is."""
     if version is None:
         return
     with _SESSION_LOCK:
@@ -562,6 +661,13 @@ def _record_version(session: LakeSession, version: str | None) -> None:
             session.lake_version = version
             return
         recorded = session.lake_version
+    _require_served_code(session, recorded, version)
+
+
+def _require_served_code(session: LakeSession, recorded: str, version: str) -> None:
+    """Raises `LakeTimeError` naming both versions when `version`'s `code`
+    part (`_served_code`) differs from `recorded`'s, the lake version of
+    `session`."""
     if _served_code(version) != _served_code(recorded):
         raise LakeTimeError(
             f"the lake's served code changed during the session at "
@@ -574,11 +680,16 @@ def _query(query: str, params: list[Any]) -> pd.DataFrame:
     """Runs one read-only `SELECT` with `?` placeholders bound to `params`
     and returns every row as a DataFrame, counting the request in
     `loader_query_counts`. Request failures propagate.
-    Inside a session, the lake refusing the read with HTTP 409 raises
-    `LakeTimeError` naming T and quoting the lake's detail (the read is
-    never retried unpinned), and a response from a different lake version
-    than the session's raises `LakeTimeError`."""
+    Inside a session, a query naming a table the session reads only
+    through `<table>_at(T)` in another way raises `UnpinnedTableReadError`
+    before it is sent (`_refuse_unpinned_names`), the lake refusing the read
+    with HTTP 409 raises `LakeTimeError` naming T and quoting the lake's
+    detail (the read is never retried unpinned), and a response whose lake
+    version has another `code` part than the session's raises
+    `LakeTimeError` (`_record_version`)."""
     session = _current_session()
+    if session is not None:
+        _refuse_unpinned_names(session, query)
     lake = _lake()
     _count_query()
     try:

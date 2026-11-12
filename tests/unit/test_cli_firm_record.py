@@ -204,7 +204,8 @@ def test_pass_paused_for_memory_restarts_pinned(
     tmp_path: Path, max_days: str | None, extra: list[str], preflight_lake: Any
 ) -> None:
     """A pass that stopped for memory prints its result, then restarts the command pinned to
-    the lake time it read and, with --max-days, to the days it has left."""
+    the lake time it read and the lake version it recorded and, with --max-days, to the days
+    it has left."""
     paused = _RESULT.model_copy(
         update={"days_written": 3, "complete": False, "paused_for_memory": True}
     )
@@ -221,7 +222,10 @@ def test_pass_paused_for_memory_restarts_pinned(
     assert FirmRecordResult.model_validate_json(result.stdout[result.stdout.index("{") :]) == (
         paused
     )
-    restart.assert_called_once_with(["--lake-time", "2026-11-06T00:00:00+00:00", *extra])
+    recorded = _bound(run_firm_record, record)["lake_version"]
+    restart.assert_called_once_with(
+        ["--lake-time", "2026-11-06T00:00:00+00:00", "--lake-version", recorded, *extra]
+    )
 
 
 def test_restart_pins_the_lake_time_the_session_read(tmp_path: Path, preflight_lake: Any) -> None:
@@ -239,9 +243,13 @@ def test_restart_pins_the_lake_time_the_session_read(tmp_path: Path, preflight_l
 
     assert result.exit_code == 0, result.output
     read = _bound(run_firm_record, record)["lake_time"]
-    flag, pinned = restart.call_args.args[0]
+    flag, pinned, version_flag, version = restart.call_args.args[0]
     assert flag == "--lake-time"
     assert datetime.fromisoformat(pinned) == read
+    assert (version_flag, version) == (
+        "--lake-version",
+        _bound(run_firm_record, record)["lake_version"],
+    )
 
 
 def test_later_options_override_earlier_ones(tmp_path: Path, preflight_lake: Any) -> None:
@@ -405,7 +413,7 @@ def _paused_trial(store_dir: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pat
         spec=spec,
         spec_hash=firm_spec_hash(spec),
         lake_time=spec.lake_time,
-        lake_version="v",
+        lake_version="fake-code-1.recorded-builds",
         quantcore_version="q",
     )
     assert _PROBE_MODULE in spec.module_hashes

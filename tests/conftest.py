@@ -97,11 +97,12 @@ class FakeLake:
     `health` answers HTTP 200's body: `version`, `health_status` as `status`
     ("ok" by default) and `write_times` (table to entry, empty by default)
     under `write_times.tables`, so a test plants a degraded answer by setting
-    those two. `sql` runs the query against the tables and exposes `version` as
-    `last_version`. Setting `fixed_result` makes every query return that
-    frame regardless of the SQL (for testing a loader's own guards against
-    a result its query should never produce); setting `error` makes every
-    call raise it."""
+    those two. `sql`, `describe` and `health` expose `version` as `last_version`,
+    as every response of the lake carries it; `sql` runs the query against the
+    tables. Setting `fixed_result` makes every query return that frame
+    regardless of the SQL (for testing a loader's own guards against a result
+    its query should never produce); setting `error` makes every call raise
+    it."""
 
     def __init__(self) -> None:
         self._connection = duckdb.connect(database=":memory:")
@@ -111,7 +112,7 @@ class FakeLake:
         self.fixed_result: pd.DataFrame | None = None
         self.error: Exception | None = None
         self.calls: list[tuple[str, list[Any]]] = []
-        self.version = "fake-lake-1"
+        self.version = "fake-code-1.fake-builds-1"
         self.last_version: str | None = None
         self.last_write_overrides: dict[str, str] = {}
         self.tie_order_overrides: dict[str, list[str] | None] = {}
@@ -236,7 +237,7 @@ class FakeLake:
         self._connection.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM {name}_log")
         self._builds_written += 1
         code = self.version.split(".", 1)[0]
-        self.version = f"{code}.build{self._builds_written}"
+        self.version = f"{code}.fake-builds-{self._builds_written + 1}"
 
     def add_empty(
         self,
@@ -283,6 +284,7 @@ class FakeLake:
 
     def describe(self, table: str) -> dict[str, Any]:
         """The lake's table metadata; a table never added reads as an empty current table."""
+        self.last_version = self.version
         meta = self._meta.get(table)
         if meta is None:
             return {
@@ -328,6 +330,7 @@ class FakeLake:
         return {"generated_at": None, "tables": self.tables()}
 
     def health(self) -> dict[str, Any]:
+        self.last_version = self.version
         tables = {table: dict(entry) for table, entry in self.write_times.items()}
         return {
             "version": self.version,

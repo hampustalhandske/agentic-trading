@@ -28,9 +28,11 @@ module's `_table_sql`, whose dedupe takes, among one key's rows written at
 its latest `scraped_at`, the first in the tie order the lake serves for
 the table (`_tie_order_sql`), and refuses a current table the lake serves
 no tie order for (`MissingTieOrderError`), and a rebuilt-whole or
-append-only table through the lake's `<table>_at(T)` macro; with no
-session open, every reference is refused (`UnpinnedLakeReadError`) outside
-`unpinned_lake_reads`."""
+append-only table through the lake's `<table>_at(T)` macro, every query
+refused before it is sent when it names such a table otherwise
+(`UnpinnedTableReadError`) and every response checked on the code part of
+the lake version alone; with no session open, every reference is refused
+(`UnpinnedLakeReadError`) outside `unpinned_lake_reads`."""
 
 from datetime import date, timedelta
 

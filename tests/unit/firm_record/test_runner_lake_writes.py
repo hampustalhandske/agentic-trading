@@ -154,7 +154,7 @@ def test_a_record_restarted_across_lake_writes_ends_with_the_unbroken_rows(
     finally:
         _WRITES_BEFORE_CALL.clear()
     assert (paused.days_written, paused.paused_for_memory) == (3, True)
-    assert fake_lake.version != "fake-lake-1"
+    assert fake_lake.version == "fake-code-1.fake-builds-2"
     resumed = _run(tmp_path / "paused", commander=_commander())
 
     assert resumed.complete and not resumed.paused_for_memory

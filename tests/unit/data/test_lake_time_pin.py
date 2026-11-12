@@ -705,3 +705,43 @@ def test_lake_provenance_carries_the_lake_time(fake_lake: Any) -> None:
 
     assert default.lake_time is None and outside.lake_time is None
     assert inside.lake_time == _T
+
+
+@pytest.mark.parametrize(
+    "relation",
+    [
+        "yahoo_split_close_basis",
+        "yahoo_split_close_basis_log",
+        "crypto_klines_1m",
+        "crypto_klines_1m_log",
+    ],
+)
+def test_a_query_naming_an_at_only_table_otherwise_is_refused_before_it_is_sent(
+    fake_lake: Any, relation: str
+) -> None:
+    """Inside a session, a query naming a rebuilt-whole table or crypto_klines_1m as a bare
+    relation or as its log raises UnpinnedTableReadError naming the table, and nothing is
+    sent."""
+    _seed_klines(fake_lake)
+    _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], _B1)
+
+    with ll.lake_session(_T):
+        with pytest.raises(ll.UnpinnedTableReadError, match=relation.removesuffix("_log")):
+            ll._query(f"SELECT count(*) AS n FROM {relation} AS t", [])
+
+    assert fake_lake.calls == []
+
+
+def test_a_query_through_the_at_macro_passes_the_guard(fake_lake: Any) -> None:
+    """`<table>_at(T)` passes the guard inside a session, and outside one (inside
+    `unpinned_lake_reads`) a bare name is not checked."""
+    _seed_klines(fake_lake)
+    _seed_splits(fake_lake, [("AAPL", "2024-08-01", 0.25, True)], _B1)
+    at = f"TIMESTAMPTZ '{_T.isoformat()}'"
+
+    with ll.lake_session(_T):
+        splits = ll._query(f"SELECT count(*) AS n FROM yahoo_split_close_basis_at({at})", [])
+        klines = ll._query(f"SELECT count(*) AS n FROM crypto_klines_1m_at({at})", [])
+    bare = ll._query("SELECT count(*) AS n FROM yahoo_split_close_basis", [])
+
+    assert (splits["n"].item(), klines["n"].item(), bare["n"].item()) == (1, 2, 1)
