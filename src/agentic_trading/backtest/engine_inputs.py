@@ -97,7 +97,8 @@ def load_benchmark_closes(ticker: str, start: date, end: date) -> pd.Series:
     frame, _ = load_price_history_with_fallback(
         [ticker], start, end, warmup_days=0, align="intersection"
     )
-    return frame[ticker]["close"].dropna()
+    closes: pd.Series = frame[ticker]["close"].dropna()
+    return closes
 
 
 def benchmark_returns_of(closes: pd.Series) -> pd.Series:
