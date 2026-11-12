@@ -32,6 +32,7 @@ agentic-trading-cli = "agentic_trading.cli:main"
 agentic-trading-experiment = "agentic_trading.cli:experiment_main"
 agentic-trading-stage-a = "agentic_trading.cli:stage_a_main"
 agentic-trading-firm-record = "agentic_trading.cli:firm_record_main"
+agentic-trading-firm-review = "agentic_trading.cli:firm_review_main"
 
 [tool.uv.sources]
 quantcore = { git = "https://github.com/hampustalhandske/quantcore.git", rev = "4ddac1624e2cd4e46b721697e1f7fc99d8144820" }

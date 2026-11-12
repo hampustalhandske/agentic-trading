@@ -84,6 +84,7 @@ app = typer.Typer()
 experiment_app = typer.Typer()
 stage_a_app = typer.Typer()
 firm_record_app = typer.Typer()
+firm_review_app = typer.Typer()
 
 # Every asset class CATALOG actually classifies into (see ticker_catalog.py's
 # AssetClass) — options are deliberately excluded there, so they're
@@ -1512,6 +1513,65 @@ def firm_record(
         _restart_record(extra)
 
 
+@firm_review_app.command()
+def firm_review(
+    checkpoint: Path = typer.Argument(  # noqa: B008
+        ...,
+        exists=True,
+        dir_okay=False,
+        help="The firm record's engine checkpoint, <store>/<spec hash>.checkpoint.sqlite.",
+    ),
+    out: Path = typer.Option(  # noqa: B008
+        ...,
+        "--out",
+        help="Where to write the summary JSON; outside the record's store.",
+    ),
+    trial_dir: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--trial-dir",
+        help="The record's trial folder (default: <store>/<spec hash>/, beside the checkpoint).",
+    ),
+    lake_cache_dir: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--lake-cache-dir",
+        help="Directory of a lake answer cache for the risk-free and SPY reads, outside the "
+        "record's store (default: no cache).",
+    ),
+) -> None:
+    """Write the run summary of a finished firm record to --out, for the
+    dashboard's "Load a saved run" panel: the engine's results of the
+    record rebuilt from its checkpoint, opened read-only, under one
+    `record` period, with SPY's total-return curve as a baseline
+    (`firm_record.review.firm_record_summary`). The DGS3MO and SPY series
+    the ratios are measured with are read from the lake at the record's
+    lake time, pinned to the lake version its spec.json records. Prints
+    the path, the file's size and the number of days; no performance
+    figure. Exits 2 when --out or --lake-cache-dir is inside the
+    directory holding the checkpoint (the record's store), which is never
+    written."""
+    # Imported here: a firm record hashes every `agentic_trading` module
+    # loaded when it starts, and the review is no part of a record.
+    from agentic_trading.firm_record.review import RECORD_PERIOD, firm_record_summary
+
+    store = checkpoint.resolve().parent
+    if out.resolve().is_relative_to(store):
+        raise typer.BadParameter(
+            f"{out} is inside the record's store {store}; write the summary outside it.",
+            param_hint="--out",
+        )
+    if lake_cache_dir is not None and lake_cache_dir.resolve().is_relative_to(store):
+        raise typer.BadParameter(
+            f"{lake_cache_dir} is inside the record's store {store}; give a directory outside it.",
+            param_hint="--lake-cache-dir",
+        )
+    configure_logging()
+    summary = firm_record_summary(checkpoint, trial_dir, lake_cache_dir=lake_cache_dir)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary), encoding="utf-8")
+    days = len(summary[RECORD_PERIOD]["portfolio_value_history"])
+    typer.echo(f"Wrote {out} ({out.stat().st_size:,} bytes): the firm record over {days} days.")
+
+
 def _package_sources() -> dict[str, str]:
     """Each .py file under `_PACKAGE_DIR`, `__pycache__` aside, by its
     POSIX path relative to that directory, to the sha256 hex digest of its
@@ -1637,3 +1697,7 @@ def stage_a_main(args: list[str] | None = None) -> None:
 
 def firm_record_main(args: list[str] | None = None) -> None:
     firm_record_app(args=args)
+
+
+def firm_review_main(args: list[str] | None = None) -> None:
+    firm_review_app(args=args)
