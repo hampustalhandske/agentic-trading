@@ -87,3 +87,78 @@ def test_a_checkpoint_of_another_layout_is_refused_unchanged(tmp_path: Path) -> 
     with pytest.raises(checkpoint_store.CheckpointFormatError, match="format 1"):
         checkpoint_store.connect_read_only(path)
     assert _digest(path) == before
+
+
+def _append_day_two(path: Path) -> None:
+    """Appends a second day to the checkpoint at `path` through a writer that waits for no
+    lock (`timeout=0`), as the engine's writer would after its busy timeout."""
+    connection = checkpoint_store.connect(path, resume=True)
+    connection.execute("PRAGMA busy_timeout = 0")
+    checkpoint_store.append_day(
+        connection,
+        as_of_date=date(2024, 1, 3),
+        portfolio_value=100_100.0,
+        new_track_record=[],
+        decisions=[],
+        new_trades=[],
+        next_day_index=2,
+        start_date=_DAY,
+        end_date=date(2024, 1, 3),
+        assets=["AAPL"],
+        portfolio={"cash": 100_100.0},
+        signal_health={},
+        pending_decisions=[],
+    )
+    connection.close()
+
+
+def test_a_snapshot_is_read_from_a_copy_the_writer_never_waits_for(tmp_path: Path) -> None:
+    """A snapshot copies the checkpoint once and is read from the copy: while it is read, the
+    run's writer commits without waiting, the snapshot keeps the state it copied, and the copy is
+    gone afterwards, outside the checkpoint's directory throughout."""
+    store = tmp_path / "store"
+    store.mkdir()
+    path = _checkpoint(store / "run.checkpoint.sqlite")
+    copies = tmp_path / "copies"
+    copies.mkdir()
+
+    with checkpoint_store.snapshot(path, directory=copies) as connection:
+        rows = connection.execute("SELECT as_of_date FROM portfolio_value")
+        assert rows.fetchone() == (_DAY.isoformat(),)
+        _append_day_two(path)
+        state = checkpoint_store.read_state(connection)
+        assert list(copies.iterdir())
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("DELETE FROM portfolio_value")
+
+    assert state is not None
+    assert state["portfolio_value_history"] == [(_DAY.isoformat(), 100_000.0)]
+    assert list(copies.iterdir()) == []
+    assert sorted(child.name for child in store.iterdir()) == ["run.checkpoint.sqlite"]
+    with checkpoint_store.snapshot(path, directory=copies) as connection:
+        assert checkpoint_store.read_last_day(connection) == date(2024, 1, 3)
+
+
+def test_a_snapshot_refuses_another_layout_and_a_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        with checkpoint_store.snapshot(tmp_path / "absent.checkpoint.sqlite"):
+            pass
+    path = _checkpoint(tmp_path / "run.checkpoint.sqlite")
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version = 1")
+    connection.close()
+
+    with pytest.raises(checkpoint_store.CheckpointFormatError):
+        with checkpoint_store.snapshot(path):
+            pass
+
+
+def test_a_snapshot_is_never_written_beside_the_checkpoint(tmp_path: Path) -> None:
+    path = _checkpoint(tmp_path / "run.checkpoint.sqlite")
+    inside = tmp_path / "trial"
+    inside.mkdir()
+
+    with pytest.raises(ValueError, match="inside the checkpoint's directory"):
+        with checkpoint_store.snapshot(path, directory=inside):
+            pass
+    assert list(inside.iterdir()) == []

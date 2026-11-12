@@ -36,7 +36,8 @@ the JSON text itself. The file records its layout as
 `resume=True` refuses a file of any other version with
 `CheckpointFormatError`, so a run is resumed only from a checkpoint of the
 layout this module writes. `connect_read_only` opens a file of that layout
-for the readers above without changing anything in it.
+for the readers above without changing anything in it, and `snapshot`
+reads a copy of it, so a run writing the file is never held up.
 
 A `carried_state` blob is a pickle: open with `connect` only checkpoint
 files this program wrote, never one from an untrusted source."""
@@ -44,8 +45,10 @@ files this program wrote, never one from an untrusted source."""
 import hashlib
 import json
 import sqlite3
+import tempfile
 import zlib
 from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -331,6 +334,45 @@ def connect_read_only(db_path: Path) -> sqlite3.Connection:
             f"reads only format {CHECKPOINT_FORMAT_VERSION}"
         )
     return connection
+
+
+@contextmanager
+def snapshot(db_path: Path, *, directory: Path | None = None) -> Iterator[sqlite3.Connection]:
+    """Copies the checkpoint at `db_path` into a temporary file and yields
+    a read-only connection (`connect_read_only`) to the copy; the copy is
+    deleted when the block ends. The copy is taken in one step of SQLite's
+    online backup from a read-only connection, so it is one committed
+    state of the file, and the file is held only while it is copied: a
+    run writing the checkpoint meanwhile commits as it would without the
+    reader. The temporary file lies in a new directory under `directory`
+    (the system's temporary directory by default), which must lie outside
+    the directory holding `db_path`. Raises `ValueError` when it does not,
+    `FileNotFoundError` when `db_path` does not exist and
+    `CheckpointFormatError` when it is not of `CHECKPOINT_FORMAT_VERSION`,
+    before anything is copied."""
+    base = Path(tempfile.gettempdir() if directory is None else directory).resolve()
+    if base.is_relative_to(db_path.resolve().parent):
+        raise ValueError(
+            f"a snapshot of {db_path} would be written under {base}, inside the checkpoint's "
+            "directory; give a directory outside it"
+        )
+    source = connect_read_only(db_path)
+    try:
+        with tempfile.TemporaryDirectory(dir=directory, prefix="checkpoint-snapshot-") as folder:
+            copy_path = Path(folder) / db_path.name
+            target = sqlite3.connect(copy_path)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+            source.close()
+            connection = connect_read_only(copy_path)
+            try:
+                yield connection
+            finally:
+                connection.close()
+    finally:
+        source.close()
 
 
 def append_day(
