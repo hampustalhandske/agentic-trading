@@ -5,13 +5,14 @@ import json
 import math
 import sqlite3
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel, ConfigDict
 from quantcore.errors import UndefinedResultError
 from quantcore.performance.metrics import (
     calmar_ratio,
@@ -236,6 +237,308 @@ class CommanderLike(Protocol):
     ) -> list[PortfolioDecision]: ...
 
 
+# ---------------------------------------------------------------------------
+# Whole-run results as pure functions of a run's histories. `BacktestEngine.run`
+# computes its `BacktestResult` through them, and an offline reader of a run's
+# checkpoint (`firm_record.review`) through the same ones.
+# ---------------------------------------------------------------------------
+
+
+class RunMetrics(BaseModel):
+    """The summary metrics of one run's book, as `BacktestResult` carries
+    them: each ratio is `None` when it is undefined on the run (see
+    `run_metrics`)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    final_sharpe_ratio: float | None
+    final_max_drawdown: float
+    final_sortino_ratio: float | None
+    final_calmar_ratio: float | None
+    final_information_ratio: float | None
+    final_hit_rate: float
+    final_profit_factor: float | None
+
+
+class ExecutionCostTotals(BaseModel):
+    """A trade log's fill costs summed over its trades, in trade order:
+    commission (`total_transaction_cost`), slippage, market impact and
+    option spread, and `total_execution_cost`, the four together."""
+
+    model_config = ConfigDict(frozen=True)
+
+    total_transaction_cost: float
+    total_slippage_cost: float
+    total_impact_cost: float
+    total_spread_cost: float
+    total_execution_cost: float
+
+
+def risk_free_rate_annual(risk_free_rate_series: pd.Series | None, day: date) -> float:
+    """Annualized risk-free rate in force on `day`: the daily decimal
+    `risk_free_rate_series` value times `settings.firm.trading_days_per_year`,
+    floored at 0.0 (the same floor `Portfolio.apply_financing` applies),
+    and 0.0 when the series is `None` or does not cover `day`."""
+    if risk_free_rate_series is None:
+        return 0.0
+    daily_rate = float(risk_free_rate_series.get(pd.Timestamp(day), 0.0))
+    return max(daily_rate * settings.firm.trading_days_per_year, 0.0)
+
+
+def risk_free_accrual(
+    risk_free_rate_series: pd.Series | None, valuation_dates: Sequence[date]
+) -> np.ndarray:
+    """Risk-free accrual over each gap between consecutive
+    `valuation_dates`: for the return ending on date t with previous
+    valuation date t-1, `rf_annual(t-1) * calendar_days(t-1, t) / 365`
+    (`risk_free_rate_annual`). That is simple actual/365 interest at the
+    rate in force when the period starts, exactly what
+    `Portfolio.apply_financing` credits a positive cash balance over the
+    same gap, so an all-cash book's excess return is zero. One entry per
+    consecutive pair (length `len(valuation_dates) - 1`, empty for fewer
+    than two dates)."""
+    return np.array(
+        [
+            risk_free_rate_annual(risk_free_rate_series, previous)
+            * (current - previous).days
+            / 365.0
+            for previous, current in itertools.pairwise(valuation_dates)
+        ],
+        dtype=np.float64,
+    )
+
+
+def benchmark_returns_on(
+    benchmark_returns: pd.Series | None, return_dates: Sequence[date]
+) -> np.ndarray | None:
+    """Daily decimal benchmark return for each of `return_dates`, from
+    `benchmark_returns` (indexed by date). `None` when there is no
+    benchmark, or when any date is missing (logged as a warning): a
+    benchmark that doesn't cover the run's trading calendar isn't the
+    right one to compare against, and gaps are never filled with 0.0."""
+    if benchmark_returns is None:
+        return None
+    aligned = benchmark_returns.reindex([pd.Timestamp(day) for day in return_dates])
+    if aligned.isna().any():
+        missing = int(aligned.isna().sum())
+        logger.warning(
+            "benchmark_returns is missing %d/%d date(s) in this run's window — "
+            "skipping information_ratio rather than filling gaps with 0.0.",
+            missing,
+            len(return_dates),
+        )
+        return None
+    return aligned.to_numpy(dtype=np.float64)
+
+
+def run_metrics(
+    portfolio_value_history: Sequence[tuple[date, float]],
+    *,
+    risk_free_rate_series: pd.Series | None,
+    benchmark_returns: pd.Series | None,
+) -> RunMetrics:
+    """The summary metrics of a book valued at `portfolio_value_history`
+    (one `(valuation date, value)` per day, in date order).
+
+    The daily returns are the simple returns between consecutive values (a
+    zero previous value gives 0.0); each is dated on its later valuation
+    date. Max drawdown and hit rate are quantcore's on those returns (0.0
+    with no return). With fewer than two returns or zero sample variance
+    every ratio is `None`. Otherwise Sharpe and Sortino are on the excess
+    returns over `risk_free_accrual(risk_free_rate_series, valuation dates)`
+    (both `None` when every excess return is within
+    `ZERO_EXCESS_RETURN_TOLERANCE` of zero), Calmar and the profit factor
+    on the raw returns. The information ratio is against
+    `benchmark_returns` on the return dates (`benchmark_returns_on`),
+    `None` without a benchmark, with fewer than two returns or with a
+    benchmark missing a date. A ratio quantcore cannot compute is `None`
+    (`_summary_metric`); each `None` ratio logs a warning."""
+    portfolio_values = [value for _, value in portfolio_value_history]
+    if len(portfolio_values) < 2:
+        daily_returns: list[float] = []
+    else:
+        daily_returns = [
+            (current - previous) / previous if previous != 0 else 0.0
+            for previous, current in itertools.pairwise(portfolio_values)
+        ]
+
+    # Each daily_returns[i] is the return realized moving from valuation
+    # date i to valuation date i+1, so it's attributable to the later date
+    # (the one the benchmark return is compared on) and its risk-free
+    # accrual covers the calendar gap between the two.
+    valuation_dates = [day for day, _ in portfolio_value_history]
+    return_dates = valuation_dates[1:]
+
+    # Each summary metric is computed on its own (`_summary_metric`), so
+    # one that is undefined on this run is None without touching the
+    # others. Max drawdown and hit rate are defined on any returns.
+    returns_array = np.array(daily_returns, dtype=np.float64)
+    if daily_returns:
+        final_max_drawdown = float(maximum_drawdown(returns_array))
+        final_hit_rate = float(hit_rate(returns_array))
+    else:
+        final_max_drawdown = 0.0
+        final_hit_rate = 0.0
+
+    final_sharpe_ratio: float | None
+    final_sortino_ratio: float | None
+    final_calmar_ratio: float | None
+    final_profit_factor: float | None
+    if len(daily_returns) < 2 or float(np.std(daily_returns, ddof=1)) == 0.0:
+        # A flat (zero-variance) or too-short return series has no
+        # volatility to scale by: every ratio is undefined.
+        logger.warning(
+            "Summary ratios (sharpe, sortino, calmar, profit factor) are undefined on this "
+            "run: %d daily return(s), fewer than two or with zero variance; reporting None.",
+            len(daily_returns),
+        )
+        final_sharpe_ratio = None
+        final_sortino_ratio = None
+        final_calmar_ratio = None
+        final_profit_factor = None
+    else:
+        excess_returns_array = returns_array - risk_free_accrual(
+            risk_free_rate_series, valuation_dates
+        )
+        if np.all(np.abs(excess_returns_array) <= ZERO_EXCESS_RETURN_TOLERANCE):
+            logger.warning(
+                "Sharpe and Sortino are undefined on this run: every daily excess return "
+                "is within %g of zero; reporting None.",
+                ZERO_EXCESS_RETURN_TOLERANCE,
+            )
+            final_sharpe_ratio = None
+            final_sortino_ratio = None
+        else:
+            final_sharpe_ratio = _summary_metric(
+                "sharpe ratio", lambda: sharpe_ratio(excess_returns_array)
+            )
+            final_sortino_ratio = _summary_metric(
+                "sortino ratio", lambda: sortino_ratio(excess_returns_array)
+            )
+        # Calmar is annualized raw return over max drawdown with no
+        # excess-return concept (quantcore's own definition) — no
+        # risk-free adjustment applies here.
+        final_calmar_ratio = _summary_metric("calmar ratio", lambda: calmar_ratio(returns_array))
+        final_profit_factor = _summary_metric("profit factor", lambda: profit_factor(returns_array))
+
+    final_information_ratio: float | None = None
+    if benchmark_returns is not None and len(daily_returns) >= 2:
+        benchmark_array = benchmark_returns_on(benchmark_returns, return_dates)
+        if benchmark_array is not None:
+            benchmark = benchmark_array
+            final_information_ratio = _summary_metric(
+                "information ratio", lambda: information_ratio(returns_array, benchmark)
+            )
+
+    return RunMetrics(
+        final_sharpe_ratio=final_sharpe_ratio,
+        final_max_drawdown=final_max_drawdown,
+        final_sortino_ratio=final_sortino_ratio,
+        final_calmar_ratio=final_calmar_ratio,
+        final_information_ratio=final_information_ratio,
+        final_hit_rate=final_hit_rate,
+        final_profit_factor=final_profit_factor,
+    )
+
+
+def source_returns_of(
+    rows: Iterable[tuple[str, float, float]],
+) -> dict[str, tuple[list[float], list[float]]]:
+    """Each source_id of `rows` (`(source_id, attributable_return,
+    raw_attributable_return)` track-record rows) to its attributable and
+    raw attributable returns, in the order of `rows`, sources in order of
+    first appearance."""
+    returns_by_source: dict[str, tuple[list[float], list[float]]] = {}
+    for source_id, attributable, raw_attributable in rows:
+        returns, raw_returns = returns_by_source.setdefault(source_id, ([], []))
+        returns.append(attributable)
+        raw_returns.append(raw_attributable)
+    return returns_by_source
+
+
+def _attribution_stats(returns: np.ndarray) -> tuple[float, float, float, float]:
+    """Returns (annualized_return, total_attributed_return, sharpe,
+    max_drawdown) of one source's attributable returns.
+    `total_attributed_return` is `np.sum(returns)` — a plain running sum
+    across every asset-day this source touched, not a compounded return,
+    kept under its own explicit name since it grows without bound over a
+    long run and is easy to mistake for one. `annualized_return`
+    (`mean(returns) * 252`) is what `source_performance_of` reports as
+    `cumulative_return` instead: a rate, comparable across sources
+    regardless of how many days/assets each one happened to have
+    observations for, the same normalization a Sharpe ratio's own
+    numerator already uses. The Sharpe ratio is the mean over the sample
+    standard deviation times sqrt(252), 0.0 without variance; the
+    drawdown is the deepest fall of the running sum from its peak."""
+    cumulative = np.cumsum(returns)
+    running_peak = np.maximum.accumulate(cumulative)
+    drawdown = float(np.min(cumulative - running_peak)) if cumulative.size else 0.0
+    standard_deviation = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+    mean_return = float(np.mean(returns)) if returns.size else 0.0
+    sharpe = (
+        float(mean_return / standard_deviation * np.sqrt(252)) if standard_deviation > 0.0 else 0.0
+    )
+    return mean_return * 252.0, float(np.sum(returns)), sharpe, drawdown
+
+
+def source_performance_of(
+    returns_by_source: Mapping[str, tuple[Sequence[float], Sequence[float]]],
+) -> dict[str, dict[str, float]]:
+    """Each source's attribution statistics (`_attribution_stats`) on its
+    attributable returns and, under `raw_` keys, on its raw attributable
+    returns, with its number of `observations`; `returns_by_source` as
+    `source_returns_of` gives it."""
+    performance: dict[str, dict[str, float]] = {}
+    for source_id, (attributable, raw_attributable) in returns_by_source.items():
+        returns = np.asarray(attributable, dtype=float)
+        raw_returns = np.asarray(raw_attributable, dtype=float)
+        annualized_return, total_attributed_return, sharpe, drawdown = _attribution_stats(returns)
+        raw_annualized_return, raw_total_attributed_return, raw_sharpe, raw_drawdown = (
+            _attribution_stats(raw_returns)
+        )
+        performance[source_id] = {
+            "cumulative_return": annualized_return,
+            "total_attributed_return": total_attributed_return,
+            "sharpe_ratio": sharpe,
+            "max_drawdown": drawdown,
+            "observations": float(len(returns)),
+            "raw_cumulative_return": raw_annualized_return,
+            "raw_total_attributed_return": raw_total_attributed_return,
+            "raw_sharpe_ratio": raw_sharpe,
+            "raw_max_drawdown": raw_drawdown,
+        }
+    return performance
+
+
+def execution_cost_totals(trades: Sequence[TradeRecord]) -> ExecutionCostTotals:
+    """`trades`' commission, slippage, impact and spread cost, each summed
+    in trade order, and their total."""
+    total_transaction_cost = sum(trade.transaction_cost for trade in trades)
+    total_slippage_cost = sum(trade.slippage_cost for trade in trades)
+    total_impact_cost = sum(trade.impact_cost for trade in trades)
+    total_spread_cost = sum(trade.spread_cost for trade in trades)
+    return ExecutionCostTotals(
+        total_transaction_cost=total_transaction_cost,
+        total_slippage_cost=total_slippage_cost,
+        total_impact_cost=total_impact_cost,
+        total_spread_cost=total_spread_cost,
+        total_execution_cost=(
+            total_transaction_cost + total_slippage_cost + total_impact_cost + total_spread_cost
+        ),
+    )
+
+
+def pod_performance_of(
+    pod_return_history: Mapping[str, Sequence[tuple[date, float]]],
+) -> dict[str, PodPerformance]:
+    """Each pod's `PodPerformance` (`_pod_performance`) over its dated
+    daily returns in `pod_return_history`, pods in its order."""
+    return {
+        pod_id: _pod_performance([value for _, value in entries])
+        for pod_id, entries in pod_return_history.items()
+    }
+
+
 class BacktestEngine:
     """Deterministic order fills and portfolio accounting. NOT an agent —
     this class contains NO LLM calls and NO unseeded randomness. Every
@@ -350,16 +653,6 @@ class BacktestEngine:
         self._option_last_mid: dict[str, float] = {}
         self._unpriced_underlyings_warned: set[str] = set()
 
-    def _risk_free_rate_annual(self, day: date) -> float:
-        """Annualized risk-free rate in force on `day`: the daily decimal
-        `risk_free_rate_series` value times `settings.firm.trading_days_per_year`,
-        floored at 0.0 (the same floor `Portfolio.apply_financing` applies),
-        and 0.0 when the series is absent or does not cover `day`."""
-        if self.risk_free_rate_series is None:
-            return 0.0
-        daily_rate = float(self.risk_free_rate_series.get(pd.Timestamp(day), 0.0))
-        return max(daily_rate * settings.firm.trading_days_per_year, 0.0)
-
     def _carry_rates(self, day: date) -> dict[str, float]:
         """Each spot FX pair among `assets` mapped to its base currency's
         policy rate minus its quote currency's in `policy_rates`, each the
@@ -382,23 +675,6 @@ class BacktestEngine:
             if math.isfinite(differential):
                 carry[asset] = differential
         return carry
-
-    def _risk_free_accrual_array(self, valuation_dates: list[date]) -> np.ndarray:
-        """Risk-free accrual over each gap between consecutive
-        `valuation_dates`: for the return ending on date t with previous
-        valuation date t-1, `rf_annual(t-1) * calendar_days(t-1, t) / 365`.
-        That is simple actual/365 interest at the rate in force when the
-        period starts, exactly what `Portfolio.apply_financing` credits a
-        positive cash balance over the same gap, so an all-cash book's
-        excess return is zero. One entry per consecutive pair (length
-        `len(valuation_dates) - 1`, empty for fewer than two dates)."""
-        return np.array(
-            [
-                self._risk_free_rate_annual(previous) * (current - previous).days / 365.0
-                for previous, current in itertools.pairwise(valuation_dates)
-            ],
-            dtype=np.float64,
-        )
 
     def _commander_risk_state(self) -> CommanderRiskState | None:
         """The commander's current risk state, or `None` for a commander
@@ -469,27 +745,6 @@ class BacktestEngine:
                     pod_return_history.setdefault(pod_id, []).append((entry_date, value))
                     new_entries.append((pod_id, entry_date, value))
         return new_entries
-
-    def _benchmark_returns_array(self, return_dates: list[date]) -> np.ndarray | None:
-        """Daily decimal benchmark return for each of `return_dates`, from
-        `self.benchmark_returns`. Returns `None` (skip information_ratio
-        entirely rather than compute it against a partially-fabricated
-        series) if any date is missing — a benchmark that doesn't cover
-        this run's actual trading calendar isn't the right benchmark to
-        compare against."""
-        if self.benchmark_returns is None:
-            return None
-        aligned = self.benchmark_returns.reindex([pd.Timestamp(day) for day in return_dates])
-        if aligned.isna().any():
-            missing = int(aligned.isna().sum())
-            logger.warning(
-                "benchmark_returns is missing %d/%d date(s) in this run's window — "
-                "skipping information_ratio rather than filling gaps with 0.0.",
-                missing,
-                len(return_dates),
-            )
-            return None
-        return aligned.to_numpy(dtype=np.float64)
 
     def _checkpoint(self) -> sqlite3.Connection | None:
         """Opens (creating tables if needed) and caches the checkpoint
@@ -655,78 +910,23 @@ class BacktestEngine:
     def _source_returns(self) -> dict[str, tuple[list[float], list[float]]]:
         """Each source_id's attributable and raw attributable returns over
         its track-record rows dated inside the run's window, in recording
-        order, sources in order of first appearance. Read from the
-        in-memory track record, or with a history horizon from the
-        checkpoint, which holds every row in the same order."""
-        returns_by_source: dict[str, tuple[list[float], list[float]]] = {}
+        order, sources in order of first appearance (`source_returns_of`).
+        Read from the in-memory track record, or with a history horizon
+        from the checkpoint, which holds every row in the same order."""
         if self.history_horizon_days is not None:
             connection = self._checkpoint()
             assert connection is not None  # a horizon needs a checkpoint_path
-            for source_id, attributable, raw_attributable in checkpoint_store.iter_source_returns(
-                connection, self.start_date, self.end_date
-            ):
-                returns, raw_returns = returns_by_source.setdefault(source_id, ([], []))
-                returns.append(attributable)
-                raw_returns.append(raw_attributable)
-            return returns_by_source
+            return source_returns_of(
+                checkpoint_store.iter_source_returns(connection, self.start_date, self.end_date)
+            )
         entries = getattr(self.track_record, "_entries", None)
         if entries is None:
             entries = getattr(self.track_record, "entries", [])
-        for entry in entries:
-            if self.start_date <= entry.as_of_date <= self.end_date:
-                returns, raw_returns = returns_by_source.setdefault(entry.source_id, ([], []))
-                returns.append(entry.attributable_return)
-                raw_returns.append(entry.raw_attributable_return)
-        return returns_by_source
-
-    def _source_performance(self) -> dict[str, dict[str, float]]:
-        """Each source's attribution statistics over the run's window (see
-        `_stats` below), from `_source_returns`."""
-
-        def _stats(returns: np.ndarray) -> tuple[float, float, float, float]:
-            """Returns (annualized_return, total_attributed_return, sharpe,
-            max_drawdown). `total_attributed_return` is `np.sum(returns)`
-            — a plain running sum across every
-            asset-day this source touched, not a compounded return, kept
-            under its own explicit name since it grows without bound over
-            a long run and is easy to mistake for one. `annualized_return`
-            (`mean(returns) * periods_per_year`) is what `cumulative_return`
-            reports below instead: a rate, comparable across sources
-            regardless of how many days/assets each one happened to have
-            observations for, the same normalization a Sharpe ratio's own
-            numerator already uses."""
-            cumulative = np.cumsum(returns)
-            running_peak = np.maximum.accumulate(cumulative)
-            drawdown = float(np.min(cumulative - running_peak)) if cumulative.size else 0.0
-            standard_deviation = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
-            mean_return = float(np.mean(returns)) if returns.size else 0.0
-            sharpe = (
-                float(mean_return / standard_deviation * np.sqrt(252))
-                if standard_deviation > 0.0
-                else 0.0
-            )
-            return mean_return * 252.0, float(np.sum(returns)), sharpe, drawdown
-
-        performance: dict[str, dict[str, float]] = {}
-        for source_id, (attributable, raw_attributable) in self._source_returns().items():
-            returns = np.asarray(attributable, dtype=float)
-            raw_returns = np.asarray(raw_attributable, dtype=float)
-            annualized_return, total_attributed_return, sharpe, drawdown = _stats(returns)
-            raw_annualized_return, raw_total_attributed_return, raw_sharpe, raw_drawdown = _stats(
-                raw_returns
-            )
-            performance[source_id] = {
-                "cumulative_return": annualized_return,
-                "total_attributed_return": total_attributed_return,
-                "sharpe_ratio": sharpe,
-                "max_drawdown": drawdown,
-                "observations": float(len(returns)),
-                "raw_cumulative_return": raw_annualized_return,
-                "raw_total_attributed_return": raw_total_attributed_return,
-                "raw_sharpe_ratio": raw_sharpe,
-                "raw_max_drawdown": raw_drawdown,
-            }
-        return performance
+        return source_returns_of(
+            (entry.source_id, entry.attributable_return, entry.raw_attributable_return)
+            for entry in entries
+            if self.start_date <= entry.as_of_date <= self.end_date
+        )
 
     def run(
         self,
@@ -810,7 +1010,6 @@ class BacktestEngine:
             if checkpoint
             else []
         )
-        portfolio_values = [value for _, value in portfolio_value_history]
         restored_decisions: dict[date, list[PortfolioDecision]] = (
             {
                 date.fromisoformat(day): [
@@ -1119,7 +1318,7 @@ class BacktestEngine:
             financing_cost = self.portfolio.apply_financing(
                 valuation_prices,
                 (
-                    self._risk_free_rate_annual(previous_valuation_date)
+                    risk_free_rate_annual(self.risk_free_rate_series, previous_valuation_date)
                     if previous_valuation_date is not None
                     else 0.0
                 ),
@@ -1134,7 +1333,6 @@ class BacktestEngine:
             # Positive zero for a negative zero, as the checkpoint's SQLite
             # REAL column stores it.
             portfolio_value = portfolio_value - financing_cost + 0.0
-            portfolio_values.append(portfolio_value)
             portfolio_value_history.append((as_of_timestamp.date(), portfolio_value))
             log_progress(
                 logger,
@@ -1412,117 +1610,35 @@ class BacktestEngine:
             if on_day_complete is not None:
                 on_day_complete(day_index, len(days), as_of_timestamp.date(), portfolio_value)
 
-        if len(portfolio_values) < 2:
-            daily_returns: list[float] = []
-        else:
-            daily_returns = [
-                (current - previous) / previous if previous != 0 else 0.0
-                for previous, current in itertools.pairwise(portfolio_values)
-            ]
-
-        # Each daily_returns[i] is the return realized moving from
-        # valuation date i to valuation date i+1, so it's attributable to
-        # the later date (the one the benchmark return is compared on) and
-        # its risk-free accrual covers the calendar gap between the two.
-        valuation_dates = [day for day, _ in portfolio_value_history]
-        return_dates = valuation_dates[1:]
-
-        # Each summary metric is computed on its own (`_summary_metric`), so
-        # one that is undefined on this run is None without touching the
-        # others. Max drawdown and hit rate are defined on any returns.
-        returns_array = np.array(daily_returns, dtype=np.float64)
-        if daily_returns:
-            final_max_drawdown = float(maximum_drawdown(returns_array))
-            final_hit_rate = float(hit_rate(returns_array))
-        else:
-            final_max_drawdown = 0.0
-            final_hit_rate = 0.0
-
-        final_sharpe_ratio: float | None
-        final_sortino_ratio: float | None
-        final_calmar_ratio: float | None
-        final_profit_factor: float | None
-        if len(daily_returns) < 2 or float(np.std(daily_returns, ddof=1)) == 0.0:
-            # A flat (zero-variance) or too-short return series has no
-            # volatility to scale by: every ratio is undefined.
-            logger.warning(
-                "Summary ratios (sharpe, sortino, calmar, profit factor) are undefined on this "
-                "run: %d daily return(s), fewer than two or with zero variance; reporting None.",
-                len(daily_returns),
-            )
-            final_sharpe_ratio = None
-            final_sortino_ratio = None
-            final_calmar_ratio = None
-            final_profit_factor = None
-        else:
-            excess_returns_array = returns_array - self._risk_free_accrual_array(valuation_dates)
-            if np.all(np.abs(excess_returns_array) <= ZERO_EXCESS_RETURN_TOLERANCE):
-                logger.warning(
-                    "Sharpe and Sortino are undefined on this run: every daily excess return "
-                    "is within %g of zero; reporting None.",
-                    ZERO_EXCESS_RETURN_TOLERANCE,
-                )
-                final_sharpe_ratio = None
-                final_sortino_ratio = None
-            else:
-                final_sharpe_ratio = _summary_metric(
-                    "sharpe ratio", lambda: sharpe_ratio(excess_returns_array)
-                )
-                final_sortino_ratio = _summary_metric(
-                    "sortino ratio", lambda: sortino_ratio(excess_returns_array)
-                )
-            # Calmar is annualized raw return over max drawdown with no
-            # excess-return concept (quantcore's own definition) — no
-            # risk-free adjustment applies here.
-            final_calmar_ratio = _summary_metric(
-                "calmar ratio", lambda: calmar_ratio(returns_array)
-            )
-            final_profit_factor = _summary_metric(
-                "profit factor", lambda: profit_factor(returns_array)
-            )
-
-        final_information_ratio: float | None = None
-        if self.benchmark_returns is not None and len(daily_returns) >= 2:
-            benchmark_array = self._benchmark_returns_array(return_dates)
-            if benchmark_array is not None:
-                benchmark = benchmark_array
-                final_information_ratio = _summary_metric(
-                    "information ratio", lambda: information_ratio(returns_array, benchmark)
-                )
-
+        metrics = run_metrics(
+            portfolio_value_history,
+            risk_free_rate_series=self.risk_free_rate_series,
+            benchmark_returns=self.benchmark_returns,
+        )
         logger.info(
             "Backtest complete: %d days simulated in %.1fs — final Sharpe=%s, max drawdown=%.2f",
             len(days),
             time.perf_counter() - run_started_at,
-            "undefined" if final_sharpe_ratio is None else f"{final_sharpe_ratio:.3f}",
-            final_max_drawdown,
+            (
+                "undefined"
+                if metrics.final_sharpe_ratio is None
+                else f"{metrics.final_sharpe_ratio:.3f}"
+            ),
+            metrics.final_max_drawdown,
         )
-        pod_performance = {
-            pod_id: _pod_performance([value for _, value in entries])
-            for pod_id, entries in pod_return_history.items()
-        }
+        pod_performance = pod_performance_of(pod_return_history)
         close_commander = getattr(self.commander, "close", None)
         if close_commander is not None:
             close_commander()
-        source_performance = self._source_performance()
+        source_performance = source_performance_of(self._source_returns())
         if self._checkpoint_connection is not None:
             self._checkpoint_connection.close()
             self._checkpoint_connection = None
-        total_transaction_cost = sum(trade.transaction_cost for trade in trade_log)
-        total_slippage_cost = sum(trade.slippage_cost for trade in trade_log)
-        total_impact_cost = sum(trade.impact_cost for trade in trade_log)
-        total_spread_cost = sum(trade.spread_cost for trade in trade_log)
         return BacktestResult(
             start_date=self.start_date,
             end_date=self.end_date,
             portfolio_value_history=portfolio_value_history,
-            final_sharpe_ratio=final_sharpe_ratio,
-            final_max_drawdown=final_max_drawdown,
-            final_sortino_ratio=final_sortino_ratio,
-            final_calmar_ratio=final_calmar_ratio,
-            final_information_ratio=final_information_ratio,
-            final_hit_rate=final_hit_rate,
-            final_profit_factor=final_profit_factor,
+            **metrics.model_dump(),
             decisions_by_day=(
                 decisions_by_day.held()
                 if isinstance(decisions_by_day, DecisionWindow)
@@ -1536,13 +1652,7 @@ class BacktestEngine:
             signal_health=signal_health,
             market_data_source=self.market_data_source,
             source_performance=source_performance,
-            total_transaction_cost=total_transaction_cost,
-            total_slippage_cost=total_slippage_cost,
-            total_impact_cost=total_impact_cost,
-            total_spread_cost=total_spread_cost,
-            total_execution_cost=(
-                total_transaction_cost + total_slippage_cost + total_impact_cost + total_spread_cost
-            ),
+            **execution_cost_totals(trade_log).model_dump(),
             total_financing_cost=total_financing_cost,
             total_option_premium_paid=total_option_premium_paid,
             pod_return_history=pod_return_history,

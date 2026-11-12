@@ -88,6 +88,24 @@ class EngineInputs(BaseModel):
         return self.market_data
 
 
+def load_benchmark_closes(ticker: str, start: date, end: date) -> pd.Series:
+    """`ticker`'s daily closes from `start` to `end`, on its own bars and
+    without warm-up (`load_price_history_with_fallback` with
+    `align="intersection"`), a bar without a close left out; indexed by
+    bar date. Read inside the caller's `lake_session`; the loader's errors
+    propagate."""
+    frame, _ = load_price_history_with_fallback(
+        [ticker], start, end, warmup_days=0, align="intersection"
+    )
+    return frame[ticker]["close"].dropna()
+
+
+def benchmark_returns_of(closes: pd.Series) -> pd.Series:
+    """The daily simple returns of `closes` (`load_benchmark_closes`), each
+    dated on the later of its two bars; the first bar has none."""
+    return closes.pct_change().dropna()
+
+
 def load_engine_inputs(
     assets: Sequence[str],
     start: date,
@@ -109,7 +127,8 @@ def load_engine_inputs(
     `load_fx_policy_rates`, which reads its own look-back before `start` so
     the rate in force on `start` is there). With a `benchmark` ticker, the
     benchmark returns are its daily close-to-close returns from `start` to
-    `end`, aligned on its own bars.
+    `end`, aligned on its own bars (`benchmark_returns_of` of
+    `load_benchmark_closes`).
 
     Raises `ValueError` when the lake has no policy rate for a currency of a
     spot FX pair among `assets` over the run; every loader's own errors
@@ -124,12 +143,11 @@ def load_engine_inputs(
         calendar=calendar,
         security_ids=security_ids,
     )
-    benchmark_returns = None
-    if benchmark is not None:
-        benchmark_frame, _ = load_price_history_with_fallback(
-            [benchmark], start, end, warmup_days=0, align="intersection"
-        )
-        benchmark_returns = benchmark_frame[benchmark]["close"].dropna().pct_change().dropna()
+    benchmark_returns = (
+        None
+        if benchmark is None
+        else benchmark_returns_of(load_benchmark_closes(benchmark, start, end))
+    )
     return EngineInputs(
         assets=tickers,
         market_data=market_data,

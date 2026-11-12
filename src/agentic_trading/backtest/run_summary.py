@@ -21,7 +21,12 @@ totals by kind. Per-pod sizing diagnostics are reduced to each pod's
 binding-stage shares and mean final-to-target vol ratio, and unfactored
 split-sized moves to a count per security (`None` for a resumed run,
 which carries no move list); the per-day and per-move entries are not
-kept. `lake` carries the lake time the run read at."""
+kept. `lake` carries the lake time the run read at.
+
+`summarize_period` and `summarize_baseline` reduce one period's or one
+baseline's full block; a firm record's summary
+(`firm_record.review.firm_record_summary`) holds one period of that shape
+keyed `record` instead of `calibration` and `test`."""
 
 from collections import Counter
 from typing import Any
@@ -134,6 +139,39 @@ def _lake_reading(experiment_result: dict[str, Any]) -> dict[str, Any]:
     return {"lake_time": lake.get("lake_time")}
 
 
+def summarize_period(block: dict[str, Any]) -> dict[str, Any]:
+    """One period's summary block from its full block, a
+    `BacktestResult.model_dump(mode="json")`: the `PERIOD_METRIC_KEYS`,
+    `signal_health`, `source_performance`, `pod_return_history`,
+    `pod_performance` and `pod_costs` as they are (the three pod fields
+    `{}` when absent), `execution_costs`, the unfactored split-move counts
+    per security, and the unfilled-order, capital-usage and sizing
+    summaries."""
+    period = {key: block[key] for key in PERIOD_METRIC_KEYS}
+    period["signal_health"] = block["signal_health"]
+    period["source_performance"] = block["source_performance"]
+    period["pod_return_history"] = block.get("pod_return_history", {})
+    period["pod_performance"] = block.get("pod_performance", {})
+    period["pod_costs"] = block.get("pod_costs", {})
+    period["execution_costs"] = _execution_costs(block)
+    period["unfactored_split_moves_by_security"] = _unfactored_split_move_counts(block)
+    period.update(_unfilled_order_counts(block))
+    period.update(_capital_usage_means(block))
+    period.update(_sizing_summary(block))
+    return period
+
+
+def summarize_baseline(block: dict[str, Any]) -> dict[str, Any]:
+    """One baseline's summary block from its full block: the
+    `PERIOD_METRIC_KEYS` and the unfilled-order and capital-usage
+    summaries."""
+    return {
+        **{key: block[key] for key in PERIOD_METRIC_KEYS},
+        **_unfilled_order_counts(block),
+        **_capital_usage_means(block),
+    }
+
+
 def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
     """The full `experiment_result.json` payload in, the compact summary
     out. `experiment_result` must have `experiment`, `market_data_source`,
@@ -146,25 +184,9 @@ def extract_run_summary(experiment_result: dict[str, Any]) -> dict[str, Any]:
         "lake": _lake_reading(experiment_result),
     }
     for period in ("calibration", "test"):
-        block = experiment_result[period]
-        summary[period] = {key: block[key] for key in PERIOD_METRIC_KEYS}
-        summary[period]["signal_health"] = block["signal_health"]
-        summary[period]["source_performance"] = block["source_performance"]
-        summary[period]["pod_return_history"] = block.get("pod_return_history", {})
-        summary[period]["pod_performance"] = block.get("pod_performance", {})
-        summary[period]["pod_costs"] = block.get("pod_costs", {})
-        summary[period]["execution_costs"] = _execution_costs(block)
-        summary[period]["unfactored_split_moves_by_security"] = _unfactored_split_move_counts(block)
-        summary[period].update(_unfilled_order_counts(block))
-        summary[period].update(_capital_usage_means(block))
-        summary[period].update(_sizing_summary(block))
-
+        summary[period] = summarize_period(experiment_result[period])
     summary["baselines"] = {
-        name: {
-            **{key: block[key] for key in PERIOD_METRIC_KEYS},
-            **_unfilled_order_counts(block),
-            **_capital_usage_means(block),
-        }
+        name: summarize_baseline(block)
         for name, block in experiment_result.get("baselines", {}).items()
     }
     return summary

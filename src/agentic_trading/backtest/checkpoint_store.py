@@ -24,6 +24,7 @@ for the fetch log.
 
 `read_all` reads the whole state back; `read_recent` reads it with only
 the recent track record and decisions a horizon-bounded engine holds;
+`read_state` reads it without the track record and the decisions;
 `read_last_day`, `read_unfilled_orders`, `iter_decision_payloads`,
 `iter_source_returns`, `decision_days` and `iter_signal_tally` read single
 columns of one table each.
@@ -34,7 +35,8 @@ the JSON text itself. The file records its layout as
 `CHECKPOINT_FORMAT_VERSION` in SQLite's `user_version`; `connect` with
 `resume=True` refuses a file of any other version with
 `CheckpointFormatError`, so a run is resumed only from a checkpoint of the
-layout this module writes.
+layout this module writes. `connect_read_only` opens a file of that layout
+for the readers above without changing anything in it.
 
 A `carried_state` blob is a pickle: open with `connect` only checkpoint
 files this program wrote, never one from an untrusted source."""
@@ -308,6 +310,26 @@ def connect(db_path: Path, *, resume: bool = False) -> sqlite3.Connection:
             connection.execute(create)
         _add_missing_columns(connection)
         connection.execute(f"PRAGMA user_version = {CHECKPOINT_FORMAT_VERSION}")
+    return connection
+
+
+def connect_read_only(db_path: Path) -> sqlite3.Connection:
+    """Opens the checkpoint database at `db_path` for reading only (SQLite's
+    `mode=ro`): nothing in the file is created, altered or written, and a
+    write through the connection fails. Raises `FileNotFoundError` when
+    the file does not exist, and `CheckpointFormatError` (closing the
+    connection) when it is not of `CHECKPOINT_FORMAT_VERSION`, naming the
+    file and both versions."""
+    if not db_path.is_file():
+        raise FileNotFoundError(f"no checkpoint at {db_path}")
+    connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    (version,) = connection.execute("PRAGMA user_version").fetchone()
+    if version != CHECKPOINT_FORMAT_VERSION:
+        connection.close()
+        raise CheckpointFormatError(
+            f"checkpoint {db_path} is of checkpoint format {version}, but this program "
+            f"reads only format {CHECKPOINT_FORMAT_VERSION}"
+        )
     return connection
 
 
@@ -759,6 +781,14 @@ def read_recent(
         )
     }
     return payload
+
+
+def read_state(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    """Everything `read_all` returns but `track_record` and
+    `decisions_by_day`: the run's config, its book and cursor values, and
+    every per-day history but those two, which are the bulk of a long
+    run's checkpoint. `None` when there is no cursor row yet."""
+    return _read_state(connection)
 
 
 def _read_state(connection: sqlite3.Connection) -> dict[str, Any] | None:
