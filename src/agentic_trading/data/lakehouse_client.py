@@ -16,14 +16,16 @@ environment (`LAKEHOUSE_API_URL`, `LAKEHOUSE_API_TOKEN`) unless given explicitly
     lake.describe("instrument_prices")                  # columns, keys, point-in-time rule, caveats
     lake.ask("What was the score in Liverpool vs Arsenal on 11 May 2025?")["answer"]
 
-Dates come back as dates and timestamps as UTC timestamps. A query that fails part-way raises
+Dates come back as dates and timestamps as UTC timestamps. Every error a call raises for the
+lake's refusal or failure is a `LakeReadError` (`data/lake_errors.py`). A query that fails part-way raises
 instead of returning a partial result: a result is returned only when its response body reached
 its end. `lake.last_version` holds the `X-Lakehouse-Version` header of the most recent response
 (`None` before the first request or when the header is absent).
 
 Retries. Reads are idempotent, so a call is sent again after a failure the lake recovers from,
 until `settings.lake.retry_budget_seconds` (read at each call) has passed since the call began;
-the error of the last send is raised when the next wait would end past the budget:
+the error of the last send is raised when the next wait would end past the budget (a transport
+error as `LakeConnectionError`, raised from it):
 
 - sent again within the budget: an HTTP 502, 503 (any detail) or 504, and an httpx transport
   error before any response arrived (connection refused or reset, a protocol or read error, a
@@ -82,6 +84,7 @@ import pyarrow as pa
 from pydantic import BaseModel, ConfigDict
 
 from agentic_trading.config import settings
+from agentic_trading.data.lake_errors import LakeReadError
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -108,7 +111,7 @@ MARKER_DIR = "requests"
 TIMEOUT_FILE = "last_timeout.json"
 
 
-class LakehouseError(RuntimeError):
+class LakehouseError(LakeReadError):
     """The API refused or failed the request; the message is the server's explanation. `status`
     is the HTTP status (`None` when no response carried one) and `retry_after` the response's
     `Retry-After` seconds (0 when absent)."""
@@ -125,7 +128,13 @@ class LakeStreamCutError(LakehouseError):
     returned."""
 
 
-class LakeQuietPeriodError(RuntimeError):
+class LakeConnectionError(LakehouseError):
+    """The lake could not be reached or sent no response: the last send of a call failed with
+    an httpx transport error (connection refused or reset, a protocol or read error, a timeout)
+    once the call's retries were spent. That error is its cause."""
+
+
+class LakeQuietPeriodError(LakeReadError):
     """A call refused before it was sent: a lake request timed out in another process, or a run
     left one unfinished, less than `settings.lake.request_quiet_seconds` ago, so the lake may
     still be working on it. `earliest` is the first UTC time a call is allowed; the message names
@@ -356,6 +365,7 @@ class Lake:
                     return
             except Exception as error:
                 if yielded or not self._wait_to_retry(error, budget, "POST", _SQL_PATH):
+                    _raise_as_lake_error(error, "POST", _SQL_PATH)
                     raise
 
     def to_parquet(self, query: str, path: str | Path, params: list[Any] | None = None) -> Path:
@@ -408,6 +418,7 @@ class Lake:
                     return consume(resp)
             except Exception as error:
                 if not self._wait_to_retry(error, budget, method, path):
+                    _raise_as_lake_error(error, method, path)
                     raise
 
     def _begin_call(self) -> _CallBudget:
@@ -689,6 +700,15 @@ class Lake:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _raise_as_lake_error(error: Exception, method: str, path: str) -> None:
+    """Raises `LakeConnectionError` from `error` when it is an httpx transport error, the last
+    failure of a call to `method` `path`; returns for any other error."""
+    if isinstance(error, httpx.TransportError):
+        raise LakeConnectionError(
+            f"{method} {path} failed: {type(error).__name__}: {error}"
+        ) from error
 
 
 def _json_body(resp: httpx.Response) -> Any:

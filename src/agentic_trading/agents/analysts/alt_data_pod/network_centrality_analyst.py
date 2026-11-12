@@ -10,6 +10,7 @@ from pydantic import PrivateAttr
 from agentic_trading.agents._market_math import RefitCache, balanced_panel, clamp
 from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.data.lake_errors import LakeReadError
 from agentic_trading.data.loaders.lakehouse_loader import (
     load_security_log_returns,
     load_sp500_member_securities_asof,
@@ -91,8 +92,8 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
         line. Returns `None` when the lake has no membership for the date
         or fewer than `_MIN_UNIVERSE_SIZE` members qualify, which the
         caller reports as unavailable for `refit_interval_days`. A failed
-        lake request propagates to `generate_signal`, which returns an
-        error signal for it. Never adds `asset` to the membership: an
+        lake read (`LakeReadError`) propagates through `generate_signal`;
+        any other exception becomes an error signal there. Never adds `asset` to the membership: an
         asset outside it is unavailable, leaving the shared cached fetch
         intact."""
         members = load_sp500_member_securities_asof(as_of_date.date())
@@ -136,6 +137,8 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
                 as_of_date,
                 lambda: self._load_broad_lakehouse_universe(as_of_date),
             )
+        except LakeReadError:
+            raise
         except (RuntimeError, ValueError) as exc:
             logger.warning(
                 "%s: broad lakehouse universe fetch failed for %s on %s (%s).",

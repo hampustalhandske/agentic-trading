@@ -37,7 +37,10 @@ import pytest
 from pydantic import BaseModel, PrivateAttr
 
 from agentic_trading.agents._market_math import RefitCache
-from agentic_trading.agents.analysts.cvar_pod import _options_data
+from agentic_trading.agents.analysts.cvar_pod import (
+    _options_data,
+    black_scholes_valuation_analyst,
+)
 from agentic_trading.agents.analysts.cvar_pod.black_scholes_valuation_analyst import (
     BlackScholesValuationAnalyst,
 )
@@ -219,7 +222,9 @@ def _mark(contract: OptionContract, as_of_date: date, spot: float) -> OptionMark
 
 @pytest.fixture(autouse=True)
 def _chain(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub SPY chain and marks for the tail-hedge manager and the engine; no split adjustment."""
+    """Stub SPY chain and marks for the tail-hedge manager and the engine; no split adjustment;
+    no FRED rate for the Black-Scholes analyst (it reports unavailable), since the engine runs
+    with no lake session and a lake read outside one stops the run."""
 
     def select_expiry(underlying, as_of_date, target_tenor_days, after=None) -> date:
         return (after or as_of_date) + timedelta(days=_EXPIRY_DAYS)
@@ -232,6 +237,9 @@ def _chain(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "agentic_trading.backtest.engine.lakehouse_loader.split_adjustment_factor",
         lambda *_args: 1.0,
+    )
+    monkeypatch.setattr(
+        black_scholes_valuation_analyst, "load_fred_vintages_from_lakehouse", lambda *_args: None
     )
 
 

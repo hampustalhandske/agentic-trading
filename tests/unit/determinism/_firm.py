@@ -12,7 +12,12 @@ firm is built: `random` (an unseeded random draw added to its confidence), `unsa
 checkpoint, holding only the agents' private attributes, does not carry), `thread` (its
 confidence depends on whether the main thread asks it) or `hash_order` (its confidence depends
 on where its series falls in the iteration order of a set of strings, which the string-hash
-seed decides)."""
+seed decides).
+
+`LAKE_FAULT_ENV`, when set and non-empty, makes the lake fail under the FRED analyst: from the
+window's `LAKE_FAILS_AFTER_DAYS + 1`-th session on, its read raises the lake's HTTP 400 as a
+`LakehouseError`. It is read at each call and is not part of the firm, so a pass without it
+resumes the same trial."""
 
 import os
 import random
@@ -36,11 +41,13 @@ from agentic_trading.agents.portfolio_construction import PortfolioConstructor
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.backtest.engine_inputs import EngineInputs
 from agentic_trading.config import settings
+from agentic_trading.data.lakehouse_client import LakehouseError
 from agentic_trading.data.loaders import lakehouse_loader
 from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.scoring.weighting import SharpeWeight, ShrinkageWeight
 
 PLANT_ENV = "AGENTIC_DETERMINISM_PLANT"
+LAKE_FAULT_ENV = "AGENTIC_DETERMINISM_LAKE_FAULT"
 PLANTS = ("random", "unsaved_state", "thread", "hash_order")
 
 LAKE_TIME = datetime(2026, 11, 6, tzinfo=UTC)
@@ -48,6 +55,8 @@ WINDOW_START, WINDOW_END = date(2016, 1, 4), date(2016, 1, 22)
 UNIVERSE = ["SPY", "QQQ", "IWM", "TLT"]
 _WARMUP = pd.DatetimeIndex(sessions_between(date(2015, 3, 2), date(2015, 12, 31)))
 _SESSIONS = pd.DatetimeIndex(sessions_between(WINDOW_START, WINDOW_END))
+# Window sessions the lake fault (`LAKE_FAULT_ENV`) lets through before the FRED read fails.
+LAKE_FAILS_AFTER_DAYS = 4
 _FRED_SERIES = "DGS3MO"
 # Iterated by the `hash_order` defect; the series' place in it differs between string-hash
 # seeds 0 and 1.
@@ -128,6 +137,8 @@ class FredTrendAnalyst(AnalystAgent):
         self, asset: str, market_data: pd.DataFrame, as_of_date: pd.Timestamp
     ) -> AgentSignal:
         _PROCESS_CALLS[0] += 1
+        if os.environ.get(LAKE_FAULT_ENV) and as_of_date >= _SESSIONS[LAKE_FAILS_AFTER_DAYS]:
+            raise LakehouseError("HTTP 400: the query failed on the lake", status=400)
         vintages = lakehouse_loader.load_fred_vintages_from_lakehouse(
             _FRED_SERIES, as_of_date.date()
         )

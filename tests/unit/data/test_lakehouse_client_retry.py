@@ -26,6 +26,7 @@ from agentic_trading.data.lakehouse_client import (
     RETRY_FIRST_WAIT_SECONDS,
     RETRY_JITTER,
     Lake,
+    LakeConnectionError,
     LakehouseError,
     LakeStreamCutError,
 )
@@ -192,18 +193,20 @@ def test_a_timeout_then_rows_waits_out_the_quiet_period() -> None:
 
 def test_the_budget_spent_raises_the_last_error(caplog: pytest.LogCaptureFixture) -> None:
     """A lake refusing connections on every send: the call sends again until the next wait
-    would end past the budget, then raises the error of its last send, and logs that the
-    budget is spent."""
+    would end past the budget, then raises `LakeConnectionError` from the error of its last
+    send, and logs that the budget is spent."""
     sent: list[httpx.Request] = []
     clock = _Clock()
     refused = [httpx.ConnectError(f"Connection refused {n}") for n in range(100)]
     lake = _lake(refused, sent, clock)
     with temporary_overrides({"lake.retry_budget_seconds": 120.0}):
         with caplog.at_level(logging.WARNING, logger=lakehouse_client.__name__):
-            with pytest.raises(httpx.ConnectError) as raised:
+            with pytest.raises(LakeConnectionError) as raised:
                 lake.sql("SELECT 1 AS one")
 
-    assert str(raised.value) == f"Connection refused {len(sent) - 1}"
+    assert isinstance(raised.value.__cause__, httpx.ConnectError)
+    assert str(raised.value.__cause__) == f"Connection refused {len(sent) - 1}"
+    assert f"Connection refused {len(sent) - 1}" in str(raised.value)
     assert 3 <= len(sent) < 100
     assert sum(clock.waits) <= 120.0
     assert any("budget" in record.getMessage() for record in caplog.records)

@@ -148,6 +148,7 @@ from agentic_trading.data.lake_answer_cache import (
     LakeAnswerCacheCounts,
     answer_inputs,
 )
+from agentic_trading.data.lake_errors import LakeReadError
 from agentic_trading.data.lakehouse_client import Lake, LakehouseError
 from agentic_trading.data.point_in_time import assert_point_in_time
 from agentic_trading.data.trading_calendar import add_sessions, is_session, next_session
@@ -178,7 +179,7 @@ class LakeProvenance(BaseModel):
     lake_time: datetime | None = None
 
 
-class LakeTimeError(RuntimeError):
+class LakeTimeError(LakeReadError):
     """A read cannot be made at the session's lake time: a conflicting
     lake time, `data_end` or lake version when joining an open session,
     the lake refusing a pinned read (HTTP 409), a change of the lake's
@@ -187,7 +188,7 @@ class LakeTimeError(RuntimeError):
     written at another lake time."""
 
 
-class HoldoutReadError(RuntimeError):
+class HoldoutReadError(LakeReadError):
     """A loader was asked for data known after the open session's
     `data_end`: its knowledge-time argument is later than the cut (see
     `_guard_data_end`). Raised before any query is sent."""
@@ -607,7 +608,7 @@ def _pinned_table_sql(session: LakeSession, table: str) -> str:
     return f"({_deduplicated_log_sql(table, metadata.key_columns, lake_time, metadata.tie_order)})"
 
 
-class UnpinnedLakeReadError(RuntimeError):
+class UnpinnedLakeReadError(LakeReadError):
     """A loader read a lake table with no `lake_session` open and outside
     `unpinned_lake_reads`, so the read would see the lake's current views
     rather than one lake time. The message names the loader and the table.
@@ -835,7 +836,7 @@ ALWAYS_POPULATED_TABLES: frozenset[str] = frozenset(
 EMPTY_READ_RETRY_SECONDS = 1.0
 
 
-class EmptyTableReadError(RuntimeError):
+class EmptyTableReadError(LakeReadError):
     """A read of a table in `ALWAYS_POPULATED_TABLES` as a whole came back
     with no rows twice, `EMPTY_READ_RETRY_SECONDS` apart, so the table is
     empty or still being rebuilt and no answer read from it can be
@@ -885,7 +886,7 @@ def _require_rows(table: str) -> None:
             session._populated_tables.add(table)
 
 
-class LakeHealthError(RuntimeError):
+class LakeHealthError(LakeReadError):
     """The lake's `/v1/health` answer does not let a run start: its
     `status` is not "ok", or a table the run reads has a
     `write_times.tables` entry that is not ok. The message names the
@@ -1433,7 +1434,7 @@ class EmptyAdjustmentTableError(EmptyTableReadError):
     every price read through it would come back unadjusted."""
 
 
-class AdjustmentFactorCollisionError(RuntimeError):
+class AdjustmentFactorCollisionError(LakeReadError):
     """`equity_adjustment_factors` holds factor rows of one `security_id`
     and `effective_date` with more than one `cum_factor` (a null counting
     as one), so which factor prices a bar would depend on the lake's row

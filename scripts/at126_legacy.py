@@ -35,7 +35,10 @@ the lake version alone; with no session open, every reference is refused
 (`UnpinnedLakeReadError`) outside `unpinned_lake_reads`; and inside a
 session with a `lake_answer_cache` open, every reference's read through
 `_query` is answered from the cache when it holds the answer and stored
-there otherwise, as the loaders' reads are."""
+there otherwise, as the loaders' reads are; and every error a reference
+raises for a lake read that failed (`LakehouseError`, `LakeTimeError`,
+`HoldoutReadError`, `UnpinnedLakeReadError`, `EmptyTableReadError` and
+their subclasses) is a `LakeReadError`, as the loaders' are."""
 
 from datetime import date, timedelta
 

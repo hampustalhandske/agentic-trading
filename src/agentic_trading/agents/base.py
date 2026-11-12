@@ -29,6 +29,7 @@ from agentic_trading.agents.schemas import (
     VolatilityEstimator,
 )
 from agentic_trading.config import settings
+from agentic_trading.data.lake_errors import LakeReadError
 from agentic_trading.logging_config import get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.weighting import WeightingStrategy
@@ -360,7 +361,10 @@ class ManagerAgent(Agent):
         When `asset` has a missing close (NaN) on some row of a
         (ticker, field) `market_data`, each analyst sees only the rows on
         which `asset` has a close, every column kept, so no signal on
-        `asset` rests on a row without its bar."""
+        `asset` rests on a row without its bar. An analyst's exception
+        becomes a flat, zero-confidence signal with status `error`, except
+        a `LakeReadError` (the lake read itself failed), which propagates
+        and stops the run."""
         if (asset, "close") in market_data.columns:
             closes = market_data[(asset, "close")]
             if bool(closes.isna().any()):
@@ -369,6 +373,8 @@ class ManagerAgent(Agent):
         for analyst in self.managed_analysts:
             try:
                 signals.append(analyst.generate_signal(asset, market_data, as_of_date))
+            except LakeReadError:
+                raise
             except Exception:
                 logger.warning(
                     "Analyst %s failed to generate a signal for %s on %s — defaulting to "
@@ -416,7 +422,9 @@ class ManagerAgent(Agent):
         weighting_strategy, evaluated against `scoreboard` to reflect each
         source analyst's trailing track record. Concrete managers
         implement scale_factor, not evaluate — this method is the same
-        mechanical wiring for every manager type.
+        mechanical wiring for every manager type. A scale_factor() that
+        raises contributes a 0 factor with status `error`, except a
+        `LakeReadError` (the lake read itself failed), which propagates.
         """
         # WeightingStrategy/PerformanceScoreboard/TrackRecord are all keyed by
         # plain `date` (see scoring/), while `as_of_date` here is a
@@ -430,6 +438,8 @@ class ManagerAgent(Agent):
             status = signal.status
             try:
                 factor = self.scale_factor(signal, market_data, as_of_date)
+            except LakeReadError:
+                raise
             except Exception:
                 logger.warning(
                     "Manager %s's scale_factor() failed for %s's signal on %s (%s) — "

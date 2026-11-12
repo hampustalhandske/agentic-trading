@@ -39,10 +39,10 @@ from agentic_trading.agents.base import (
 )
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
+from agentic_trading.data.lake_errors import LakeReadError
 from agentic_trading.data.loaders.lakehouse_loader import (
     HoldoutReadError,
     LakeSession,
-    LakeTimeError,
     lake_session,
 )
 from agentic_trading.data.point_in_time import get_point_in_time_data
@@ -160,13 +160,13 @@ def system_resources_ok(store_dir: Path) -> bool:
 def _signal(
     analyst: AnalystAgent, asset: str, market_data: pd.DataFrame, as_of: pd.Timestamp
 ) -> AgentSignal:
-    """`analyst`'s signal for `asset` at `as_of`. Any exception other than
-    `HoldoutReadError` and `LakeTimeError`, which propagate, becomes a
-    flat, zero-confidence signal with status `error`, logged as a
-    WARNING."""
+    """`analyst`'s signal for `asset` at `as_of`. Any exception other than a
+    `LakeReadError` (a failed lake read, `HoldoutReadError` and
+    `LakeTimeError` among them), which propagates, becomes a flat,
+    zero-confidence signal with status `error`, logged as a WARNING."""
     try:
         return analyst.generate_signal(asset, market_data, as_of)
-    except (HoldoutReadError, LakeTimeError):
+    except LakeReadError:
         raise
     except Exception as error:
         logger.warning(
@@ -281,8 +281,9 @@ def run_batch(
     `repo_root`. A
     `LedgerError` from registering or recording propagates. An analyst's
     exception is stored as that asset's error signal for the day, except
-    `HoldoutReadError` and `LakeTimeError`, which propagate with the day
-    unwritten; so does `HoldoutReadError` for a day on which a read past
+    a `LakeReadError` (a failed lake read, `HoldoutReadError` and
+    `LakeTimeError` among them), which propagates with the day unwritten;
+    so does `HoldoutReadError` for a day on which a read past
     data_end was refused and caught. A store mismatch or a refused row
     propagates from `SignalStore`."""
     data_end = settings.stage_a.data_end
