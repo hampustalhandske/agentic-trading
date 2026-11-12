@@ -1540,30 +1540,42 @@ def firm_review(
 ) -> None:
     """Write the run summary of a finished firm record to --out, for the
     dashboard's "Load a saved run" panel: the engine's results of the
-    record rebuilt from its checkpoint, opened read-only, under one
+    record rebuilt from a copy of its checkpoint, under one
     `record` period, with SPY's total-return curve as a baseline
     (`firm_record.review.firm_record_summary`). The DGS3MO and SPY series
     the ratios are measured with are read from the lake at the record's
     lake time, pinned to the lake version its spec.json records. Prints
     the path, the file's size and the number of days; no performance
     figure. Exits 2 when --out or --lake-cache-dir is inside the
-    directory holding the checkpoint (the record's store), which is never
-    written."""
+    directory holding the checkpoint (the record's store) or inside the
+    record's trial folder, neither of which is ever written; every path is
+    compared with its symbolic links resolved."""
     # Imported here: a firm record hashes every `agentic_trading` module
     # loaded when it starts, and the review is no part of a record.
-    from agentic_trading.firm_record.review import RECORD_PERIOD, firm_record_summary
+    from agentic_trading.firm_record.review import (
+        RECORD_PERIOD,
+        checkpoint_trial_dir,
+        firm_record_summary,
+    )
 
     store = checkpoint.resolve().parent
-    if out.resolve().is_relative_to(store):
-        raise typer.BadParameter(
-            f"{out} is inside the record's store {store}; write the summary outside it.",
-            param_hint="--out",
-        )
-    if lake_cache_dir is not None and lake_cache_dir.resolve().is_relative_to(store):
-        raise typer.BadParameter(
-            f"{lake_cache_dir} is inside the record's store {store}; give a directory outside it.",
-            param_hint="--lake-cache-dir",
-        )
+    if trial_dir is None:
+        try:
+            trial = checkpoint_trial_dir(checkpoint.resolve())
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="CHECKPOINT") from exc
+    else:
+        trial = trial_dir.resolve()
+    kept = ((store, "the record's store"), (trial, "the record's trial folder"))
+    for path, flag in ((out, "--out"), (lake_cache_dir, "--lake-cache-dir")):
+        if path is None:
+            continue
+        for directory, name in kept:
+            if path.resolve().is_relative_to(directory):
+                raise typer.BadParameter(
+                    f"{path} is inside {name} {directory}; give a path outside it.",
+                    param_hint=flag,
+                )
     configure_logging()
     summary = firm_record_summary(checkpoint, trial_dir, lake_cache_dir=lake_cache_dir)
     out.parent.mkdir(parents=True, exist_ok=True)

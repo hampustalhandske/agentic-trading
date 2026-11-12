@@ -110,6 +110,56 @@ def test_nothing_is_written_inside_the_records_store(
     assert sorted(path.name for path in checkpoint.parent.iterdir()) == [checkpoint.name]
 
 
+@pytest.mark.parametrize("flag", ["--out", "--lake-cache-dir"])
+def test_nothing_is_written_inside_the_records_trial_folder(
+    checkpoint: Path, summary_calls: list[tuple[Any, ...]], tmp_path: Path, flag: str
+) -> None:
+    """A trial folder given with --trial-dir, away from the store, is guarded as well."""
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    args = [str(checkpoint), "--out", str(tmp_path / "s.json"), "--trial-dir", str(trial)]
+
+    result = runner.invoke(firm_review_app, [*args, flag, str(trial / "inside")])
+
+    assert result.exit_code == 2
+    assert summary_calls == []
+    assert list(trial.iterdir()) == []
+
+
+@pytest.mark.parametrize("flag", ["--out", "--lake-cache-dir"])
+def test_the_guards_see_through_symbolic_links(
+    checkpoint: Path, summary_calls: list[tuple[Any, ...]], tmp_path: Path, flag: str
+) -> None:
+    """A path reaching the store or the trial folder through a symbolic link, on either side of
+    the comparison, is refused like the real path."""
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    trial_link = tmp_path / "trial_link"
+    trial_link.symlink_to(trial, target_is_directory=True)
+    store_link = tmp_path / "store_link"
+    store_link.symlink_to(checkpoint.parent, target_is_directory=True)
+    linked_checkpoint = tmp_path / "elsewhere" / checkpoint.name
+    linked_checkpoint.parent.mkdir()
+    linked_checkpoint.symlink_to(checkpoint)
+    cases = [
+        (checkpoint, trial, trial_link / "x"),
+        (checkpoint, trial_link, trial / "x"),
+        (checkpoint, None, store_link / "x"),
+        (linked_checkpoint, None, checkpoint.parent / "x"),
+    ]
+
+    for checkpoint_arg, trial_arg, inside in cases:
+        args = [str(checkpoint_arg), "--out", str(tmp_path / "s.json"), flag, str(inside)]
+        if trial_arg is not None:
+            args += ["--trial-dir", str(trial_arg)]
+        result = runner.invoke(firm_review_app, args)
+        assert result.exit_code == 2, (args, result.output)
+
+    assert summary_calls == []
+    assert list(trial.iterdir()) == []
+    assert sorted(path.name for path in checkpoint.parent.iterdir()) == [checkpoint.name]
+
+
 def test_a_missing_checkpoint_is_a_usage_error(
     summary_calls: list[tuple[Any, ...]], tmp_path: Path
 ) -> None:

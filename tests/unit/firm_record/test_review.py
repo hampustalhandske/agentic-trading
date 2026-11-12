@@ -6,6 +6,7 @@
 
 import hashlib
 import json
+import shutil
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -399,6 +400,32 @@ def test_a_lake_cache_inside_the_store_is_refused(record: _Record) -> None:
         review.firm_record_summary(
             record.checkpoint, record.trial_dir, lake_cache_dir=record.store / "lake_cache"
         )
+
+
+def test_a_lake_cache_inside_a_trial_folder_away_from_the_store_is_refused(
+    record: _Record, tmp_path: Path
+) -> None:
+    trial_dir = tmp_path / "trial"
+    shutil.copytree(record.trial_dir, trial_dir)
+
+    with pytest.raises(ValueError, match="trial folder"):
+        review.firm_record_summary(
+            record.checkpoint, trial_dir, lake_cache_dir=trial_dir / "lake_cache"
+        )
+    assert not (trial_dir / "lake_cache").exists()
+
+
+def test_a_checkpoint_reached_through_a_link_reads_the_trial_folder_beside_its_file(
+    record: _Record, tmp_path: Path
+) -> None:
+    linked = tmp_path / record.checkpoint.name
+    linked.symlink_to(record.checkpoint)
+
+    summary = review.firm_record_summary(linked, benchmarks=record_benchmarks())
+
+    assert summary == review.firm_record_summary(
+        record.checkpoint, record.trial_dir, benchmarks=record_benchmarks()
+    )
 
 
 def test_the_benchmarks_are_read_at_the_records_lake_time_and_version(

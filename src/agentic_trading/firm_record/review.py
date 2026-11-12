@@ -469,7 +469,8 @@ def firm_record_summary(
 ) -> dict[str, Any]:
     """The run summary of the firm record whose engine checkpoint is
     `checkpoint_path` and whose trial folder is `trial_dir` (by default
-    the one beside it, `checkpoint_trial_dir`), as JSON values.
+    the one beside the checkpoint's file, its symbolic links resolved,
+    `checkpoint_trial_dir`), as JSON values.
 
     It holds `experiment` (`_experiment`), `market_data_source`, `lake`
     (the record's `lake_time` and `lake_version`), one period block keyed
@@ -498,7 +499,8 @@ def firm_record_summary(
     applied (`applied_record_settings`); the reading and loading errors of
     `read_trial_spec`, `checkpoint_store.snapshot` and
     `load_record_benchmarks` propagate."""
-    trial_dir = checkpoint_trial_dir(checkpoint_path) if trial_dir is None else trial_dir
+    if trial_dir is None:
+        trial_dir = checkpoint_trial_dir(checkpoint_path.resolve())
     if lake_cache_dir is not None:
         cache = lake_cache_dir.resolve()
         for kept, name in (
