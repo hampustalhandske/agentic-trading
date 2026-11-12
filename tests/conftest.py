@@ -59,6 +59,8 @@ def pytest_configure(config: pytest.Config) -> None:
 _DEFAULT_SCRAPED_AT = "2020-01-01T00:00:00Z"
 # A log table's bookkeeping columns, never part of the tie order the lake serves.
 _LOG_BOOKKEEPING_COLUMNS = ("scraped_at", "dt", "table")
+# The start of the error a `FakeLake` table macro raises for a lake time with no build.
+_NO_BUILD_MARKER = "no build of"
 
 
 def _utc_iso(value: Any) -> str:
@@ -79,8 +81,10 @@ class FakeLake:
     `scraped_at` argument is given. A `rebuilt_whole` table's current rows
     carry that `scraped_at` too, its build time, as the lake's current
     views do. `add_log_rows` appends further versions
-    to the log only. A table added with `pin_column` (an append-only table
-    with no `scraped_at`) gets no log; its pin is its own row-time column.
+    to the log only. `add_build` gives a rebuilt-whole table a new build:
+    the table and its log hold the new rows, the build they held is kept
+    for `<table>_at(T)`, and the `builds` part of `version` changes, as the
+    lake's `X-Lakehouse-Version` does.
     `add_view` registers a view with no log. `describe`, `tables`, `status`
     and `health` answer from that metadata (`kind`, `key_columns` and the
     same list as `keys`, `rebuilt_whole`); `last_write_overrides` replaces a
@@ -88,14 +92,17 @@ class FakeLake:
     `tie_order`, its non-key columns in column order without `scraped_at`,
     `dt` and `table`; `tie_order_overrides` replaces it, and an override of
     `None` serves none.
+    Every rebuilt-whole and append-only table has the lake's table macro
+    `<table>_at(T)` (see `_create_at_macro`).
     `health` answers HTTP 200's body: `version`, `health_status` as `status`
     ("ok" by default) and `write_times` (table to entry, empty by default)
     under `write_times.tables`, so a test plants a degraded answer by setting
-    those two. `sql` runs the query against the tables and exposes `version` as
-    `last_version`. Setting `fixed_result` makes every query return that
-    frame regardless of the SQL (for testing a loader's own guards against
-    a result its query should never produce); setting `error` makes every
-    call raise it."""
+    those two. `sql`, `describe` and `health` expose `version` as `last_version`,
+    as every response of the lake carries it; `sql` runs the query against the
+    tables. Setting `fixed_result` makes every query return that frame
+    regardless of the SQL (for testing a loader's own guards against a result
+    its query should never produce); setting `error` makes every call raise
+    it."""
 
     def __init__(self) -> None:
         self._connection = duckdb.connect(database=":memory:")
@@ -105,7 +112,7 @@ class FakeLake:
         self.fixed_result: pd.DataFrame | None = None
         self.error: Exception | None = None
         self.calls: list[tuple[str, list[Any]]] = []
-        self.version = "fake-lake-1"
+        self.version = "fake-code-1.fake-builds-1"
         self.last_version: str | None = None
         self.last_write_overrides: dict[str, str] = {}
         self.tie_order_overrides: dict[str, list[str] | None] = {}
@@ -113,6 +120,7 @@ class FakeLake:
         self.write_times: dict[str, dict[str, Any]] = {}
         self._meta: dict[str, dict[str, Any]] = {}
         self._date_columns: dict[str, tuple[str, ...]] = {}
+        self._builds_written = 0
 
     def _columns(self, name: str) -> list[str]:
         description = self._connection.execute(f"SELECT * FROM {name} LIMIT 0").description
@@ -124,7 +132,6 @@ class FakeLake:
         kind: str,
         key_columns: list[str] | None,
         rebuilt_whole: bool,
-        pin_column: str | None = None,
         has_log: bool = True,
     ) -> None:
         columns = self._columns(name)
@@ -133,9 +140,41 @@ class FakeLake:
             "kind": kind,
             "key_columns": list(keys),
             "rebuilt_whole": rebuilt_whole,
-            "pin_column": pin_column,
-            "has_log": has_log and pin_column is None,
+            "has_log": has_log,
         }
+
+    def _create_at_macro(self, name: str) -> None:
+        """Creates the table macro `name_at(t)`, the lake's `<table>_at(T)`, for a
+        rebuilt-whole or append-only table; any other table gets none.
+
+        A rebuilt-whole table answers every row of the one build with the greatest
+        `scraped_at` at or before `t`, from its current build (`name_log`) and the builds it
+        replaced (`name_retired`); when the table holds rows but none written at or before
+        `t`, the query fails with `_NO_BUILD_MARKER` in its message (`sql` turns that into
+        the lake's HTTP 400), and a table that holds no rows answers none. An append-only
+        table answers the rows of `name_log` with `scraped_at <= t`."""
+        meta = self._meta[name]
+        pin = "scraped_at <= CAST(t AS TIMESTAMPTZ)"
+        if meta["rebuilt_whole"]:
+            self._connection.execute(
+                f"CREATE OR REPLACE TABLE {name}_retired AS SELECT * FROM {name}_log LIMIT 0"
+            )
+            message = f"'{_NO_BUILD_MARKER} {name} at or before ' || CAST(t AS VARCHAR)"
+            self._connection.execute(
+                f"CREATE OR REPLACE MACRO {name}_at(t) AS TABLE "
+                f"WITH builds AS (SELECT * FROM {name}_log "
+                f"UNION ALL BY NAME SELECT * FROM {name}_retired), "
+                f"pick AS (SELECT count(*) AS stored, count(*) FILTER (WHERE {pin}) AS reached "
+                "FROM builds) "
+                "SELECT builds.* FROM builds, pick WHERE builds.scraped_at = "
+                f"CASE WHEN pick.stored > 0 AND pick.reached = 0 THEN error({message}) "
+                f"ELSE (SELECT max(scraped_at) FROM builds WHERE {pin}) END"
+            )
+        elif meta["kind"] == "append-only":
+            self._connection.execute(
+                f"CREATE OR REPLACE MACRO {name}_at(t) AS TABLE "
+                f"SELECT * FROM {name}_log WHERE {pin}"
+            )
 
     def _build_log(self, name: str, scraped_at: Any) -> None:
         """Creates `name_log` from `name`'s rows plus a `scraped_at` column."""
@@ -163,7 +202,6 @@ class FakeLake:
         kind: str = "current",
         key_columns: list[str] | None = None,
         rebuilt_whole: bool = False,
-        pin_column: str | None = None,
     ) -> None:
         frame = frame.copy()
         for column in date_columns:
@@ -172,10 +210,34 @@ class FakeLake:
         self._connection.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM _staged_{name}")
         self._connection.unregister(f"_staged_{name}")
         self._date_columns[name] = tuple(date_columns)
-        self._register(name, kind, key_columns, rebuilt_whole, pin_column)
+        self._register(name, kind, key_columns, rebuilt_whole)
         self._build_log(name, scraped_at)
         if rebuilt_whole and "scraped_at" not in self._columns(name):
             self._connection.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM {name}_log")
+        self._create_at_macro(name)
+
+    def add_build(self, name: str, frame: pd.DataFrame, scraped_at: Any) -> None:
+        """Gives rebuilt-whole table `name` a new build: `frame`'s rows, written at
+        `scraped_at`, become the table and its log, the build they replace is kept for
+        `name_at(T)`, and the `builds` part of `version` (after its first `.`) changes.
+        `frame`'s date columns are the ones `add` was given."""
+        if not self._meta[name]["rebuilt_whole"]:
+            raise ValueError(f"{name} is not rebuilt whole")
+        frame = frame.copy()
+        for column in self._date_columns.get(name, ()):
+            frame[column] = pd.to_datetime(frame[column]).dt.date
+        self._connection.execute(f"INSERT INTO {name}_retired BY NAME SELECT * FROM {name}_log")
+        self._connection.register("_staged_build", frame)
+        self._connection.execute(
+            f"CREATE OR REPLACE TABLE {name}_log AS "
+            "SELECT *, CAST(? AS TIMESTAMPTZ) AS scraped_at FROM _staged_build",
+            [_utc_iso(scraped_at)],
+        )
+        self._connection.unregister("_staged_build")
+        self._connection.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM {name}_log")
+        self._builds_written += 1
+        code = self.version.split(".", 1)[0]
+        self.version = f"{code}.fake-builds-{self._builds_written + 1}"
 
     def add_empty(
         self,
@@ -185,14 +247,14 @@ class FakeLake:
         kind: str = "current",
         key_columns: list[str] | None = None,
         rebuilt_whole: bool = False,
-        pin_column: str | None = None,
     ) -> None:
         """Registers a table with no rows; `columns` maps names to DuckDB types."""
         definition = ", ".join(f"{column} {kind_}" for column, kind_ in columns.items())
         self._connection.execute(f"CREATE OR REPLACE TABLE {name} ({definition})")
         self._date_columns[name] = ()
-        self._register(name, kind, key_columns, rebuilt_whole, pin_column)
+        self._register(name, kind, key_columns, rebuilt_whole)
         self._build_log(name, None)
+        self._create_at_macro(name)
 
     def add_view(self, name: str, select_sql: str, kind: str = "compatibility view") -> None:
         """Registers view `name` over `select_sql`; it has no log and no key columns."""
@@ -222,6 +284,7 @@ class FakeLake:
 
     def describe(self, table: str) -> dict[str, Any]:
         """The lake's table metadata; a table never added reads as an empty current table."""
+        self.last_version = self.version
         meta = self._meta.get(table)
         if meta is None:
             return {
@@ -233,10 +296,10 @@ class FakeLake:
                 "tie_order": [],
             }
         last_write = self.last_write_overrides.get(table)
-        source = f"max({meta['pin_column']})" if meta["pin_column"] else "max(scraped_at)"
-        relation = table if meta["pin_column"] else f"{table}_log"
-        if last_write is None and (meta["has_log"] or meta["pin_column"]):
-            newest = self._connection.execute(f"SELECT epoch({source}) FROM {relation}").fetchone()
+        if last_write is None and meta["has_log"]:
+            newest = self._connection.execute(
+                f"SELECT epoch(max(scraped_at)) FROM {table}_log"
+            ).fetchone()
             if newest is not None and newest[0] is not None:
                 rounded = datetime.fromtimestamp(math.ceil(newest[0]), UTC)
                 last_write = rounded.isoformat().replace("+00:00", "Z")
@@ -267,6 +330,7 @@ class FakeLake:
         return {"generated_at": None, "tables": self.tables()}
 
     def health(self) -> dict[str, Any]:
+        self.last_version = self.version
         tables = {table: dict(entry) for table, entry in self.write_times.items()}
         return {
             "version": self.version,
@@ -282,7 +346,12 @@ class FakeLake:
         if self.fixed_result is not None:
             return self.fixed_result
         with self._sql_lock:
-            return self._connection.execute(query, params or []).df()
+            try:
+                return self._connection.execute(query, params or []).df()
+            except duckdb.InvalidInputException as error:
+                if _NO_BUILD_MARKER in str(error):
+                    raise lakehouse_client.LakehouseError(f"HTTP 400: {error}") from error
+                raise
 
 
 _REAL_LAKE_ACCESSOR = lakehouse_loader._lake
@@ -443,17 +512,22 @@ def preflight_lake(fake_lake: FakeLake) -> FakeLake:
     against the real schema. Every view is empty except the
     always-populated tables, which hold the one `_PLACEHOLDER_ROWS` row
     each (in the table and its log, scraped at `_CATALOGUE_LAST_WRITE`)
-    so their table-level reads find rows. Every requirement reports no
+    so their table-level reads find rows. Each table is rebuilt whole or
+    append-only as the contract's `tables` says, so it has the lake's
+    `<table>_at(T)` macro. Every requirement reports no
     coverage. Each view reports a `last_write` of `_CATALOGUE_LAST_WRITE`,
     so a `lake_session` opened on it has a default lake time."""
     contract = json.loads(_CONTRACT_PATH.read_text())
     for view, columns in contract["views"].items():
+        contract_kind = contract["tables"][view]["kind"]
         fake_lake.add_empty(
             view,
             {
                 f'"{name}"': ("VARCHAR" if kind == '"NULL"' else kind)
                 for name, kind in columns.items()
             },
+            kind="append-only" if contract_kind == "append_only" else "current",
+            rebuilt_whole=contract_kind == "rebuilt_whole",
         )
         fake_lake.last_write_overrides[view] = _CATALOGUE_LAST_WRITE
     assert set(_PLACEHOLDER_ROWS) == lakehouse_loader.ALWAYS_POPULATED_TABLES

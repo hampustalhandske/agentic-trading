@@ -161,10 +161,6 @@ def test_run_reads_inside_one_session_and_records_its_time(
     assert all(stamp == expected for stamps in seen.values() for stamp in stamps)
     lake = _payload(result.stdout)["provenance"]["lake"]
     assert datetime.fromisoformat(lake["lake_time"]) == expected
-    assert set(lake["rebuilt_whole_builds"]) >= {
-        "equity_adjustment_factors",
-        "yahoo_split_close_basis",
-    }
     assert ll.current_lake_time() is None
 
 
@@ -193,29 +189,27 @@ def test_experiment_uses_one_lake_time_for_calibration_and_test(cli_lake: Any) -
     assert datetime.fromisoformat(lake["lake_time"]) == _T
 
 
-def _rebuild_splits(lake: Any) -> BacktestResult:
+def _rebuild_splits_then_read(lake: Any, factors: list[float]) -> BacktestResult:
+    """Gives `yahoo_split_close_basis` a new build written after T (AAA's split restated from
+    2-for-1 to 4-for-1), then appends the split factor the run reads for AAA to `factors`."""
     splits = pd.DataFrame(
         {"ticker": ["AAA"], "ex_date": ["2024-01-02"], "ratio": [0.25], "in_close_basis": [True]}
     )
-    lake.add(
-        "yahoo_split_close_basis",
-        splits,
-        ("ex_date",),
-        scraped_at="2024-06-01T13:00:00Z",
-        rebuilt_whole=True,
-    )
+    lake.add_build("yahoo_split_close_basis", splits, "2024-06-01T13:00:00Z")
+    factors.append(ll.split_adjustment_factor("AAA", date(2024, 1, 1)))
     return _result()
 
 
 @pytest.mark.parametrize("command", ["run", "experiment"])
-def test_a_rebuild_during_the_run_fails_it_before_any_result_is_printed(
-    cli_lake: Any, command: str
-) -> None:
-    """A rebuilt-whole table rebuilt while the engine runs fails the command, naming the table,
-    and no result JSON reaches stdout."""
+def test_a_rebuild_during_the_run_changes_nothing_it_reads(cli_lake: Any, command: str) -> None:
+    """A rebuilt-whole table rebuilt while the engine runs leaves the run reading the build of
+    T, and the command completes with its result."""
     seen: dict[str, list[Any]] = {}
+    factors: list[float] = []
     with _stubbed_cli(seen) as engine_cls:
-        engine_cls.return_value.run.side_effect = lambda *a, **k: _rebuild_splits(cli_lake)
+        engine_cls.return_value.run.side_effect = lambda *a, **k: _rebuild_splits_then_read(
+            cli_lake, factors
+        )
         if command == "run":
             result = runner.invoke(app, [*_RUN_ARGS, "--lake-time", "2024-06-01T12:00:00Z"])
         else:
@@ -223,10 +217,9 @@ def test_a_rebuild_during_the_run_fails_it_before_any_result_is_printed(
                 experiment_app, [*_EXPERIMENT_ARGS, "--lake-time", "2024-06-01T12:00:00Z"]
             )
 
-    assert result.exit_code != 0
-    assert isinstance(result.exception, ll.LakeTimeError)
-    assert "yahoo_split_close_basis" in str(result.exception)
-    assert '"result"' not in result.stdout
+    assert result.exit_code == 0, result.output
+    assert '"result"' in result.stdout or '"experiment"' in result.stdout
+    assert factors and set(factors) == {2.0}
     assert ll.current_lake_time() is None
 
 
