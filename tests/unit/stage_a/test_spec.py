@@ -91,6 +91,8 @@ def test_build_spec_records_the_trial() -> None:
         "trials.registry_dir",
         "trials.firm_family",
         "lake.request_quiet_seconds",
+        "lake.retry_budget_seconds",
+        "lake.max_concurrent_queries",
     )
     assert spec.agent_id == "cir_rate_regime_analyst"
     assert spec.analyst_class in {cls.__qualname__, f"{cls.__module__}.{cls.__qualname__}"}

@@ -50,6 +50,8 @@ _RUNTIME_FIELDS = {
     "trials.registry_dir",
     "trials.firm_family",
     "lake.request_quiet_seconds",
+    "lake.retry_budget_seconds",
+    "lake.max_concurrent_queries",
 }
 _ERRORS: dict[str, type[Exception]] = {
     "value": ValueError,

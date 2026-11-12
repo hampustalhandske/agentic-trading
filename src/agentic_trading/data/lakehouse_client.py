@@ -9,6 +9,7 @@ environment (`LAKEHOUSE_API_URL`, `LAKEHOUSE_API_TOKEN`) unless given explicitly
     lake = Lake()
     df = lake.sql("SELECT ticker, date, close FROM instrument_prices WHERE ticker = ? AND date >= ?",
                   ["AAPL", "2020-01-01"])              # pandas DataFrame, every row
+    answer = lake.sql_answer("SELECT ...", [...])       # the Arrow table and its lake version
     for batch in lake.sql_batches("SELECT * FROM reddit_comments"):   # results larger than memory
         ...
     lake.tables()                                       # what exists, with coverage and status
@@ -16,31 +17,49 @@ environment (`LAKEHOUSE_API_URL`, `LAKEHOUSE_API_TOKEN`) unless given explicitly
     lake.ask("What was the score in Liverpool vs Arsenal on 11 May 2025?")["answer"]
 
 Dates come back as dates and timestamps as UTC timestamps. A query that fails part-way raises
-instead of returning a partial result. `lake.last_version` holds the `X-Lakehouse-Version` header
-of the most recent response (`None` before the first request or when the header is absent).
+instead of returning a partial result: a result is returned only when its response body reached
+its end. `lake.last_version` holds the `X-Lakehouse-Version` header of the most recent response
+(`None` before the first request or when the header is absent).
 
-An HTTP 503 whose detail says the lake's query slots are busy is sent again after each of
-`BUSY_RETRY_DELAYS`, each scaled by a random factor within `BUSY_RETRY_JITTER` and never shorter
-than the response's `Retry-After` seconds. The lake itself waits up to 30 s for a slot before it
-answers busy, and holds the slot of a request whose client went away until the request's 300 s
-deadline, so the seven sends span at least about six and a half minutes. Each retry is logged as
-a warning, and the answer to the last send raises like any other. Every other refusal or failure
-raises at once.
+Retries. Reads are idempotent, so a call is sent again after a failure the lake recovers from,
+until `settings.lake.retry_budget_seconds` (read at each call) has passed since the call began;
+the error of the last send is raised when the next wait would end past the budget:
 
-After a request times out, or a run is killed with a request unfinished, the lake may keep working
-on it, so no new call is sent for `settings.lake.request_quiet_seconds` (read at each call). The
-rule holds across processes through files in the client's state directory (`state_dir()`: the
-directory `AGENTIC_LAKE_STATE_DIR` names, else `agentic-trading/lake` under the user's XDG state
-directory, `~/.local/state` by default). Each request writes a marker file under `requests/`
-naming its process and start time when it starts, and removes it when it ends; a request that
-times out (`httpx.TimeoutException`, also when it cuts off a streamed result) removes its marker
-and records the time in `last_timeout.json`, and one interrupted by `KeyboardInterrupt` or
-`SystemExit` leaves its marker. Before each call the client refuses with `LakeQuietPeriodError`,
-naming the earliest UTC time a call is allowed, when the recorded timeout is within the window,
-or when a leftover marker (one whose process has exited, or one naming this process that no
-request of it holds) started within the window. A leftover marker older than the window is
-removed. A marker of another live process is that process's request in flight and never refuses.
-The timeout and the refusal are each logged as a warning.
+- sent again within the budget: an HTTP 502, 503 (any detail) or 504, and an httpx transport
+  error before any response arrived (connection refused or reset, a protocol or read error, a
+  timeout), as when launchd is starting or restarting the API;
+- sent again at most `LIMITED_RETRIES` times in a call: an HTTP 500 or any other 5xx, and a
+  response cut off part-way (`LakeStreamCutError`: the lake's whole-query deadline or memory
+  limit, or the connection lost while reading), which is usually deterministic;
+- raised at once: every 4xx (bad SQL, a missing build, 401, a 409 pin refusal, a 423 read
+  freeze) and any other error.
+
+The wait before send n + 1 is `RETRY_FIRST_WAIT_SECONDS * 2**(n - 1)`, capped at
+`RETRY_MAX_WAIT_SECONDS`, scaled by a random factor within `RETRY_JITTER`, and never shorter than
+the response's `Retry-After` seconds; after a timeout it is never shorter than the quiet period.
+Each retry is logged as a warning naming the attempt, the error and the wait.
+
+`/v1/sql` requests of the process, over every client and thread, are capped at
+`settings.lake.max_concurrent_queries` in flight; a further one waits for a slot before it is
+sent. A slot is held from the send until the response is done, never during a retry's wait.
+
+Quiet period. After a request times out, or a run is killed with a request unfinished, the lake
+may keep working on it, so no new call is sent for `settings.lake.request_quiet_seconds` (read at
+each call). The rule holds across processes through files in the client's state directory
+(`state_dir()`: the directory `AGENTIC_LAKE_STATE_DIR` names, else `agentic-trading/lake` under
+the user's XDG state directory, `~/.local/state` by default). Each send writes a marker file under
+`requests/` naming its process and start time when it starts, and removes it when it ends; a send
+that times out (`httpx.TimeoutException`, also when it cuts off a streamed result) removes its
+marker and records the time and its process in `last_timeout.json`, and one interrupted by
+`KeyboardInterrupt` or `SystemExit` leaves its marker. Before the first send of a call the client
+looks for a recorded timeout within the window, and for leftover markers (one whose process has
+exited, or one naming this process that no request of it holds) started within it. A timeout this
+process recorded (same pid, which an `os.execv` restart keeps) is waited out; any other cause
+refuses the call with `LakeQuietPeriodError`, naming the earliest UTC time a call is allowed, as
+for a new process started after a kill. A leftover marker older than the window is removed. A
+marker of another live process is that process's request in flight and never refuses. Within a
+call, a send after a timeout waits out the quiet period as part of its retry wait. The timeout,
+the wait and the refusal are each logged as a warning.
 """
 
 from __future__ import annotations
@@ -60,6 +79,7 @@ from typing import Any
 
 import httpx
 import pyarrow as pa
+from pydantic import BaseModel, ConfigDict
 
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
@@ -68,15 +88,19 @@ logger = get_logger(__name__)
 
 DEFAULT_URL = "http://localhost:8600"
 VERSION_HEADER = "X-Lakehouse-Version"
+_SQL_PATH = "/v1/sql"
 
-# Seconds to wait before each new send of a request the lake answered with busy query slots: seven
-# sends in all, four minutes of waiting before the last (see the module docstring).
-BUSY_RETRY_DELAYS: tuple[float, ...] = (10.0, 20.0, 30.0, 60.0, 60.0, 60.0)
-# Each delay is scaled by a factor drawn uniformly from [1 - jitter, 1 + jitter].
-BUSY_RETRY_JITTER = 0.2
-# The status and the text of its detail that mean the lake's query slots are all in use.
-_BUSY_STATUS = 503
-_BUSY_DETAIL = "query slots are busy"
+# Seconds before the second send of a call; each later wait doubles, up to the cap.
+RETRY_FIRST_WAIT_SECONDS = 2.0
+# The longest backoff wait between two sends (a `Retry-After` or the quiet period may be longer).
+RETRY_MAX_WAIT_SECONDS = 60.0
+# Each backoff wait is scaled by a factor drawn uniformly from [1 - jitter, 1 + jitter].
+RETRY_JITTER = 0.2
+# Sends again at most this many times in one call after a 5xx other than 502/503/504 or a cut-off
+# response: such a failure usually repeats, and splitting the query is the fix.
+LIMITED_RETRIES = 2
+# Statuses that mean the API is unavailable for now (busy query slots, restarting).
+_UNAVAILABLE_STATUSES = frozenset({502, 503, 504})
 # Names the client's state directory (see `state_dir`).
 STATE_DIR_ENV_VAR = "AGENTIC_LAKE_STATE_DIR"
 # Under the state directory: one marker file per request in flight, and the last client timeout.
@@ -85,17 +109,41 @@ TIMEOUT_FILE = "last_timeout.json"
 
 
 class LakehouseError(RuntimeError):
-    """The API refused or failed the request; the message is the server's explanation."""
+    """The API refused or failed the request; the message is the server's explanation. `status`
+    is the HTTP status (`None` when no response carried one) and `retry_after` the response's
+    `Retry-After` seconds (0 when absent)."""
+
+    def __init__(self, message: str, status: int | None = None, retry_after: float = 0.0) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+class LakeStreamCutError(LakehouseError):
+    """A response was cut off before its end: the lake stopped the query after it had started
+    answering, or the connection was lost while the body was read. No partial result is
+    returned."""
 
 
 class LakeQuietPeriodError(RuntimeError):
-    """A call refused before it was sent: a lake request timed out, or a run left one unfinished,
-    less than `settings.lake.request_quiet_seconds` ago, so the lake may still be working on it.
-    `earliest` is the first UTC time a call is allowed; the message names it and each cause."""
+    """A call refused before it was sent: a lake request timed out in another process, or a run
+    left one unfinished, less than `settings.lake.request_quiet_seconds` ago, so the lake may
+    still be working on it. `earliest` is the first UTC time a call is allowed; the message names
+    it and each cause."""
 
     def __init__(self, message: str, earliest: datetime) -> None:
         super().__init__(message)
         self.earliest = earliest
+
+
+class LakeAnswer(BaseModel):
+    """One `/v1/sql` answer read to its end: `table` holds every row as the lake sent it, and
+    `version` the response's `X-Lakehouse-Version` (`None` when it carried none)."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    table: pa.Table
+    version: str | None
 
 
 def state_dir() -> Path:
@@ -159,7 +207,7 @@ class _ByteStream(io.RawIOBase):
             except StopIteration:
                 return 0
             except httpx.TransportError as exc:
-                raise LakehouseError(
+                raise LakeStreamCutError(
                     "the response was cut off: the query failed or timed out on the server after it had "
                     "started returning rows; no partial result is returned"
                 ) from exc
@@ -169,18 +217,61 @@ class _ByteStream(io.RawIOBase):
         return n
 
 
+def _arrow_reader(resp: httpx.Response) -> pa.RecordBatchStreamReader:
+    """An Arrow stream reader over `resp`'s body."""
+    try:
+        return pa.ipc.open_stream(io.BufferedReader(_ByteStream(resp.iter_bytes())))
+    except pa.ArrowInvalid as exc:
+        raise LakeStreamCutError(f"the response is not a whole Arrow stream: {exc}") from exc
+
+
+def _read_arrow(resp: httpx.Response) -> pa.Table:
+    """Every row of `resp`'s Arrow body; `LakeStreamCutError` when the body ends part-way."""
+    reader = _arrow_reader(resp)
+    try:
+        return reader.read_all()
+    except pa.ArrowInvalid as exc:
+        raise LakeStreamCutError(f"the response ended part-way through the Arrow stream: {exc}") from exc
+
+
+class _QuietCause(BaseModel):
+    """One reason no call may be sent before `until`: `own` when this process recorded it."""
+
+    until: datetime
+    text: str
+    own: bool
+
+
+class _CallBudget:
+    """The retry state of one call: when it began, the seconds it has waited, the backoff waits
+    taken and the limited retries used."""
+
+    def __init__(self, began: datetime) -> None:
+        self.began = began
+        self.waited = 0.0
+        self.backoffs = 0
+        self.limited = 0
+        self.sends = 1
+
+    def elapsed(self, now: datetime) -> float:
+        """Seconds the call has taken: the time since it began, and at least its waits."""
+        return max((now - self.began).total_seconds(), self.waited)
+
+
 class Lake:
     """A client of the lakehouse API at `base_url` with `token`. `transport` replaces the HTTP
-    transport (tests), `busy_retry_delays` the waits before each new send of a busy-slots answer
-    (see the module docstring), `sleep` the function that waits and `clock` the one that gives the
-    current aware time for the quiet period. `in_flight` counts this client's requests sent and
-    not yet finished, over every thread, and `Lake.in_flight_in_process()` those of every client
-    in the process."""
+    transport (tests), `sleep` the function that waits and `clock` the one that gives the current
+    aware time for the quiet period and the retry budget. `in_flight` counts this client's
+    requests sent and not yet finished, over every thread, and `Lake.in_flight_in_process()`
+    those of every client in the process."""
 
     _process_in_flight = 0
     _process_lock = threading.Lock()
     # The marker files of this process's requests in flight, over every client.
     _process_markers: set[Path] = set()
+    # The `/v1/sql` requests of this process in flight, over every client, and its waiters.
+    _query_slots_held = 0
+    _query_slots = threading.Condition()
 
     def __init__(
         self,
@@ -189,7 +280,6 @@ class Lake:
         timeout: float = 600.0,
         *,
         transport: httpx.BaseTransport | None = None,
-        busy_retry_delays: tuple[float, ...] = BUSY_RETRY_DELAYS,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
@@ -201,7 +291,6 @@ class Lake:
             timeout=httpx.Timeout(timeout, connect=10.0),
             transport=transport,
         )
-        self._busy_retry_delays = busy_retry_delays
         self._sleep = sleep
         self._clock = clock
         self._in_flight = 0
@@ -221,6 +310,12 @@ class Lake:
         with cls._process_lock:
             return cls._process_in_flight
 
+    @classmethod
+    def queries_in_flight_in_process(cls) -> int:
+        """The number of `/v1/sql` requests every `Lake` of this process holds a slot for."""
+        with cls._query_slots:
+            return cls._query_slots_held
+
     def _count_in_flight(self, change: int) -> None:
         with self._in_flight_lock:
             self._in_flight += change
@@ -235,31 +330,48 @@ class Lake:
 
     def sql_arrow(self, query: str, params: list[Any] | None = None) -> pa.Table:
         """Every row as a pyarrow Table (convert with `.to_pandas()`, or `polars.from_arrow`)."""
-        with self._arrow_reader(query, params) as reader:
-            return reader.read_all()
+        return self.sql_answer(query, params).table
+
+    def sql_answer(self, query: str, params: list[Any] | None = None) -> LakeAnswer:
+        """Every row as a pyarrow Table, with the lake version of the response that held it."""
+        body = {"sql": query, "params": params or [], "format": "arrow"}
+
+        def consume(resp: httpx.Response) -> LakeAnswer:
+            return LakeAnswer(table=_read_arrow(resp), version=resp.headers.get(VERSION_HEADER))
+
+        return self._request("POST", _SQL_PATH, consume, json=body)
 
     def sql_batches(self, query: str, params: list[Any] | None = None) -> Iterator[pa.RecordBatch]:
-        """The result one record batch at a time, for results too large to hold at once."""
-        with self._arrow_reader(query, params) as reader:
-            yield from reader
-
-    @contextlib.contextmanager
-    def _arrow_reader(self, query: str, params: list[Any] | None) -> Iterator[pa.RecordBatchStreamReader]:
+        """The result one record batch at a time, for results too large to hold at once. A
+        failure before the first batch is retried like any call; one after it raises."""
         body = {"sql": query, "params": params or [], "format": "arrow"}
-        with self._response("POST", "/v1/sql", json=body) as resp:
-            yield pa.ipc.open_stream(io.BufferedReader(_ByteStream(resp.iter_bytes())))
+        budget = self._begin_call()
+        while True:
+            yielded = False
+            try:
+                with self._sent("POST", _SQL_PATH, json=body) as resp:
+                    for batch in _arrow_reader(resp):
+                        yielded = True
+                        yield batch
+                    return
+            except Exception as error:
+                if yielded or not self._wait_to_retry(error, budget, "POST", _SQL_PATH):
+                    raise
 
     def to_parquet(self, query: str, path: str | Path, params: list[Any] | None = None) -> Path:
         """Write the result to one Parquet file at `path` without holding it in memory."""
         path = Path(path)
         body = {"sql": query, "params": params or [], "format": "parquet"}
         tmp = path.with_suffix(path.suffix + ".partial")
-        with self._response("POST", "/v1/sql", json=body) as resp:
+
+        def consume(resp: httpx.Response) -> Path:
             with tmp.open("wb") as fh:
                 for chunk in resp.iter_bytes():
                     fh.write(chunk)
-        tmp.replace(path)
-        return path
+            tmp.replace(path)
+            return path
+
+        return self._request("POST", _SQL_PATH, consume, json=body)
 
     # -- catalogue and questions ------------------------------------------------------
 
@@ -276,9 +388,7 @@ class Lake:
     def ask(self, question: str, as_of: str | None = None, include_evidence: bool = False) -> dict[str, Any]:
         """A natural-language answer with the SQL it rests on (needs the `ask` scope)."""
         body = {"question": question, "as_of": as_of, "include_evidence": include_evidence}
-        with self._response("POST", "/v1/ask", json=body) as resp:
-            resp.read()
-            return resp.json()
+        return self._request("POST", "/v1/ask", _json_body, json=body)
 
     def health(self) -> dict[str, Any]:
         return self._get("/v1/health")
@@ -286,59 +396,142 @@ class Lake:
     # -- helpers ----------------------------------------------------------------------
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        with self._response("GET", path, params=params) as resp:
-            resp.read()
-            return resp.json()
+        return self._request("GET", path, _json_body, params=params)
+
+    def _request[T](self, method: str, path: str, consume: Callable[[httpx.Response], T], **kwargs: Any) -> T:
+        """`consume` applied to the response to `method` `path`, sent again after each failure
+        the retry rules allow (see the module docstring)."""
+        budget = self._begin_call()
+        while True:
+            try:
+                with self._sent(method, path, **kwargs) as resp:
+                    return consume(resp)
+            except Exception as error:
+                if not self._wait_to_retry(error, budget, method, path):
+                    raise
+
+    def _begin_call(self) -> _CallBudget:
+        """Starts a call: waits out a quiet period this process recorded, or raises
+        `LakeQuietPeriodError` for one it did not (see the module docstring)."""
+        now = self._now()
+        budget = _CallBudget(now)
+        causes = self._quiet_causes(state_dir(), now)
+        if not causes:
+            return budget
+        earliest = max(cause.until for cause in causes)
+        message = (
+            f"lake call refused until {earliest.isoformat()} "
+            f"({settings.lake.request_quiet_seconds:g} s quiet period): "
+            + "; ".join(cause.text for cause in causes)
+        )
+        wait = (earliest - now).total_seconds()
+        if any(not cause.own for cause in causes) or wait > settings.lake.retry_budget_seconds:
+            logger.warning("%s", message)
+            raise LakeQuietPeriodError(message, earliest)
+        logger.warning(
+            "Lake call waits %.1f s, until %s, for the quiet period after this process's timeout",
+            wait,
+            earliest.isoformat(),
+        )
+        self._pause(wait, budget)
+        return budget
+
+    def _pause(self, seconds: float, budget: _CallBudget) -> None:
+        budget.waited += seconds
+        self._sleep(seconds)
+
+    def _wait_to_retry(self, error: Exception, budget: _CallBudget, method: str, path: str) -> bool:
+        """Waits before the next send of a call that failed with `error` and returns `True`, or
+        returns `False` when the error is raised at once or the call is out of retries."""
+        status = error.status if isinstance(error, LakehouseError) else None
+        unavailable = status in _UNAVAILABLE_STATUSES or isinstance(error, httpx.TransportError)
+        limited = isinstance(error, LakeStreamCutError) or (
+            status is not None and status >= 500 and not unavailable
+        )
+        if limited:
+            if budget.limited >= LIMITED_RETRIES:
+                return False
+            budget.limited += 1
+        elif not unavailable:
+            return False
+        backoff = min(RETRY_MAX_WAIT_SECONDS, RETRY_FIRST_WAIT_SECONDS * 2.0**budget.backoffs)
+        wait = backoff * random.uniform(1.0 - RETRY_JITTER, 1.0 + RETRY_JITTER)
+        if isinstance(error, LakehouseError):
+            wait = max(wait, error.retry_after)
+        if _is_timeout(error):
+            wait = max(wait, settings.lake.request_quiet_seconds)
+        if budget.elapsed(self._now()) + wait > settings.lake.retry_budget_seconds:
+            logger.warning(
+                "Lake %s %s failed on send %d (%s: %s); the retry budget of %g s is spent",
+                method,
+                path,
+                budget.sends,
+                type(error).__name__,
+                error,
+                settings.lake.retry_budget_seconds,
+            )
+            return False
+        logger.warning(
+            "Lake %s %s failed on send %d (%s: %s); sending again in %.1f s",
+            method,
+            path,
+            budget.sends,
+            type(error).__name__,
+            error,
+            wait,
+        )
+        budget.backoffs += 1
+        budget.sends += 1
+        self._pause(wait, budget)
+        return True
 
     @contextlib.contextmanager
-    def _response(self, method: str, path: str, **kwargs: Any) -> Iterator[httpx.Response]:
-        """The streamed response to `method` `path`, after recording its version and raising
-        `LakehouseError` for a refusal. Raises `LakeQuietPeriodError` before sending inside the
-        quiet period, and holds a request marker until the response is done (see the module
-        docstring). A busy-slots answer is sent again after each of the busy retry delays, each
-        logged; the answer after the last delay raises like any other."""
-        marker = self._begin_request(method, path)
-        keep_marker = False
+    def _query_slot(self, path: str) -> Iterator[None]:
+        """Holds one of the process's `/v1/sql` slots while the block runs (any other path
+        holds none), waiting for one while `settings.lake.max_concurrent_queries` are held."""
+        if path != _SQL_PATH:
+            yield
+            return
+        with Lake._query_slots:
+            while Lake._query_slots_held >= settings.lake.max_concurrent_queries:
+                Lake._query_slots.wait()
+            Lake._query_slots_held += 1
         try:
-            with self._sent(method, path, **kwargs) as resp:
-                yield resp
-        except BaseException as error:
-            if _is_timeout(error):
-                self._record_timeout(method, path)
-            elif isinstance(error, KeyboardInterrupt | SystemExit):
-                keep_marker = True
-            raise
+            yield
         finally:
-            self._end_request(marker, keep_marker)
+            with Lake._query_slots:
+                Lake._query_slots_held -= 1
+                Lake._query_slots.notify_all()
 
     @contextlib.contextmanager
     def _sent(self, method: str, path: str, **kwargs: Any) -> Iterator[httpx.Response]:
-        """The sends of `_response`, busy retries included."""
-        delays = self._busy_retry_delays
-        for attempt in range(len(delays) + 1):
+        """One send of `method` `path`: the streamed response, after recording its version and
+        raising `LakehouseError` for a refusal. Holds a query slot and a request marker until
+        the response is done; a transport error while the block reads the body raises
+        `LakeStreamCutError`. A timeout is recorded for the quiet period."""
+        with self._query_slot(path):
+            marker = self._begin_request(method, path)
+            keep_marker = False
             self._count_in_flight(1)
             try:
                 with self._http.stream(method, path, **kwargs) as resp:
                     self._record_version(resp)
-                    if attempt == len(delays) or not self._is_busy(resp):
-                        self._raise_for(resp)
+                    self._raise_for(resp)
+                    try:
                         yield resp
-                        return
+                    except httpx.TransportError as exc:
+                        raise LakeStreamCutError(
+                            f"the response to {method} {path} was cut off while it was read: {exc}"
+                        ) from exc
+            except BaseException as error:
+                if _is_timeout(error):
+                    self._record_timeout(method, path)
+                elif isinstance(error, KeyboardInterrupt | SystemExit):
+                    keep_marker = True
+                raise
             finally:
                 self._count_in_flight(-1)
-            wait = max(
-                delays[attempt] * random.uniform(1.0 - BUSY_RETRY_JITTER, 1.0 + BUSY_RETRY_JITTER),
-                self._retry_after(resp),
-            )
-            logger.warning(
-                "Lakehouse query slots busy (HTTP 503) on %s %s; send %d of %d in %.1f s",
-                method,
-                path,
-                attempt + 2,
-                len(delays) + 1,
-                wait,
-            )
-            self._sleep(wait)
+                self._end_request(marker, keep_marker)
 
     # -- quiet period -------------------------------------------------------------------
 
@@ -346,16 +539,17 @@ class Lake:
         return self._clock().astimezone(UTC)
 
     def _begin_request(self, method: str, path: str) -> Path:
-        """Refuses inside the quiet period, then writes this request's marker and returns its
-        path. The marker is held in this process's set before it is written, so no other thread
-        reads it as left over."""
-        now = self._now()
-        directory = state_dir()
-        self._refuse_inside_quiet_period(directory, now)
-        marker = directory / MARKER_DIR / f"{os.getpid()}-{uuid.uuid4().hex}.json"
+        """Writes this send's marker and returns its path. The marker is held in this
+        process's set before it is written, so no other thread reads it as left over."""
+        marker = state_dir() / MARKER_DIR / f"{os.getpid()}-{uuid.uuid4().hex}.json"
         with Lake._process_lock:
             Lake._process_markers.add(marker)
-        payload = {"pid": os.getpid(), "started_at": now.isoformat(), "method": method, "path": path}
+        payload = {
+            "pid": os.getpid(),
+            "started_at": self._now().isoformat(),
+            "method": method,
+            "path": path,
+        }
         try:
             _write_json(marker, payload)
         except BaseException:
@@ -405,37 +599,48 @@ class Lake:
         except (ValueError, KeyError, TypeError):
             return None, modified
 
-    def _refuse_inside_quiet_period(self, directory: Path, now: datetime) -> None:
-        """Raises `LakeQuietPeriodError` when the recorded timeout, or a leftover marker's start,
-        is less than the quiet period before `now`; removes each leftover marker older than that."""
+    def _quiet_causes(self, directory: Path, now: datetime) -> list[_QuietCause]:
+        """Each recorded timeout and leftover marker less than the quiet period before `now`;
+        removes each leftover marker older than that."""
         window = timedelta(seconds=settings.lake.request_quiet_seconds)
-        causes: list[tuple[datetime, str]] = []
+        causes: list[_QuietCause] = []
         timeout = directory / TIMEOUT_FILE
         if timeout.exists():
+            pid: int | None
             try:
-                at = datetime.fromisoformat(json.loads(timeout.read_text())["at"]).astimezone(UTC)
-            except (ValueError, KeyError, TypeError):
+                recorded = json.loads(timeout.read_text())
+                at = datetime.fromisoformat(recorded["at"]).astimezone(UTC)
+                pid = recorded.get("pid")
+            except (ValueError, KeyError, TypeError, AttributeError):
                 at = datetime.fromtimestamp(timeout.stat().st_mtime, UTC)
+                pid = None
             if now < at + window:
-                causes.append((at + window, f"a lake request timed out at {at.isoformat()}"))
+                causes.append(
+                    _QuietCause(
+                        until=at + window,
+                        text=f"a lake request timed out at {at.isoformat()}",
+                        own=pid == os.getpid(),
+                    )
+                )
         markers = directory / MARKER_DIR
         for marker in sorted(markers.glob("*.json")) if markers.is_dir() else []:
             with Lake._process_lock:
                 if marker in Lake._process_markers:
                     continue
-            recorded = self._marker_start(marker)
-            if recorded is None:
+            started_by = self._marker_start(marker)
+            if started_by is None:
                 continue
-            pid, started = recorded
-            if pid is not None and pid != os.getpid() and _process_alive(pid):
+            owner_pid, started = started_by
+            if owner_pid is not None and owner_pid != os.getpid() and _process_alive(owner_pid):
                 continue
-            owner = "an unreadable marker" if pid is None else f"process {pid}"
+            owner = "an unreadable marker" if owner_pid is None else f"process {owner_pid}"
             if now < started + window:
                 causes.append(
-                    (
-                        started + window,
-                        f"{owner} left a lake request unfinished that started at "
+                    _QuietCause(
+                        until=started + window,
+                        text=f"{owner} left a lake request unfinished that started at "
                         f"{started.isoformat()} ({marker})",
+                        own=False,
                     )
                 )
             else:
@@ -446,15 +651,7 @@ class Lake:
                     owner,
                     started.isoformat(),
                 )
-        if causes:
-            earliest = max(when for when, _ in causes)
-            message = (
-                f"lake call refused until {earliest.isoformat()} "
-                f"({settings.lake.request_quiet_seconds:g} s quiet period): "
-                + "; ".join(cause for _, cause in causes)
-            )
-            logger.warning("%s", message)
-            raise LakeQuietPeriodError(message, earliest)
+        return causes
 
     @staticmethod
     def _retry_after(resp: httpx.Response) -> float:
@@ -464,21 +661,13 @@ class Lake:
         except ValueError:
             return 0.0
 
-    @staticmethod
-    def _is_busy(resp: httpx.Response) -> bool:
-        """Whether `resp` is the lake's answer that every query slot is in use."""
-        if resp.status_code != _BUSY_STATUS:
-            return False
-        resp.read()
-        return _BUSY_DETAIL in resp.text
-
     def _record_version(self, resp: httpx.Response) -> None:
         """Sets `last_version` from `resp`'s `X-Lakehouse-Version` header (header names are
         case-insensitive), or to `None` when the response carries none."""
         self.last_version = resp.headers.get(VERSION_HEADER)
 
-    @staticmethod
-    def _raise_for(resp: httpx.Response) -> None:
+    @classmethod
+    def _raise_for(cls, resp: httpx.Response) -> None:
         if resp.status_code < 400:
             return
         resp.read()
@@ -486,7 +675,11 @@ class Lake:
             detail = resp.json().get("detail", resp.text)
         except ValueError:
             detail = resp.text
-        raise LakehouseError(f"HTTP {resp.status_code}: {detail}")
+        raise LakehouseError(
+            f"HTTP {resp.status_code}: {detail}",
+            status=resp.status_code,
+            retry_after=cls._retry_after(resp),
+        )
 
     def close(self) -> None:
         self._http.close()
@@ -496,3 +689,9 @@ class Lake:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _json_body(resp: httpx.Response) -> Any:
+    """`resp`'s body read whole and parsed as JSON."""
+    resp.read()
+    return resp.json()

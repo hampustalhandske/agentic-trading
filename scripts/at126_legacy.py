@@ -32,7 +32,10 @@ append-only table through the lake's `<table>_at(T)` macro, every query
 refused before it is sent when it names such a table otherwise
 (`UnpinnedTableReadError`) and every response checked on the code part of
 the lake version alone; with no session open, every reference is refused
-(`UnpinnedLakeReadError`) outside `unpinned_lake_reads`."""
+(`UnpinnedLakeReadError`) outside `unpinned_lake_reads`; and inside a
+session with a `lake_answer_cache` open, every reference's read through
+`_query` is answered from the cache when it holds the answer and stored
+there otherwise, as the loaders' reads are."""
 
 from datetime import date, timedelta
 

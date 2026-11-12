@@ -106,7 +106,12 @@ def _record_until_complete(
 
 
 def _trial(store_dir: Path) -> Path:
-    (trial,) = [path for path in store_dir.iterdir() if path.is_dir()]
+    """The store's one trial folder; the lake answer cache beside it is not a trial."""
+    (trial,) = [
+        path
+        for path in store_dir.iterdir()
+        if path.is_dir() and path.name != cli.FIRM_RECORD_LAKE_CACHE_DIR
+    ]
     return trial
 
 
