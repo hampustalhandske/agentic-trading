@@ -43,6 +43,8 @@ from agentic_trading.data.loader import (
 )
 from agentic_trading.data.loaders.lakehouse_loader import (
     declare_loader_window,
+    lake_answer_cache,
+    lake_answer_cache_counts,
     lake_requests_in_flight,
     lake_session,
     loader_query_counts,
@@ -228,6 +230,11 @@ _LOADER_STORE_HELP = (
 LOADER_QUERY_COUNTS_PREFIX = "loader-query-counts "
 # Prefix of the stderr line holding the window store's memory as JSON.
 LOADER_STORE_USAGE_PREFIX = "loader-store-usage "
+# Prefix of the stderr line holding the lake answer cache's counts as JSON.
+LAKE_ANSWER_CACHE_PREFIX = "lake-answer-cache "
+# The firm record's lake answer cache directory under --store-dir, unless
+# --lake-cache-dir names one.
+FIRM_RECORD_LAKE_CACHE_DIR = "lake_cache"
 
 
 def declare_run_window(enabled: bool, start: date, end: date, warmup_days: int) -> None:
@@ -253,6 +260,14 @@ def echo_loader_store_usage() -> None:
     usage = loader_store_usage()
     text = "null" if usage is None else usage.model_dump_json()
     typer.echo(LOADER_STORE_USAGE_PREFIX + text, err=True)
+
+
+def echo_lake_answer_cache_counts() -> None:
+    """Writes one stderr line: `LAKE_ANSWER_CACHE_PREFIX` and the JSON of
+    `lake_answer_cache_counts()` (`null` when no cache is open)."""
+    counts = lake_answer_cache_counts()
+    text = "null" if counts is None else counts.model_dump_json()
+    typer.echo(LAKE_ANSWER_CACHE_PREFIX + text, err=True)
 
 
 def _parse_lake_time_flag(value: str | None) -> datetime | None:
@@ -1248,6 +1263,13 @@ def firm_record(
         help="Start even when the Mac draws from battery, is in Low Power Mode or its power "
         "cannot be checked; not part of the spec.",
     ),
+    lake_cache_dir: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--lake-cache-dir",
+        help=f"Directory of the lake answer cache; default <store-dir>/"
+        f"{FIRM_RECORD_LAKE_CACHE_DIR}. A restart or resume with the same directory reads every "
+        "answer it holds from disk. Not part of the spec.",
+    ),
 ) -> None:
     """Record the registered firm (agentic-firm-v1) from --start to --end:
     the Commander's daily pod targets written as a `decision_file.v1` trial
@@ -1278,9 +1300,14 @@ def firm_record(
     default) the session's loader window store is declared over the same
     span, --start minus `stage_a.warmup_days` to --end
     (`declare_run_window`); --no-loader-store leaves every loader call
-    fetching for itself. Before the session closes, the loader query
-    counts and the store's usage are written to stderr
-    (`echo_loader_query_counts`, `echo_loader_store_usage`). The firm's hypothesis is
+    fetching for itself. Every lake read of the session goes through the
+    lake answer cache at --lake-cache-dir (default
+    `<store-dir>/lake_cache`, `lakehouse_loader.lake_answer_cache`), so a
+    restart or resume of the record reads every answer the cache holds
+    from disk. Before the session closes, the loader query counts, the
+    store's usage and the answer cache's counts are written to stderr
+    (`echo_loader_query_counts`, `echo_loader_store_usage`,
+    `echo_lake_answer_cache_counts`). The firm's hypothesis is
     registered in the trial ledger at `trials.ledger_path` from its
     registry file before the first day; without that file the record is
     uncounted. Prints the result as JSON, which holds no performance
@@ -1344,7 +1371,11 @@ def firm_record(
         store_dir,
     )
     require_lake_health()
-    with lake_session(requested_lake_time, data_end=data_end) as session:
+    answers_dir = lake_cache_dir or store_dir / FIRM_RECORD_LAKE_CACHE_DIR
+    with (
+        lake_answer_cache(answers_dir),
+        lake_session(requested_lake_time, data_end=data_end) as session,
+    ):
         typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
         declare_run_window(loader_store, window_start, window_end, settings.stage_a.warmup_days)
         inputs = load_engine_inputs(
@@ -1394,6 +1425,7 @@ def firm_record(
         )
         echo_loader_query_counts()
         echo_loader_store_usage()
+        echo_lake_answer_cache_counts()
         pinned_lake_time = session.lake_time
     typer.echo(result.model_dump_json(indent=2))
     if result.paused_for_memory:

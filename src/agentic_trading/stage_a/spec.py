@@ -46,6 +46,8 @@ RUNTIME_SETTINGS_FIELDS: tuple[str, ...] = (
     "trials.registry_dir",
     "trials.firm_family",
     "lake.request_quiet_seconds",
+    "lake.retry_budget_seconds",
+    "lake.max_concurrent_queries",
 )
 
 # The rule that turns one day's analyst signals into instrument weights.

@@ -598,6 +598,16 @@ class LakeConfig(BaseModel):
     # working on such a request until its 300 s deadline, plus a 30 s margin.
     # Policy choice.
     request_quiet_seconds: float = Field(default=330.0, gt=0.0)
+    # Seconds one lake call keeps sending again after failures the lake
+    # recovers from (a 503 or a 502/504, connection refused or reset, a
+    # timeout) before it raises the last error: covers a launchd restart of
+    # the API, a query slot an abandoned request holds for up to 300 s, the
+    # quiet period after a timeout and lake load spikes. Policy choice.
+    retry_budget_seconds: float = Field(default=1800.0, ge=0.0)
+    # `/v1/sql` requests this process has in flight at most: the lake runs
+    # two query slots, so more only draw 503s (four pod threads otherwise
+    # would), and holding more starves the other projects reading the lake.
+    max_concurrent_queries: int = Field(default=2, ge=1)
 
 
 class StrategyConfig(BaseModel):

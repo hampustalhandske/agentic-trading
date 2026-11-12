@@ -93,9 +93,26 @@ A loader joins the store with one fetch and one select:
 
 `ranged=True` marks a source whose stored rows start at a date (a call
 starting earlier fetches the key again from there); a source holding a
-key's full history up to `end` passes `ranged=False`."""
+key's full history up to `end` passes `ranged=False`.
+
+Answer cache. Inside `lake_answer_cache(directory)`, every `/v1/sql` read
+`_query` makes while a session is open is first looked up on disk
+(`data/lake_answer_cache.py`) and, when the lake answers it, stored there,
+so a run restarted or resumed with the same directory reads each answer it
+already has from disk. An answer is keyed on the session's lake version,
+its lake time T, the state the session recorded for each unpinned table
+the SQL names (`_unpinned_state`), the SQL text and the parameters. Before
+the session knows its lake version nothing is looked up: the read goes to
+the lake, its response's version is recorded in the session, and the
+answer is stored under that version; an answer whose response carries no
+version is never stored. A response of another version than the
+session's raises `LakeTimeError` before anything is stored, so no answer
+is ever served under a version other than the one it came from. Reads
+with no session open, and the catalogue, health and status calls, never
+use the cache. `lake_answer_cache_counts` reports its hits and stores."""
 
 import functools
+import re
 import threading
 import time
 from collections.abc import Callable, Hashable, Iterator, Sequence
@@ -103,6 +120,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, date, datetime, timedelta
 from functools import cache
+from pathlib import Path
 from typing import Any, Literal, cast, get_args
 from weakref import WeakKeyDictionary
 
@@ -113,6 +131,11 @@ from pydantic import BaseModel, PrivateAttr
 from agentic_trading.agents.schemas import UnfactoredSplitMove
 from agentic_trading.config import _env_value, settings
 from agentic_trading.data.instruments import futures_root
+from agentic_trading.data.lake_answer_cache import (
+    LakeAnswerCache,
+    LakeAnswerCacheCounts,
+    answer_inputs,
+)
 from agentic_trading.data.lakehouse_client import Lake, LakehouseError
 from agentic_trading.data.point_in_time import assert_point_in_time
 from agentic_trading.data.trading_calendar import add_sessions, is_session, next_session
@@ -662,19 +685,69 @@ def _record_version(session: LakeSession, version: str | None) -> None:
         )
 
 
-def _query(query: str, params: list[Any]) -> pd.DataFrame:
-    """Runs one read-only `SELECT` with `?` placeholders bound to `params`
-    and returns every row as a DataFrame, counting the request in
-    `loader_query_counts`. Request failures propagate.
-    Inside a session, the lake refusing the read with HTTP 409 raises
-    `LakeTimeError` naming T and quoting the lake's detail (the read is
-    never retried unpinned), and a response from a different lake version
-    than the session's raises `LakeTimeError`."""
-    session = _current_session()
-    lake = _lake()
-    _count_query()
+# The answer cache `lake_answer_cache` opened, `None` outside one.
+_ANSWER_CACHE: LakeAnswerCache | None = None
+
+
+@contextmanager
+def lake_answer_cache(directory: Path) -> Iterator[LakeAnswerCache]:
+    """Answers `/v1/sql` reads made inside a `lake_session` from the
+    answers stored under `directory`, and stores each new one there, while
+    the block runs (see "Answer cache" in the module docstring); yields the
+    cache. Raises `RuntimeError` when a cache is open already."""
+    global _ANSWER_CACHE
+    with _SESSION_LOCK:
+        if _ANSWER_CACHE is not None:
+            raise RuntimeError(f"a lake answer cache at {_ANSWER_CACHE.directory} is open already")
+        answers = LakeAnswerCache(directory)
+        _ANSWER_CACHE = answers
     try:
-        frame = cast(pd.DataFrame, lake.sql(query, params))
+        yield answers
+    finally:
+        with _SESSION_LOCK:
+            _ANSWER_CACHE = None
+
+
+def lake_answer_cache_counts() -> LakeAnswerCacheCounts | None:
+    """What the open `lake_answer_cache` did since it was opened, `None`
+    when none is open."""
+    with _SESSION_LOCK:
+        answers = _ANSWER_CACHE
+    return None if answers is None else answers.counts()
+
+
+def _unpinned_state(session: LakeSession, query: str) -> dict[str, str | None]:
+    """Each table `query` names that the session reads without a
+    `scraped_at` pin, to the state the session recorded for it: a
+    rebuilt-whole table's build (`None` when it held no rows) and a
+    row-time pinned table's `last_write`, as UTC ISO 8601. An answer
+    reading such a table depends on that state as well as on T."""
+    recorded: dict[str, datetime | None] = {
+        table: session.rebuilt_whole_builds.get(table)
+        for table, metadata in session._tables.items()
+        if metadata.rebuilt_whole
+    }
+    for table in session.row_time_pinned_tables():
+        recorded[table] = session._tables[table].last_write
+    return {
+        table: None if when is None else when.astimezone(UTC).isoformat()
+        for table, when in sorted(recorded.items())
+        if re.search(rf"\b{re.escape(table)}\b", query)
+    }
+
+
+def _names_always_populated(query: str) -> bool:
+    """Whether `query` names a table of `ALWAYS_POPULATED_TABLES`, or a
+    relation whose name starts with one (its log)."""
+    return any(re.search(rf"\b{table}", query) for table in ALWAYS_POPULATED_TABLES)
+
+
+@contextmanager
+def _pin_refusal(session: LakeSession | None) -> Iterator[None]:
+    """Turns the lake's HTTP 409 refusal of a read inside `session` into
+    `LakeTimeError` naming T and quoting the lake's detail."""
+    try:
+        yield
     except LakehouseError as error:
         if session is not None and str(error).startswith(_HTTP_409_PREFIX):
             raise LakeTimeError(
@@ -682,9 +755,63 @@ def _query(query: str, params: list[Any]) -> pd.DataFrame:
                 f"{error}"
             ) from error
         raise
+
+
+def _query(query: str, params: list[Any]) -> pd.DataFrame:
+    """Runs one read-only `SELECT` with `?` placeholders bound to `params`
+    and returns every row as a DataFrame, counting the request in
+    `loader_query_counts`. Request failures propagate.
+    Inside a session, the lake refusing the read with HTTP 409 raises
+    `LakeTimeError` naming T and quoting the lake's detail (the read is
+    never retried unpinned), and a response from a different lake version
+    than the session's raises `LakeTimeError`. Inside a session with a
+    `lake_answer_cache` open the answer comes from the cache when it holds
+    it (no request is sent or counted) and is stored there otherwise."""
+    session = _current_session()
+    lake = _lake()
+    with _SESSION_LOCK:
+        answers = _ANSWER_CACHE
+    if session is not None and answers is not None:
+        return _cached_query(session, answers, lake, query, params)
+    _count_query()
+    with _pin_refusal(session):
+        frame = cast(pd.DataFrame, lake.sql(query, params))
     if session is not None:
         _record_version(session, lake.last_version)
     return frame
+
+
+def _cached_query(
+    session: LakeSession,
+    answers: LakeAnswerCache,
+    lake: Lake,
+    query: str,
+    params: list[Any],
+) -> pd.DataFrame:
+    """`_query` inside `session` with `answers` open: the stored answer
+    under the session's lake version when it has one, else the lake's
+    answer, stored under the version its response carries once that
+    version is recorded in the session. An answer with no rows to a query
+    naming a table of `ALWAYS_POPULATED_TABLES` is never stored: it may be
+    a read that landed on a rebuild, which `_query_table` reads again."""
+    with _SESSION_LOCK:
+        version = session.lake_version
+    state = _unpinned_state(session, query)
+    if version is not None:
+        stored = answers.get(answer_inputs(version, session.lake_time, state, query, params))
+        if stored is not None:
+            return cast(pd.DataFrame, stored.to_pandas(date_as_object=False))
+    _count_query()
+    with _pin_refusal(session):
+        answer = lake.sql_answer(query, params)
+    _record_version(session, answer.version)
+    if answer.version is None or (answer.table.num_rows == 0 and _names_always_populated(query)):
+        answers.count_unstored()
+    else:
+        answers.put(
+            answer_inputs(answer.version, session.lake_time, state, query, params), answer.table
+        )
+    return cast(pd.DataFrame, answer.table.to_pandas(date_as_object=False))
 
 
 # Tables the lake rebuilds whole that always hold rows: an empty read of
@@ -865,7 +992,8 @@ class LoaderQueryCount(BaseModel):
     call served from the window store (it queries only on a miss) and
     "direct" for a call that fetched for itself. `queries` counts every
     `/v1/sql` request sent inside the call, including the session-memoized
-    table checks and the split-factor reads made on its behalf; a public
+    table checks and the split-factor reads made on its behalf (a read
+    answered from the lake answer cache sends none); a public
     loader called by another is counted inside the outer call. Queries
     sent outside any public loader (preflight coverage, provenance) are
     counted under `loader` "unattributed" with `calls` 0."""

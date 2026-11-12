@@ -2,11 +2,13 @@
 
 """After a lake request times out, or a run is killed with a request unfinished, the lake may
 keep working on it, so `Lake` makes no new call for `settings.lake.request_quiet_seconds`. Each
-request writes a marker file in the client's state directory while it runs and clears it when
-it ends; a timeout is recorded there too. A call that finds a timeout recorded inside the window,
+send writes a marker file in the client's state directory while it runs and clears it when
+it ends; a timeout is recorded there too, with its process. A call that finds a timeout this
+process recorded inside the window waits it out; one that finds a timeout of another process,
 or a leftover marker (one no live request owns) started inside it, raises
-`LakeQuietPeriodError` naming the earliest UTC time a call is allowed, and both the timeout and
-the refusal are logged. Every clock here is injected; nothing sleeps."""
+`LakeQuietPeriodError` naming the earliest UTC time a call is allowed. A send after a timeout
+within one call waits out the window as its retry wait. The timeout, the retry and the refusal
+are logged. Every clock here is injected; nothing sleeps."""
 
 import io
 import json
@@ -40,13 +42,18 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 class _Clock:
-    """A settable UTC clock."""
+    """A settable UTC clock; `sleep` records each wait in `waits` and moves the clock on by it."""
 
     def __init__(self, now: datetime) -> None:
         self.now = now
+        self.waits: list[float] = []
 
     def __call__(self) -> datetime:
         return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.waits.append(seconds)
+        self.now += timedelta(seconds=seconds)
 
 
 def _arrow_body() -> bytes:
@@ -66,8 +73,7 @@ def _lake(handler: Callable[[httpx.Request], httpx.Response], clock: _Clock) -> 
         base_url="http://lake.test",
         token="t",
         transport=httpx.MockTransport(handler),
-        busy_retry_delays=(),
-        sleep=lambda _: None,
+        sleep=clock.sleep,
         clock=clock,
     )
 
@@ -120,63 +126,107 @@ def test_the_quiet_period_is_the_lakes_deadline_plus_a_margin() -> None:
     assert _quiet_seconds() == 330.0
 
 
-def test_a_timeout_is_recorded_logged_and_refuses_the_next_call_inside_the_window(
+def test_a_timeout_is_recorded_logged_and_waited_out_before_the_send_again(
     state_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A request that times out raises as before, leaves no marker and records the timeout; a
-    call 100 s later is refused before anything is sent, naming the earliest allowed UTC time,
-    and both are logged."""
+    """A request that times out leaves no marker and records the timeout with this process;
+    the call waits out the quiet period, then sends again and returns the rows, and the timeout
+    and the retry are both logged."""
     sent: list[httpx.Request] = []
     clock = _Clock(_T0)
     lake = _lake(_timing_out(sent), clock)
     with caplog.at_level(logging.WARNING, logger=lakehouse_client.__name__):
-        with pytest.raises(httpx.ReadTimeout):
-            lake.sql("SELECT 1 AS one")
-        clock.now = _T0 + timedelta(seconds=100)
-        with pytest.raises(LakeQuietPeriodError) as refused:
-            lake.sql("SELECT 1 AS one")
+        assert lake.sql("SELECT 1 AS one")["one"].tolist() == [1]
 
-    earliest = _T0 + timedelta(seconds=_quiet_seconds())
-    assert refused.value.earliest == earliest
-    assert earliest.isoformat() in str(refused.value)
-    assert len(sent) == 1
+    assert len(sent) == 2
+    assert clock.waits[0] >= _quiet_seconds()
     assert _markers(state_dir) == []
-    assert (state_dir / lakehouse_client.TIMEOUT_FILE).exists()
+    recorded = json.loads((state_dir / lakehouse_client.TIMEOUT_FILE).read_text())
+    assert recorded["pid"] == os.getpid()
     messages = [record.getMessage() for record in caplog.records]
     assert any("timed out" in message for message in messages)
-    assert any("refused" in message and earliest.isoformat() in message for message in messages)
+    assert any("sending again" in message and "ReadTimeout" in message for message in messages)
+
+
+def test_this_processs_timeout_is_waited_out_by_a_new_call(state_dir: Path) -> None:
+    """A timeout this process recorded (as before an `os.execv` restart, which keeps the pid)
+    makes a new call wait until the window has passed, then send, rather than refuse."""
+    state_dir.mkdir(parents=True)
+    at = _T0 - timedelta(seconds=30)
+    (state_dir / lakehouse_client.TIMEOUT_FILE).write_text(
+        json.dumps({"at": at.isoformat(), "pid": os.getpid()})
+    )
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return _ok()
+
+    clock = _Clock(_T0)
+    lake = _lake(handler, clock)
+    assert lake.sql("SELECT 1 AS one")["one"].tolist() == [1]
+    assert clock.waits == [pytest.approx(_quiet_seconds() - 30)]
+    assert len(sent) == 1
+
+
+def test_a_timeout_of_a_process_that_has_exited_refuses_a_new_call(state_dir: Path) -> None:
+    """A timeout another process recorded inside the window refuses the call before anything
+    is sent, as for a new process started after a kill."""
+    state_dir.mkdir(parents=True)
+    (state_dir / lakehouse_client.TIMEOUT_FILE).write_text(
+        json.dumps({"at": _T0.isoformat(), "pid": _dead_pid()})
+    )
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return _ok()
+
+    lake = _lake(handler, _Clock(_T0 + timedelta(seconds=100)))
+    with pytest.raises(LakeQuietPeriodError) as refused:
+        lake.sql("SELECT 1 AS one")
+    assert refused.value.earliest == _T0 + timedelta(seconds=_quiet_seconds())
+    assert sent == []
 
 
 def test_a_call_once_the_window_has_passed_is_sent(state_dir: Path) -> None:
-    """At the timeout plus the window, the next call is sent and returns its rows."""
+    """At another process's timeout plus the window, the call is sent and returns its rows."""
+    state_dir.mkdir(parents=True)
+    (state_dir / lakehouse_client.TIMEOUT_FILE).write_text(json.dumps({"at": _T0.isoformat()}))
     sent: list[httpx.Request] = []
-    clock = _Clock(_T0)
-    lake = _lake(_timing_out(sent), clock)
-    with pytest.raises(httpx.ReadTimeout):
-        lake.sql("SELECT 1 AS one")
-    clock.now = _T0 + timedelta(seconds=_quiet_seconds())
 
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return _ok()
+
+    lake = _lake(handler, _Clock(_T0 + timedelta(seconds=_quiet_seconds())))
     assert lake.sql("SELECT 1 AS one")["one"].tolist() == [1]
-    assert len(sent) == 2
+    assert len(sent) == 1
 
 
 def test_a_timeout_while_reading_rows_is_recorded(state_dir: Path) -> None:
-    """A read that times out after the response has started raises the cut-off
-    `LakehouseError` and records the timeout, so the next call inside the window is refused."""
+    """A read that times out after the response has started is a cut-off answer: it is sent
+    again at most `LIMITED_RETRIES` times, each after the quiet period, then raises the cut-off
+    `LakehouseError`; the timeout is recorded."""
 
     class _TimingOutStream(httpx.SyncByteStream):
         def __iter__(self) -> Iterator[bytes]:
             raise httpx.ReadTimeout("timed out")
             yield b""
 
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, stream=_TimingOutStream())
+
     clock = _Clock(_T0)
-    lake = _lake(lambda request: httpx.Response(200, stream=_TimingOutStream()), clock)
+    lake = _lake(handler, clock)
     with pytest.raises(LakehouseError, match="cut off"):
         lake.sql("SELECT 1 AS one")
-    clock.now = _T0 + timedelta(seconds=1)
-
-    with pytest.raises(LakeQuietPeriodError):
-        lake.sql("SELECT 1 AS one")
+    assert len(sent) == 1 + lakehouse_client.LIMITED_RETRIES
+    assert all(wait >= _quiet_seconds() for wait in clock.waits)
+    assert (state_dir / lakehouse_client.TIMEOUT_FILE).exists()
 
 
 def test_a_planted_timeout_refuses_another_client(state_dir: Path) -> None:
@@ -259,10 +309,11 @@ def test_a_marker_of_a_live_other_process_is_a_request_in_flight(state_dir: Path
 
 def test_a_request_holds_a_marker_while_in_flight_and_clears_it_after(state_dir: Path) -> None:
     """While a streamed result is read the state directory holds one marker naming this
-    process and the request's start; it is gone after the read, after a refusal and after a
-    timeout alike."""
+    process and the request's start; it is gone after the read and after a refusal (an HTTP 500
+    on every send) alike."""
     clock = _Clock(_T0)
-    answers = [_ok(), httpx.Response(500, json={"detail": "query failed"})]
+    failed = [httpx.Response(500, json={"detail": "query failed"}) for _ in range(3)]
+    answers = [_ok(), *failed]
     lake = _lake(lambda request: answers.pop(0), clock)
     for _ in lake.sql_batches("SELECT 1 AS one"):
         markers = _markers(state_dir)
@@ -279,8 +330,8 @@ def test_a_request_holds_a_marker_while_in_flight_and_clears_it_after(state_dir:
 
 def test_concurrent_requests_of_one_process_never_refuse_each_other(state_dir: Path) -> None:
     """Eight threads whose requests are all in flight at once (the transport holds each until
-    every one has been sent) each get their rows: a request of this process in flight is never
-    a leftover marker to another."""
+    every one has been sent, with the query cap raised to eight) each get their rows: a request
+    of this process in flight is never a leftover marker to another."""
     threads = 8
     barrier = threading.Barrier(threads, timeout=10)
     in_flight_markers: list[int] = []
@@ -303,10 +354,11 @@ def test_concurrent_requests_of_one_process_never_refuse_each_other(state_dir: P
             results.append(outcome)
 
     workers = [threading.Thread(target=call) for _ in range(threads)]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join(timeout=20)
+    with temporary_overrides({"lake.max_concurrent_queries": threads}):
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=20)
 
     assert results == [[1]] * threads
     assert max(in_flight_markers) == threads

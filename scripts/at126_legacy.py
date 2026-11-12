@@ -29,7 +29,10 @@ its latest `scraped_at`, the first in the tie order the lake serves for
 the table (`_tie_order_sql`), and refuses a current table the lake serves
 no tie order for (`MissingTieOrderError`); with no session open, every
 reference is refused (`UnpinnedLakeReadError`) outside
-`unpinned_lake_reads`."""
+`unpinned_lake_reads`; and inside a session with a `lake_answer_cache`
+open, every reference's read through `_query` is answered from the cache
+when it holds the answer and stored there otherwise, as the loaders'
+reads are."""
 
 from datetime import date, timedelta
 

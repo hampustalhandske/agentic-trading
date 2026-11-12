@@ -139,6 +139,15 @@ _ALLOWED: dict[str, str] = {
         "marker files of the process's unfinished lake requests, empty between requests; it "
         "decides only whether a call is refused during the quiet period, never a result"
     ),
+    "agentic_trading.data.lakehouse_client:Lake._query_slots": (
+        _LOCK + "; it guards the count of the process's /v1/sql requests in flight, 0 between "
+        "requests, which decides only when a query is sent, never a result"
+    ),
+    "agentic_trading.data.loaders.lakehouse_loader:_ANSWER_CACHE": (
+        "the open lake answer cache; it serves a read only the answer the lake gave to the "
+        "same SQL and parameters at the same lake time and lake version, which a pinned read "
+        "never changes, so a resumed run reads the same frames from it as from the lake"
+    ),
     "agentic_trading.data.loaders.lakehouse_loader:_STORE": (
         "the session's window store; a resumed process re-fetches from the lake pinned at the "
         "same lake time, and every stored query orders by every column it returns, by the "

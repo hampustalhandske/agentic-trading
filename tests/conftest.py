@@ -29,6 +29,7 @@ from typing import Any
 
 import duckdb
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 from agentic_trading.logging_config import configure_logging
@@ -37,6 +38,7 @@ configure_logging(disable=True)
 
 from agentic_trading import provenance  # noqa: E402
 from agentic_trading.data import lakehouse_client  # noqa: E402
+from agentic_trading.data.lakehouse_client import LakeAnswer  # noqa: E402
 from agentic_trading.data.loaders import lakehouse_loader  # noqa: E402
 from agentic_trading.data.loaders.lakehouse_loader import LakeProvenance  # noqa: E402
 from edgelab_live import configure as configure_edgelab_live  # noqa: E402
@@ -92,7 +94,8 @@ class FakeLake:
     ("ok" by default) and `write_times` (table to entry, empty by default)
     under `write_times.tables`, so a test plants a degraded answer by setting
     those two. `sql` runs the query against the tables and exposes `version` as
-    `last_version`. Setting `fixed_result` makes every query return that
+    `last_version`; `sql_answer` gives the same rows as an Arrow table with
+    `version`. Setting `fixed_result` makes every query return that
     frame regardless of the SQL (for testing a loader's own guards against
     a result its query should never produce); setting `error` makes every
     call raise it."""
@@ -283,6 +286,14 @@ class FakeLake:
             return self.fixed_result
         with self._sql_lock:
             return self._connection.execute(query, params or []).df()
+
+    def sql_answer(self, query: str, params: list[Any] | None = None) -> LakeAnswer:
+        """`sql`'s rows as an Arrow table with `version`, the answer the lake answer cache
+        stores: the frame converts back to the frame `sql` returns."""
+        frame = self.sql(query, params)
+        return LakeAnswer(
+            table=pa.Table.from_pandas(frame, preserve_index=False), version=self.version
+        )
 
 
 _REAL_LAKE_ACCESSOR = lakehouse_loader._lake
