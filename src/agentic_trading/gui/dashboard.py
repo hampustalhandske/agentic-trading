@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
@@ -1166,7 +1167,13 @@ def _firm_record_summary_cached(checkpoint: str, modified_ns: int) -> dict[str, 
     """`firm_record_summary` of the firm record whose engine checkpoint is
     at `checkpoint`, its trial folder beside it. Cached per checkpoint path
     and modification time (`modified_ns`, part of the cache key only), so
-    a record is read from its checkpoint and the lake once per session."""
+    a record is read from its checkpoint and the lake once per session.
+
+    The build holds the process-wide `settings` at the record's settings
+    and opens a process-wide `lake_session` at the record's lake time while
+    it runs (`firm_record_summary`), so a simulation started in another
+    browser session of the same server while a record loads would run
+    under them."""
     del modified_ns
     return firm_record_summary(Path(checkpoint))
 
@@ -1180,10 +1187,12 @@ def _load_saved_run_summary(path: Path) -> dict[str, Any]:
     record's summary (one `record` period, `agentic-trading-firm-review`),
     or a firm record's engine checkpoint (`<store>/<spec hash>.checkpoint.sqlite`,
     its trial folder `<store>/<spec hash>/` beside it), whose summary is
-    built from the checkpoint, read-only, and the lake
-    (`_firm_record_summary_cached`). Raises on a missing file, invalid
-    JSON, or a JSON payload with neither the `test`/`calibration` blocks
-    nor a `record` block."""
+    built from a copy of the checkpoint and the lake
+    (`_firm_record_summary_cached`, whose build changes process-wide state
+    while it runs). Raises on a missing file, invalid JSON, a JSON payload
+    with neither the `test`/`calibration` blocks nor a `record` block, and
+    the errors of `firm_record_summary`, among them `sqlite3.Error` for a
+    checkpoint SQLite cannot read."""
     if path.name.endswith(CHECKPOINT_SUFFIX):
         resolved = path.resolve()
         return _firm_record_summary_cached(str(resolved), resolved.stat().st_mtime_ns)
@@ -1906,7 +1915,14 @@ def render_dashboard() -> None:
                         Path(saved_run_path_input)
                     )
                 st.session_state["saved_run_source_path"] = saved_run_path_input
-            except (OSError, json.JSONDecodeError, KeyError, ValueError, RuntimeError) as exc:
+            except (
+                OSError,
+                json.JSONDecodeError,
+                KeyError,
+                ValueError,
+                RuntimeError,
+                sqlite3.Error,
+            ) as exc:
                 st.sidebar.error(f"Could not load {saved_run_path_input!r}: {exc}")
 
     if reset_clicked:

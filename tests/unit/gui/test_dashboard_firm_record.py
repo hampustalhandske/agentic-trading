@@ -191,3 +191,27 @@ def test_the_saved_run_view_shows_a_firm_record_without_a_live_run() -> None:
     assert periods and list(periods[0].options) == ["record"]
     assert {metric.label for metric in at.metric} >= {"Sharpe", "Information ratio"}
     assert len(at.dataframe) >= 2
+
+
+def test_a_checkpoint_sqlite_cannot_read_is_shown_as_a_load_error(tmp_path: Path) -> None:
+    """A firm record's checkpoint that is not a database fails the load with an error in the
+    sidebar, not an exception on the page."""
+    written = write_record(tmp_path / "store")
+    store = tmp_path / "broken"
+    store.mkdir()
+    trial_dir = store / written.trial_dir.name
+    trial_dir.mkdir()
+    (trial_dir / "spec.json").write_bytes((written.trial_dir / "spec.json").read_bytes())
+    checkpoint = store / written.checkpoint.name
+    checkpoint.write_bytes(b"not a database" * 512)
+    at = AppTest.from_file(dashboard_module.__file__)
+    at.run(timeout=30)
+
+    at.text_input(key="saved_run_path_input").input(str(checkpoint))
+    next(button for button in at.button if button.label == "Load run").click()
+    at.run(timeout=30)
+
+    assert not at.exception
+    errors = [error.value for error in at.sidebar.error]
+    assert any(str(checkpoint) in error for error in errors)
+    assert "saved_run_summary" not in at.session_state

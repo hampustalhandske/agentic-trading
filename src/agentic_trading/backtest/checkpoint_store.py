@@ -320,13 +320,18 @@ def connect_read_only(db_path: Path) -> sqlite3.Connection:
     """Opens the checkpoint database at `db_path` for reading only (SQLite's
     `mode=ro`): nothing in the file is created, altered or written, and a
     write through the connection fails. Raises `FileNotFoundError` when
-    the file does not exist, and `CheckpointFormatError` (closing the
-    connection) when it is not of `CHECKPOINT_FORMAT_VERSION`, naming the
-    file and both versions."""
+    the file does not exist, `CheckpointFormatError` when it is not of
+    `CHECKPOINT_FORMAT_VERSION`, naming the file and both versions, and
+    `sqlite3.DatabaseError` when it is not an SQLite database; the
+    connection is closed on every error."""
     if not db_path.is_file():
         raise FileNotFoundError(f"no checkpoint at {db_path}")
     connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
-    (version,) = connection.execute("PRAGMA user_version").fetchone()
+    try:
+        (version,) = connection.execute("PRAGMA user_version").fetchone()
+    except sqlite3.Error:
+        connection.close()
+        raise
     if version != CHECKPOINT_FORMAT_VERSION:
         connection.close()
         raise CheckpointFormatError(

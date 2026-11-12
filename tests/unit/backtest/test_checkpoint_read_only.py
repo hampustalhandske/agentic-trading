@@ -162,3 +162,18 @@ def test_a_snapshot_is_never_written_beside_the_checkpoint(tmp_path: Path) -> No
         with checkpoint_store.snapshot(path, directory=inside):
             pass
     assert list(inside.iterdir()) == []
+
+
+def test_a_file_that_is_not_a_database_is_refused_unchanged(tmp_path: Path) -> None:
+    path = tmp_path / "run.checkpoint.sqlite"
+    path.write_bytes(b"not a database" * 512)
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    with pytest.raises(sqlite3.DatabaseError):
+        checkpoint_store.connect_read_only(path)
+    with pytest.raises(sqlite3.DatabaseError):
+        with checkpoint_store.snapshot(path):
+            pass
+
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    assert sorted(child.name for child in tmp_path.iterdir()) == [path.name]
