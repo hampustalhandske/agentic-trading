@@ -6,9 +6,9 @@
 
 import hashlib
 import json
-from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -22,14 +22,20 @@ from agentic_trading.agents.schemas import AgentSignal, BacktestResult
 from agentic_trading.backtest.engine import BacktestEngine, longest_track_record_lookback
 from agentic_trading.backtest.portfolio import Portfolio
 from agentic_trading.backtest.run_summary import PERIOD_METRIC_KEYS, summarize_period
-from agentic_trading.config import temporary_overrides
+from agentic_trading.config import settings, temporary_overrides
 from agentic_trading.data.loaders import lakehouse_loader
 from agentic_trading.firm_record import review
 from agentic_trading.firm_record.submission import META_FILE, AgenticMeta
 from agentic_trading.provenance import runtime_environment
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import EqualWeight
-from agentic_trading.stage_a.spec import FirmSpec, FirmSpecRecord, firm_spec_hash
+from agentic_trading.stage_a.spec import (
+    RUNTIME_SETTINGS_FIELDS,
+    FirmSpec,
+    FirmSpecRecord,
+    firm_spec_hash,
+    hashed_settings,
+)
 
 _WARMUP = 10
 _INDEX = pd.bdate_range("2024-01-01", periods=_WARMUP + 45)
@@ -124,19 +130,17 @@ def _spy_closes() -> pd.Series:
     return _random_walk(29).loc[pd.Timestamp(_DAYS[0]) :]
 
 
-@pytest.fixture(autouse=True)
-def _lift_firm_limits() -> Iterator[None]:
-    with temporary_overrides(
-        {
-            "firm.max_single_name_weight": 100.0,
-            "firm.max_gross_exposure": 1000.0,
-            "firm.max_daily_var": 1000.0,
-        }
-    ):
-        yield
+# The firm limits the fixture records run under, so the stub pods' weights reach the book.
+_LIFTED_LIMITS = {
+    "firm.max_single_name_weight": 100.0,
+    "firm.max_gross_exposure": 1000.0,
+    "firm.max_daily_var": 1000.0,
+}
 
 
-def _spec_record() -> FirmSpecRecord:
+def _spec_record(settings_snapshot: dict[str, Any], window_end: date = _DAYS[-1]) -> FirmSpecRecord:
+    """The spec of a fixture record over `_DAYS[0]` to `window_end`, recording
+    `settings_snapshot` as its settings."""
     spec = FirmSpec(
         commander={"class": "agentic_trading.agents.commander.Commander"},
         roster=[
@@ -145,11 +149,11 @@ def _spec_record() -> FirmSpecRecord:
             {"agent_id": "contrarian_manager", "class": "agentic_trading.agents.managers.x.M"},
             {"agent_id": "contrarian_analyst", "class": "agentic_trading.agents.analysts.x.A"},
         ],
-        settings={"stage_a": {"data_end": "2024-12-31"}},
+        settings=settings_snapshot,
         module_hashes={},
         universe=list(_ASSETS),
         window_start=_DAYS[0],
-        window_end=_DAYS[-1],
+        window_end=window_end,
         decision_rule="test rule",
         quantcore_sha="0" * 40,
         lake_time=_LAKE_TIME,
@@ -164,11 +168,13 @@ def _spec_record() -> FirmSpecRecord:
 
 
 class _Record:
-    """A finished firm record on disk: the store's trial folder and the engine checkpoint beside
-    it, and the `BacktestResult` the engine run that wrote them returned."""
+    """A firm record on disk: the store's trial folder and the engine checkpoint beside it, and
+    the `BacktestResult` the engine run that wrote them returned. The run covers `_DAYS`; with a
+    later `window_end` its window has sessions after its last day, as an unfinished record's
+    has. Built under the settings the record records."""
 
-    def __init__(self, store: Path) -> None:
-        self.spec = _spec_record()
+    def __init__(self, store: Path, window_end: date = _DAYS[-1]) -> None:
+        self.spec = _spec_record(hashed_settings(RUNTIME_SETTINGS_FIELDS), window_end)
         self.store = store
         self.trial_dir = store / self.spec.spec_hash
         self.trial_dir.mkdir(parents=True)
@@ -192,7 +198,7 @@ class _Record:
             track_record=TrackRecord(horizon_days=horizon),
             data_loader=lambda _assets, _start, _end: _frame(),
             start_date=_DAYS[0],
-            end_date=_DAYS[-1],
+            end_date=window_end,
             assets=list(_ASSETS),
             market_data_source="lakehouse data",
             execution_lag_days=1,
@@ -216,22 +222,18 @@ class _CatalogueOnlyLake:
         return {"kind": "current", "key_columns": [], "rebuilt_whole": False, "last_write": None}
 
 
-def write_record(store: Path) -> _Record:
-    """A firm record written under `store` by an engine run with the firm limits lifted, the
-    lake's catalogue answering so its lake session opens."""
+def write_record(
+    store: Path, *, overrides: dict[str, Any] | None = None, window_end: date = _DAYS[-1]
+) -> _Record:
+    """A firm record written under `store` by an engine run with the firm limits lifted and
+    `overrides` applied, the lake's catalogue answering so its lake session opens."""
     lake = _CatalogueOnlyLake()
     with (
         pytest.MonkeyPatch.context() as patch,
-        temporary_overrides(
-            {
-                "firm.max_single_name_weight": 100.0,
-                "firm.max_gross_exposure": 1000.0,
-                "firm.max_daily_var": 1000.0,
-            }
-        ),
+        temporary_overrides({**_LIFTED_LIMITS, **(overrides or {})}),
     ):
         patch.setattr(lakehouse_loader, "_lake", lambda: lake)
-        return _Record(store)
+        return _Record(store, window_end)
 
 
 @pytest.fixture(scope="module")
@@ -266,6 +268,7 @@ def test_record_result_is_the_engine_result(record: _Record) -> None:
     memory held."""
     rebuilt = review.record_result(
         record.checkpoint,
+        record_settings=record.spec.spec.settings,
         risk_free_rate_series=_risk_free(),
         benchmark_returns=_spy_closes().pct_change().dropna(),
         market_data_source="lakehouse data",
@@ -358,7 +361,7 @@ def test_a_file_not_named_as_a_checkpoint_has_no_trial_folder(tmp_path: Path) ->
 def test_a_trial_folder_of_another_record_is_refused(record: _Record, tmp_path: Path) -> None:
     other = tmp_path / "other"
     other.mkdir()
-    spec = _spec_record().spec.model_copy(update={"decision_rule": "another rule"})
+    spec = record.spec.spec.model_copy(update={"decision_rule": "another rule"})
     other_record = FirmSpecRecord(
         spec=spec,
         spec_hash=firm_spec_hash(spec),
@@ -373,7 +376,7 @@ def test_a_trial_folder_of_another_record_is_refused(record: _Record, tmp_path: 
 
 
 def test_a_checkpoint_at_another_lake_time_is_refused(record: _Record, tmp_path: Path) -> None:
-    spec = _spec_record().spec.model_copy(update={"lake_time": datetime(2026, 2, 1, tzinfo=UTC)})
+    spec = record.spec.spec.model_copy(update={"lake_time": datetime(2026, 2, 1, tzinfo=UTC)})
     moved = FirmSpecRecord(
         spec=spec,
         spec_hash=firm_spec_hash(spec),
@@ -427,12 +430,105 @@ def test_the_benchmarks_are_read_at_the_records_lake_time_and_version(
     monkeypatch.setattr(review, "load_risk_free_rate_series", _risk_free_reader)
     monkeypatch.setattr(review, "load_benchmark_closes", _closes_reader)
 
-    benchmarks = review.load_record_benchmarks(_spec_record(), lake_cache_dir=tmp_path / "cache")
+    benchmarks = review.load_record_benchmarks(
+        _spec_record(hashed_settings(RUNTIME_SETTINGS_FIELDS)), lake_cache_dir=tmp_path / "cache"
+    )
 
-    pinned = (_LAKE_TIME, _LAKE_VERSION, date(2024, 12, 31), True)
+    pinned = (_LAKE_TIME, _LAKE_VERSION, settings.stage_a.data_end, True)
     assert reads == [
         ("risk_free", _DAYS[0], _DAYS[-1], *pinned),
         (review.BENCHMARK_TICKER, _DAYS[0], _DAYS[-1], *pinned),
     ]
     pd.testing.assert_series_equal(benchmarks.benchmark_closes, _spy_closes())
     assert review.BENCHMARK_TICKER == "SPY"
+
+
+def _moved_record(
+    record: _Record, directory: Path, **update: Any
+) -> tuple[FirmSpecRecord, Path, Path]:
+    """`record`'s spec with `update` applied, written as a trial folder under `directory` with a
+    copy of `record`'s checkpoint beside it named after the new spec hash."""
+    spec = record.spec.spec.model_copy(update=update)
+    moved = FirmSpecRecord(
+        spec=spec,
+        spec_hash=firm_spec_hash(spec),
+        lake_time=spec.lake_time,
+        lake_version=_LAKE_VERSION,
+        quantcore_version="0.0.0",
+    )
+    trial_dir = directory / moved.spec_hash
+    trial_dir.mkdir()
+    (trial_dir / "spec.json").write_text(moved.model_dump_json())
+    checkpoint = directory / f"{moved.spec_hash}.checkpoint.sqlite"
+    checkpoint.write_bytes(record.checkpoint.read_bytes())
+    return moved, trial_dir, checkpoint
+
+
+def test_an_unfinished_record_is_refused(tmp_path: Path) -> None:
+    """A record whose checkpoint ends before the last session of its window is unfinished, and
+    its summary would read as the whole window's."""
+    unfinished = write_record(tmp_path / "store", window_end=date(2024, 3, 28))
+    assert unfinished.result.portfolio_value_history[-1][0] == _DAYS[-1]
+
+    with pytest.raises(ValueError, match=r"unfinished.*2024-03-15.*2024-03-28"):
+        review.firm_record_summary(unfinished.checkpoint, benchmarks=record_benchmarks())
+
+
+def test_a_record_run_under_other_settings_is_rebuilt_under_its_own(tmp_path: Path) -> None:
+    """The rebuild applies the settings the record's spec records, whatever `settings` holds when
+    it runs, and restores them afterwards: a record run with another day count per year is
+    rebuilt to its own engine result, which today's settings would not give."""
+    other = write_record(tmp_path / "store", overrides={"firm.trading_days_per_year": 260})
+    assert settings.firm.trading_days_per_year == 252
+    arguments: dict[str, Any] = {
+        "risk_free_rate_series": _risk_free(),
+        "benchmark_returns": _spy_closes().pct_change().dropna(),
+        "market_data_source": "lakehouse data",
+    }
+
+    rebuilt = review.record_result(
+        other.checkpoint, record_settings=other.spec.spec.settings, **arguments
+    )
+    under_today = review.record_result(
+        other.checkpoint, record_settings=hashed_settings(RUNTIME_SETTINGS_FIELDS), **arguments
+    )
+
+    assert rebuilt.model_dump(exclude=_ENGINE_ONLY_FIELDS) == other.result.model_dump(
+        exclude=_ENGINE_ONLY_FIELDS
+    )
+    assert under_today.model_dump(exclude=_ENGINE_ONLY_FIELDS) != rebuilt.model_dump(
+        exclude=_ENGINE_ONLY_FIELDS
+    )
+    assert settings.firm.trading_days_per_year == 252
+    summary = review.firm_record_summary(other.checkpoint, benchmarks=record_benchmarks())
+    assert summary["record"]["pod_costs"] == json.loads(
+        json.dumps({pod: costs.model_dump() for pod, costs in other.result.pod_costs.items()})
+    )
+
+
+def test_a_record_setting_this_code_does_not_have_is_refused(
+    record: _Record, tmp_path: Path
+) -> None:
+    recorded = json.loads(json.dumps(record.spec.spec.settings))
+    recorded["firm"]["retired_setting"] = 1.0
+    _, trial_dir, checkpoint = _moved_record(record, tmp_path, settings=recorded)
+
+    with pytest.raises(ValueError, match=r"firm\.retired_setting"):
+        review.firm_record_summary(checkpoint, trial_dir, benchmarks=record_benchmarks())
+
+
+def test_a_record_setting_this_code_does_not_accept_restores_every_setting(
+    record: _Record, tmp_path: Path
+) -> None:
+    """A recorded value its setting rejects fails the review and leaves `settings` as it found
+    them, the settings applied before it included."""
+    recorded = json.loads(json.dumps(record.spec.spec.settings))
+    recorded["firm"]["trading_days_per_year"] = 260
+    recorded["stage_a"]["session_calendar"] = {"not": "a calendar name"}
+    _, trial_dir, checkpoint = _moved_record(record, tmp_path, settings=recorded)
+    before = settings.model_dump()
+
+    with pytest.raises(ValueError, match="session_calendar"):
+        review.firm_record_summary(checkpoint, trial_dir, benchmarks=record_benchmarks())
+
+    assert settings.model_dump() == before

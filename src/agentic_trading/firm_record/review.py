@@ -9,17 +9,23 @@ A firm record (`firm_record.runner`) keeps its engine checkpoint at
 `<store>/<spec hash>.checkpoint.sqlite`, beside its trial folder
 `<store>/<spec hash>/`, whose spec.json (`FirmSpecRecord`) names the
 window, the universe, the roster, the lake time and the lake version the
-record read at. `record_result` opens the checkpoint read-only
-(`checkpoint_store.connect_read_only`) and computes the `BacktestResult`
-the engine's run returns from the histories it holds, through the engine's
-own functions (`backtest.engine.run_metrics`, `source_performance_of`,
-`pod_performance_of`, `pod_cost_attribution`, `execution_cost_totals`):
+record read at, and the settings it ran under. `record_result` reads one
+consistent copy of the checkpoint (`checkpoint_store.snapshot`, so a
+record still being written is never held up) and computes the
+`BacktestResult` the engine's run returns from the histories it holds,
+through the engine's own functions (`backtest.engine.run_metrics`,
+`source_performance_of`, `pod_performance_of`, `pod_cost_attribution`,
+`execution_cost_totals`) under the settings the record's spec records:
 the same numbers, but for what only the engine's memory held (its last
 decisions, its horizon setting and the split moves its own reads found).
+A record whose checkpoint ends before the last session of its window is
+unfinished, and its summary is refused.
 
-Sharpe and Sortino are on excess returns over the DGS3MO accrual and the
-information ratio is against SPY's total return; neither series is in the
-checkpoint, so `load_record_benchmarks` reads both from the lake through
+Sharpe and Sortino are on excess returns over the DGS3MO accrual, as the
+engine computes them. The firm record runs its engine without a
+benchmark, so its own result has no information ratio; the review adds
+one, against SPY's total return. Neither series is in the checkpoint, so
+`load_record_benchmarks` reads both from the lake through
 the loaders the engine's inputs come from
 (`macro_loader.load_risk_free_rate_series`,
 `engine_inputs.load_benchmark_closes`), inside one `lake_session` pinned
@@ -34,7 +40,8 @@ summary as JSON, or load the checkpoint in the dashboard."""
 
 import json
 import math
-from contextlib import nullcontext
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, nullcontext
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -62,11 +69,13 @@ from agentic_trading.backtest.engine import (
 )
 from agentic_trading.backtest.engine_inputs import benchmark_returns_of, load_benchmark_closes
 from agentic_trading.backtest.run_summary import summarize_baseline, summarize_period
+from agentic_trading.config import apply_overrides, settings
 from agentic_trading.data.loaders.lakehouse_loader import lake_answer_cache, lake_session
 from agentic_trading.data.loaders.macro_loader import load_risk_free_rate_series
+from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.firm_record.submission import META_FILE, AgenticMeta
 from agentic_trading.logging_config import get_logger
-from agentic_trading.stage_a.spec import FirmSpecRecord
+from agentic_trading.stage_a.spec import RUNTIME_SETTINGS_FIELDS, FirmSpecRecord
 
 logger = get_logger(__name__)
 
@@ -118,20 +127,101 @@ def read_trial_spec(trial_dir: Path) -> FirmSpecRecord:
     return FirmSpecRecord.model_validate_json((trial_dir / "spec.json").read_bytes())
 
 
+# Marks a recorded setting this code's `settings` does not have.
+_MISSING = object()
+
+
+def _settings_paths(target: Any, snapshot: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Each setting of `snapshot` (`settings` as JSON values, the shape
+    `stage_a.spec.hashed_settings` gives) by its dotted path under
+    `prefix`, walked alongside `target`, the settings object at `prefix`:
+    a value whose setting is a group (a model, or a mapping of models such
+    as the pods of `pod_sizing`) is walked into, any other is a setting.
+    A path `target` does not have maps to the `_MISSING` marker."""
+    paths: dict[str, Any] = {}
+    for key, value in snapshot.items():
+        path = f"{prefix}{key}"
+        if isinstance(target, BaseModel):
+            child = getattr(target, key) if key in type(target).model_fields else _MISSING
+        elif isinstance(target, dict):
+            child = target.get(key, _MISSING)
+        else:
+            child = _MISSING
+        if child is _MISSING:
+            paths[path] = _MISSING
+        elif isinstance(value, dict) and (
+            isinstance(child, BaseModel)
+            or (
+                isinstance(child, dict)
+                and bool(child)
+                and all(isinstance(entry, BaseModel) for entry in child.values())
+            )
+        ):
+            paths.update(_settings_paths(child, value, f"{path}."))
+        else:
+            paths[path] = value
+    return paths
+
+
+@contextmanager
+def applied_record_settings(snapshot: Mapping[str, Any]) -> Iterator[None]:
+    """Runs the block under the settings a firm record ran under:
+    `snapshot` is its spec's `settings` (`stage_a.spec.hashed_settings` at
+    the record's start). Every setting it records is set on the
+    process-wide `settings` for the block (`config.apply_overrides`) and
+    every one set is restored afterwards, also when the block or a later
+    setting fails; a setting this code has and the snapshot does not keeps
+    its current value, and is logged as a warning unless it is one of
+    `RUNTIME_SETTINGS_FIELDS`, which a snapshot never holds. Raises `ValueError`
+    naming every recorded setting this code does not have, and every one
+    that does not read back as recorded once applied, before the block
+    runs; a value the setting does not accept raises its
+    `pydantic.ValidationError`."""
+    recorded = _settings_paths(settings, snapshot)
+    unknown = sorted(path for path, value in recorded.items() if value is _MISSING)
+    if unknown:
+        raise ValueError(
+            "the record ran under settings this code does not have: " + ", ".join(unknown)
+        )
+    previous: dict[str, Any] = {}
+    try:
+        for path, value in recorded.items():
+            previous.update(apply_overrides({path: value}))
+        current = _settings_paths(settings, settings.model_dump(mode="json"))
+        differing = sorted(path for path, value in recorded.items() if current[path] != value)
+        if differing:
+            raise ValueError(
+                "the record's settings do not read back as recorded once applied: "
+                + ", ".join(differing)
+            )
+        unrecorded = sorted(set(current) - set(recorded) - set(RUNTIME_SETTINGS_FIELDS))
+        if unrecorded:
+            logger.warning(
+                "The record's spec records no value for %d setting(s), which keep this code's "
+                "values in the review: %s",
+                len(unrecorded),
+                ", ".join(unrecorded),
+            )
+        yield
+    finally:
+        apply_overrides(previous)
+
+
 def _read_checkpoint(
     checkpoint_path: Path,
-) -> tuple[dict[str, Any], dict[str, tuple[list[float], list[float]]]]:
-    """Reads the checkpoint at `checkpoint_path` opened read-only: its
-    state, everything `checkpoint_store.read_state` gives, and each
-    source's attributable returns over the run's window
-    (`source_returns_of`), both as read, without validating their millions
-    of values. Raises `FileNotFoundError` when the file is absent,
-    `CheckpointFormatError` when it is of another layout and `ValueError`
-    when it holds no day."""
-    connection = checkpoint_store.connect_read_only(checkpoint_path)
-    try:
+) -> tuple[dict[str, Any], dict[str, tuple[list[float], list[float]]], date]:
+    """Reads one consistent copy of the checkpoint at `checkpoint_path`
+    (`checkpoint_store.snapshot`): its state, everything
+    `checkpoint_store.read_state` gives, each source's attributable returns
+    over the run's window (`source_returns_of`), both as read, without
+    validating their millions of values, and the last day it holds
+    (`checkpoint_store.read_last_day`). Raises
+    `FileNotFoundError` when the file is absent, `CheckpointFormatError`
+    when it is of another layout and `ValueError` when it holds no day."""
+    with checkpoint_store.snapshot(checkpoint_path) as connection:
         state = checkpoint_store.read_state(connection)
-        if state is None:
+        last_day = checkpoint_store.read_last_day(connection)
+        if state is None or last_day is None:
             raise ValueError(f"checkpoint {checkpoint_path} holds no day")
         source_returns = source_returns_of(
             checkpoint_store.iter_source_returns(
@@ -140,9 +230,7 @@ def _read_checkpoint(
                 date.fromisoformat(state["config"]["end_date"]),
             )
         )
-    finally:
-        connection.close()
-    return state, source_returns
+    return state, source_returns, last_day
 
 
 def _result_of(
@@ -196,25 +284,34 @@ def _result_of(
 def record_result(
     checkpoint_path: Path,
     *,
+    record_settings: Mapping[str, Any],
     risk_free_rate_series: pd.Series | None,
     benchmark_returns: pd.Series | None,
     market_data_source: str | None,
 ) -> BacktestResult:
     """The `BacktestResult` of the engine run that wrote the checkpoint at
-    `checkpoint_path`, computed from the checkpoint opened read-only, with
-    the run's `risk_free_rate_series` and `benchmark_returns` as the engine
-    takes them. Every field is the engine's, from the same functions on the
-    same histories, but `decisions_by_day` (empty), `history_horizon_days`
+    `checkpoint_path`, computed from one consistent copy of it
+    (`_read_checkpoint`) under `record_settings`, the settings its spec
+    records (`applied_record_settings`). Given the
+    `risk_free_rate_series` and `benchmark_returns` the run was given,
+    every field is the engine's, from the same functions on the same
+    histories, but `decisions_by_day` (empty), `history_horizon_days`
     (`None`) and `unfactored_split_moves` (`None`: the checkpoint does not
-    carry the registry). Raises `FileNotFoundError` when the file is
-    absent, `CheckpointFormatError` when it is of another layout and
-    `ValueError` when it holds no day."""
-    return _result_of(
-        *_read_checkpoint(checkpoint_path),
-        risk_free_rate_series=risk_free_rate_series,
-        benchmark_returns=benchmark_returns,
-        market_data_source=market_data_source,
-    )
+    carry the registry). A firm record's engine runs without a benchmark,
+    so its own result has no information ratio: with `benchmark_returns`
+    given, `final_information_ratio` is against them, a figure the review
+    adds. Raises `FileNotFoundError` when the file is absent,
+    `CheckpointFormatError` when it is of another layout, and `ValueError`
+    when it holds no day or `record_settings` cannot be applied."""
+    state, source_returns, _ = _read_checkpoint(checkpoint_path)
+    with applied_record_settings(record_settings):
+        return _result_of(
+            state,
+            source_returns,
+            risk_free_rate_series=risk_free_rate_series,
+            benchmark_returns=benchmark_returns,
+            market_data_source=market_data_source,
+        )
 
 
 def load_record_benchmarks(
@@ -305,6 +402,31 @@ def _experiment(record: FirmSpecRecord, meta: AgenticMeta | None) -> dict[str, A
     }
 
 
+def _require_finished(checkpoint_path: Path, last_day: date, record: FirmSpecRecord) -> None:
+    """Raises `ValueError` unless `last_day`, the last day the checkpoint at
+    `checkpoint_path` holds, is the last session of `record`'s window on
+    `settings.stage_a.session_calendar` (read at call time): a checkpoint
+    that ends before it is of a record still running, or stopped, and
+    covers only part of its window."""
+    spec = record.spec
+    calendar = settings.stage_a.session_calendar
+    sessions = sessions_between(spec.window_start, spec.window_end, calendar)
+    if not sessions:
+        raise ValueError(
+            f"firm record {record.spec_hash} has no {calendar} session in its window "
+            f"{spec.window_start.isoformat()} to {spec.window_end.isoformat()}"
+        )
+    last_session = sessions[-1]
+    if last_day != last_session:
+        raise ValueError(
+            f"firm record {record.spec_hash} is unfinished: its checkpoint "
+            f"{checkpoint_path.name} ends on {last_day.isoformat()}, before "
+            f"{last_session.isoformat()}, the last {calendar} session of its window "
+            f"{spec.window_start.isoformat()} to {spec.window_end.isoformat()}; review it once "
+            "it has run to its end"
+        )
+
+
 def _require_matching_checkpoint(
     checkpoint_path: Path, state: dict[str, Any], record: FirmSpecRecord
 ) -> None:
@@ -356,40 +478,57 @@ def firm_record_summary(
     Sortino, `BENCHMARK_TICKER`'s daily returns for the information ratio)
     and `baselines`, holding under `BENCHMARK_BASELINE` the benchmark's
     buy-and-hold over the firm's sessions (`benchmark_baseline`,
-    `summarize_baseline`) when it has a close on any of them. Without
-    `benchmarks` they are read from the lake (`load_record_benchmarks`,
-    through an answer cache at `lake_cache_dir` when given). Nothing under
-    the checkpoint's directory is written.
+    `summarize_baseline`) when it has a close on any of them. The record
+    ran its engine without a benchmark: the information ratio is the
+    review's, against SPY's total return. Without `benchmarks` they are
+    read from the lake (`load_record_benchmarks`, through an answer cache
+    at `lake_cache_dir` when given). The checks, the benchmarks' reads, the
+    rebuild and the baseline run under the settings the record's spec
+    records (`applied_record_settings`), which the process-wide `settings`
+    hold for that time. The checkpoint is read from one copy of it in the
+    system's temporary directory, deleted afterwards
+    (`checkpoint_store.snapshot`); nothing under the checkpoint's directory
+    or the trial folder is written.
 
     Raises `ValueError` when `lake_cache_dir` is inside the checkpoint's
-    directory (the record's store), when the checkpoint is not the trial's
-    (`_require_matching_checkpoint`) or holds no day; the reading and
-    loading errors of `read_trial_spec`, `record_result` and
+    directory (the record's store) or the trial folder, when the checkpoint
+    is not the trial's (`_require_matching_checkpoint`), holds no day or
+    ends before the last session of the record's window
+    (`_require_finished`), and when the record's settings cannot be
+    applied (`applied_record_settings`); the reading and loading errors of
+    `read_trial_spec`, `checkpoint_store.snapshot` and
     `load_record_benchmarks` propagate."""
-    store = checkpoint_path.resolve().parent
-    if lake_cache_dir is not None and lake_cache_dir.resolve().is_relative_to(store):
-        raise ValueError(
-            f"lake cache directory {lake_cache_dir} is inside the record's store {store}; "
-            "give one outside it"
-        )
     trial_dir = checkpoint_trial_dir(checkpoint_path) if trial_dir is None else trial_dir
+    if lake_cache_dir is not None:
+        cache = lake_cache_dir.resolve()
+        for kept, name in (
+            (checkpoint_path.resolve().parent, "the record's store"),
+            (trial_dir.resolve(), "the record's trial folder"),
+        ):
+            if cache.is_relative_to(kept):
+                raise ValueError(
+                    f"lake cache directory {lake_cache_dir} is inside {name} {kept}; give one "
+                    "outside it"
+                )
     record = read_trial_spec(trial_dir)
-    state, source_returns = _read_checkpoint(checkpoint_path)
+    state, source_returns, last_day = _read_checkpoint(checkpoint_path)
     _require_matching_checkpoint(checkpoint_path, state, record)
-    if benchmarks is None:
-        benchmarks = load_record_benchmarks(record, lake_cache_dir=lake_cache_dir)
-    result = _result_of(
-        state,
-        source_returns,
-        risk_free_rate_series=benchmarks.risk_free_rate_series,
-        benchmark_returns=benchmark_returns_of(benchmarks.benchmark_closes),
-        market_data_source=_MARKET_DATA_SOURCE,
-    )
-    baseline = benchmark_baseline(
-        result.portfolio_value_history,
-        benchmarks.benchmark_closes,
-        risk_free_rate_series=benchmarks.risk_free_rate_series,
-    )
+    with applied_record_settings(record.spec.settings):
+        _require_finished(checkpoint_path, last_day, record)
+        if benchmarks is None:
+            benchmarks = load_record_benchmarks(record, lake_cache_dir=lake_cache_dir)
+        result = _result_of(
+            state,
+            source_returns,
+            risk_free_rate_series=benchmarks.risk_free_rate_series,
+            benchmark_returns=benchmark_returns_of(benchmarks.benchmark_closes),
+            market_data_source=_MARKET_DATA_SOURCE,
+        )
+        baseline = benchmark_baseline(
+            result.portfolio_value_history,
+            benchmarks.benchmark_closes,
+            risk_free_rate_series=benchmarks.risk_free_rate_series,
+        )
     if baseline is None:
         logger.warning(
             "Firm record %s: %s has no close on any of its sessions; no baseline",
