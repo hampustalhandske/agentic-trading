@@ -216,8 +216,9 @@ class _CatalogueOnlyLake:
         return {"kind": "current", "key_columns": [], "rebuilt_whole": False, "last_write": None}
 
 
-@pytest.fixture(scope="module")
-def record(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Record]:
+def write_record(store: Path) -> _Record:
+    """A firm record written under `store` by an engine run with the firm limits lifted, the
+    lake's catalogue answering so its lake session opens."""
     lake = _CatalogueOnlyLake()
     with (
         pytest.MonkeyPatch.context() as patch,
@@ -230,11 +231,16 @@ def record(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Record]:
         ),
     ):
         patch.setattr(lakehouse_loader, "_lake", lambda: lake)
-        written = _Record(tmp_path_factory.mktemp("firm_store"))
-    yield written
+        return _Record(store)
 
 
-def _benchmarks() -> review.RecordBenchmarks:
+@pytest.fixture(scope="module")
+def record(tmp_path_factory: pytest.TempPathFactory) -> _Record:
+    return write_record(tmp_path_factory.mktemp("firm_store"))
+
+
+def record_benchmarks() -> review.RecordBenchmarks:
+    """The series the fixture record's engine run measured its ratios with."""
     return review.RecordBenchmarks(
         risk_free_rate_series=_risk_free(), benchmark_closes=_spy_closes()
     )
@@ -275,7 +281,7 @@ def test_the_record_period_is_the_engine_results_summary(record: _Record) -> Non
     """The `record` block is `summarize_period` of the engine's own result, its information
     ratio against SPY's total return."""
     summary = review.firm_record_summary(
-        record.checkpoint, record.trial_dir, benchmarks=_benchmarks()
+        record.checkpoint, record.trial_dir, benchmarks=record_benchmarks()
     )
 
     # A checkpoint carries no split-move registry: the record's count is None, as for a run
@@ -291,7 +297,7 @@ def test_the_record_period_is_the_engine_results_summary(record: _Record) -> Non
 
 def test_the_summary_names_the_record_and_its_lake(record: _Record) -> None:
     summary = review.firm_record_summary(
-        record.checkpoint, record.trial_dir, benchmarks=_benchmarks()
+        record.checkpoint, record.trial_dir, benchmarks=record_benchmarks()
     )
 
     experiment = summary["experiment"]
@@ -313,7 +319,7 @@ def test_the_summary_names_the_record_and_its_lake(record: _Record) -> None:
 
 def test_the_spy_baseline_starts_at_the_firms_value_and_follows_spy(record: _Record) -> None:
     summary = review.firm_record_summary(
-        record.checkpoint, record.trial_dir, benchmarks=_benchmarks()
+        record.checkpoint, record.trial_dir, benchmarks=record_benchmarks()
     )
 
     baseline = summary["baselines"][review.BENCHMARK_BASELINE]
@@ -332,7 +338,7 @@ def test_the_spy_baseline_starts_at_the_firms_value_and_follows_spy(record: _Rec
 def test_reading_the_record_changes_nothing_on_disk(record: _Record) -> None:
     before = {path: _digest(path) for path in record.store.rglob("*") if path.is_file()}
 
-    review.firm_record_summary(record.checkpoint, record.trial_dir, benchmarks=_benchmarks())
+    review.firm_record_summary(record.checkpoint, record.trial_dir, benchmarks=record_benchmarks())
 
     after = {path: _digest(path) for path in record.store.rglob("*") if path.is_file()}
     assert after == before
@@ -340,7 +346,7 @@ def test_reading_the_record_changes_nothing_on_disk(record: _Record) -> None:
 
 def test_the_trial_folder_is_found_beside_the_checkpoint(record: _Record) -> None:
     assert review.checkpoint_trial_dir(record.checkpoint) == record.trial_dir
-    summary = review.firm_record_summary(record.checkpoint, benchmarks=_benchmarks())
+    summary = review.firm_record_summary(record.checkpoint, benchmarks=record_benchmarks())
     assert summary["experiment"]["spec_hash"] == record.spec.spec_hash
 
 
@@ -363,7 +369,7 @@ def test_a_trial_folder_of_another_record_is_refused(record: _Record, tmp_path: 
     (other / "spec.json").write_text(other_record.model_dump_json())
 
     with pytest.raises(ValueError, match="spec hash"):
-        review.firm_record_summary(record.checkpoint, other, benchmarks=_benchmarks())
+        review.firm_record_summary(record.checkpoint, other, benchmarks=record_benchmarks())
 
 
 def test_a_checkpoint_at_another_lake_time_is_refused(record: _Record, tmp_path: Path) -> None:
@@ -382,7 +388,7 @@ def test_a_checkpoint_at_another_lake_time_is_refused(record: _Record, tmp_path:
     checkpoint.write_bytes(record.checkpoint.read_bytes())
 
     with pytest.raises(ValueError, match="lake time"):
-        review.firm_record_summary(checkpoint, trial_dir, benchmarks=_benchmarks())
+        review.firm_record_summary(checkpoint, trial_dir, benchmarks=record_benchmarks())
 
 
 def test_a_lake_cache_inside_the_store_is_refused(record: _Record) -> None:
