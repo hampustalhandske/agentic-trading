@@ -37,7 +37,7 @@ import math
 from contextlib import nullcontext
 from datetime import date
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict
@@ -118,20 +118,16 @@ def read_trial_spec(trial_dir: Path) -> FirmSpecRecord:
     return FirmSpecRecord.model_validate_json((trial_dir / "spec.json").read_bytes())
 
 
-class _CheckpointReading(NamedTuple):
-    """What a review reads from an engine checkpoint: `state`, everything
-    `checkpoint_store.read_state` gives, and each source's attributable
-    returns over the run's window (`source_returns_of`). Held within this
-    module only, as read, without validating its millions of values."""
-
-    state: dict[str, Any]
-    source_returns: dict[str, tuple[list[float], list[float]]]
-
-
-def _read_checkpoint(checkpoint_path: Path) -> _CheckpointReading:
-    """Reads the checkpoint at `checkpoint_path` opened read-only. Raises
-    `FileNotFoundError` when the file is absent, `CheckpointFormatError`
-    when it is of another layout and `ValueError` when it holds no day."""
+def _read_checkpoint(
+    checkpoint_path: Path,
+) -> tuple[dict[str, Any], dict[str, tuple[list[float], list[float]]]]:
+    """Reads the checkpoint at `checkpoint_path` opened read-only: its
+    state, everything `checkpoint_store.read_state` gives, and each
+    source's attributable returns over the run's window
+    (`source_returns_of`), both as read, without validating their millions
+    of values. Raises `FileNotFoundError` when the file is absent,
+    `CheckpointFormatError` when it is of another layout and `ValueError`
+    when it holds no day."""
     connection = checkpoint_store.connect_read_only(checkpoint_path)
     try:
         state = checkpoint_store.read_state(connection)
@@ -146,18 +142,19 @@ def _read_checkpoint(checkpoint_path: Path) -> _CheckpointReading:
         )
     finally:
         connection.close()
-    return _CheckpointReading(state=state, source_returns=source_returns)
+    return state, source_returns
 
 
 def _result_of(
-    reading: _CheckpointReading,
+    state: dict[str, Any],
+    source_returns: dict[str, tuple[list[float], list[float]]],
     *,
     risk_free_rate_series: pd.Series | None,
     benchmark_returns: pd.Series | None,
     market_data_source: str | None,
 ) -> BacktestResult:
-    """`record_result` of the checkpoint `reading` was read from."""
-    state = reading.state
+    """`record_result` of the checkpoint read as `state` and
+    `source_returns` (`_read_checkpoint`)."""
     portfolio_value_history = [
         (date.fromisoformat(day), float(value)) for day, value in state["portfolio_value_history"]
     ]
@@ -185,7 +182,7 @@ def _result_of(
         ],
         signal_health=state["signal_health"],
         market_data_source=market_data_source,
-        source_performance=source_performance_of(reading.source_returns),
+        source_performance=source_performance_of(source_returns),
         **execution_cost_totals(trade_log).model_dump(),
         total_financing_cost=state["total_financing_cost"],
         total_option_premium_paid=state["total_option_premium_paid"],
@@ -213,7 +210,7 @@ def record_result(
     absent, `CheckpointFormatError` when it is of another layout and
     `ValueError` when it holds no day."""
     return _result_of(
-        _read_checkpoint(checkpoint_path),
+        *_read_checkpoint(checkpoint_path),
         risk_free_rate_series=risk_free_rate_series,
         benchmark_returns=benchmark_returns,
         market_data_source=market_data_source,
@@ -309,17 +306,18 @@ def _experiment(record: FirmSpecRecord, meta: AgenticMeta | None) -> dict[str, A
 
 
 def _require_matching_checkpoint(
-    checkpoint_path: Path, reading: _CheckpointReading, record: FirmSpecRecord
+    checkpoint_path: Path, state: dict[str, Any], record: FirmSpecRecord
 ) -> None:
     """Raises `ValueError` unless the checkpoint at `checkpoint_path`, read
-    as `reading`, is the one `record`'s trial wrote: named after its spec
-    hash, over its window and universe, at its lake time."""
+    as `state` (`_read_checkpoint`), is the one `record`'s trial wrote:
+    named after its spec hash, over its window and universe, at its lake
+    time."""
     if checkpoint_path.name != f"{record.spec_hash}{CHECKPOINT_SUFFIX}":
         raise ValueError(
             f"checkpoint {checkpoint_path.name} is not the one of the trial with spec hash "
             f"{record.spec_hash}"
         )
-    config = reading.state["config"]
+    config = state["config"]
     spec = record.spec
     if (
         config["start_date"] != spec.window_start.isoformat()
@@ -331,7 +329,7 @@ def _require_matching_checkpoint(
             f"{config['end_date']} over {len(config['assets'])} assets, not the trial's window "
             "and universe"
         )
-    lake_time = reading.state["lake_time"]
+    lake_time = state["lake_time"]
     if lake_time != record.lake_time:
         written_at = "no lake session" if lake_time is None else lake_time.isoformat()
         raise ValueError(
@@ -376,12 +374,13 @@ def firm_record_summary(
         )
     trial_dir = checkpoint_trial_dir(checkpoint_path) if trial_dir is None else trial_dir
     record = read_trial_spec(trial_dir)
-    reading = _read_checkpoint(checkpoint_path)
-    _require_matching_checkpoint(checkpoint_path, reading, record)
+    state, source_returns = _read_checkpoint(checkpoint_path)
+    _require_matching_checkpoint(checkpoint_path, state, record)
     if benchmarks is None:
         benchmarks = load_record_benchmarks(record, lake_cache_dir=lake_cache_dir)
     result = _result_of(
-        reading,
+        state,
+        source_returns,
         risk_free_rate_series=benchmarks.risk_free_rate_series,
         benchmark_returns=benchmark_returns_of(benchmarks.benchmark_closes),
         market_data_source=_MARKET_DATA_SOURCE,
