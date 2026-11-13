@@ -10,7 +10,7 @@ formation window that ends strictly before the basket's own test period
 starts (2018-04-02), so the seed pairs never see the data they will
 later be evaluated on. Prices come from the lakehouse
 (`load_price_history_from_lakehouse`), the same source every backtest
-run reads.
+run reads, inside one `lake_session` at the default lake time.
 
 The printed tuple is only the starting wiring: `StatArbManager`
 re-screens the candidate set quarterly at runtime and replaces partners
@@ -27,7 +27,10 @@ from datetime import date
 import numpy as np
 from quantcore.statistics.cointegration import adf_test, engle_granger_test
 
-from agentic_trading.data.loaders.lakehouse_loader import load_price_history_from_lakehouse
+from agentic_trading.data.loaders.lakehouse_loader import (
+    lake_session,
+    load_price_history_from_lakehouse,
+)
 from agentic_trading.logging_config import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -88,12 +91,13 @@ def main() -> None:
     configure_logging(verbose=False, disable=True)
     passing: list[tuple[str, str]] = []
     print(f"{'sector':28s} {'pair':14s} {'detail':30s} verdict")
-    for ticker_a, ticker_b, sector in SECTOR_PAIRS:
-        cointegrated, detail = _is_cointegrated(ticker_a, ticker_b)
-        verdict = "COINTEGRATED" if cointegrated else "not cointegrated"
-        print(f"{sector:28s} {ticker_a}/{ticker_b:10s} {detail:30s} {verdict}")
-        if cointegrated:
-            passing.append((ticker_a, ticker_b))
+    with lake_session():
+        for ticker_a, ticker_b, sector in SECTOR_PAIRS:
+            cointegrated, detail = _is_cointegrated(ticker_a, ticker_b)
+            verdict = "COINTEGRATED" if cointegrated else "not cointegrated"
+            print(f"{sector:28s} {ticker_a}/{ticker_b:10s} {detail:30s} {verdict}")
+            if cointegrated:
+                passing.append((ticker_a, ticker_b))
 
     print("\n_COINTEGRATED_PAIRS = (")
     for ticker_a, ticker_b in passing:

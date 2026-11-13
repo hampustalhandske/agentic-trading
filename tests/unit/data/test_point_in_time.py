@@ -104,7 +104,7 @@ def test_assert_point_in_time_is_noop_on_none() -> None:
 
 
 def test_assert_point_in_time_is_noop_on_list_of_tickers() -> None:
-    """load_sp500_constituents_asof returns tickers, not dates — nothing to check."""
+    """A list of tickers carries no dates — nothing to check."""
     assert_point_in_time(["AAPL", "MSFT"], date(2024, 1, 5))
 
 

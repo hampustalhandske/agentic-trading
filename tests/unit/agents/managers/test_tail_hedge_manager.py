@@ -4,6 +4,8 @@ the analyst's confidence, rolls it inside the roll window, and falls
 back to the short-SPY equity weight when no usable chain exists."""
 
 from datetime import date, timedelta
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -19,6 +21,8 @@ from agentic_trading.data.loaders.option_marks import OptionMark
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import EqualWeight
+
+pytestmark = pytest.mark.unpinned_lake_reads
 
 AS_OF = pd.Timestamp("2024-06-20")
 SPOT = 500.0
@@ -98,7 +102,9 @@ def chain(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     the strike target the manager requested."""
     requested: dict[str, object] = {}
 
-    def select_expiry(underlying: str, as_of_date: date, target_tenor_days: int) -> date:
+    def select_expiry(
+        underlying: str, as_of_date: date, target_tenor_days: int, after: date | None = None
+    ) -> date:
         return as_of_date + timedelta(days=target_tenor_days)
 
     def nearest_strike(underlying, expiry, option_type, target_strike, as_of_date) -> float:
@@ -153,7 +159,7 @@ def test_floors_the_sleeve_at_the_base_confidence(chain, monkeypatch) -> None:
             asset=asset,
             as_of_date=as_of_date.date(),
             direction="short",
-            confidence=0.0,
+            confidence=0.01,
             rationale="calm",
         ),
     )
@@ -206,7 +212,7 @@ def test_holds_the_contract_until_the_roll_window_then_rolls(chain) -> None:
 
 
 def test_falls_back_to_the_short_spy_equity_weight_without_a_chain(monkeypatch) -> None:
-    monkeypatch.setattr(option_marks, "select_expiry", lambda *_: None)
+    monkeypatch.setattr(option_marks, "select_expiry", lambda *_, **__: None)
 
     decisions = _manager().construct_portfolio(["SPY"], _market_data(), AS_OF, _scoreboard())
 
@@ -225,3 +231,117 @@ def test_falls_back_when_the_selected_put_is_untradeable(chain, monkeypatch) -> 
 
     assert all(decision.instrument is None for decision in decisions)
     assert _by_asset(decisions)["SPY"].target_weight < 0.0
+
+
+def _lake_chain_expiring_on(fake_lake: Any, underlying: str, day: date, strike: float) -> None:
+    """Seeds `fake_lake` with one quoted snapshot dated `day - 1` whose only
+    expiry is `day`, and no splits."""
+    fake_lake.add(
+        "dolthub_option_chain",
+        pd.DataFrame(
+            [
+                {
+                    "underlying": underlying,
+                    "date": (day - timedelta(days=1)).isoformat(),
+                    "expiration": day.isoformat(),
+                    "option_type": option_type,
+                    "strike": strike,
+                    "bid": 1.0,
+                    "ask": 1.2,
+                    "implied_volatility": 0.25,
+                    "delta": 0.5 if option_type == "call" else -0.5,
+                    "gamma": 0.02,
+                    "theta": -0.05,
+                    "vega": 0.1,
+                    "rho": 0.01,
+                }
+                for option_type in ("call", "put")
+            ]
+        ),
+        date_columns=("date", "expiration"),
+    )
+    fake_lake.add_empty(
+        "yahoo_split_close_basis",
+        {"ticker": "VARCHAR", "ex_date": "DATE", "ratio": "DOUBLE", "in_close_basis": "BOOLEAN"},
+    )
+    fake_lake._connection.execute(
+        "INSERT INTO yahoo_split_close_basis VALUES ('ZZUNREL', DATE '2000-01-03', 0.5, TRUE)"
+    )
+
+
+def test_lagged_chain_listing_only_todays_expiry_selects_no_put(
+    fake_lake: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chain read at `day - 1` lists only `day`'s expiry; no put is selected even
+    though any contract chosen would mark as tradeable."""
+    day = AS_OF.date()
+    _lake_chain_expiring_on(
+        fake_lake, "SPY", day, SPOT * settings.options.tail_hedge_strike_moneyness
+    )
+    monkeypatch.setattr(
+        option_marks,
+        "load_option_mark",
+        lambda contract, as_of_date, spot: _mark(contract, as_of_date),
+    )
+    option_marks.clear_cache()
+    try:
+        assert option_marks.list_expiries("SPY", day - timedelta(days=1)) == [day]
+        assert _manager()._select_put(_market_data(), AS_OF, 0.01) is None
+    finally:
+        option_marks.clear_cache()
+
+
+@pytest.fixture
+def manager_logs(caplog: pytest.LogCaptureFixture) -> Any:
+    """Routes the tail-hedge manager's logger (the package logger does not propagate) into
+    `caplog` at INFO."""
+    import logging
+
+    manager_logger = logging.getLogger("agentic_trading.agents.managers.tail_hedge_manager")
+    manager_logger.addHandler(caplog.handler)
+    previous_level = manager_logger.level
+    manager_logger.setLevel(logging.INFO)
+    yield caplog
+    manager_logger.setLevel(previous_level)
+    manager_logger.removeHandler(caplog.handler)
+
+
+def _protection_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records if "protection" in record.getMessage()]
+
+
+def test_logs_the_protection_the_budget_buys(chain, manager_logs) -> None:
+    _manager().construct_portfolio(["SPY"], _market_data(), AS_OF, _scoreboard())
+
+    assert _protection_lines(manager_logs)
+
+
+@pytest.mark.parametrize(
+    "sizing",
+    [
+        ValueError("undefined result"),
+        SimpleNamespace(protection_pct_achieved=float("nan"), breakeven=480.0),
+        SimpleNamespace(protection_pct_achieved=0.9, breakeven=float("inf")),
+    ],
+    ids=["raises", "nan_protection", "inf_breakeven"],
+)
+def test_an_undefined_protection_sizing_skips_only_the_log_line(
+    chain, monkeypatch: pytest.MonkeyPatch, manager_logs, sizing: Any
+) -> None:
+    """The sizing feeds only a log line: an undefined one leaves the decisions as they are."""
+    from agentic_trading.agents.managers import tail_hedge_manager
+
+    expected = _manager().construct_portfolio(["SPY"], _market_data(), AS_OF, _scoreboard())
+    manager_logs.clear()
+
+    def _sizing(*_args: Any) -> Any:
+        if isinstance(sizing, Exception):
+            raise sizing
+        return sizing
+
+    monkeypatch.setattr(tail_hedge_manager, "protective_put_sizing", _sizing)
+
+    decisions = _manager().construct_portfolio(["SPY"], _market_data(), AS_OF, _scoreboard())
+
+    assert decisions == expected
+    assert _protection_lines(manager_logs) == []

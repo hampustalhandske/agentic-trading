@@ -1,0 +1,233 @@
+"""The text of an edgelab replay strategy folder: `strategy.yaml` as
+`edgelab strategy init <slug> --asset-class replay` scaffolds it at edgelab
+04d7c5c, and the
+`strategy.py` shim whose `Replay` subclasses edgelab's built-in
+`TargetWeightsReplay`.
+
+`REPLAY_STRATEGY_YAML` is the scaffold with its comment lines removed (the
+scaffold itself is vendored as `tests/fixtures/edgelab_replay_strategy.yaml`
+and its grading block's JSON schema as `grading_spec.v1.json` in
+`tests/fixtures/edgelab_grading_golden/docs/schema/`); its
+`<...>` placeholders, `strategy`, universe, data block, capital, seed and
+replication are replaced by `firm_record.submission.strategy_config`, which
+also drops the grading block. The
+files are written as text, so edgelab is never imported here."""
+
+REPLAY_STRATEGY_YAML = """\
+name: "<Author year short title>"
+version: "1.0.0"
+author: "edgelab"
+created: 2026-09-30
+strategy: strategies/<slug>/strategy.py:TemplateStrategy
+params:
+  universe: {kind: static, symbols: ["<SYMBOL1>", "<SYMBOL2>"]}
+  schedule:
+    frequency: "1d"
+    decision_time: null
+    rebalance: daily
+    calendar: XNYS
+    bars_per_year: 252
+  risk_limits: {max_gross: 1.0, max_net: 1.0, max_weight_per_instrument: 0.5}
+  rebalance_band: 0.0
+  on_missing_data: hold
+  order_timing: open
+  shorting: not_allowed
+  price_basis_for_signals: total_return
+  on_delisting: exit_at_last_price
+  on_capacity_shortfall: drop_remainder
+  share_rounding: fractional
+parameters:
+  grid: {}
+  selected: {}
+hypothesis:
+  rationale: >
+    TODO: the economic rationale, written before any data was touched -- who is on the other
+    side of the trade, and why the effect should persist.
+  null_hypothesis: "mean daily net excess return <= 0"
+  alternative_hypothesis: "mean daily net excess return > 0"
+  primary_metric: sharpe
+  threshold: 0.0
+  alpha: 0.05
+  sided: one
+  benchmark: {kind: universe_equal_weight}
+data:
+  provider: parquet
+  range: {start: 1926-08-01, end: 2026-06-30}
+  frequency: "1d"
+  params: {path: "strategies/<slug>/data", prices_adjusted: true, survivorship_free: true}
+grading:
+  execution:
+    decision_delay_bars: 1
+    decision_delay_trading_days: 1
+    option_fill_fraction: 0.75
+    option_min_half_spread_bps: 0.0
+    option_max_quote_age_bars: 0
+    option_max_iv_age_bars: 5
+    prediction_market_max_quote_age_bars: 0
+    prediction_market_max_participation_frac: 1.0
+    prediction_market_fee_scale: 1.0
+    max_adv_participation: 0.05
+  costs:
+    equity:
+      commission_bps: 1.0
+      commission_per_contract: 0.0
+      half_spread_bps: 5.0
+      slippage_bps: 2.0
+      impact:
+        kind: sqrt
+        coefficient: 1.0
+      financing_spread_bps: 100.0
+      exchange_fee_bps: 0.0
+      cash_day_count: act360
+      borrow_annual_bps: 50.0
+      hard_to_borrow_rate_bps: null
+      liquidation_fee_bps: 0.0
+    future:
+      commission_bps: 1.0
+      commission_per_contract: 0.0
+      half_spread_bps: 5.0
+      slippage_bps: 2.0
+      impact:
+        kind: sqrt
+        coefficient: 1.0
+      financing_spread_bps: 100.0
+      exchange_fee_bps: 0.0
+      cash_day_count: act360
+      borrow_annual_bps: 50.0
+      hard_to_borrow_rate_bps: null
+      liquidation_fee_bps: 0.0
+    option:
+      commission_bps: 1.0
+      commission_per_contract: 0.0
+      half_spread_bps: 5.0
+      slippage_bps: 2.0
+      impact:
+        kind: sqrt
+        coefficient: 1.0
+      financing_spread_bps: 100.0
+      exchange_fee_bps: 0.0
+      cash_day_count: act360
+      borrow_annual_bps: 50.0
+      hard_to_borrow_rate_bps: null
+      liquidation_fee_bps: 0.0
+    fx:
+      commission_bps: 1.0
+      commission_per_contract: 0.0
+      half_spread_bps: 5.0
+      slippage_bps: 2.0
+      impact:
+        kind: sqrt
+        coefficient: 1.0
+      financing_spread_bps: 100.0
+      exchange_fee_bps: 0.0
+      cash_day_count: act360
+      borrow_annual_bps: 50.0
+      hard_to_borrow_rate_bps: null
+      liquidation_fee_bps: 0.0
+    crypto:
+      commission_bps: 1.0
+      commission_per_contract: 0.0
+      half_spread_bps: 5.0
+      slippage_bps: 2.0
+      impact:
+        kind: sqrt
+        coefficient: 1.0
+      financing_spread_bps: 100.0
+      exchange_fee_bps: 0.0
+      cash_day_count: act360
+      borrow_annual_bps: 50.0
+      hard_to_borrow_rate_bps: null
+      liquidation_fee_bps: 50.0
+    prediction_market:
+      commission_bps: 1.0
+      commission_per_contract: 0.0
+      half_spread_bps: 5.0
+      slippage_bps: 2.0
+      impact:
+        kind: sqrt
+        coefficient: 1.0
+      financing_spread_bps: 100.0
+      exchange_fee_bps: 0.0
+      cash_day_count: act360
+      borrow_annual_bps: 50.0
+      hard_to_borrow_rate_bps: null
+      liquidation_fee_bps: 0.0
+  validation:
+    holdout:
+      kind: fraction
+      fraction: 0.2
+    search_window: null
+    walk_forward: null
+    cpcv:
+      n_groups: 8
+      k_test: 3
+      min_paths: 10
+    kfold_splits: 5
+    purge_bars: 1
+    embargo_bars: 0
+  robustness:
+    cost_multipliers:
+    - 0.5
+    - 1.0
+    - 1.5
+    - 2.0
+    - 3.0
+    extra_delay_bars:
+    - 1
+    - 2
+    extra_delay: []
+    noise_bps: 5.0
+    n_noise_draws: 20
+    remove_best_k:
+    - 1
+    - 5
+    - 10
+    n_subperiods: 3
+    n_start_date_shifts: 5
+  gates:
+    min_hac_t_multiple: 2.5
+    min_hac_t_single: 2.0
+    min_psr: 0.95
+    min_dsr: 0.95
+    max_pbo_green: 0.2
+    max_pbo_red: 0.5
+    require_min_trl: true
+    cpcv_percentile: 5.0
+    min_cpcv_percentile_sharpe: 0.0
+    require_holdout_positive: true
+    min_breakeven_cost_multiple: 2.0
+    min_delay_sharpe_retention: 0.5
+    min_factor_alpha_t: 2.0
+    max_random_entry_p: 0.05
+    max_calibration_p: 0.05
+    min_round_trips: 30
+    min_active_bars: 30
+    amber_band: 0.1
+    min_survivorship_coverage: 0.95
+    dsr_trial_variance: no_skill
+  data_fit:
+    min_density: 0.9
+    min_decisions_base: 30
+    edge_tolerance_sessions: 5
+    power_table_reference: edgelab-power-table-v1
+    power_calibration_constant: 5.222516970368799
+    max_min_detectable_sharpe: 3.0
+  margin:
+    liquidation_order: largest_loss_first
+    initial_margin_short_pct: 1.5
+    maintenance_margin_short_pct: 0.3
+    maintenance_margin_long_pct: 0.25
+    crypto_spot_maintenance_margin_pct: 0.25
+    crypto_perpetual_initial_margin_rate: 0.1
+    crypto_perpetual_maintenance_margin_rate: 0.05
+capital: 100000.0
+seed: 7
+replication: strategies/<slug>/replication.yaml
+"""
+
+REPLAY_STRATEGY_PY = (
+    '"""The built-in decision-file replay."""\n\n'
+    "from edgelab.strategy.replay import TargetWeightsReplay\n\n\n"
+    "class Replay(TargetWeightsReplay):\n"
+    '    """Trades the submission\'s decision file."""\n'
+)

@@ -1,0 +1,224 @@
+# test_broad_universe_securities.py
+
+"""The Fama-MacBeth and lead-lag centrality broad universes are built from member securities."""
+
+import logging
+from datetime import date, timedelta
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from agentic_trading.agents.analysts.alt_data_pod import network_centrality_analyst as network
+from agentic_trading.agents.analysts.alt_data_pod.network_centrality_analyst import (
+    LeadLagNetworkCentralityAnalyst,
+)
+from agentic_trading.agents.analysts.factor_pod import fama_macbeth_analyst as fama
+from agentic_trading.agents.analysts.factor_pod.fama_macbeth_analyst import FamaMacbethAnalyst
+from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.data.loaders.lakehouse_loader import IndexMember
+
+_AS_OF = pd.Timestamp("2024-03-08")
+_SHORT_MEMBERS = 2
+
+
+def _forbidden(*args: Any, **kwargs: Any) -> Any:
+    raise AssertionError("ticker-keyed loader must not be used for the broad universe")
+
+
+def _series(size: int, seed: int) -> pd.Series:
+    index = pd.bdate_range(end=_AS_OF, periods=size)
+    return pd.Series(np.random.default_rng(seed).normal(0, 0.01, size), index=index)
+
+
+def _install(
+    monkeypatch: pytest.MonkeyPatch, module: Any, min_size: int, usable_size: int, members: int
+) -> list[tuple[list[int], date, date]]:
+    """Patches the module with `members` full-history securities plus short-history ones."""
+    total = members + _SHORT_MEMBERS
+    roster = [IndexMember(security_id=100 + i, ticker=f"T{i:03d}") for i in range(total)]
+    calls: list[tuple[list[int], date, date]] = []
+
+    def returns(ids: list[int], start: date, end: date) -> dict[int, pd.Series]:
+        calls.append((list(ids), start, end))
+        return {
+            m.security_id: _series(usable_size if i < members else min_size - 1, i)
+            for i, m in enumerate(roster)
+            if m.security_id in ids
+        }
+
+    monkeypatch.setattr(module, "load_sp500_member_securities_asof", lambda d: roster)
+    monkeypatch.setattr(module, "load_security_log_returns", returns)
+    monkeypatch.setattr(module, "load_price_history_from_lakehouse", _forbidden, raising=False)
+    return calls
+
+
+def _info_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+
+
+@pytest.fixture
+def package_log(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
+    package = logging.getLogger("agentic_trading")
+    package.addHandler(caplog.handler)
+    caplog.set_level(logging.INFO, logger="agentic_trading")
+    yield caplog
+    package.removeHandler(caplog.handler)
+
+
+def test_fama_macbeth_universe_keyed_by_ticker_and_logs_exclusions(
+    monkeypatch: pytest.MonkeyPatch, package_log: pytest.LogCaptureFixture
+) -> None:
+    """Members with enough returns are keyed by ticker; the excluded count is logged at INFO."""
+    min_size = fama._RISK_WINDOW // 2
+    calls = _install(monkeypatch, fama, min_size, min_size, fama._MIN_UNIVERSE_SIZE)
+
+    result = FamaMacbethAnalyst()._load_broad_lakehouse_universe(_AS_OF)
+
+    assert result is not None
+    tickers, returns = result
+    expected = {f"T{i:03d}" for i in range(fama._MIN_UNIVERSE_SIZE)}
+    assert set(tickers) == expected == set(returns)
+    assert all(series.size >= min_size for series in returns.values())
+    assert calls and calls[0][2] == _AS_OF.date()
+    assert any(str(_SHORT_MEMBERS) in message for message in _info_messages(package_log))
+
+
+def test_fama_macbeth_universe_none_when_membership_missing_or_too_thin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No membership, or fewer usable members than the minimum, gives None."""
+    min_size = fama._RISK_WINDOW // 2
+    _install(monkeypatch, fama, min_size, min_size, fama._MIN_UNIVERSE_SIZE - 1)
+    assert FamaMacbethAnalyst()._load_broad_lakehouse_universe(_AS_OF) is None
+
+    monkeypatch.setattr(fama, "load_sp500_member_securities_asof", lambda d: None)
+    assert FamaMacbethAnalyst()._load_broad_lakehouse_universe(_AS_OF) is None
+
+
+def test_network_universe_keyed_by_ticker_and_logs_exclusions(
+    monkeypatch: pytest.MonkeyPatch, package_log: pytest.LogCaptureFixture
+) -> None:
+    """Members with enough returns are keyed by ticker; the excluded count is logged at INFO."""
+    min_size = network.WINDOW + network.LAG
+    calls = _install(monkeypatch, network, min_size, min_size, network._MIN_UNIVERSE_SIZE)
+
+    result = LeadLagNetworkCentralityAnalyst()._load_broad_lakehouse_universe(_AS_OF)
+
+    assert result is not None
+    assert set(result) == {f"T{i:03d}" for i in range(network._MIN_UNIVERSE_SIZE)}
+    assert all(series.size >= min_size for series in result.values())
+    assert calls and calls[0][1:] == (
+        _AS_OF.date() - timedelta(days=network._UNIVERSE_HISTORY_DAYS),
+        _AS_OF.date(),
+    )
+    assert any(str(_SHORT_MEMBERS) in message for message in _info_messages(package_log))
+
+
+def test_network_universe_none_when_membership_missing_or_too_thin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No membership, or fewer usable members than the minimum, gives None."""
+    min_size = network.WINDOW + network.LAG
+    _install(monkeypatch, network, min_size, min_size, network._MIN_UNIVERSE_SIZE - 1)
+    assert LeadLagNetworkCentralityAnalyst()._load_broad_lakehouse_universe(_AS_OF) is None
+
+    monkeypatch.setattr(network, "load_sp500_member_securities_asof", lambda d: None)
+    assert LeadLagNetworkCentralityAnalyst()._load_broad_lakehouse_universe(_AS_OF) is None
+
+
+@pytest.mark.parametrize("module", [fama, network], ids=["fama_macbeth", "lead_lag"])
+def test_no_cross_section_is_unavailable_without_a_ticker_universe(
+    monkeypatch: pytest.MonkeyPatch, module: Any
+) -> None:
+    """No membership, or too few qualifying members, is unavailable and reads no ticker prices."""
+    analyst_class = FamaMacbethAnalyst if module is fama else LeadLagNetworkCentralityAnalyst
+    min_size = fama._RISK_WINDOW // 2 if module is fama else network.WINDOW + network.LAG
+    assert not hasattr(module, "load_fixed_universe_returns")
+
+    _install(monkeypatch, module, min_size, min_size, module._MIN_UNIVERSE_SIZE - 1)
+    thin = analyst_class().generate_signal("T000", pd.DataFrame(), _AS_OF)
+    assert (thin.status, thin.direction, thin.confidence) == ("unavailable", "flat", 0.0)
+
+    monkeypatch.setattr(module, "load_sp500_member_securities_asof", lambda d: None)
+    missing = analyst_class().generate_signal("T000", pd.DataFrame(), _AS_OF)
+    assert (missing.status, missing.direction, missing.confidence) == ("unavailable", "flat", 0.0)
+
+
+def test_fama_macbeth_reads_a_firm_equity_outside_the_universe_by_security_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registered-firm equity missing from the cached cross-section (here MON, whose ticker
+    has no instrument_prices rows) is read by its security id, never by ticker."""
+    universe = {"T000": _series(80, 0)}
+    calls: list[tuple[list[int], date, date]] = []
+    own = _series(80, 1)
+
+    def returns(ids: list[int], start: date, end: date) -> dict[int, pd.Series]:
+        calls.append((list(ids), start, end))
+        return {38786: own}
+
+    monkeypatch.setattr(fama, "load_security_log_returns", returns)
+    monkeypatch.setattr(fama, "load_price_history_from_lakehouse", _forbidden)
+
+    result = FamaMacbethAnalyst()._resolve_with_broad_universe((("T000",), universe), "MON", _AS_OF)
+
+    assert not isinstance(result, AgentSignal)
+    tickers, merged = result
+    assert tickers == ("T000", "MON")
+    assert merged["MON"] is own
+    assert calls == [([38786], (_AS_OF - timedelta(days=250)).date(), _AS_OF.date())]
+
+
+def test_fama_macbeth_reads_any_other_asset_by_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An asset that is not a registered-firm equity keeps the ticker read, and a firm equity
+    whose security has no returns is unavailable."""
+    universe = {"T000": _series(80, 0)}
+    index = pd.bdate_range(end=_AS_OF, periods=3)
+    frame = pd.concat(
+        {"ZZZ": pd.DataFrame({"log_return": [np.nan, 0.01, -0.02]}, index=index)}, axis=1
+    )
+    monkeypatch.setattr(fama, "load_security_log_returns", lambda ids, start, end: {})
+    monkeypatch.setattr(fama, "load_price_history_from_lakehouse", lambda tickers, s, e: frame)
+    analyst = FamaMacbethAnalyst()
+
+    result = analyst._resolve_with_broad_universe((("T000",), universe), "ZZZ", _AS_OF)
+    missing = analyst._resolve_with_broad_universe((("T000",), universe), "MON", _AS_OF)
+
+    assert not isinstance(result, AgentSignal)
+    assert result[1]["ZZZ"].tolist() == [0.01, -0.02]
+    assert isinstance(missing, AgentSignal) and missing.status == "unavailable"
+
+
+def test_fama_macbeth_counts_a_firm_equity_held_under_another_ticker_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Alphabet class A (security 25819) sits in the S&P cross-section as GOOG while the asset
+    is GOOGL: the member is the asset, renamed in place, with no second read of its returns."""
+    min_size = fama._RISK_WINDOW // 2
+    roster = [
+        *(IndexMember(security_id=100 + i, ticker=f"T{i:03d}") for i in range(30)),
+        IndexMember(security_id=25819, ticker="GOOG"),
+    ]
+    calls: list[list[int]] = []
+
+    def returns(ids: list[int], start: date, end: date) -> dict[int, pd.Series]:
+        calls.append(list(ids))
+        return {m.security_id: _series(min_size, i) for i, m in enumerate(roster)}
+
+    monkeypatch.setattr(fama, "load_sp500_member_securities_asof", lambda d: roster)
+    monkeypatch.setattr(fama, "load_security_log_returns", returns)
+    monkeypatch.setattr(fama, "load_price_history_from_lakehouse", _forbidden)
+    analyst = FamaMacbethAnalyst()
+    universe = analyst._load_broad_lakehouse_universe(_AS_OF)
+    assert universe is not None
+
+    result = analyst._resolve_with_broad_universe(universe, "GOOGL", _AS_OF)
+
+    assert not isinstance(result, AgentSignal)
+    tickers, merged = result
+    assert tickers.count("GOOGL") == 1 and "GOOG" not in tickers
+    assert list(merged) == list(tickers) and len(tickers) == len(roster)
+    assert merged["GOOGL"] is universe[1]["GOOG"]
+    assert len(calls) == 1

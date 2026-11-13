@@ -9,6 +9,7 @@ from agentic_trading.agents._market_math import single_asset_from_attrs
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import CommanderRiskState
 from agentic_trading.agents.schemas import PortfolioDecision
+from agentic_trading.data.lake_errors import LakeReadError
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 
 # volatility_target compares a *daily* trailing-stdev against this
@@ -130,6 +131,8 @@ class SingleAnalystCommander:
                 signal = self.analyst.generate_signal(asset, market_data, as_of_date)
                 direction_sign = {"long": 1.0, "short": -1.0, "flat": 0.0}[signal.direction]
                 target_weight = direction_sign * signal.confidence
+            except LakeReadError:
+                raise
             except Exception:
                 target_weight = 0.0
             decisions.append(

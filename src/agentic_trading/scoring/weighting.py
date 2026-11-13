@@ -39,6 +39,12 @@ class WeightingStrategy(ABC):
         the result is combined with other multiplicative factors."""
         ...
 
+    def track_record_lookback_days(self) -> int:
+        """The longest trailing window, in calendar days ending on the
+        decision day, this strategy reads from the track record: its
+        `lookback_days` when it has one, else 0 (it reads none)."""
+        return int(getattr(self, "lookback_days", 0))
+
 
 class Hedge(WeightingStrategy):
     """Exponentiated trailing-return weighting normalized to average 1.0."""
@@ -76,7 +82,17 @@ class EqualWeight(WeightingStrategy):
 
 
 class SharpeWeight(WeightingStrategy):
-    """Positive trailing-Sharpe weighting with a conservative equal fallback."""
+    """Trailing-Sharpe weighting: each source's raw weight is
+    `max(floor, 1 + sharpe / 3)` over `lookback_days`, and the raw weights
+    are normalized to average 1.0.
+
+    A source with fewer than two observations has no track record yet and
+    takes the neutral raw weight 1.0. A source whose Sharpe is undefined
+    (`PerformanceScoreboard.sharpe_ratio` returns `None`: its returns have
+    zero standard deviation) takes the raw weight `floor`, the lowest any
+    measured Sharpe can reach: a record with no variance shows no skill, so
+    it never outweighs a source with a measured Sharpe, and the
+    normalization leaves the ratios between measured sources unchanged."""
 
     def __init__(self, lookback_days: int = 60, floor: float = 0.25) -> None:
         self.lookback_days = lookback_days
@@ -91,7 +107,10 @@ class SharpeWeight(WeightingStrategy):
                 score = scoreboard.sharpe_ratio(source_id, as_of_date, self.lookback_days)
             except ValueError:
                 score = 0.0
-            raw[source_id] = max(self.floor, 1.0 + score / 3.0)
+            if score is None:
+                raw[source_id] = self.floor
+            else:
+                raw[source_id] = max(self.floor, 1.0 + score / 3.0)
         average = sum(raw.values()) / len(raw)
         return {source_id: value / average for source_id, value in raw.items()}
 
@@ -137,6 +156,14 @@ class ShrinkageWeight(WeightingStrategy):
                 shrinkage_factor * weight + (1.0 - shrinkage_factor) * average_weight
             )
         return shrunk_weights
+
+    def track_record_lookback_days(self) -> int:
+        """The longer of the wrapped strategy's own window and the window
+        the observation counts are taken over (the wrapped strategy's
+        `lookback_days`, 30 when it has none)."""
+        return max(
+            self.base.track_record_lookback_days(), int(getattr(self.base, "lookback_days", 30))
+        )
 
 
 class DrawdownAwareWeight(WeightingStrategy):

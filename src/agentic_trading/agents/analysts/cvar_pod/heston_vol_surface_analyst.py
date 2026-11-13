@@ -4,14 +4,22 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from pydantic import Field, PrivateAttr
 
-from agentic_trading.agents._market_math import clamp, market_slice
+from agentic_trading.agents._market_math import RefitCache, clamp, market_slice, raw_spot
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
     annualized_garch_volatility,
+    chain_snapshot_date,
+    options_chain_requirements,
     real_atm_options_by_expiration,
 )
-from agentic_trading.agents.base import AnalystAgent
-from agentic_trading.agents.schemas import AgentSignal, SignalStatus
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
+from agentic_trading.agents.schemas import (
+    AgentSignal,
+    SignalStatus,
+    VolatilityEstimator,
+    VolatilityProvenance,
+)
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -69,18 +77,38 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
     term-structure model, so the signal uses the observed surface
     directly: `vrp = IV_30 - GARCH vol` (30-day ATM IV interpolated in
     total variance, against this analyst's own annualized GARCH(1,1) read
-    on a year of returns) and `slope = IV_longest - IV_nearest`.
+    on a year of returns) and `slope = IV_longest - IV_nearest`. The GARCH
+    read is refit at most once every `_refit_cache.refit_interval_days`
+    simulated days per asset — see `RefitCache`'s docstring.
 
     A rich premium (`vrp >= vrp_threshold`) in contango is long
     (Bollerslev-Tauchen-Zhou: a positive variance risk premium predicts
     positive returns); implied vol below the model forecast, or a
     backwardated curve, is short. Confidence grows from zero at the
     threshold to full `vrp_full_confidence_span` beyond it, with up to a
-    50% uplift for a steep term slope, capped at 0.75. Flat with zero
-    confidence when fewer than two usable expiries exist for the date.
-    The agent id is kept so scoreboard history stays continuous."""
+    50% uplift for a steep term slope, capped at 0.75. A premium inside
+    the threshold on a curve that is not backwardated abstains (active,
+    flat, confidence 0). Flat with zero confidence and unavailable when
+    fewer than two usable expiries exist for the date. The agent id is
+    kept so scoreboard history stays continuous.
+
+    Every signal read off the model volatility, an abstention included,
+    carries its `volatility_estimator`: "garch_11" or "ewma" from
+    `_market_math.conditional_daily_volatility`, or "realized_std" when
+    that read raises and the annualized sample std of the last
+    `REALIZED_FALLBACK_WINDOW` returns stands in.
+
+    Every active signal's `source_as_of`, an abstention included, is the
+    date of the chain snapshot the surface was read from
+    (`_options_data.chain_snapshot_date`), the snapshot's own date rather
+    than the later decision date the publication lag first makes it
+    visible on."""
 
     agent_id: str = "heston_vol_surface_analyst"
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=options_chain_requirements
+    )
+    _refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)
 
     def _flat(
         self,
@@ -88,6 +116,7 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
         as_of_date: pd.Timestamp,
         rationale: str,
         status: SignalStatus = "active",
+        volatility_estimator: VolatilityEstimator | None = None,
     ) -> AgentSignal:
         return AgentSignal(
             agent_id=self.agent_id,
@@ -97,6 +126,7 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
             confidence=0.0,
             rationale=rationale,
             status=status,
+            volatility_estimator=volatility_estimator,
         )
 
     def generate_signal(
@@ -105,14 +135,16 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        slice_ = market_slice(market_data, as_of_date, asset)
-        returns = slice_.log_returns[-settings.analysts.risk_window_long :]
-        if slice_.close is None or returns.size < MIN_RETURN_OBSERVATIONS:
+        returns = market_slice(market_data, as_of_date, asset).log_returns[
+            -settings.analysts.risk_window_long :
+        ]
+        spot = raw_spot(market_data, as_of_date, asset)
+        if spot is None or returns.size < MIN_RETURN_OBSERVATIONS:
             return self._flat(
                 asset, as_of_date, "insufficient history for a volatility read", "unavailable"
             )
 
-        real_options = real_atm_options_by_expiration(asset, as_of_date, slice_.close)
+        real_options = real_atm_options_by_expiration(asset, as_of_date, spot)
         if real_options is None or real_options.empty:
             return self._flat(
                 asset,
@@ -132,12 +164,17 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
         ivs = usable["implied_volatility"].to_numpy(dtype=np.float64)
 
         iv_30 = _interpolated_atm_iv(days, ivs, TARGET_DTE)
+        volatility_read = VolatilityProvenance()
         try:
-            model_vol = annualized_garch_volatility(returns, self.agent_id, asset, as_of_date)
+            model_vol = annualized_garch_volatility(
+                returns, self._refit_cache, self.agent_id, asset, as_of_date, volatility_read
+            )
+            estimator = volatility_read.estimator
         except (RuntimeError, ValueError):
             model_vol = float(np.std(returns[-REALIZED_FALLBACK_WINDOW:], ddof=1)) * np.sqrt(
                 settings.firm.trading_days_per_year
             )
+            estimator = "realized_std"
         vrp = iv_30 - model_vol
         if abs(vrp) > MAX_ABS_VRP:
             return self._flat(
@@ -145,23 +182,35 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
                 as_of_date,
                 f"variance risk premium {vrp:.3f} outside plausible range",
                 "unavailable",
+                estimator,
             )
         slope = float(ivs[-1] - ivs[0]) if days[-1] - days[0] >= MIN_SLOPE_SPAN_DAYS else 0.0
 
         threshold = settings.analysts.vrp_threshold
-        direction: Literal["long", "short", "flat"] = "flat"
+        source_as_of = chain_snapshot_date(real_options)
+        rationale = (
+            f"variance risk premium {vrp:+.4f} (IV_30={iv_30:.4f} vs model vol "
+            f"{model_vol:.4f}), term slope {slope:+.4f} over {days[0]:.0f}-{days[-1]:.0f} DTE"
+        )
+        direction: Literal["long", "short"]
         if vrp >= threshold and slope >= 0.0:
             direction = "long"
         elif vrp <= -threshold or slope <= BACKWARDATION_SLOPE:
             direction = "short"
-
-        confidence = 0.0
-        if direction != "flat":
-            premium_strength = clamp(
-                (abs(vrp) - threshold) / settings.analysts.vrp_full_confidence_span
+        else:
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                rationale,
+                source_as_of=source_as_of,
+                volatility_estimator=estimator,
             )
-            slope_uplift = 1.0 + SLOPE_UPLIFT_WEIGHT * clamp(abs(slope) / SLOPE_FULL_UPLIFT)
-            confidence = clamp(premium_strength * slope_uplift, 0.0, MAX_CONFIDENCE)
+
+        premium_strength = clamp(
+            (abs(vrp) - threshold) / settings.analysts.vrp_full_confidence_span
+        )
+        slope_uplift = 1.0 + SLOPE_UPLIFT_WEIGHT * clamp(abs(slope) / SLOPE_FULL_UPLIFT)
+        confidence = clamp(premium_strength * slope_uplift, 0.0, MAX_CONFIDENCE)
 
         return AgentSignal(
             agent_id=self.agent_id,
@@ -169,8 +218,7 @@ class HestonVolSurfaceAnalyst(AnalystAgent):
             as_of_date=as_of_date.date(),
             direction=direction,
             confidence=confidence,
-            rationale=(
-                f"variance risk premium {vrp:+.4f} (IV_30={iv_30:.4f} vs model vol "
-                f"{model_vol:.4f}), term slope {slope:+.4f} over {days[0]:.0f}-{days[-1]:.0f} DTE"
-            ),
+            rationale=rationale,
+            source_as_of=source_as_of,
+            volatility_estimator=estimator,
         )

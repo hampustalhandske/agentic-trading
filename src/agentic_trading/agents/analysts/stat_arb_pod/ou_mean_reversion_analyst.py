@@ -7,9 +7,10 @@ import numpy as np
 import pandas as pd
 from pydantic import PrivateAttr
 from quantcore.core.stochastic import simulate_ou_paths
+from quantcore.errors import UndefinedResultError
 from quantcore.statistics.cointegration import ou_half_life, spread_zscore
 
-from agentic_trading.agents._market_math import RefitCache, market_slice
+from agentic_trading.agents._market_math import RefitCache, derived_seed, market_slice
 from agentic_trading.agents.analysts.stat_arb_pod.pairs_cointegration_analyst import (
     spread_confidence,
     spread_direction,
@@ -25,6 +26,25 @@ MIN_HALF_LIFE_DAYS = 1.0
 MAX_ZSCORE_WINDOW = 250
 
 
+def undefined_slope_reason(spread: np.ndarray) -> str | None:
+    """Why the AR(1) slope of `spread`'s steps on its lagged level is
+    undefined in exact arithmetic, or `None` when it is defined: "a straight
+    line" when every step is the same (the slope is exactly 0), "a constant
+    level before the last observation" when the lagged level has no range.
+
+    Quantcore gap: `ou_half_life` raises the same `UndefinedResultError` for
+    these spreads and for a defined slope that shows no mean reversion
+    (`phi >= 0`, or not negative beyond its rounding error), so the analyst
+    tells the two apart here: the first is unavailable, the second an
+    abstention."""
+    steps = np.diff(spread)
+    if steps.size > 0 and float(np.ptp(steps)) == 0.0:
+        return "a straight line"
+    if spread.size > 1 and float(np.ptp(spread[:-1])) == 0.0:
+        return "a constant level before the last observation"
+    return None
+
+
 class OUMeanReversionAnalyst(AnalystAgent):
     """De-trends the asset's own log price (or a configurable benchmark
     spread) and signals from how far the resulting spread has drifted from
@@ -34,7 +54,21 @@ class OUMeanReversionAnalyst(AnalystAgent):
     `RefitCache`'s docstring. Entry/exit follow the pod's shared
     `spread_direction` rule: enter against the spread beyond
     `z_entry_threshold`, hold while outside `z_exit_threshold`, flat once
-    it reverts inside."""
+    it reverts inside.
+
+    A spread under 10 points is unavailable, and so is one whose
+    half-life is undefined: quantcore's `UndefinedResultError` on a spread
+    whose AR(1) slope is undefined (`undefined_slope_reason`: a straight
+    line, or a constant level before the last observation), or a
+    non-finite estimate. A spread that is not mean-reverting
+    (`UndefinedResultError` on any other spread: the fitted slope shows no
+    mean reversion), whose finite half-life exceeds
+    `settings.analysts.ou_max_half_life_windows` times the fitted spread's
+    length (the data shows less than that many half-lives of reversion), or
+    whose simulated OU paths do not revert in the trade's direction,
+    abstains (active, flat, confidence 0). Any other `ou_half_life` failure
+    is an error. Every non-signal branch clears the asset's open
+    direction."""
 
     agent_id: str = "ou_mean_reversion_analyst"
 
@@ -72,35 +106,50 @@ class OUMeanReversionAnalyst(AnalystAgent):
         spread = self._build_spread(market_data, as_of_date, asset)
         if spread.size < 10:
             self._open_direction_by_asset.pop(asset, None)
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient history to build an OU spread",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient history to build an OU spread"
             )
-
         try:
             raw_half_life = float(
                 self._refit_cache.get_or_refit(asset, as_of_date, lambda: ou_half_life(spread))
             )
-        except ValueError as exc:
+        except UndefinedResultError as exc:
+            self._open_direction_by_asset.pop(asset, None)
+            reason = undefined_slope_reason(spread)
+            if reason is not None:
+                return self.unavailable_signal(
+                    asset, as_of_date, f"OU half-life undefined on this spread: {reason}"
+                )
             logger.debug(
                 "%s: spread for %s does not exhibit mean reversion (%s) — holding.",
                 self.agent_id,
                 asset,
                 exc,
             )
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                "spread is not mean-reverting over the current window — holding",
+            )
+        except ValueError as exc:
             self._open_direction_by_asset.pop(asset, None)
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="spread is not mean-reverting over the current window — holding",
+            logger.warning("%s: ou_half_life failed for %s (%s).", self.agent_id, asset, exc)
+            return self.error_signal(asset, as_of_date, f"OU half-life fit failed: {exc}")
+        if not math.isfinite(raw_half_life):
+            self._open_direction_by_asset.pop(asset, None)
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"OU half-life undefined on this spread (estimate {raw_half_life})",
+            )
+        max_half_life = settings.analysts.ou_max_half_life_windows * spread.size
+        if raw_half_life > max_half_life:
+            self._open_direction_by_asset.pop(asset, None)
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                f"OU half-life {raw_half_life:.1f}d exceeds the {spread.size}-session fitted "
+                "window — not mean-reverting on a holdable horizon — holding",
             )
         half_life = max(raw_half_life, MIN_HALF_LIFE_DAYS)
         z_window = int(min(max(round(4 * half_life), 5), MAX_ZSCORE_WINDOW, spread.size))
@@ -119,14 +168,27 @@ class OUMeanReversionAnalyst(AnalystAgent):
             mu = float(np.mean(spread))
             sigma = float(np.std(spread, ddof=1))
             simulated = simulate_ou_paths(
-                theta, mu, sigma, spread[-1], t=half_life * 4, n_paths=500, n_steps=50, seed=42
+                theta,
+                mu,
+                sigma,
+                spread[-1],
+                t=half_life * 4,
+                n_paths=500,
+                n_steps=50,
+                seed=derived_seed(self.agent_id, asset, as_of_date.date()),
             )
             reverted_toward_mean = simulated[:, -1] - spread[-1]
             simulated_direction_agrees = (
                 direction == "long" and float(np.mean(reverted_toward_mean > 0)) > 0.5
             ) or (direction == "short" and float(np.mean(reverted_toward_mean < 0)) > 0.5)
             if not simulated_direction_agrees:
-                confidence = 0.0
+                self._open_direction_by_asset.pop(asset, None)
+                return self.abstain_signal(
+                    asset,
+                    as_of_date,
+                    f"simulated OU paths do not revert toward the {direction} trade "
+                    f"(z-score={current_z:.2f}, half-life={half_life:.1f}d) — holding",
+                )
 
         return AgentSignal(
             agent_id=self.agent_id,

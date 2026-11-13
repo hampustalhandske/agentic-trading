@@ -1,0 +1,205 @@
+# test_lake_contract.py
+
+"""Conformance of the lakehouse loaders with the lake's frozen data contract.
+
+`tests/fixtures/lakehouse_contract_v2.json` lists every view the loaders read
+(a `<table>_log` read is a read of the table's log, which has the table's columns)
+and each view's column names and DuckDB types, and each table's kind, keys and tie order.
+Registering those views as typed tables and running every loader proves each SQL statement binds
+against the contract's names and types. Every table is empty except the
+always-populated tables (`ALWAYS_POPULATED_TABLES`), which hold one unrelated
+row each because the loaders refuse to read one of them empty.
+"""
+
+import hashlib
+import inspect
+import json
+import re
+from collections.abc import Callable
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from agentic_trading.data.loaders import lakehouse_loader
+from edgelab_live import contract_text_path
+
+pytestmark = pytest.mark.unpinned_lake_reads
+
+_CONTRACT_PATH = Path(__file__).parents[3] / "fixtures" / "lakehouse_contract_v2.json"
+_CONTRACT = json.loads(_CONTRACT_PATH.read_text())
+_AS_OF = date(2024, 3, 15)
+_START = date(2024, 1, 2)
+_END = date(2024, 3, 15)
+
+_EMPTY_CASES: dict[str, Callable[[], Any]] = {
+    "load_sp500_member_securities_asof": lambda: lakehouse_loader.load_sp500_member_securities_asof(
+        _AS_OF
+    ),
+    "load_security_log_returns": lambda: (
+        lakehouse_loader.load_security_log_returns([1], _START, _END) or None
+    ),
+    "load_security_daily_bars": lambda: lakehouse_loader.load_security_daily_bars(
+        [1], _START, _END
+    ),
+    "load_sp500_member_count": lambda: lakehouse_loader.load_sp500_member_count(_START, _END),
+    "load_split_ex_dates": lambda: lakehouse_loader.load_split_ex_dates("AAPL", _AS_OF) or None,
+    "load_options_snapshot_from_lakehouse": lambda: (
+        lakehouse_loader.load_options_snapshot_from_lakehouse("AAPL", _AS_OF)
+    ),
+    "load_cot_positioning_from_lakehouse[disaggregated]": lambda: (
+        lakehouse_loader.load_cot_positioning_from_lakehouse("GC=F", _AS_OF)
+    ),
+    "load_cot_positioning_from_lakehouse[tff]": lambda: (
+        lakehouse_loader.load_cot_positioning_from_lakehouse("EURUSD=X", _AS_OF)
+    ),
+    "load_cot_reports_from_lakehouse[disaggregated]": lambda: (
+        lakehouse_loader.load_cot_reports_from_lakehouse("GC=F", _AS_OF)
+    ),
+    "load_cot_reports_from_lakehouse[tff]": lambda: (
+        lakehouse_loader.load_cot_reports_from_lakehouse("EURUSD=X", _AS_OF)
+    ),
+    "load_dividends_from_lakehouse": lambda: lakehouse_loader.load_dividends_from_lakehouse(
+        "AAPL", _AS_OF
+    ),
+    "load_earnings_surprise_from_lakehouse": lambda: (
+        lakehouse_loader.load_earnings_surprise_from_lakehouse("AAPL", _AS_OF)
+    ),
+    "load_sic_code_from_lakehouse": lambda: lakehouse_loader.load_sic_code_from_lakehouse("AAPL"),
+    "load_price_history_from_lakehouse": lambda: lakehouse_loader.load_price_history_from_lakehouse(
+        ["AAPL", "MSFT"], _START, _END
+    ),
+    "load_futures_price_history_from_lakehouse": lambda: (
+        lakehouse_loader.load_futures_price_history_from_lakehouse(["CL=F", "GC=F"], _START, _END)
+    ),
+    "load_policy_rates_from_lakehouse": lambda: lakehouse_loader.load_policy_rates_from_lakehouse(
+        ["USD", "JPY"], _START, _END
+    ),
+    "load_raw_close_from_lakehouse": lambda: lakehouse_loader.load_raw_close_from_lakehouse(
+        "AAPL", _AS_OF, 10
+    ),
+    "load_fred_series_from_lakehouse": lambda: lakehouse_loader.load_fred_series_from_lakehouse(
+        "DGS3MO", _AS_OF
+    ),
+    "load_fred_vintages_from_lakehouse": lambda: lakehouse_loader.load_fred_vintages_from_lakehouse(
+        "DGS3MO", _AS_OF
+    ),
+    "load_fama_french_factors_from_lakehouse[3factor]": lambda: (
+        lakehouse_loader.load_fama_french_factors_from_lakehouse(_AS_OF, "3factor")
+    ),
+    "load_fama_french_factors_from_lakehouse[5factor]": lambda: (
+        lakehouse_loader.load_fama_french_factors_from_lakehouse(_AS_OF, "5factor")
+    ),
+    "load_company_facts_from_lakehouse": lambda: lakehouse_loader.load_company_facts_from_lakehouse(
+        "AAPL", _AS_OF
+    ),
+    "load_short_interest_from_lakehouse": lambda: (
+        lakehouse_loader.load_short_interest_from_lakehouse("AAPL", _AS_OF)
+    ),
+    "load_insider_transactions_from_lakehouse": lambda: (
+        lakehouse_loader.load_insider_transactions_from_lakehouse("AAPL", _AS_OF)
+    ),
+    "load_option_quote_from_lakehouse": lambda: lakehouse_loader.load_option_quote_from_lakehouse(
+        "AAPL", date(2024, 6, 21), "call", 190.0, _AS_OF, 10
+    ),
+}
+
+
+def _register_contract(fake_lake: Any) -> None:
+    """Creates every contract view as an empty table with its exact column types, except
+    that each adjustment table holds one row for an unrelated security and
+    `cftc_cot_publication` and `sp500_membership` one row matching no read, so the loaders'
+    empty-table guards pass."""
+    for view, columns in _CONTRACT["views"].items():
+        quoted = {
+            f'"{name}"': ("VARCHAR" if kind == '"NULL"' else kind) for name, kind in columns.items()
+        }
+        fake_lake.add_empty(view, quoted)
+    fake_lake._connection.execute(
+        "INSERT INTO equity_adjustment_factors (ticker, effective_date, cum_factor, security_id) "
+        "VALUES ('ZZUNREL', DATE '2000-01-03', 0.5, 999)"
+    )
+    fake_lake._connection.execute(
+        "INSERT INTO yahoo_split_close_basis (ticker, ex_date, ratio) "
+        "VALUES ('ZZUNREL', DATE '2000-01-03', 0.5)"
+    )
+    fake_lake._connection.execute(
+        "INSERT INTO cftc_cot_publication (report_date, published_date) "
+        "VALUES (DATE '2000-01-04', DATE '2000-01-07')"
+    )
+    fake_lake._connection.execute(
+        "INSERT INTO sp500_membership (ticker, start_date, end_date) "
+        "VALUES ('ZZUNREL', DATE '2000-01-03', DATE '2000-06-30')"
+    )
+
+
+@pytest.mark.parametrize("case", list(_EMPTY_CASES), ids=list(_EMPTY_CASES))
+def test_loader_sql_binds_against_contract_and_returns_empty_value(
+    fake_lake: Any, case: str
+) -> None:
+    """Each loader's SQL runs on empty contract-typed views and yields its empty value."""
+    _register_contract(fake_lake)
+
+    assert _EMPTY_CASES[case]() is None
+    assert fake_lake.calls
+
+
+def test_every_public_loader_has_a_conformance_case() -> None:
+    """No public `load_*` function in the loader module escapes the conformance cases."""
+    public = {
+        name
+        for name, member in inspect.getmembers(lakehouse_loader, inspect.isfunction)
+        if name.startswith("load_") and member.__module__ == lakehouse_loader.__name__
+    }
+    covered = {case.split("[")[0] for case in _EMPTY_CASES}
+
+    assert public == covered
+
+
+def test_every_table_in_loader_sql_is_a_contract_view() -> None:
+    """Each table the loader's SQL names, through `_table_sql` or `READ_TABLES`, is a view in the
+    frozen contract (a `<table>_log` read is a view's log), and every table its SQL names is in
+    `READ_TABLES`."""
+    assert _CONTRACT["contract"] == "lakehouse-contract-v2"
+    source = Path(inspect.getsourcefile(lakehouse_loader) or "").read_text()
+    named = set(re.findall(r"_table_sql\(\s*[\"']([A-Za-z_][A-Za-z0-9_]*)[\"']", source))
+    read = set(lakehouse_loader.READ_TABLES)
+
+    assert named
+    assert re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", source) == []
+    assert {name.removesuffix("_log") for name in named | read} <= set(_CONTRACT["views"])
+    assert named <= read
+
+
+def test_every_read_table_has_the_key_and_tie_order_the_loader_expects() -> None:
+    """Each table the loader reads is in the contract's `tables` with a kind the loader handles;
+    a "current" table serves a `tie_order` (a pinned read of one without it is refused), and its
+    keys and tie order name columns of its view."""
+    bases = {name.removesuffix("_log") for name in lakehouse_loader.READ_TABLES}
+
+    assert bases == set(_CONTRACT["tables"]) == set(_CONTRACT["views"])
+    for table, entry in _CONTRACT["tables"].items():
+        assert entry["kind"] in {"current", "rebuilt_whole", "append_only"}, table
+        columns = set(_CONTRACT["views"][table])
+        if entry["kind"] == "current":
+            assert entry["keys"], table
+            assert isinstance(entry["tie_order"], list), table
+            assert set(entry["keys"]) | set(entry["tie_order"]) <= columns, table
+
+
+@pytest.mark.private_contract
+def test_vendored_subset_matches_the_full_contract_text() -> None:
+    """The served contract text hashes to the vendored `sha256`, re-serialising its parsed
+    document gives the same bytes, and every vendored entry equals the full document's."""
+    raw = contract_text_path().read_bytes()
+    full = json.loads(raw)
+
+    assert hashlib.sha256(raw).hexdigest() == _CONTRACT["sha256"]
+    assert (json.dumps(full, indent=1) + "\n").encode() == raw
+    for key in ("contract", "frozen_on", "supersedes", "schemas", "guarantees"):
+        assert _CONTRACT[key] == full[key], key
+    for section in ("views", "tables"):
+        assert _CONTRACT[section], section
+        for table, entry in _CONTRACT[section].items():
+            assert full[section][table] == entry, (section, table)

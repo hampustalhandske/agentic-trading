@@ -6,7 +6,8 @@ Two things every options analyst in this pod reads from one place, so
 they all see the same numbers on the same day:
 
 - **Real option chain**: the lakehouse's historical chain snapshot for
-  the asset (`real_atm_options_by_expiration`), reduced to one ATM row
+  the asset as published by the decision date
+  (`real_atm_options_by_expiration`), reduced to one ATM row
   per real expiration. The pod is scoped (`cvar_manager.OPTIONS_ASSETS`)
   to tickers with real chain coverage, and an analyst that still finds
   no snapshot for a given date returns a flat, zero-confidence signal —
@@ -16,37 +17,64 @@ they all see the same numbers on the same day:
   volatility view that gets compared against the real market quote.
 """
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 
 from agentic_trading.agents._market_math import RefitCache, conditional_daily_volatility
-from agentic_trading.data.loaders.lakehouse_loader import load_options_snapshot_from_lakehouse
+from agentic_trading.agents.base import DataRequirement
+from agentic_trading.agents.schemas import VolatilityProvenance
+from agentic_trading.config import settings
+from agentic_trading.data.loaders.lakehouse_loader import (
+    DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS,
+    load_options_snapshot_from_lakehouse,
+)
+from agentic_trading.data.loaders.option_marks import published_chain_date
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 TRADING_DAYS_PER_YEAR = 252
 
-# Shared across every CVaR-pod analyst that calls annualized_garch_volatility
-# (a plain module-level function, not bound to any one analyst instance) —
-# keyed by (agent_id, asset), so each analyst still gets its own independent
-# refit cadence rather than accidentally sharing one analyst's fit with
-# another's.
-_GARCH_REFIT_CACHE = RefitCache()
-
 
 def annualized_garch_volatility(
-    returns: np.ndarray, agent_id: str, asset: str, as_of_date: pd.Timestamp
+    returns: np.ndarray,
+    refit_cache: RefitCache,
+    agent_id: str,
+    asset: str,
+    as_of_date: pd.Timestamp,
+    provenance: VolatilityProvenance | None = None,
 ) -> float:
     """Annualized (sqrt 252) one-step-ahead conditional volatility from
     `_market_math.conditional_daily_volatility` (a sanity-checked
-    GARCH(1,1), EWMA when the fit is unusable), refit at most once every
-    `_GARCH_REFIT_CACHE.refit_interval_days` simulated days per
-    (agent_id, asset)."""
+    GARCH(1,1), EWMA when the fit is unusable), which sets `provenance`'s
+    estimator when one is given. The fit is kept in the
+    caller's `refit_cache` under `"<agent_id>:<asset>"` and refit at most
+    once every `refit_cache.refit_interval_days` simulated days. Pass a
+    cache the analyst holds as a private attribute, so a checkpoint
+    carries it."""
     daily_volatility = conditional_daily_volatility(
-        returns, _GARCH_REFIT_CACHE, f"{agent_id}:{asset}", as_of_date, agent_id
+        returns, refit_cache, f"{agent_id}:{asset}", as_of_date, agent_id, provenance=provenance
     )
     return daily_volatility * float(np.sqrt(TRADING_DAYS_PER_YEAR))
+
+
+def options_chain_requirements() -> tuple[DataRequirement, ...]:
+    """The option-chain `DataRequirement` of every analyst reading
+    `real_atm_options_by_expiration`: the snapshot it sees on a decision
+    date is at most `settings.options.publication_lag_days` plus
+    `DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS` calendar days old."""
+    return (
+        DataRequirement(
+            source="options_chain",
+            identifier="{ticker}",
+            asset_scoped=True,
+            description="Option chain snapshots",
+            lookback_days=settings.options.publication_lag_days
+            + DEFAULT_OPTIONS_SNAPSHOT_LOOKBACK_DAYS,
+        ),
+    )
 
 
 def real_atm_options_by_expiration(
@@ -59,14 +87,19 @@ def real_atm_options_by_expiration(
     the strike closest to `spot`, that strike's call/put implied
     volatility averaged (put-call parity means they're already close;
     averaging is noise reduction, not a new assumption), and the call
-    leg's real delta/gamma. `days_to_expiration` is measured from the
-    snapshot's own date, not `as_of_date` (they can differ by up to the
-    loader's `lookback_days`, since coverage isn't daily-dense).
+    leg's real delta/gamma. Only a snapshot already published by
+    `as_of_date` is visible: one dated on or before
+    `option_marks.published_chain_date(as_of_date)`. `days_to_expiration` is
+    measured from the snapshot's own date, not `as_of_date` (they differ
+    by at least the publication lag and up to the lag plus the loader's
+    `lookback_days`, since coverage isn't daily-dense), floored at 1, so an
+    expiration on or before the day after the snapshot counts as 1. Rows
+    are sorted by `days_to_expiration`, then `expiration`.
 
     Returns `None` if `asset` has no real snapshot for this date; every
     CVaR-pod analyst calling this then reports flat with zero confidence
     rather than pricing off a model-implied substitute quote."""
-    snapshot = load_options_snapshot_from_lakehouse(asset, as_of_date.date())
+    snapshot = load_options_snapshot_from_lakehouse(asset, published_chain_date(as_of_date.date()))
     if snapshot is None or snapshot.empty:
         return None
 
@@ -87,6 +120,7 @@ def real_atm_options_by_expiration(
         days_to_expiration = max(int((expiration - snapshot_date).days), 1)
         rows.append(
             {
+                "snapshot_date": snapshot_date,
                 "expiration": expiration,
                 "days_to_expiration": days_to_expiration,
                 "strike": float(np.asarray(nearest_strike, dtype=np.float64)),
@@ -97,4 +131,16 @@ def real_atm_options_by_expiration(
         )
     if not rows:
         return None
-    return pd.DataFrame(rows).sort_values("days_to_expiration").reset_index(drop=True)
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["days_to_expiration", "expiration"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def chain_snapshot_date(options: pd.DataFrame) -> date:
+    """The date of the chain snapshot a non-empty
+    `real_atm_options_by_expiration` frame was reduced from: an
+    end-of-day quote published at that date's close, so the publication
+    date of the data a signal read off `options` rests on."""
+    return pd.Timestamp(options["snapshot_date"].iloc[0]).date()

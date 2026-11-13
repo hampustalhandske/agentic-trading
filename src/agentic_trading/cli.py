@@ -1,24 +1,58 @@
 # cli.py
 
+import hashlib
 import json
-from datetime import date
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import date, datetime, timedelta
+from importlib import metadata
+from pathlib import Path
+from typing import cast, get_args
 
 import typer
+from pydantic import BaseModel, ConfigDict
 
+from agentic_trading import provenance
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.commander import Commander
-from agentic_trading.agents.roster import build_default_analysts, build_default_managers
+from agentic_trading.agents.managers.cross_asset_manager import CRYPTO_ASSETS
+from agentic_trading.agents.roster import (
+    FIRM_V1_EQUITY_SECURITY_IDS,
+    FIRM_V1_EXCLUDED_ANALYST_IDS,
+    FIRM_V1_UNIVERSE,
+    FIRM_V1_WINDOW_END,
+    FIRM_V1_WINDOW_START,
+    build_default_analysts,
+    build_default_managers,
+)
 from agentic_trading.agents.schemas import BacktestResult
+from agentic_trading.backtest import checkpoint_store
 from agentic_trading.backtest.baselines import BaselineCommander, SingleAnalystCommander
-from agentic_trading.backtest.engine import BacktestEngine
-from agentic_trading.backtest.portfolio import Portfolio
-from agentic_trading.backtest.preflight import check_data_availability
+from agentic_trading.backtest.engine import BacktestEngine, CommanderLike
+from agentic_trading.backtest.engine_inputs import load_engine_inputs
+from agentic_trading.backtest.preflight import check_data_availability, check_price_coverage
+from agentic_trading.backtest.resume_fingerprint import roster_agents
 from agentic_trading.config import apply_overrides, parse_override, settings
 from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
     load_price_history_with_fallback,
 )
-from agentic_trading.data.loaders.macro_loader import load_risk_free_rate_series
+from agentic_trading.data.loaders.lakehouse_loader import (
+    check_lake_version_pair,
+    declare_loader_window,
+    lake_answer_cache,
+    lake_answer_cache_counts,
+    lake_requests_in_flight,
+    lake_session,
+    loader_query_counts,
+    loader_store_usage,
+    require_lake_health,
+    reset_loader_query_counts,
+)
 
 # NOTE: adjust this import to wherever ticker_catalog.py actually lives in the
 # repo (it reads as a data/ module from its own docstring — "data/loader.py"
@@ -29,12 +63,28 @@ from agentic_trading.data.ticker_catalog import (
     TickerGroup,
     tickers_by_asset_class,
 )
+from agentic_trading.firm_record.runner import run_firm_record
+from agentic_trading.firm_record.spec import _HASHED_ROOTS, build_firm_spec
 from agentic_trading.logging_config import configure_logging, get_logger
+from agentic_trading.provenance import build_run_provenance
 from agentic_trading.scoring.track_record import TrackRecord
 from agentic_trading.scoring.weighting import Hedge, ShrinkageWeight
+from agentic_trading.stage_a.runner import EXCLUDED_ANALYSTS, run_batch
+from agentic_trading.stage_a.spec import (
+    FirmSpecRecord,
+    _module_hashes,
+    _package_source,
+    firm_spec_hash,
+)
+from agentic_trading.stage_a.store import InstrumentKind
+from agentic_trading.trials.ledger import TrialLedger
+from agentic_trading.trials.rows import firm_registered_trials
 
 app = typer.Typer()
 experiment_app = typer.Typer()
+stage_a_app = typer.Typer()
+firm_record_app = typer.Typer()
+firm_review_app = typer.Typer()
 
 # Every asset class CATALOG actually classifies into (see ticker_catalog.py's
 # AssetClass) — options are deliberately excluded there, so they're
@@ -164,23 +214,165 @@ def _parse_date_flag(value: str, flag_name: str) -> date:
         ) from exc
 
 
+_LAKE_TIME_EXAMPLE = "2024-06-01T12:00:00+00:00"
+_LAKE_TIME_HELP = (
+    "Lake time T every lakehouse read sees, as ISO 8601 with a UTC offset "
+    f"(e.g. {_LAKE_TIME_EXAMPLE} or 2024-06-01T12:00:00Z). Rerun at an earlier run's "
+    "recorded lake_time to read the same lake state. Default: 1 s after the newest "
+    "write of the tables the run reads."
+)
+
+_LAKE_VERSION_HELP = (
+    "Lake version the record reads at, the X-Lakehouse-Version pair <code>.<builds> "
+    "(e.g. 5941cb993106.989067ad8ba0), pinned the way --lake-time pins T: every response must "
+    "carry its code part, and the record writes this pair. Required with --lake-time for a "
+    "counted record unless the store already holds the trial, whose recorded pair is then "
+    "used. Default: the first version the lake answers with."
+)
+
+_LOADER_STORE_HELP = (
+    "Serve the loaders' per-day reads from data read once over the run's window "
+    "(the window store); --no-loader-store makes every read query the lake itself. "
+    "Both give the same result."
+)
+
+# Prefix of the stderr line holding the run's loader query counts as JSON.
+LOADER_QUERY_COUNTS_PREFIX = "loader-query-counts "
+# Prefix of the stderr line holding the window store's memory as JSON.
+LOADER_STORE_USAGE_PREFIX = "loader-store-usage "
+# Prefix of the stderr line holding the lake answer cache's counts as JSON.
+LAKE_ANSWER_CACHE_PREFIX = "lake-answer-cache "
+# The firm record's lake answer cache directory under --store-dir, unless
+# --lake-cache-dir names one.
+FIRM_RECORD_LAKE_CACHE_DIR = "lake_cache"
+
+
+def declare_run_window(enabled: bool, start: date, end: date, warmup_days: int) -> None:
+    """Resets the loader query counts and, when `enabled`, declares the
+    open session's window store for a run from `start` to `end` with
+    `warmup_days` calendar days of warm-up: from `start - warmup_days`
+    to `end`."""
+    reset_loader_query_counts()
+    if enabled:
+        declare_loader_window(start - timedelta(days=warmup_days), end)
+
+
+def echo_loader_query_counts() -> None:
+    """Writes one stderr line: `LOADER_QUERY_COUNTS_PREFIX` and the JSON
+    list of `loader_query_counts()`."""
+    counts = [count.model_dump() for count in loader_query_counts()]
+    typer.echo(LOADER_QUERY_COUNTS_PREFIX + json.dumps(counts), err=True)
+
+
+def echo_loader_store_usage() -> None:
+    """Writes one stderr line: `LOADER_STORE_USAGE_PREFIX` and the JSON of
+    `loader_store_usage()` (`null` when no window store is declared)."""
+    usage = loader_store_usage()
+    text = "null" if usage is None else usage.model_dump_json()
+    typer.echo(LOADER_STORE_USAGE_PREFIX + text, err=True)
+
+
+def echo_lake_answer_cache_counts() -> None:
+    """Writes one stderr line: `LAKE_ANSWER_CACHE_PREFIX` and the JSON of
+    `lake_answer_cache_counts()` (`null` when no cache is open)."""
+    counts = lake_answer_cache_counts()
+    text = "null" if counts is None else counts.model_dump_json()
+    typer.echo(LAKE_ANSWER_CACHE_PREFIX + text, err=True)
+
+
+def _parse_lake_time_flag(value: str | None) -> datetime | None:
+    """The `--lake-time` value as an aware `datetime`, or `None` when the
+    flag was not given. A value that is not ISO 8601, or that has no UTC
+    offset, is a usage error."""
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"--lake-time must be ISO 8601 with a UTC offset (e.g. {_LAKE_TIME_EXAMPLE}), "
+            f"got {value!r}."
+        ) from exc
+    if parsed.utcoffset() is None:
+        raise typer.BadParameter(
+            f"--lake-time {value!r} has no UTC offset; add one, e.g. {_LAKE_TIME_EXAMPLE}."
+        )
+    return parsed
+
+
+def _parse_lake_version_flag(value: str | None) -> str | None:
+    """The `--lake-version` value, or `None` when the flag was not given. A
+    value that is not `<code>.<builds>` (`check_lake_version_pair`) is a
+    usage error."""
+    if value is None:
+        return None
+    try:
+        return check_lake_version_pair(value.strip())
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--lake-version") from exc
+
+
+def _recorded_lake_version(
+    store_dir: Path,
+    commander: Commander,
+    tickers: list[str],
+    window_start: date,
+    window_end: date,
+    lake_time: datetime,
+) -> str | None:
+    """The lake version the spec.json under `store_dir` records for the
+    firm trial of `commander` over `tickers` from `window_start` to
+    `window_end` at `lake_time` (its spec built as `run_firm_record` builds
+    it, read from `store_dir / <spec hash> / spec.json`), or `None` when the
+    store holds no spec.json for that trial."""
+    spec = build_firm_spec(commander, tickers, window_start, window_end, lake_time)
+    spec_path = store_dir / firm_spec_hash(spec) / "spec.json"
+    if not spec_path.exists():
+        return None
+    return FirmSpecRecord.model_validate_json(spec_path.read_bytes()).lake_version
+
+
+def _checkpoint_lake_time(checkpoint_paths: list[str | None]) -> datetime | None:
+    """The lake time stored in the given checkpoint files (missing paths
+    and files without one are skipped), or `None` when none stores one.
+    Two checkpoints storing different lake times are a usage error: one
+    experiment reads at one lake time."""
+    stored = {
+        lake_time
+        for path in checkpoint_paths
+        if path is not None
+        and (lake_time := checkpoint_store.read_lake_time(Path(path))) is not None
+    }
+    if len(stored) > 1:
+        listed = ", ".join(sorted(lake_time.isoformat() for lake_time in stored))
+        raise typer.BadParameter(
+            f"the checkpoints were written at different lake times ({listed}); "
+            "resume them separately or pass --lake-time"
+        )
+    return next(iter(stored), None)
+
+
 def resolve_roster_after_preflight(
     analysts: list[AnalystAgent],
     assets: list[str],
     start_date: date,
     end_date: date,
     *,
+    warmup_days: int,
     auto_confirm: bool,
 ) -> list[AnalystAgent]:
     """Runs `check_data_availability` against the final roster/ticker
-    list, prints a report for anything that can't run fully with real
-    lakehouse data, and — unless `auto_confirm` — asks once (a single
+    list over the run window plus its `warmup_days` of history, prints a
+    report for anything that can't run fully with real lakehouse data,
+    and — unless `auto_confirm` — asks once (a single
     batched prompt covering every failing analyst, not one per analyst)
     whether to drop them and continue. Exits the process on a decline,
     or on any failure at all when `auto_confirm` is False and the run
     isn't interactive enough to ask (Typer's `confirm` itself handles
     the actual prompting)."""
-    report = check_data_availability(analysts, assets, start_date, end_date)
+    report = check_data_availability(
+        analysts, assets, start_date, end_date, warmup_days=warmup_days
+    )
     if not report.failing_analyst_ids:
         return analysts
 
@@ -205,14 +397,26 @@ def resolve_roster_after_preflight(
 # --------------------------------------------------------------------------
 
 
+# Settings read once at import (`firm.max_leverage` bounds the Pydantic
+# schemas in `agents/schemas.py`), so a `--set` for them would be recorded
+# in provenance without changing what the run trades on.
+_IMPORT_TIME_SETTINGS = frozenset({"firm.max_leverage"})
+
+
 def _apply_cli_overrides(tokens: list[str]) -> dict[str, str]:
     """Parse repeated `--set group.field=value` tokens and apply them to
-    `config.settings` before any analyst/manager is built; a bad key or
-    out-of-range value is a usage error, not a silent default."""
+    `config.settings` before any analyst/manager is built; a bad key,
+    an out-of-range value, or a key in `_IMPORT_TIME_SETTINGS` is a usage
+    error, not a silent default."""
     overrides: dict[str, str] = {}
     for token in tokens:
         try:
             key, value = parse_override(token)
+            if key in _IMPORT_TIME_SETTINGS:
+                raise ValueError(
+                    f"{key} is read at import and cannot be overridden with --set; "
+                    "change its default in config.py instead"
+                )
             apply_overrides({key: value})
         except (KeyError, ValueError) as exc:
             raise typer.BadParameter(str(exc)) from exc
@@ -246,9 +450,6 @@ def run(
     parallel_workers: int = typer.Option(
         4, min=1, help="Concurrent manager-signal workers used within each simulated day."
     ),
-    parallel_backend: str = typer.Option(
-        "thread", help="Concurrency backend: 'thread' for APIs or 'process' for CPU-heavy runs."
-    ),
     set_override: list[str] = typer.Option(  # noqa: B008
         [],
         "--set",
@@ -263,10 +464,21 @@ def run(
         help="Auto-drop analysts that fail the real-data preflight check instead of "
         "prompting — required for scripted/CI use.",
     ),
+    lake_time: str | None = typer.Option(None, "--lake-time", help=_LAKE_TIME_HELP),
+    loader_store: bool = typer.Option(
+        True, "--loader-store/--no-loader-store", help=_LOADER_STORE_HELP
+    ),
 ) -> None:
     """Wires together Portfolio, Commander, and BacktestEngine for the
     given assets and date range, runs the backtest, and prints a summary
-    of the resulting BacktestResult.
+    of the resulting BacktestResult. Every lakehouse read (the preflight,
+    the price history, the engine run and the provenance) happens inside
+    one lake session, at `--lake-time` or the default lake time, and the
+    provenance records it. Unless `--no-loader-store`, the session's
+    window store is declared from the start date minus the warm-up to the
+    end date. The loader query counts and the window store's memory go to
+    stderr as one `LOADER_QUERY_COUNTS_PREFIX` and one
+    `LOADER_STORE_USAGE_PREFIX` line.
 
     Run with every argument given (assets + --start-date + --end-date) for a
     fully non-interactive, scriptable invocation — nothing is prompted, and a
@@ -287,6 +499,7 @@ def run(
         uv run agentic-trading-cli AAPL MSFT GOOGL \\
             --start-date 2023-01-01 --end-date 2023-12-31
     """
+    requested_lake_time = _parse_lake_time_flag(lake_time)
     # True whenever anything essential wasn't supplied on the command line —
     # this is also what gates the portfolio-construction prompt, so a fully
     # scripted invocation that omits --portfolio-construction silently
@@ -318,9 +531,6 @@ def run(
             f"--start-date ({parsed_start_date.isoformat()})."
         )
 
-    if parallel_backend not in {"thread", "process"}:
-        raise typer.BadParameter("--parallel-backend must be 'thread' or 'process'")
-
     typer.echo()
     typer.echo(f"  Assets:                 {', '.join(resolved_assets)}")
     typer.echo(
@@ -338,52 +548,88 @@ def run(
         parsed_start_date,
         parsed_end_date,
     )
-    analysts = resolve_roster_after_preflight(
-        build_default_analysts(),
-        resolved_assets,
-        parsed_start_date,
-        parsed_end_date,
-        auto_confirm=yes,
-    )
-    commander = Commander(
-        managers=build_default_managers(analysts),
-        weighting_strategy=ShrinkageWeight(Hedge()),
-        parallel_workers=parallel_workers,
-        parallel_backend=parallel_backend,  # type: ignore[arg-type]
-    )
-    # Pre-fetched once, lakehouse-only, rather than passed to
-    # BacktestEngine as a lazy callable: this way the CLI can log the
-    # source_label the run actually used, and the engine's data_loader
-    # stays a trivial pass-through.
-    market_data, source_label = load_price_history_with_fallback(
-        resolved_assets,
-        parsed_start_date,
-        parsed_end_date,
-        warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
-    )
-    logger.info("Market data source: %s", source_label)
-    engine = BacktestEngine(
-        commander=commander,
-        portfolio=Portfolio(cash=settings.firm.starting_cash, positions={}),
-        track_record=TrackRecord(),
-        data_loader=lambda _assets, _start, _end: market_data,
-        start_date=parsed_start_date,
-        end_date=parsed_end_date,
-        assets=resolved_assets,
-        market_data_source=source_label,
-        execution_lag_days=settings.firm.execution_lag_days,
-    )
-    try:
-        result = engine.run()
-    except Exception:
-        logger.exception(
-            "CLI run failed for assets=%s (%s to %s)",
+    with lake_session(requested_lake_time) as session:
+        logger.info("Reading the lake at lake time %s", session.lake_time.isoformat())
+        declare_run_window(
+            loader_store, parsed_start_date, parsed_end_date, DEFAULT_BACKTEST_WARMUP_DAYS
+        )
+        analysts = resolve_roster_after_preflight(
+            build_default_analysts(),
             resolved_assets,
             parsed_start_date,
             parsed_end_date,
+            warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+            auto_confirm=yes,
         )
-        raise
-    typer.echo(result.model_dump_json(indent=2))
+        managers = build_default_managers(analysts)
+        provenance = build_run_provenance(
+            {
+                "assets": resolved_assets,
+                "start_date": parsed_start_date.isoformat(),
+                "end_date": parsed_end_date.isoformat(),
+                "parallel_workers": parallel_workers,
+                "set": list(set_override),
+                "yes": yes,
+                "verbose": verbose,
+                "no_log": no_log,
+                "lake_time": lake_time,
+                "loader_store": loader_store,
+            },
+            [analyst.agent_id for analyst in analysts],
+            [manager.agent_id for manager in managers],
+        )
+        commander = Commander(
+            managers=managers,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            parallel_workers=parallel_workers,
+        )
+        # Pre-fetched once, lakehouse-only, rather than passed to
+        # BacktestEngine as a lazy callable: this way the CLI can log the
+        # source label the run actually used, and the engine's data_loader
+        # stays a trivial pass-through.
+        inputs = load_engine_inputs(
+            resolved_assets,
+            parsed_start_date,
+            parsed_end_date,
+            warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+            align="intersection",
+        )
+        logger.info("Market data source: %s", inputs.market_data_source)
+        engine = BacktestEngine(
+            commander=commander,
+            portfolio=inputs.portfolio(),
+            track_record=TrackRecord(),
+            data_loader=inputs.data_loader,
+            start_date=parsed_start_date,
+            end_date=parsed_end_date,
+            assets=inputs.assets,
+            market_data_source=inputs.market_data_source,
+            execution_lag_days=settings.firm.execution_lag_days,
+            risk_free_rate_series=inputs.risk_free_rate_series,
+            policy_rates=inputs.policy_rates,
+            benchmark_returns=inputs.benchmark_returns,
+        )
+        try:
+            result = engine.run()
+        except Exception:
+            logger.exception(
+                "CLI run failed for assets=%s (%s to %s)",
+                resolved_assets,
+                parsed_start_date,
+                parsed_end_date,
+            )
+            raise
+        echo_loader_query_counts()
+        echo_loader_store_usage()
+        typer.echo(
+            json.dumps(
+                {
+                    "provenance": provenance.model_dump(mode="json"),
+                    "result": result.model_dump(mode="json"),
+                },
+                indent=2,
+            )
+        )
 
 
 @experiment_app.command()
@@ -401,24 +647,24 @@ def experiment(
     parallel_workers: int = typer.Option(
         4, min=1, help="Concurrent manager-signal workers per simulated day."
     ),
-    parallel_backend: str = typer.Option(
-        "thread", help="Concurrency backend: 'thread' or 'process'."
-    ),
-    commission_rate: float = typer.Option(
-        settings.firm.commission_rate,
+    commission_rate: float | None = typer.Option(
+        None,
         min=0.0,
-        help="Commission as a fraction of traded notional (default: firm.commission_rate).",
+        help="Commission as a fraction of traded notional "
+        "(default: firm.commission_rate, after --set).",
     ),
-    slippage_bps: float = typer.Option(
-        settings.firm.slippage_bps,
+    slippage_bps: float | None = typer.Option(
+        None,
         min=0.0,
-        help="Execution slippage in basis points per trade (default: firm.slippage_bps).",
+        help="Execution slippage in basis points per trade "
+        "(default: firm.slippage_bps, after --set).",
     ),
-    execution_lag_days: int = typer.Option(
-        settings.firm.execution_lag_days,
+    execution_lag_days: int | None = typer.Option(
+        None,
         min=0,
         max=1,
-        help="Bars between signal formation and execution (default: firm.execution_lag_days).",
+        help="Bars between signal formation and execution "
+        "(default: firm.execution_lag_days, after --set).",
     ),
     calibration_checkpoint: str | None = typer.Option(
         None, help="JSON checkpoint path for calibration; add --resume to continue it."
@@ -432,8 +678,8 @@ def experiment(
     ),
     include_isolated: bool = typer.Option(
         False,
-        help="Run every analyst and manager as an isolated test strategy; "
-        "slower but more diagnostic.",
+        help="Refused: the isolated runs would reuse the test phase's analyst instances, "
+        "whose model-refit caches hold fits dated up to the test end (look-ahead).",
     ),
     exclude_analyst: list[str] = typer.Option(  # noqa: B008
         [],
@@ -454,6 +700,21 @@ def experiment(
         help="Auto-drop analysts that fail the real-data preflight check instead of "
         "prompting — required for scripted/CI use.",
     ),
+    lake_time: str | None = typer.Option(
+        None,
+        "--lake-time",
+        help=_LAKE_TIME_HELP + " With --resume and no --lake-time, the lake time stored "
+        "in the checkpoints.",
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Log detailed per-step timing (log-file only)."
+    ),
+    no_log: bool = typer.Option(
+        False, "--no-log", help="Disable logging entirely — nothing is written to the log file."
+    ),
+    loader_store: bool = typer.Option(
+        True, "--loader-store/--no-loader-store", help=_LOADER_STORE_HELP
+    ),
 ) -> None:
     """Run a calibration phase followed by a separate out-of-sample test phase.
 
@@ -461,9 +722,20 @@ def experiment(
     not train a machine-learning model.
     The test phase starts with fresh portfolio holdings but carries those
     learned weights forward. Both phases use strict real market data.
+
+    Both phases, the baselines and the provenance read the lake inside one
+    lake session: at `--lake-time` when given; otherwise, with `--resume`,
+    at the lake time stored in the checkpoints; otherwise at the default
+    lake time. Unless `--no-loader-store`, the session's window store is
+    declared from the training start minus `--warmup-days` to the test
+    end.
+
+    The JSON result is the only thing on stdout; progress messages and
+    one `LOADER_QUERY_COUNTS_PREFIX` line of loader query counts and one
+    `LOADER_STORE_USAGE_PREFIX` line of window-store memory go to
+    stderr, and the run log to `log/agentic_trading.log` (none with
+    `--no-log`).
     """
-    if parallel_backend not in {"thread", "process"}:
-        raise typer.BadParameter("--parallel-backend must be 'thread' or 'process'")
     parsed_train_start = _parse_date_flag(train_start, "--train-start")
     parsed_train_end = _parse_date_flag(train_end, "--train-end")
     parsed_test_start = _parse_date_flag(test_start, "--test-start")
@@ -472,10 +744,36 @@ def experiment(
         raise typer.BadParameter("--train-end must be before --test-start")
     if parsed_test_end <= parsed_test_start:
         raise typer.BadParameter("--test-end must be after --test-start")
+    if include_isolated:
+        raise typer.BadParameter(
+            "--include-isolated is refused: the isolated runs would reuse the test phase's "
+            "analyst instances, whose model-refit caches hold fits dated up to the test end "
+            "(look-ahead)."
+        )
+    requested_lake_time = _parse_lake_time_flag(lake_time)
+    if requested_lake_time is None and resume:
+        requested_lake_time = _checkpoint_lake_time([calibration_checkpoint, test_checkpoint])
 
     resolved_assets = [symbol.strip().upper() for symbol in assets]
-    configure_logging(disable=True)
+    configure_logging(verbose=verbose, disable=no_log, console=False)
     overrides = _apply_cli_overrides(set_override)
+    # An explicit flag wins; otherwise the firm setting as `--set` left it.
+    resolved_commission_rate = (
+        settings.firm.commission_rate if commission_rate is None else commission_rate
+    )
+    resolved_slippage_bps = settings.firm.slippage_bps if slippage_bps is None else slippage_bps
+    resolved_execution_lag_days = (
+        settings.firm.execution_lag_days if execution_lag_days is None else execution_lag_days
+    )
+    # The resolved values go back onto `settings.firm`, so the no-trade band
+    # and the provenance read the same costs the fills pay.
+    apply_overrides(
+        {
+            "firm.commission_rate": resolved_commission_rate,
+            "firm.slippage_bps": resolved_slippage_bps,
+            "firm.execution_lag_days": resolved_execution_lag_days,
+        }
+    )
     excluded = frozenset(analyst_id.strip() for analyst_id in exclude_analyst)
     analysts = build_default_analysts(excluded_analyst_ids=excluded)
     typer.echo(
@@ -483,181 +781,918 @@ def experiment(
         f"{', '.join(sorted(excluded)) or 'none'}",
         err=True,
     )
-    analysts = resolve_roster_after_preflight(
-        analysts,
-        resolved_assets,
-        parsed_train_start,
-        parsed_test_end,
-        auto_confirm=yes,
+    with lake_session(requested_lake_time) as session:
+        typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
+        declare_run_window(loader_store, parsed_train_start, parsed_test_end, warmup_days)
+        analysts = resolve_roster_after_preflight(
+            analysts,
+            resolved_assets,
+            parsed_train_start,
+            parsed_test_end,
+            warmup_days=warmup_days,
+            auto_confirm=yes,
+        )
+        managers = build_default_managers(analysts)
+        provenance = build_run_provenance(
+            {
+                "assets": resolved_assets,
+                "train_start": parsed_train_start.isoformat(),
+                "train_end": parsed_train_end.isoformat(),
+                "test_start": parsed_test_start.isoformat(),
+                "test_end": parsed_test_end.isoformat(),
+                "warmup_days": warmup_days,
+                "parallel_workers": parallel_workers,
+                "commission_rate": resolved_commission_rate,
+                "slippage_bps": resolved_slippage_bps,
+                "execution_lag_days": resolved_execution_lag_days,
+                "calibration_checkpoint": calibration_checkpoint,
+                "test_checkpoint": test_checkpoint,
+                "resume": resume,
+                "include_baselines": include_baselines,
+                "include_isolated": include_isolated,
+                "exclude_analyst": sorted(excluded),
+                "set": list(set_override),
+                "yes": yes,
+                "verbose": verbose,
+                "no_log": no_log,
+                "lake_time": lake_time,
+                "loader_store": loader_store,
+            },
+            [analyst.agent_id for analyst in analysts],
+            [manager.agent_id for manager in managers],
+        )
+        commander = Commander(
+            managers=managers,
+            weighting_strategy=ShrinkageWeight(Hedge()),
+            parallel_workers=parallel_workers,
+        )
+        # Every engine of the experiment (both phases, the baselines and any
+        # --include-isolated run) shares one set of inputs: the prices, the
+        # risk-free rate (FRED DGS3MO) for excess-return Sharpe/Sortino, the
+        # BIS policy rates FX carry accrues from, and an S&P 500
+        # buy-and-hold's daily returns as the information-ratio benchmark.
+        inputs = load_engine_inputs(
+            resolved_assets,
+            parsed_train_start,
+            parsed_test_end,
+            warmup_days=warmup_days,
+            align="intersection",
+            benchmark=SP500_BENCHMARK_TICKER,
+        )
+        source_label = inputs.market_data_source
+        typer.echo(
+            f"Market data ready: {source_label}; {len(inputs.market_data)} aligned rows. "
+            "Starting calibration...",
+            err=True,
+        )
+        track_record = TrackRecord()
+
+        def experiment_engine(
+            engine_commander: CommanderLike,
+            engine_track_record: TrackRecord,
+            start: date,
+            end: date,
+            checkpoint_path: str | None = None,
+            resume_checkpoint: bool = False,
+        ) -> BacktestEngine:
+            return BacktestEngine(
+                commander=engine_commander,
+                portfolio=inputs.portfolio(),
+                track_record=engine_track_record,
+                data_loader=inputs.data_loader,
+                start_date=start,
+                end_date=end,
+                assets=inputs.assets,
+                market_data_source=inputs.market_data_source,
+                execution_lag_days=settings.firm.execution_lag_days,
+                checkpoint_path=checkpoint_path,
+                resume=resume_checkpoint,
+                risk_free_rate_series=inputs.risk_free_rate_series,
+                policy_rates=inputs.policy_rates,
+                benchmark_returns=inputs.benchmark_returns,
+            )
+
+        def build_engine(start: date, end: date) -> BacktestEngine:
+            return experiment_engine(
+                commander,
+                track_record,
+                start,
+                end,
+                checkpoint_path=(
+                    calibration_checkpoint if start == parsed_train_start else test_checkpoint
+                ),
+                resume_checkpoint=resume,
+            )
+
+        def run_phase(label: str, start: date, end: date) -> BacktestResult:
+            def on_day_complete(
+                day_index: int, total_days: int, as_of_date: date, value: float
+            ) -> None:
+                typer.echo(
+                    f"{label}: day {day_index + 1}/{total_days} ({as_of_date}) "
+                    f"portfolio=${value:,.2f}",
+                    err=True,
+                )
+
+            result = build_engine(start, end).run(on_day_complete=on_day_complete)
+            typer.echo(f"{label} complete. Starting next phase...", err=True)
+            return result
+
+        calibration_result = run_phase("CALIBRATION", parsed_train_start, parsed_train_end)
+        test_result = run_phase("TEST", parsed_test_start, parsed_test_end)
+        baseline_results: dict[str, dict[str, object]] = {}
+        if include_baselines:
+            for strategy in ("equal_weight", "buy_and_hold", "momentum", "volatility_target"):
+                baseline_engine = experiment_engine(
+                    BaselineCommander(strategy), TrackRecord(), parsed_test_start, parsed_test_end
+                )
+                baseline_results[strategy] = baseline_engine.run().model_dump(mode="json")
+        isolated_results: dict[str, dict[str, object]] = {}
+        if include_isolated:
+            for analyst in analysts:
+                isolated_engine = experiment_engine(
+                    SingleAnalystCommander(analyst),
+                    TrackRecord(),
+                    parsed_test_start,
+                    parsed_test_end,
+                )
+                isolated_results[f"analyst:{analyst.agent_id}"] = isolated_engine.run().model_dump(
+                    mode="json"
+                )
+            for manager in build_default_managers(analysts):
+                isolated_engine = experiment_engine(
+                    Commander(
+                        managers=[manager],
+                        weighting_strategy=ShrinkageWeight(Hedge()),
+                        parallel_workers=parallel_workers,
+                    ),
+                    TrackRecord(),
+                    parsed_test_start,
+                    parsed_test_end,
+                )
+                isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump(
+                    mode="json"
+                )
+        echo_loader_query_counts()
+        echo_loader_store_usage()
+        typer.echo(
+            json.dumps(
+                {
+                    "provenance": provenance.model_dump(mode="json"),
+                    "experiment": {
+                        "assets": resolved_assets,
+                        "train_start": parsed_train_start.isoformat(),
+                        "train_end": parsed_train_end.isoformat(),
+                        "test_start": parsed_test_start.isoformat(),
+                        "test_end": parsed_test_end.isoformat(),
+                        "warmup_days": warmup_days,
+                        "excluded_analysts": sorted(excluded),
+                        "config_overrides": overrides,
+                    },
+                    "market_data_source": source_label,
+                    "calibration": calibration_result.model_dump(mode="json"),
+                    "test": test_result.model_dump(mode="json"),
+                    "baselines": baseline_results,
+                    "isolated": isolated_results,
+                },
+                indent=2,
+            )
+        )
+
+
+# The repository root; a stage (a) store must lie outside it, and the trial
+# ledger's relative paths are resolved against it.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+# The `agentic_trading` package directory whose source files a firm record's
+# restart requires unchanged (`_package_sources`).
+_PACKAGE_DIR = Path(__file__).resolve().parent
+
+# Exit code of `agentic-trading-stage-a` when the batch stopped for resources.
+_EXIT_STOPPED_FOR_RESOURCES = 3
+# Resident memory (MB) above which a firm record restarts in a fresh process
+# (`firm_record --restart-above-rss-mb`): above the 3-3.5 GB the 2010-2017
+# record is projected to reach, and well below the 16 GB of the machine it
+# runs on. A fresh process resumed from the checkpoint starts near 0.8 GB.
+_FIRM_RECORD_RESTART_RSS_MB = 4096
+# Seconds `pmset` may take before the firm record's power preflight gives up
+# on it and refuses: it answers in well under a second.
+_PMSET_TIMEOUT_SECONDS = 10.0
+# The `pmset -g batt` power source the firm record runs on without
+# --allow-battery: on battery and in Low Power Mode a record runs about 1.6x
+# slower (AT-170).
+_MAINS_POWER_SOURCE = "AC Power"
+
+
+class PowerState(BaseModel):
+    """The Mac's power as `pmset` reports it: `source`, the name in the
+    `Now drawing from '<source>'` line of `pmset -g batt` ('AC Power',
+    'Battery Power', 'UPS Power'), and `low_power_mode`, whether the
+    `lowpowermode` setting of `pmset -g` is 1."""
+
+    model_config = ConfigDict(frozen=True)
+
+    source: str
+    low_power_mode: bool
+
+
+class PowerCheckError(RuntimeError):
+    """`pmset` is installed but failed, or its output could not be read."""
+
+
+def _run_pmset(*args: str) -> str | None:
+    """The standard output of `pmset <args>`, or `None` when `pmset` is not
+    on the PATH (Linux, CI). Raises `PowerCheckError` when it cannot be
+    run, exits non-zero or takes longer than `_PMSET_TIMEOUT_SECONDS`."""
+    if shutil.which("pmset") is None:
+        return None
+    command = ["pmset", *args]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=_PMSET_TIMEOUT_SECONDS, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PowerCheckError(f"{' '.join(command)} failed: {exc}") from exc
+    if completed.returncode != 0:
+        raise PowerCheckError(
+            f"{' '.join(command)} exited {completed.returncode}: {completed.stderr.strip()}"
+        )
+    return str(completed.stdout)
+
+
+def parse_power_state(battery_report: str, power_settings: str) -> PowerState:
+    """The `PowerState` in `battery_report` (the output of `pmset -g batt`)
+    and `power_settings` (the output of `pmset -g`). Raises
+    `PowerCheckError` when the first has no `Now drawing from '<source>'`
+    line or the second no `lowpowermode 0` or `lowpowermode 1` line."""
+    source = re.search(r"Now drawing from '([^']+)'", battery_report)
+    if source is None:
+        raise PowerCheckError(f"pmset -g batt names no power source: {battery_report!r}")
+    low_power = re.search(r"^\s*lowpowermode\s+([01])\s*$", power_settings, re.MULTILINE)
+    if low_power is None:
+        raise PowerCheckError(f"pmset -g reports no lowpowermode setting: {power_settings!r}")
+    return PowerState(source=source.group(1), low_power_mode=low_power.group(1) == "1")
+
+
+def read_power_state() -> PowerState | None:
+    """This machine's `PowerState`, read from `pmset -g batt` and `pmset -g`
+    (`_run_pmset`, `parse_power_state`); `None` when `pmset` is not
+    installed, as on Linux and in CI, where there is nothing to check.
+    Raises `PowerCheckError` when `pmset` fails or its output cannot be
+    read."""
+    battery_report = _run_pmset("-g", "batt")
+    power_settings = _run_pmset("-g")
+    if battery_report is None or power_settings is None:
+        return None
+    return parse_power_state(battery_report, power_settings)
+
+
+def _require_mains_power(allow_battery: bool) -> None:
+    """Exits with code 1, saying why, unless `allow_battery` or this machine
+    draws from `_MAINS_POWER_SOURCE` with Low Power Mode off
+    (`read_power_state`). A machine without `pmset` passes; a `pmset` that
+    fails or prints what cannot be read refuses."""
+    if allow_battery:
+        return
+    try:
+        state = read_power_state()
+    except PowerCheckError as exc:
+        typer.echo(
+            f"Refusing to start the firm record: the power source cannot be checked ({exc}). "
+            "Pass --allow-battery to run anyway.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    if state is None:
+        return
+    if state.source != _MAINS_POWER_SOURCE or state.low_power_mode:
+        typer.echo(
+            f"Refusing to start the firm record: the Mac draws from {state.source!r} with Low "
+            f"Power Mode {'on' if state.low_power_mode else 'off'}; it needs "
+            f"{_MAINS_POWER_SOURCE!r} with Low Power Mode off. Pass --allow-battery to run "
+            "anyway.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+def _stage_a_analysts(agent_ids: list[str]) -> list[AnalystAgent]:
+    """The default-roster analysts with `agent_ids`, in that order. An id
+    the roster does not hold, an id in `stage_a.runner.EXCLUDED_ANALYSTS`
+    (reported with its reason), or an id given twice, is a usage error."""
+    roster = {analyst.agent_id: analyst for analyst in build_default_analysts()}
+    unknown = [agent_id for agent_id in agent_ids if agent_id not in roster]
+    if unknown:
+        raise typer.BadParameter(
+            f"no analyst in the default roster has id(s) {unknown}", param_hint="--analyst"
+        )
+    excluded = [agent_id for agent_id in agent_ids if agent_id in EXCLUDED_ANALYSTS]
+    if excluded:
+        raise typer.BadParameter(
+            "excluded from stage (a): "
+            + "; ".join(f"{agent_id} {EXCLUDED_ANALYSTS[agent_id]}" for agent_id in excluded),
+            param_hint="--analyst",
+        )
+    repeated = sorted({agent_id for agent_id in agent_ids if agent_ids.count(agent_id) > 1})
+    if repeated:
+        raise typer.BadParameter(f"analyst id(s) given twice: {repeated}", param_hint="--analyst")
+    return [roster[agent_id] for agent_id in agent_ids]
+
+
+def _stage_a_instrument_kind(value: str) -> InstrumentKind:
+    """`value` as a `decision_file.v1` instrument kind; any other value is a
+    usage error."""
+    kinds: tuple[str, ...] = get_args(InstrumentKind)
+    if value not in kinds:
+        raise typer.BadParameter(
+            f"must be one of {', '.join(kinds)}, got {value!r}", param_hint="--instrument-kind"
+        )
+    return cast(InstrumentKind, value)
+
+
+@stage_a_app.command()
+def stage_a(
+    analyst: list[str] = typer.Option(  # noqa: B008
+        ...,
+        "--analyst",
+        help="Default-roster analyst id to run; repeat for several, run in the order given.",
+    ),
+    universe: list[str] = typer.Option(  # noqa: B008
+        ..., "--universe", help="Instrument id (ticker) to run over; repeat for several."
+    ),
+    store_dir: Path = typer.Option(  # noqa: B008
+        ...,
+        "--store-dir",
+        help="Directory outside the repository holding one subdirectory per trial spec hash.",
+    ),
+    instrument_kind: str = typer.Option(
+        "equity",
+        "--instrument-kind",
+        help="decision_file.v1 instrument kind every row is written as: "
+        "equity, etf, future, fx, crypto or option.",
+    ),
+    window_start: str | None = typer.Option(
+        None,
+        "--window-start",
+        help=f"First decision date, {_DATE_FORMAT_HINT} (default: stage_a.window_start).",
+    ),
+    window_end: str | None = typer.Option(
+        None,
+        "--window-end",
+        help=f"Last decision date, {_DATE_FORMAT_HINT}, at most stage_a.data_end "
+        "(default: stage_a.data_end).",
+    ),
+    lake_time: str | None = typer.Option(None, "--lake-time", help=_LAKE_TIME_HELP),
+    set_override: list[str] = typer.Option(  # noqa: B008
+        [],
+        "--set",
+        help="Override one strategy constant for this batch, as group.field=value "
+        "(e.g. stage_a.session_calendar=XSTO); repeat for several. Hashed settings "
+        "enter each trial's spec; trials.ledger_path moves the trial ledger. See "
+        "agentic_trading/config.py for every key.",
+    ),
+) -> None:
+    """Compute and store stage (a) signals and decisions for the given
+    analysts over the universe, resuming each trial from its store, and
+    record each batch in the trial ledger.
+
+    Loads the universe's prices from the window start minus
+    `stage_a.warmup_days` calendar days to the window end, then runs `stage_a.runner.run_batch`, all
+    inside one lake session cut at `stage_a.data_end`, so the prices and
+    every analyst read see the same lake time. The spec records that
+    lake time, the lake version and the installed quantcore version and
+    commit. Each analyst's hypothesis is registered in the trial ledger at
+    `trials.ledger_path` (relative to the repository root unless absolute)
+    before its first day is computed, and each analyst that wrote a day
+    records a trial row there, whose spec holds the batch's window. Prints
+    the batch result as JSON. Exits 0 when every analyst finished, 3 when
+    the batch stopped for low memory or disk (rerun to resume), and 2 on a
+    usage error: an unknown analyst id or one excluded from stage (a)
+    (`stage_a.runner.EXCLUDED_ANALYSTS`), a missing
+    --store-dir or one inside the repository, a naive --lake-time, a bad
+    --set, or a window that is reversed or ends after stage_a.data_end.
+
+    `--set` overrides apply before any setting is read. Prices are aligned
+    on the sessions of `stage_a.session_calendar`, the calendar the batch
+    decides on, so an instrument without a bar on a session is stored as
+    unavailable that day rather than removing the day for every instrument.
+    """
+    _apply_cli_overrides(set_override)
+    requested_lake_time = _parse_lake_time_flag(lake_time)
+    kind = _stage_a_instrument_kind(instrument_kind)
+    data_end = settings.stage_a.data_end
+    start = (
+        settings.stage_a.window_start
+        if window_start is None
+        else _parse_date_flag(window_start, "--window-start")
     )
+    end = data_end if window_end is None else _parse_date_flag(window_end, "--window-end")
+    if start > end:
+        raise typer.BadParameter(
+            f"--window-start ({start.isoformat()}) is after --window-end ({end.isoformat()})."
+        )
+    if end > data_end:
+        raise typer.BadParameter(
+            f"--window-end ({end.isoformat()}) is after stage_a.data_end "
+            f"({data_end.isoformat()}); the holdout stays locked."
+        )
+    if store_dir.resolve().is_relative_to(_REPO_ROOT):
+        raise typer.BadParameter(
+            f"{store_dir} is inside the repository; give a directory outside it.",
+            param_hint="--store-dir",
+        )
+    analysts = _stage_a_analysts([agent_id.strip() for agent_id in analyst])
+    tickers = [ticker.strip() for ticker in universe]
+
+    configure_logging()
+    logger = get_logger(__name__)
+    logger.info(
+        "Stage (a) batch: analysts=%s, universe=%s, %s to %s, store %s",
+        [agent.agent_id for agent in analysts],
+        tickers,
+        start,
+        end,
+        store_dir,
+    )
+    with lake_session(requested_lake_time, data_end=data_end) as session:
+        typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
+        market_data, source_label = load_price_history_with_fallback(
+            tickers,
+            start,
+            end,
+            warmup_days=settings.stage_a.warmup_days,
+            align="sessions",
+            calendar=settings.stage_a.session_calendar,
+        )
+        typer.echo(f"Market data ready: {source_label}; {len(market_data)} rows.", err=True)
+        lake_version = (
+            session.lake_version
+            if session.lake_version is not None
+            else provenance.lake_provenance().lake_version
+        )
+        result = run_batch(
+            analysts,
+            tickers,
+            kind,
+            start,
+            end,
+            store_dir,
+            market_data,
+            lake_time=session.lake_time,
+            lake_version=lake_version,
+            quantcore_version=metadata.version("quantcore"),
+            ledger=TrialLedger(_REPO_ROOT / settings.trials.ledger_path, _REPO_ROOT),
+            repo_root=_REPO_ROOT,
+        )
+    typer.echo(result.model_dump_json(indent=2))
+    if result.stopped_for_resources:
+        raise typer.Exit(code=_EXIT_STOPPED_FOR_RESOURCES)
+
+
+@firm_record_app.command()
+def firm_record(
+    start: str = typer.Option(
+        ...,
+        "--start",
+        help=f"First decision date, {_DATE_FORMAT_HINT}; the registered window starts "
+        f"{FIRM_V1_WINDOW_START.isoformat()}.",
+    ),
+    end: str = typer.Option(
+        ...,
+        "--end",
+        help=f"Last decision date, {_DATE_FORMAT_HINT}, at most stage_a.data_end; the "
+        f"registered window ends {FIRM_V1_WINDOW_END.isoformat()}.",
+    ),
+    store_dir: Path = typer.Option(  # noqa: B008
+        ...,
+        "--store-dir",
+        help="Directory outside the repository holding one subdirectory per firm spec hash, "
+        f"and the lake answer cache ({FIRM_RECORD_LAKE_CACHE_DIR}) unless --lake-cache-dir "
+        "names another.",
+    ),
+    max_days: int | None = typer.Option(
+        None,
+        "--max-days",
+        min=1,
+        help="Write at most this many days in this call; rerun to resume (default: all).",
+    ),
+    lake_time: str | None = typer.Option(None, "--lake-time", help=_LAKE_TIME_HELP),
+    lake_version: str | None = typer.Option(None, "--lake-version", help=_LAKE_VERSION_HELP),
+    parallel_workers: int = typer.Option(
+        4,
+        min=1,
+        help="Concurrent manager-signal workers per decision day; not part of the spec.",
+    ),
+    set_override: list[str] = typer.Option(  # noqa: B008
+        [],
+        "--set",
+        help="Override one strategy constant for this record, as group.field=value; repeat "
+        "for several. Hashed settings enter the firm's spec; trials.ledger_path moves the "
+        "trial ledger. See agentic_trading/config.py for every key.",
+    ),
+    loader_store: bool = typer.Option(
+        True, "--loader-store/--no-loader-store", help=_LOADER_STORE_HELP
+    ),
+    restart_above_rss_mb: int = typer.Option(
+        _FIRM_RECORD_RESTART_RSS_MB,
+        "--restart-above-rss-mb",
+        min=0,
+        help="Once the process's resident memory is above this many MB, stop at the next day "
+        "boundary and resume from the checkpoint in a fresh process; 0 never restarts. Not "
+        "part of the spec.",
+    ),
+    allow_battery: bool = typer.Option(
+        False,
+        "--allow-battery",
+        help="Start even when the Mac draws from battery, is in Low Power Mode or its power "
+        "cannot be checked; not part of the spec.",
+    ),
+    lake_cache_dir: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--lake-cache-dir",
+        help=f"Directory of the lake answer cache; default <store-dir>/"
+        f"{FIRM_RECORD_LAKE_CACHE_DIR}. A restart or resume with the same directory reads every "
+        "answer it holds from disk. Not part of the spec.",
+    ),
+) -> None:
+    """Record the registered firm (agentic-firm-v1) from --start to --end:
+    the Commander's daily pod targets written as a `decision_file.v1` trial
+    under --store-dir, resuming from its store.
+
+    The firm is the default roster without `roster.FIRM_V1_EXCLUDED_ANALYST_IDS`
+    and the default managers under a Commander weighting pods by
+    `ShrinkageWeight(Hedge())`, over `roster.FIRM_V1_UNIVERSE`. Loads the
+    engine's inputs (`backtest.engine_inputs.load_engine_inputs`): the
+    universe's prices aligned on `stage_a.session_calendar`, from --start
+    minus `stage_a.warmup_days` calendar days to --end, each of
+    `roster.FIRM_V1_EQUITIES` by its `roster.FIRM_V1_EQUITY_SECURITY_IDS`
+    id from `equity_daily_from_bars` and every other instrument by ticker,
+    the risk-free rate for --start to --end, and the spot FX pairs' BIS
+    policy rates for --start to --end plus the loader's look-back of
+    `lakehouse_loader.POLICY_RATE_LOOKBACK_DAYS` (14) calendar days before
+    --start, so the rate in force on --start is there. Before anything is
+    written, checks the universe's price coverage
+    (`backtest.preflight.check_price_coverage`): each firm equity needs a
+    bar on every session from --start to --end bar the
+    `firm.known_price_gaps`, and every other instrument a bar near both
+    ends of the window, the crypto pairs near its end only. It raises
+    `PriceCoverageError` listing each failing instrument. An instrument
+    whose bars start inside the warm-up passes, and its `ShortWarmup` goes
+    to agentic_meta.json. Then runs `firm_record.runner.run_firm_record`
+    on those inputs, all inside one lake session cut
+    at `stage_a.data_end` and pinned to the lake version the record
+    writes. That version is --lake-version when given; with --lake-time and
+    no --lake-version, the one the store's spec.json records for this trial
+    when the store holds it (a resume), and otherwise, for a record that
+    would be counted (the firm's registry file exists), a usage error; in
+    every other case the first version the lake answers with. Every lake
+    response must carry the pinned version's code part
+    (`lakehouse_loader.lake_session`). With --loader-store (the
+    default) the session's loader window store is declared over the same
+    span, --start minus `stage_a.warmup_days` to --end
+    (`declare_run_window`); --no-loader-store leaves every loader call
+    fetching for itself. Every lake read of the session goes through the
+    lake answer cache at --lake-cache-dir (default
+    `<store-dir>/lake_cache`, `lakehouse_loader.lake_answer_cache`), so a
+    restart or resume of the record reads every answer the cache holds
+    from disk. Before the session closes, the loader query counts, the
+    store's usage and the answer cache's counts are written to stderr
+    (`echo_loader_query_counts`, `echo_loader_store_usage`,
+    `echo_lake_answer_cache_counts`). The firm's hypothesis is
+    registered in the trial ledger at `trials.ledger_path` from its
+    registry file before the first day; without that file the record is
+    uncounted. Prints the result as JSON, which holds no performance
+    figure. When the pass stopped because its resident memory passed
+    --restart-above-rss-mb, the command then replaces its process with the
+    same command line (`_restart_record`), pinned to the lake time it read
+    and the lake version it wrote and, with --max-days, to the days still
+    allowed, so the record resumes
+    from its checkpoint in a fresh process under the same pid. It raises
+    `RuntimeError` instead when the source on disk no longer gives the
+    running trial's spec hash (`_require_unchanged_source`). Exits 2
+    on a usage error: a reversed window, one ending after
+    stage_a.data_end, a --store-dir inside the repository, a naive
+    --lake-time, a --lake-version not of the form <code>.<builds>, a
+    counted record given --lake-time without --lake-version (above) or a
+    bad --set. `--set` overrides apply before any setting
+    is read. The sha256 of every .py file under the package directory
+    is taken when the command starts, and a restart raises `RuntimeError`
+    when any has changed, been added or been removed since
+    (`_require_unchanged_package`). After the usage checks and before anything is read, exits 1
+    without --allow-battery when the Mac draws from battery, is in Low
+    Power Mode, or `pmset` fails or prints what cannot be read
+    (`_require_mains_power`); a machine without `pmset` passes. A restart
+    runs the same check. Then, before the lake session opens, the lake's
+    health is checked (`lakehouse_loader.require_lake_health`): an answer
+    whose status is not ok, or whose write times are not ok for a table
+    the record reads, raises `LakeHealthError` naming it."""
+    started_sources = _package_sources()
+    _apply_cli_overrides(set_override)
+    requested_lake_time = _parse_lake_time_flag(lake_time)
+    pinned_lake_version = _parse_lake_version_flag(lake_version)
+    data_end = settings.stage_a.data_end
+    window_start = _parse_date_flag(start, "--start")
+    window_end = _parse_date_flag(end, "--end")
+    if window_start > window_end:
+        raise typer.BadParameter(
+            f"--start ({window_start.isoformat()}) is after --end ({window_end.isoformat()})."
+        )
+    if window_end > data_end:
+        raise typer.BadParameter(
+            f"--end ({window_end.isoformat()}) is after stage_a.data_end "
+            f"({data_end.isoformat()}); the holdout stays locked."
+        )
+    if store_dir.resolve().is_relative_to(_REPO_ROOT):
+        raise typer.BadParameter(
+            f"{store_dir} is inside the repository; give a directory outside it.",
+            param_hint="--store-dir",
+        )
+    _require_mains_power(allow_battery)
+    analysts = build_default_analysts(excluded_analyst_ids=FIRM_V1_EXCLUDED_ANALYST_IDS)
     commander = Commander(
         managers=build_default_managers(analysts),
         weighting_strategy=ShrinkageWeight(Hedge()),
         parallel_workers=parallel_workers,
-        parallel_backend=parallel_backend,  # type: ignore[arg-type]
     )
-    market_data, source_label = load_price_history_with_fallback(
-        resolved_assets,
-        parsed_train_start,
-        parsed_test_end,
-        warmup_days=warmup_days,
-    )
-    typer.echo(
-        f"Market data ready: {source_label}; {len(market_data)} aligned rows. "
-        "Starting calibration...",
-        err=True,
-    )
-    track_record = TrackRecord()
+    tickers = list(FIRM_V1_UNIVERSE)
+    if requested_lake_time is not None and pinned_lake_version is None:
+        pinned_lake_version = _recorded_lake_version(
+            store_dir, commander, tickers, window_start, window_end, requested_lake_time
+        )
+        if pinned_lake_version is None and firm_registered_trials(_REPO_ROOT) is not None:
+            raise typer.BadParameter(
+                "a counted record pinned to --lake-time needs the lake version it reads at; "
+                "pass the registered <code>.<builds> pair",
+                param_hint="--lake-version",
+            )
 
-    # Every Sharpe/Sortino/Information-Ratio this experiment reports (system,
-    # baselines, and any --include-isolated run) shares these two inputs, so
-    # they're loaded once here rather than per-engine: a real 3-month T-bill
-    # rate (FRED DGS3MO from the lakehouse) for excess-return Sharpe/Sortino, and an
-    # S&P 500 buy-and-hold's own daily returns as the market benchmark
-    # information_ratio is computed against.
-    risk_free_rate_series = load_risk_free_rate_series(parsed_train_start, parsed_test_end)
-    sp500_frame, _sp500_source = load_price_history_with_fallback(
-        [SP500_BENCHMARK_TICKER],
-        parsed_train_start,
-        parsed_test_end,
-        warmup_days=0,
+    configure_logging()
+    logger = get_logger(__name__)
+    logger.info(
+        "Firm record: %d instruments, %s to %s, store %s",
+        len(tickers),
+        window_start,
+        window_end,
+        store_dir,
     )
-    benchmark_returns = sp500_frame[SP500_BENCHMARK_TICKER]["close"].dropna().pct_change().dropna()
+    require_lake_health()
+    answers_dir = lake_cache_dir or store_dir / FIRM_RECORD_LAKE_CACHE_DIR
+    with (
+        lake_answer_cache(answers_dir),
+        lake_session(
+            requested_lake_time, data_end=data_end, lake_version=pinned_lake_version
+        ) as session,
+    ):
+        typer.echo(f"Reading the lake at lake time {session.lake_time.isoformat()}", err=True)
+        declare_run_window(loader_store, window_start, window_end, settings.stage_a.warmup_days)
+        inputs = load_engine_inputs(
+            tickers,
+            window_start,
+            window_end,
+            warmup_days=settings.stage_a.warmup_days,
+            align="sessions",
+            calendar=settings.stage_a.session_calendar,
+            security_ids=FIRM_V1_EQUITY_SECURITY_IDS,
+        )
+        typer.echo(
+            f"Market data ready: {inputs.market_data_source}; {len(inputs.market_data)} rows.",
+            err=True,
+        )
+        coverage = check_price_coverage(
+            inputs.market_data,
+            tickers,
+            window_start - timedelta(days=settings.stage_a.warmup_days),
+            window_start,
+            window_end,
+            calendar=settings.stage_a.session_calendar,
+            complete=FIRM_V1_EQUITY_SECURITY_IDS,
+            known_gaps=settings.firm.known_price_gaps,
+            start_exempt=CRYPTO_ASSETS,
+        )
+        recorded_lake_version = (
+            session.lake_version
+            if session.lake_version is not None
+            else provenance.lake_provenance().lake_version
+        )
+        result = run_firm_record(
+            commander,
+            tickers,
+            window_start,
+            window_end,
+            store_dir,
+            inputs,
+            lake_time=session.lake_time,
+            lake_version=recorded_lake_version,
+            quantcore_version=metadata.version("quantcore"),
+            max_days=max_days,
+            ledger=TrialLedger(_REPO_ROOT / settings.trials.ledger_path, _REPO_ROOT),
+            repo_root=_REPO_ROOT,
+            short_warmup=[entry.short_warmup for entry in coverage if entry.short_warmup],
+            restart_above_rss_mb=restart_above_rss_mb or None,
+        )
+        echo_loader_query_counts()
+        echo_loader_store_usage()
+        echo_lake_answer_cache_counts()
+        pinned_lake_time = session.lake_time
+    typer.echo(result.model_dump_json(indent=2))
+    if result.paused_for_memory:
+        extra = [
+            "--lake-time",
+            pinned_lake_time.isoformat(),
+            "--lake-version",
+            recorded_lake_version,
+        ]
+        if max_days is not None:
+            extra += ["--max-days", str(max_days - result.days_written)]
+        logger.info(
+            "Firm record: restarting in a fresh process after %d day(s), at %s",
+            result.days_written,
+            result.last_completed,
+        )
+        _require_unchanged_source(store_dir, result.spec_hash, commander)
+        _require_unchanged_package(started_sources)
+        _restart_record(extra)
 
-    def build_engine(start: date, end: date) -> BacktestEngine:
-        return BacktestEngine(
-            commander=commander,
-            portfolio=Portfolio(
-                cash=settings.firm.starting_cash,
-                positions={},
-                commission_rate=commission_rate,
-                slippage_bps=slippage_bps,
-            ),
-            track_record=track_record,
-            data_loader=lambda _assets, _start, _end: market_data,
-            start_date=start,
-            end_date=end,
-            assets=resolved_assets,
-            market_data_source=source_label,
-            execution_lag_days=execution_lag_days,
-            checkpoint_path=(
-                calibration_checkpoint if start == parsed_train_start else test_checkpoint
-            ),
-            resume=resume,
-            risk_free_rate_series=risk_free_rate_series,
-            benchmark_returns=benchmark_returns,
+
+@firm_review_app.command()
+def firm_review(
+    checkpoint: Path = typer.Argument(  # noqa: B008
+        ...,
+        exists=True,
+        dir_okay=False,
+        help="The firm record's engine checkpoint, <store>/<spec hash>.checkpoint.sqlite.",
+    ),
+    out: Path = typer.Option(  # noqa: B008
+        ...,
+        "--out",
+        help="Where to write the summary JSON; outside the record's store.",
+    ),
+    trial_dir: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--trial-dir",
+        help="The record's trial folder (default: <store>/<spec hash>/, beside the checkpoint).",
+    ),
+    lake_cache_dir: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--lake-cache-dir",
+        help="Directory of a lake answer cache for the risk-free and SPY reads, outside the "
+        "record's store (default: no cache).",
+    ),
+) -> None:
+    """Write the run summary of a finished firm record to --out, for the
+    dashboard's "Load a saved run" panel: the engine's results of the
+    record rebuilt from a copy of its checkpoint, under one
+    `record` period, with SPY's total-return curve as a baseline
+    (`firm_record.review.firm_record_summary`). The DGS3MO and SPY series
+    the ratios are measured with are read from the lake at the record's
+    lake time, pinned to the lake version its spec.json records. Prints
+    the path, the file's size and the number of days; no performance
+    figure. Exits 2 when --out or --lake-cache-dir is inside the
+    directory holding the checkpoint (the record's store) or inside the
+    record's trial folder, neither of which is ever written; every path is
+    compared with its symbolic links resolved."""
+    # Imported here: a firm record hashes every `agentic_trading` module
+    # loaded when it starts, and the review is no part of a record.
+    from agentic_trading.firm_record.review import (
+        RECORD_PERIOD,
+        checkpoint_trial_dir,
+        firm_record_summary,
+    )
+
+    store = checkpoint.resolve().parent
+    if trial_dir is None:
+        try:
+            trial = checkpoint_trial_dir(checkpoint.resolve())
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="CHECKPOINT") from exc
+    else:
+        trial = trial_dir.resolve()
+    kept = ((store, "the record's store"), (trial, "the record's trial folder"))
+    for path, flag in ((out, "--out"), (lake_cache_dir, "--lake-cache-dir")):
+        if path is None:
+            continue
+        for directory, name in kept:
+            if path.resolve().is_relative_to(directory):
+                raise typer.BadParameter(
+                    f"{path} is inside {name} {directory}; give a path outside it.",
+                    param_hint=flag,
+                )
+    configure_logging()
+    summary = firm_record_summary(checkpoint, trial_dir, lake_cache_dir=lake_cache_dir)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary), encoding="utf-8")
+    days = len(summary[RECORD_PERIOD]["portfolio_value_history"])
+    typer.echo(f"Wrote {out} ({out.stat().st_size:,} bytes): the firm record over {days} days.")
+
+
+def _package_sources() -> dict[str, str]:
+    """Each .py file under `_PACKAGE_DIR`, `__pycache__` aside, by its
+    POSIX path relative to that directory, to the sha256 hex digest of its
+    bytes on disk, sorted by path. Every file counts, the command line and
+    the dashboard included, since a restarted process runs whatever is on
+    disk."""
+    sources: dict[str, str] = {}
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        relative = path.relative_to(_PACKAGE_DIR).as_posix()
+        sources[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return sources
+
+
+def _require_unchanged_package(started: dict[str, str]) -> None:
+    """Raises `RuntimeError` naming the changed, added and removed files
+    when `_package_sources()` now differs from `started`, the sources the
+    command started with: a restarted process would run other code."""
+    now = _package_sources()
+    changed = sorted(name for name in set(started) & set(now) if started[name] != now[name])
+    added = sorted(set(now) - set(started))
+    removed = sorted(set(started) - set(now))
+    if changed or added or removed:
+        raise RuntimeError(
+            f"the firm record cannot restart: the package source under {_PACKAGE_DIR} changed "
+            f"since the command started (changed: {changed}, added: {added}, "
+            f"removed: {removed})"
         )
 
-    def run_phase(label: str, start: date, end: date) -> BacktestResult:
-        def on_day_complete(
-            day_index: int, total_days: int, as_of_date: date, value: float
-        ) -> None:
-            typer.echo(
-                f"{label}: day {day_index + 1}/{total_days} ({as_of_date}) portfolio=${value:,.2f}",
-                err=True,
-            )
 
-        result = build_engine(start, end).run(on_day_complete=on_day_complete)
-        typer.echo(f"{label} complete. Starting next phase...", err=True)
-        return result
+def _on_disk_module_hashes(names: list[str], commander: Commander) -> dict[str, str]:
+    """Dotted module name to the sha256 hex digest of its source file as
+    it is on disk now, for each of `names` and for every module
+    `firm_record.spec.build_firm_spec` hashes from `commander`'s agents'
+    modules and `firm_record.spec._HASHED_ROOTS` (`stage_a.spec._module_hashes`,
+    which parses source without importing it). A loaded module's file is
+    its `__file__`, any other's is found under the package directory. A
+    name whose file is gone is left out. Raises `RuntimeError` when a root
+    module's source cannot be read."""
+    hashes: dict[str, str] = {}
+    for name in names:
+        file = getattr(sys.modules.get(name), "__file__", None)
+        path = Path(file) if file is not None else _package_source(name)
+        if path is None or not path.is_file():
+            continue
+        hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    roots = {type(agent).__module__ for agent in roster_agents(commander)} | set(_HASHED_ROOTS)
+    for root in sorted(roots):
+        try:
+            hashes.update(_module_hashes(root))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"cannot read the source of {root}: {exc}") from exc
+    return dict(sorted(hashes.items()))
 
-    calibration_result = run_phase("CALIBRATION", parsed_train_start, parsed_train_end)
-    test_result = run_phase("TEST", parsed_test_start, parsed_test_end)
-    baseline_results: dict[str, dict[str, object]] = {}
-    if include_baselines:
-        for strategy in ("equal_weight", "buy_and_hold", "momentum", "volatility_target"):
-            baseline_engine = BacktestEngine(
-                commander=BaselineCommander(strategy),
-                portfolio=Portfolio(
-                    cash=settings.firm.starting_cash,
-                    positions={},
-                    commission_rate=commission_rate,
-                    slippage_bps=slippage_bps,
-                ),
-                track_record=TrackRecord(),
-                data_loader=lambda _assets, _start, _end: market_data,
-                start_date=parsed_test_start,
-                end_date=parsed_test_end,
-                assets=resolved_assets,
-                market_data_source=source_label,
-                execution_lag_days=execution_lag_days,
-                risk_free_rate_series=risk_free_rate_series,
-                benchmark_returns=benchmark_returns,
-            )
-            baseline_results[strategy] = baseline_engine.run().model_dump(mode="json")
-    isolated_results: dict[str, dict[str, object]] = {}
-    if include_isolated:
-        for analyst in analysts:
-            isolated_engine = BacktestEngine(
-                commander=SingleAnalystCommander(analyst),
-                portfolio=Portfolio(
-                    cash=settings.firm.starting_cash,
-                    positions={},
-                    commission_rate=commission_rate,
-                    slippage_bps=slippage_bps,
-                ),
-                track_record=TrackRecord(),
-                data_loader=lambda _assets, _start, _end: market_data,
-                start_date=parsed_test_start,
-                end_date=parsed_test_end,
-                assets=resolved_assets,
-                market_data_source=source_label,
-                execution_lag_days=execution_lag_days,
-                risk_free_rate_series=risk_free_rate_series,
-                benchmark_returns=benchmark_returns,
-            )
-            isolated_results[f"analyst:{analyst.agent_id}"] = isolated_engine.run().model_dump(
-                mode="json"
-            )
-        for manager in build_default_managers(analysts):
-            isolated_engine = BacktestEngine(
-                commander=Commander(
-                    managers=[manager],
-                    weighting_strategy=ShrinkageWeight(Hedge()),
-                    parallel_workers=parallel_workers,
-                    parallel_backend=parallel_backend,  # type: ignore[arg-type]
-                ),
-                portfolio=Portfolio(
-                    cash=settings.firm.starting_cash,
-                    positions={},
-                    commission_rate=commission_rate,
-                    slippage_bps=slippage_bps,
-                ),
-                track_record=TrackRecord(),
-                data_loader=lambda _assets, _start, _end: market_data,
-                start_date=parsed_test_start,
-                end_date=parsed_test_end,
-                assets=resolved_assets,
-                market_data_source=source_label,
-                execution_lag_days=execution_lag_days,
-                risk_free_rate_series=risk_free_rate_series,
-                benchmark_returns=benchmark_returns,
-            )
-            isolated_results[f"manager:{manager.agent_id}"] = isolated_engine.run().model_dump(
-                mode="json"
-            )
-    typer.echo(
-        json.dumps(
-            {
-                "experiment": {
-                    "assets": resolved_assets,
-                    "train_start": parsed_train_start.isoformat(),
-                    "train_end": parsed_train_end.isoformat(),
-                    "test_start": parsed_test_start.isoformat(),
-                    "test_end": parsed_test_end.isoformat(),
-                    "warmup_days": warmup_days,
-                    "excluded_analysts": sorted(excluded),
-                    "config_overrides": overrides,
-                },
-                "market_data_source": source_label,
-                "calibration": calibration_result.model_dump(mode="json"),
-                "test": test_result.model_dump(mode="json"),
-                "baselines": baseline_results,
-                "isolated": isolated_results,
-            },
-            indent=2,
+
+def _require_unchanged_source(store_dir: Path, spec_hash: str, commander: Commander) -> None:
+    """Raises `RuntimeError` unless the source on disk gives the running
+    trial `spec_hash` the same spec hash: a restarted process hashes the
+    files on disk, so changed source would start it on another trial. The
+    running trial's spec is read from `store_dir / spec_hash / spec.json`;
+    its module hashes are recomputed from disk (`_on_disk_module_hashes`)
+    over the modules it records and those `commander` and the record's
+    roots reach, and the spec is hashed again with them. Also raises when
+    that spec.json is missing, unreadable or of another trial."""
+    spec_path = store_dir / spec_hash / "spec.json"
+    try:
+        record = FirmSpecRecord.model_validate_json(spec_path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"the firm record cannot restart: the running trial's {spec_path} "
+            f"cannot be read ({exc})"
+        ) from exc
+    if record.spec_hash != spec_hash:
+        raise RuntimeError(
+            f"the firm record cannot restart: {spec_path} holds trial {record.spec_hash}, "
+            f"not the running trial {spec_hash}"
         )
-    )
+    recorded = record.spec.module_hashes
+    on_disk = _on_disk_module_hashes(list(recorded), commander)
+    on_disk_hash = firm_spec_hash(record.spec.model_copy(update={"module_hashes": on_disk}))
+    if on_disk_hash != spec_hash:
+        changed = sorted(
+            name for name in set(recorded) | set(on_disk) if recorded.get(name) != on_disk.get(name)
+        )
+        raise RuntimeError(
+            f"the firm record cannot restart: the source on disk gives spec hash "
+            f"{on_disk_hash}, not the running trial's {spec_hash}, so a restart would start "
+            f"another trial; changed since the pass began: {', '.join(changed)}"
+        )
+
+
+def _restart_record(extra_args: list[str]) -> None:
+    """Replaces this process with the command line it was started with
+    (`sys.orig_argv`) plus `extra_args`, whose options override earlier
+    ones of the same name, after flushing the standard streams and the log
+    handlers. The pid stays the same. Raises `RuntimeError` instead when a
+    lake request is still in flight (`lake_requests_in_flight`), since the
+    exec would abandon it and the lake would hold its query slot."""
+    in_flight = lake_requests_in_flight()
+    if in_flight:
+        raise RuntimeError(
+            f"the firm record cannot restart with {in_flight} lake request(s) in flight; "
+            "the lake would hold their query slots until their deadline"
+        )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    logging.shutdown()
+    os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:], *extra_args])
 
 
 def main(args: list[str] | None = None) -> None:
@@ -666,3 +1701,15 @@ def main(args: list[str] | None = None) -> None:
 
 def experiment_main(args: list[str] | None = None) -> None:
     experiment_app(args=args)
+
+
+def stage_a_main(args: list[str] | None = None) -> None:
+    stage_a_app(args=args)
+
+
+def firm_record_main(args: list[str] | None = None) -> None:
+    firm_record_app(args=args)
+
+
+def firm_review_main(args: list[str] | None = None) -> None:
+    firm_review_app(args=args)

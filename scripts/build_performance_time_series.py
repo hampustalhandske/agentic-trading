@@ -3,7 +3,7 @@
 """Builds a per-analyst and per-manager cumulative-attributed-return time
 series from a run's resumable checkpoint (`track_record` is the full,
 chronological `PerformanceRecord` log both backtest phases wrote into —
-see `backtest/engine.py::_source_performance`, which computes the run's
+see `backtest/engine.py::source_performance_of`, which computes the run's
 final `source_performance` numbers from the exact same log via
 `np.sum(returns)`, a plain running sum, not compounding).
 
@@ -37,7 +37,7 @@ def build_time_series(checkpoint_path: Path, start: date) -> dict:
     """Streams `checkpoint_path`'s `track_record` array, keeping only
     entries on/after `start` (so a checkpoint whose track record spans
     calibration+test can be restricted to just the test period, matching
-    how `_source_performance` computes each phase's own numbers
+    how `source_performance_of` computes each phase's own numbers
     independently). Returns `{source_type: {source_id: [[date, cumulative_return], ...]}}`."""
     daily_sum: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     source_type_of: dict[str, str] = {}

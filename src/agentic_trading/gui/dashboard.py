@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
@@ -35,6 +36,7 @@ from agentic_trading.agents.roster import (
     RATES_MANAGER_ANALYST_IDS,
     RISK_MANAGER_ANALYST_IDS,
     STAT_ARB_MANAGER_ANALYST_IDS,
+    TAIL_HEDGE_MANAGER_ANALYST_IDS,
     build_default_analysts,
     build_default_managers,
 )
@@ -52,7 +54,13 @@ from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
     load_price_history_with_fallback,
 )
+from agentic_trading.data.loaders.lakehouse_loader import lake_session
+from agentic_trading.data.loaders.macro_loader import (
+    load_fx_policy_rates,
+    load_risk_free_rate_series,
+)
 from agentic_trading.data.ticker_catalog import TICKER_GROUPS, TickerGroup, tickers_by_asset_class
+from agentic_trading.firm_record.review import CHECKPOINT_SUFFIX, RECORD_PERIOD, firm_record_summary
 from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.track_record import TrackRecord
@@ -67,12 +75,26 @@ SP500_TICKER = "^GSPC"
 AUTOPLAY_INTERVAL_SECONDS = 0.9
 
 
+def _require_whole_decision_history(backtest_result: BacktestResult) -> None:
+    """Raises `ValueError` for a result whose engine ran with a history
+    horizon: its `decisions_by_day` holds only the last days, and every
+    view of the dashboard reads every day's decisions."""
+    if backtest_result.history_horizon_days is not None:
+        raise ValueError(
+            "the dashboard needs every day's decisions, but this backtest ran with a "
+            f"{backtest_result.history_horizon_days}-day history horizon and its result "
+            "holds only the last days' decisions; run it without a horizon"
+        )
+
+
 @dataclass(slots=True)
 class DeskRun:
     """Everything one simulation run produced: the multi-asset backtest
     itself (via the shared `BacktestEngine` — see `_simulate_desk`, there is
     no separate GUI-only simulation loop) plus the two benchmarks it's
-    judged against throughout the GUI."""
+    judged against throughout the GUI. Raises `ValueError` for a
+    `backtest_result` from a run with a history horizon, which lacks most
+    days' decisions."""
 
     tickers: list[str]
     group_name: str
@@ -87,6 +109,9 @@ class DeskRun:
     scoreboard: PerformanceScoreboard
     sp500_benchmark: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     basket_benchmark: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+
+    def __post_init__(self) -> None:
+        _require_whole_decision_history(self.backtest_result)
 
     @property
     def decisions_by_day(self) -> dict[date, list[PortfolioDecision]]:
@@ -275,12 +300,14 @@ def _load_basket_data(
     warmup_days: int = 0,
 ) -> tuple[pd.DataFrame, str]:
     """Thin wrapper around the shared `data.loader.load_price_history_with_fallback`
-    — the exact same, lakehouse-only function the CLI uses."""
+    — the exact same, lakehouse-only function the CLI uses, on the rows where
+    every ticker has a close, as the backtest engine needs."""
     return load_price_history_with_fallback(
         list(tickers),
         start,
         end,
         warmup_days=warmup_days,
+        align="intersection",
     )
 
 
@@ -521,7 +548,9 @@ def _simulate_desk(
     fetches fresh market data and runs a fresh backtest for whatever
     tickers/dates/manager mode are currently selected. `on_day_complete`, if
     given, is forwarded straight to `BacktestEngine.run()` to drive a live
-    progress display — see `_run_simulation_with_progress()`.
+    progress display — see `_run_simulation_with_progress()`. Every lake
+    read the desk makes (prices, the engine run and the benchmarks) happens
+    inside one lake session at the default lake time.
 
     Each pod manager always sizes its own book via its own
     `PortfolioConstructor` (risk parity + volatility targeting) — no
@@ -529,50 +558,54 @@ def _simulate_desk(
     if start > end:
         start, end = end, start
 
-    analysts = _build_analysts()
-    managers = _build_managers(manager_mode, analysts)
-    commander = Commander(
-        managers=managers, weighting_strategy=ShrinkageWeight(Hedge()), parallel_workers=4
-    )
-    portfolio = Portfolio(cash=initial_cash, positions={})
-    track_record = TrackRecord()
-    market_data, source_label = _load_basket_data(
-        tuple(tickers),
-        start,
-        end,
-        warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
-    )
+    with lake_session():
+        analysts = _build_analysts()
+        managers = _build_managers(manager_mode, analysts)
+        commander = Commander(
+            managers=managers, weighting_strategy=ShrinkageWeight(Hedge()), parallel_workers=4
+        )
+        portfolio = Portfolio(cash=initial_cash, positions={})
+        track_record = TrackRecord()
+        market_data, source_label = _load_basket_data(
+            tuple(tickers),
+            start,
+            end,
+            warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+        )
 
-    engine = BacktestEngine(
-        commander=commander,
-        portfolio=portfolio,
-        track_record=track_record,
-        data_loader=lambda _assets, _start, _end: market_data,
-        start_date=start,
-        end_date=end,
-        assets=tickers,
-        market_data_source=source_label,
-        execution_lag_days=settings.firm.execution_lag_days,
-    )
-    backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
+        engine = BacktestEngine(
+            commander=commander,
+            portfolio=portfolio,
+            track_record=track_record,
+            data_loader=lambda _assets, _start, _end: market_data,
+            start_date=start,
+            end_date=end,
+            assets=tickers,
+            market_data_source=source_label,
+            execution_lag_days=settings.firm.execution_lag_days,
+            risk_free_rate_series=load_risk_free_rate_series(start, end),
+            policy_rates=load_fx_policy_rates(tickers, start, end),
+        )
+        backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
+        _require_whole_decision_history(backtest_result)
 
-    return DeskRun(
-        tickers=tickers,
-        group_name=group_name,
-        manager_mode=manager_mode,
-        source_label=source_label,
-        manager_ids=[manager.agent_id for manager in managers],
-        analyst_ids=[analyst.agent_id for analyst in analysts],
-        price_history=market_data,
-        trade_blotter=_build_trade_blotter(
-            backtest_result.trade_log, backtest_result.decisions_by_day
-        ),
-        backtest_result=backtest_result,
-        track_record=track_record,
-        scoreboard=PerformanceScoreboard(track_record),
-        sp500_benchmark=_sp500_benchmark(start, end),
-        basket_benchmark=_basket_index_benchmark(market_data, tickers, start),
-    )
+        return DeskRun(
+            tickers=tickers,
+            group_name=group_name,
+            manager_mode=manager_mode,
+            source_label=source_label,
+            manager_ids=[manager.agent_id for manager in managers],
+            analyst_ids=[analyst.agent_id for analyst in analysts],
+            price_history=market_data,
+            trade_blotter=_build_trade_blotter(
+                backtest_result.trade_log, backtest_result.decisions_by_day
+            ),
+            backtest_result=backtest_result,
+            track_record=track_record,
+            scoreboard=PerformanceScoreboard(track_record),
+            sp500_benchmark=_sp500_benchmark(start, end),
+            basket_benchmark=_basket_index_benchmark(market_data, tickers, start),
+        )
 
 
 def _run_simulation_with_progress(
@@ -1039,6 +1072,7 @@ def _trust_panel_frame(desk_run: DeskRun, source_ids: list[str], as_of_date: dat
     weights = Hedge().get_weights(desk_run.scoreboard, source_ids, as_of_date)
     rows = []
     for source_id in source_ids:
+        sharpe: float | None
         try:
             sharpe = desk_run.scoreboard.sharpe_ratio(source_id, as_of_date, 30)
         except ValueError:
@@ -1108,6 +1142,7 @@ _POD_ANALYST_IDS: dict[str, frozenset[str]] = {
     "Factor": FACTOR_MANAGER_ANALYST_IDS,
     "Event/Credit": EVENT_CREDIT_MANAGER_ANALYST_IDS,
     "Alt-Data": ALT_DATA_MANAGER_ANALYST_IDS,
+    "Tail-Hedge": TAIL_HEDGE_MANAGER_ANALYST_IDS,
 }
 _ANALYST_ID_TO_POD: dict[str, str] = {
     analyst_id: pod for pod, analyst_ids in _POD_ANALYST_IDS.items() for analyst_id in analyst_ids
@@ -1123,23 +1158,55 @@ _MANAGER_ID_TO_POD: dict[str, str] = {
     "factor_manager": "Factor",
     "event_credit_manager": "Event/Credit",
     "alt_data_manager": "Alt-Data",
+    "tail_hedge_manager": "Tail-Hedge",
 }
 
 
+@st.cache_data(show_spinner=False, max_entries=4)
+def _firm_record_summary_cached(checkpoint: str, modified_ns: int) -> dict[str, Any]:
+    """`firm_record_summary` of the firm record whose engine checkpoint is
+    at `checkpoint`, its trial folder beside it. Cached per checkpoint path
+    and modification time (`modified_ns`, part of the cache key only), so
+    a record is read from its checkpoint and the lake once per session.
+
+    The build holds the process-wide `settings` at the record's settings
+    and opens a process-wide `lake_session` at the record's lake time while
+    it runs (`firm_record_summary`), so a simulation started in another
+    browser session of the same server while a record loads would run
+    under them."""
+    del modified_ns
+    return firm_record_summary(Path(checkpoint))
+
+
 def _load_saved_run_summary(path: Path) -> dict[str, Any]:
-    """Reads a saved-run JSON file from disk and returns it in the compact
-    `run_summary.extract_run_summary` shape, accepting either that summary
-    directly or a full `experiment_result.json`/checkpoint (auto-extracted
-    on load, since a raw run file is `decisions_by_day`/`trade_log`-heavy —
-    hundreds of MB — and this GUI panel only ever reads the smaller shape).
-    Raises on a missing file, invalid JSON, or a payload missing the
-    `test`/`calibration` blocks the rest of this panel assumes exist."""
+    """Reads a saved run from disk and returns it in the compact
+    `run_summary.extract_run_summary` shape. Accepts that summary directly,
+    a full `experiment_result.json`/checkpoint (auto-extracted on load,
+    since a raw run file is `decisions_by_day`/`trade_log`-heavy — hundreds
+    of MB — and this GUI panel only ever reads the smaller shape), a firm
+    record's summary (one `record` period, `agentic-trading-firm-review`),
+    or a firm record's engine checkpoint (`<store>/<spec hash>.checkpoint.sqlite`,
+    its trial folder `<store>/<spec hash>/` beside it), whose summary is
+    built from a copy of the checkpoint and the lake
+    (`_firm_record_summary_cached`, whose build changes process-wide state
+    while it runs). Raises on a missing file, invalid JSON, a JSON payload
+    with neither the `test`/`calibration` blocks nor a `record` block, and
+    the errors of `firm_record_summary`, among them `sqlite3.Error` for a
+    checkpoint SQLite cannot read."""
+    if path.name.endswith(CHECKPOINT_SUFFIX):
+        resolved = path.resolve()
+        return _firm_record_summary_cached(str(resolved), resolved.stat().st_mtime_ns)
     with path.open() as f:
         raw: dict[str, Any] = json.load(f)
     if "decisions_by_day" in raw.get("test", {}):
         return extract_run_summary(raw)
+    if RECORD_PERIOD in raw:
+        return raw
     if "test" not in raw or "calibration" not in raw:
-        raise ValueError("expected a 'test'/'calibration' keyed run summary or result file")
+        raise ValueError(
+            "expected a 'test'/'calibration' keyed run summary or result file, or a firm "
+            f"record's '{RECORD_PERIOD}' summary"
+        )
     return raw
 
 
@@ -1171,31 +1238,126 @@ def _saved_run_pod_frame(source_performance: dict[str, dict[str, float]]) -> pd.
     return frame.sort_values("cumulative_return") if not frame.empty else frame
 
 
+def _pod_cumulative_return_frame(pod_return_history: dict[str, list[Any]]) -> pd.DataFrame:
+    """Each pod's cumulative return in %, its daily returns in
+    `pod_return_history` (pod id to `[ISO date, return]` pairs, in date
+    order) compounded, one column per pod id in the mapping's order,
+    indexed by date. A pod's column is NaN on the dates it has no return;
+    empty when no pod has one."""
+    columns: dict[str, pd.Series] = {}
+    for pod_id, entries in pod_return_history.items():
+        if not entries:
+            continue
+        returns = np.array([value for _, value in entries], dtype=np.float64)
+        columns[pod_id] = pd.Series(
+            (np.cumprod(1.0 + returns) - 1.0) * 100.0,
+            index=pd.to_datetime([day for day, _ in entries]),
+        )
+    return pd.DataFrame(columns)
+
+
+def _pod_table_frame(
+    pod_performance: dict[str, dict[str, Any]], pod_costs: dict[str, dict[str, Any]]
+) -> pd.DataFrame:
+    """One row per pod id of `pod_performance`, then per further id of
+    `pod_costs` (the `"commander"` entry for costs no pod's change
+    explains): its pod name (`_MANAGER_ID_TO_POD`, the id itself for an
+    id it does not name), its `PodPerformance` fields and its
+    `PodCostAttribution` fields, missing ones NaN. Empty for no pod."""
+    rows = [
+        {
+            "pod_id": pod_id,
+            "pod": _MANAGER_ID_TO_POD.get(pod_id, pod_id),
+            **pod_performance.get(pod_id, {}),
+            **pod_costs.get(pod_id, {}),
+        }
+        for pod_id in dict.fromkeys([*pod_performance, *pod_costs])
+    ]
+    return pd.DataFrame(rows)
+
+
+def _render_saved_run_pods(period_data: dict[str, Any]) -> None:
+    """The saved-run tab's Pods section for one period: each pod's
+    cumulative real return over time, and its performance and costs."""
+    st.markdown("##### Pods")
+    returns_frame = _pod_cumulative_return_frame(period_data.get("pod_return_history", {}))
+    table = _pod_table_frame(
+        period_data.get("pod_performance", {}), period_data.get("pod_costs", {})
+    )
+    if returns_frame.empty and table.empty:
+        st.write("No pod returns or costs recorded for this period.")
+        return
+    st.caption(
+        "Each pod's own book as if run alone: its previous day's target weights times the "
+        "day's asset returns, compounded (%), before the Commander's allocation — a real "
+        "return, unlike the attribution scores above. Costs are in currency, the pod's share "
+        "of each fill by its change in contribution; turnover is annualized."
+    )
+    if not returns_frame.empty:
+        st.line_chart(returns_frame, height=360)
+    if not table.empty:
+        st.dataframe(
+            table,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "cumulative_return": st.column_config.NumberColumn(
+                    "Cumulative return", format="percent"
+                ),
+                "annualized_vol": st.column_config.NumberColumn("Ann. vol", format="percent"),
+                "sharpe_ratio": st.column_config.NumberColumn("Sharpe", format="%.2f"),
+                "max_drawdown": st.column_config.NumberColumn("Max drawdown", format="percent"),
+                "execution_cost": st.column_config.NumberColumn("Execution cost", format="%.0f"),
+                "option_premium_paid": st.column_config.NumberColumn(
+                    "Option premium paid", format="%.0f"
+                ),
+                "turnover": st.column_config.NumberColumn("Turnover (ann.)", format="%.2f"),
+            },
+        )
+
+
+def _ratio_text(value: float | None) -> str:
+    """A run-summary ratio to two decimals, or "n/a" when it is undefined
+    on the run (`None`)."""
+    return "n/a" if value is None else f"{value:.2f}"
+
+
 def _render_saved_run_tab() -> None:
     """A saved, already-completed run's results (loaded via the sidebar's
     "Load a saved run" panel), independent of the live desk simulation the
     rest of this dashboard drives — for browsing a multi-year CLI
-    (`agentic-trading-experiment`) run too large to re-simulate live in a
-    Streamlit session, not for stepping through it day by day the way the
-    Overview tab does for a freshly-run desk."""
+    (`agentic-trading-experiment`) run or a firm record too large to
+    re-simulate live in a Streamlit session, not for stepping through it
+    day by day the way the Overview tab does for a freshly-run desk. A firm
+    record's summary has one `record` period, charted against its SPY
+    total-return baseline."""
     summary = st.session_state.get("saved_run_summary")
     if summary is None:
         st.info(
             "Load a saved run from the sidebar (**Load a saved run**) to browse it here — "
             "point it at a run's `experiment_result.json`, checkpoint, or pre-extracted "
-            "`summary.json` (see `scripts/extract_run_summary.py`)."
+            "`summary.json` (see `scripts/extract_run_summary.py`), or at a firm record's "
+            "`<spec hash>.checkpoint.sqlite` or its `agentic-trading-firm-review` summary."
         )
         return
 
     experiment = summary["experiment"]
     st.markdown(f"#### `{st.session_state.get('saved_run_source_path', 'loaded run')}`")
-    st.caption(
+    caption = (
         f"Assets: {', '.join(experiment.get('assets', []))} · "
         f"Excluded analysts: {', '.join(experiment.get('excluded_analysts', [])) or 'none'} · "
         f"Market data: {summary['market_data_source']}"
     )
+    lake = summary.get("lake") or {}
+    if lake.get("lake_time"):
+        caption += f" · Lake time: {lake['lake_time']}"
+    if lake.get("lake_version"):
+        caption += f" · Lake version: {lake['lake_version']}"
+    if experiment.get("spec_hash"):
+        caption += f" · Spec hash: {experiment['spec_hash']}"
+    st.caption(caption)
 
-    available_periods = [p for p in ("test", "calibration") if p in summary]
+    available_periods = [p for p in (RECORD_PERIOD, "test", "calibration") if p in summary]
     period = st.radio("Period", available_periods, horizontal=True, key="saved_run_period")
     period_data = summary[period]
 
@@ -1203,20 +1365,24 @@ def _render_saved_run_tab() -> None:
         f"**{period_data['start_date']} → {period_data['end_date']}**"
         f" ({len(period_data['portfolio_value_history'])} trading days)"
     )
-    metric_cols = st.columns(6)
-    metric_cols[0].metric("Sharpe", f"{period_data['final_sharpe_ratio']:.2f}")
-    metric_cols[1].metric("Sortino", f"{period_data['final_sortino_ratio']:.2f}")
-    metric_cols[2].metric("Calmar", f"{period_data['final_calmar_ratio']:.2f}")
+    metric_cols = st.columns(7)
+    metric_cols[0].metric("Sharpe", _ratio_text(period_data["final_sharpe_ratio"]))
+    metric_cols[1].metric("Sortino", _ratio_text(period_data["final_sortino_ratio"]))
+    metric_cols[2].metric("Calmar", _ratio_text(period_data["final_calmar_ratio"]))
     metric_cols[3].metric("Max drawdown", f"{period_data['final_max_drawdown']:.1%}")
     metric_cols[4].metric("Hit rate", f"{period_data['final_hit_rate']:.1%}")
-    metric_cols[5].metric("Profit factor", f"{period_data['final_profit_factor']:.2f}")
+    metric_cols[5].metric("Profit factor", _ratio_text(period_data["final_profit_factor"]))
+    metric_cols[6].metric(
+        "Information ratio", _ratio_text(period_data.get("final_information_ratio"))
+    )
 
     st.markdown("##### Equity curve")
     equity_frame = pd.DataFrame(
-        period_data["portfolio_value_history"], columns=["date", "system"]
+        period_data["portfolio_value_history"],
+        columns=["date", "firm" if period == RECORD_PERIOD else "system"],
     ).set_index("date")
     equity_frame.index = pd.to_datetime(equity_frame.index)
-    if period == "test" and summary.get("baselines"):
+    if period in ("test", RECORD_PERIOD) and summary.get("baselines"):
         for name, baseline in summary["baselines"].items():
             baseline_series = pd.DataFrame(
                 baseline["portfolio_value_history"], columns=["date", name]
@@ -1252,6 +1418,8 @@ def _render_saved_run_tab() -> None:
                 width="stretch",
                 hide_index=True,
             )
+
+    _render_saved_run_pods(period_data)
 
     st.markdown("##### Signal health")
     st.caption(
@@ -1372,7 +1540,7 @@ def _render_overview_tab() -> None:
             f"${current_value:,.2f}",
             f"{daily_change:,.2f} / {daily_change_pct:.2f}%",
         )
-        metric_mid.metric("Sharpe", f"{backtest_result.final_sharpe_ratio:.2f}")
+        metric_mid.metric("Sharpe", _ratio_text(backtest_result.final_sharpe_ratio))
         metric_right.metric("Max drawdown", f"{backtest_result.final_max_drawdown:,.2f}")
         metric_far.metric("Desk date", current_date.isoformat())
 
@@ -1725,7 +1893,10 @@ def render_dashboard() -> None:
                 "Browse a completed CLI run (`agentic-trading-experiment`) in the "
                 "**Saved Run** tab instead of re-simulating it live — point this at "
                 "its `experiment_result.json`/checkpoint, or a pre-extracted "
-                "`summary.json` (`scripts/extract_run_summary.py`)."
+                "`summary.json` (`scripts/extract_run_summary.py`). A firm record "
+                "loads from its `<spec hash>.checkpoint.sqlite` (read-only, its trial "
+                "folder beside it; the first load reads the lake) or from the summary "
+                "`agentic-trading-firm-review` writes."
             )
             saved_run_path_input = st.text_input(
                 "Path",
@@ -1744,7 +1915,14 @@ def render_dashboard() -> None:
                         Path(saved_run_path_input)
                     )
                 st.session_state["saved_run_source_path"] = saved_run_path_input
-            except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            except (
+                OSError,
+                json.JSONDecodeError,
+                KeyError,
+                ValueError,
+                RuntimeError,
+                sqlite3.Error,
+            ) as exc:
                 st.sidebar.error(f"Could not load {saved_run_path_input!r}: {exc}")
 
     if reset_clicked:
@@ -1794,6 +1972,9 @@ def render_dashboard() -> None:
         )
 
     if st.session_state.get("backtest_result") is None:
+        if st.session_state.get("saved_run_summary") is not None:
+            _render_saved_run_tab()
+            return
         st.info("Configure the desk in the sidebar and click **Run simulation** to begin.")
         return
 

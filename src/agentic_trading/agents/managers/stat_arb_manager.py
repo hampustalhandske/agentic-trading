@@ -1,5 +1,7 @@
 # stat_arb_manager.py
 
+from collections.abc import Mapping
+
 import pandas as pd
 from pydantic import PrivateAttr
 
@@ -16,7 +18,7 @@ from agentic_trading.agents.analysts.stat_arb_pod.pairs_cointegration_analyst im
     PairsCointegrationAnalyst,
 )
 from agentic_trading.agents.base import ManagerAgent
-from agentic_trading.agents.schemas import AgentSignal, PortfolioDecision
+from agentic_trading.agents.schemas import AgentSignal, ManagerSignal, PortfolioDecision
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
@@ -59,11 +61,13 @@ class StatArbManager(ManagerAgent):
     - the surviving set is ranked by half-life (fastest reversion first)
       and truncated to `max_pairs`.
 
-    The resulting partner wiring and Engle-Granger hedge ratios are pushed
+    The held pairs' partner wiring and Engle-Granger hedge ratios are pushed
     into `PairsCointegrationAnalyst` (`partner_tickers_by_asset`,
     `hedge_ratio_by_pair`) and `KalmanHedgeRatioAnalyst`
     (`partner_ticker_by_asset`) on whichever of its own `managed_analysts`
-    are those types. An asset with no held pair falls into both analysts'
+    are those types, on every `construct_portfolio` call, so the wiring
+    follows the held set whether it was screened this run or restored from
+    a checkpoint. An asset with no held pair falls into both analysts'
     "no partner ticker(s) configured" flat path."""
 
     agent_id: str = "stat_arb_manager"
@@ -196,10 +200,10 @@ class StatArbManager(ManagerAgent):
                     as_of_date.date(),
                     {pair: f"{v.half_life:.1f}d" for pair, v in held.items()},
                 )
-            self._wire_analysts(held)
             return tuple(held)
 
         self._pairs_refit_cache.get_or_refit("pairs", as_of_date, _refresh)
+        self._wire_analysts(self._held_pairs)
 
     def construct_portfolio(
         self,
@@ -207,9 +211,13 @@ class StatArbManager(ManagerAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
         scoreboard: PerformanceScoreboard,
+        *,
+        carried: Mapping[str, list[ManagerSignal]] | None = None,
     ) -> list[PortfolioDecision]:
         self._maybe_rescreen_pairs(assets, market_data, as_of_date)
-        return super().construct_portfolio(assets, market_data, as_of_date, scoreboard)
+        return super().construct_portfolio(
+            assets, market_data, as_of_date, scoreboard, carried=carried
+        )
 
     def scale_factor(
         self,

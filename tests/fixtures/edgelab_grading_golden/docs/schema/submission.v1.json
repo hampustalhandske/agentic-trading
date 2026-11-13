@@ -1,0 +1,441 @@
+{
+  "$defs": {
+    "ClientRef": {
+      "additionalProperties": false,
+      "description": "The client project and revision a submission comes from.\n\nAttributes:\n    project: Plain project name, lower-case letters, digits and hyphens.\n    git_sha: Commit of the client repository the strategy code was taken from (7 to 40 hex\n        characters).\n    hypothesis_id: The client's identifier of the hypothesis under test.",
+      "properties": {
+        "git_sha": {
+          "description": "Client commit, 7 to 40 hex characters.",
+          "title": "Git Sha",
+          "type": "string"
+        },
+        "hypothesis_id": {
+          "description": "The client's hypothesis identifier.",
+          "minLength": 1,
+          "title": "Hypothesis Id",
+          "type": "string"
+        },
+        "project": {
+          "description": "Client project name: lower-case letters, digits, hyphens.",
+          "title": "Project",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "git_sha",
+        "hypothesis_id"
+      ],
+      "title": "ClientRef",
+      "type": "object"
+    },
+    "DateWindow": {
+      "additionalProperties": false,
+      "description": "A closed date range, `start <= end`.\n\nAttributes:\n    start: First day.\n    end: Last day, inclusive.",
+      "properties": {
+        "end": {
+          "format": "date",
+          "title": "End",
+          "type": "string"
+        },
+        "start": {
+          "format": "date",
+          "title": "Start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "title": "DateWindow",
+      "type": "object"
+    },
+    "DecisionFileSpec": {
+      "additionalProperties": false,
+      "description": "The replay decision file: one Parquet per variant, read as rows of `DecisionRow`.\n\nA full snapshot of target weights per decision date; an instrument absent from a date's rows\nhas weight 0. Decided after the close of `decision_date`, filled at the open of the next\nsession. A file holds one asset class: equity (bond ETFs included) or FX.\n\nAttributes:\n    path: The Parquet file, relative to the submission folder.\n    sources: The input sources the rows' `source` column may name, each listed once.",
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sources": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DecisionSource"
+          },
+          "title": "Sources",
+          "type": "array"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "DecisionFileSpec",
+      "type": "object"
+    },
+    "DecisionSource": {
+      "additionalProperties": false,
+      "description": "One input source of a decision file, declared once for the look-ahead audit.\n\nA dated source says whether it can publish after the close (earnings releases, 8-Ks, Form 4\nfilings, FINRA short interest). An undated source has no publication date at all (a current\nSIC code used to screen candidates); it states its `limitation` and is never named by a row.\n\nAttributes:\n    name: The name rows use in their `source` column.\n    can_publish_after_close: `True` when the source can publish after the 16:00 ET close of a\n        session, `False` when it always publishes before it; absent for an undated source.\n    undated: `True` for a source with no date; it then needs a `limitation`.\n    limitation: One line saying what an undated source is and where it is used.",
+      "properties": {
+        "can_publish_after_close": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Can Publish After Close"
+        },
+        "limitation": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Limitation"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "undated": {
+          "default": false,
+          "title": "Undated",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "DecisionSource",
+      "type": "object"
+    },
+    "LakeQuery": {
+      "additionalProperties": false,
+      "description": "One query against a lake table.\n\nAttributes:\n    table: The lake table.\n    sql: The query text.",
+      "properties": {
+        "sql": {
+          "minLength": 1,
+          "title": "Sql",
+          "type": "string"
+        },
+        "table": {
+          "minLength": 1,
+          "title": "Table",
+          "type": "string"
+        }
+      },
+      "required": [
+        "table",
+        "sql"
+      ],
+      "title": "LakeQuery",
+      "type": "object"
+    },
+    "LakeQueryBundle": {
+      "additionalProperties": false,
+      "description": "Data to be read from the lake as of a fixed time.\n\nAttributes:\n    kind: `\"lake\"`.\n    lake_time: The lake state to read, a UTC timestamp.\n    queries: The queries; may be empty.",
+      "properties": {
+        "kind": {
+          "const": "lake",
+          "default": "lake",
+          "title": "Kind",
+          "type": "string"
+        },
+        "lake_time": {
+          "format": "date-time",
+          "title": "Lake Time",
+          "type": "string"
+        },
+        "queries": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/LakeQuery"
+          },
+          "title": "Queries",
+          "type": "array"
+        }
+      },
+      "required": [
+        "lake_time"
+      ],
+      "title": "LakeQueryBundle",
+      "type": "object"
+    },
+    "ParquetBundle": {
+      "additionalProperties": false,
+      "description": "Data supplied as a Parquet bundle inside the submission folder.\n\nAttributes:\n    kind: `\"parquet\"`.\n    path: The bundle folder, relative to the submission folder.",
+      "properties": {
+        "kind": {
+          "const": "parquet",
+          "default": "parquet",
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "ParquetBundle",
+      "type": "object"
+    },
+    "PriorExposure": {
+      "additionalProperties": false,
+      "description": "Earlier looks of this strategy family at the data, which the trial count did not see.\n\nAttributes:\n    note: What the earlier looks were.\n    windows: The date windows the earlier runs of this family (its variants) were evaluated on.\n    min_count: The known lower bound of those uncounted earlier runs.",
+      "properties": {
+        "min_count": {
+          "minimum": 0,
+          "title": "Min Count",
+          "type": "integer"
+        },
+        "note": {
+          "minLength": 1,
+          "title": "Note",
+          "type": "string"
+        },
+        "windows": {
+          "items": {
+            "$ref": "#/$defs/DateWindow"
+          },
+          "minItems": 1,
+          "title": "Windows",
+          "type": "array"
+        }
+      },
+      "required": [
+        "note",
+        "windows",
+        "min_count"
+      ],
+      "title": "PriorExposure",
+      "type": "object"
+    },
+    "ScoreWindow": {
+      "additionalProperties": false,
+      "description": "The window the evidence is scored on, `start < end`.\n\nAttributes:\n    start: First day.\n    end: Last day, strictly after `start`.",
+      "properties": {
+        "end": {
+          "format": "date",
+          "title": "End",
+          "type": "string"
+        },
+        "start": {
+          "format": "date",
+          "title": "Start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "title": "ScoreWindow",
+      "type": "object"
+    },
+    "TrialDeclaration": {
+      "additionalProperties": false,
+      "description": "How many hypotheses the client tried before this one, as the client states it.\n\nAttributes:\n    family_id: The client's name for the trial family.\n    declared_n: Number of trials the client counts for the family.\n    ledger_ref: The client's ledger reference, or `None`.\n    test_keys: The client's keys of the tests behind `declared_n` (unique); `None` when not\n        given. At most `declared_n` of them.\n    ledger_export_path: Path inside the folder to the client's ledger export, or `None`.\n    prior_exposure: Earlier looks at the data that are not in the count, or `None`.",
+      "properties": {
+        "declared_n": {
+          "minimum": 1,
+          "title": "Declared N",
+          "type": "integer"
+        },
+        "family_id": {
+          "minLength": 1,
+          "title": "Family Id",
+          "type": "string"
+        },
+        "ledger_export_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ledger Export Path"
+        },
+        "ledger_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ledger Ref"
+        },
+        "prior_exposure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PriorExposure"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "test_keys": {
+          "anyOf": [
+            {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Test Keys"
+        }
+      },
+      "required": [
+        "family_id",
+        "declared_n"
+      ],
+      "title": "TrialDeclaration",
+      "type": "object"
+    }
+  },
+  "$id": "urn:edgelab:schema:submission.v1",
+  "additionalProperties": false,
+  "description": "The content of a submission folder's `submission.json`.\n\nAttributes:\n    schema_version: `1` or `2`. Version 2 adds `policy`; every other field is the same.\n    kind: `\"code\"` (a strategy the pipeline runs) or `\"replay\"` (a decision file replayed by a\n        `TargetWeightsReplay` strategy).\n    client: Which client project and commit this comes from.\n    strategy_dir: The strategy folder, relative to the submission folder; holds\n        `strategy.yaml` for a `code` submission.\n    data: Where the data comes from: a Parquet bundle in the folder, or a lake query bundle\n        (validated but not run yet).\n    decisions: The decision file; required for `replay`, absent for `code`.\n    trials: The client's trial declaration.\n    groups_path: Parquet file with columns `instrument_id` and `group`, or `None`.\n    train_end: The last date the client used to design or fit the strategy; data up to it is\n        warm-up and features only. `None` when not stated.\n    test_window: The window the evidence is scored on, starting after `train_end`; `None`\n        scores the strategy config's data range.\n    seed: Seed of every stochastic step of the run.\n    profile: Sample-size profile of the run.\n    policy: A published grading policy name, version 2 only. The run is graded under that\n        policy's registered values in place of the strategy folder's `grading:` block and\n        records the policy and its cost table hash. `None` grades under the folder's block.",
+  "properties": {
+    "client": {
+      "$ref": "#/$defs/ClientRef"
+    },
+    "data": {
+      "discriminator": {
+        "mapping": {
+          "lake": "#/$defs/LakeQueryBundle",
+          "parquet": "#/$defs/ParquetBundle"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ParquetBundle"
+        },
+        {
+          "$ref": "#/$defs/LakeQueryBundle"
+        }
+      ],
+      "title": "Data"
+    },
+    "decisions": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DecisionFileSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "groups_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Groups Path"
+    },
+    "kind": {
+      "enum": [
+        "code",
+        "replay"
+      ],
+      "title": "Kind",
+      "type": "string"
+    },
+    "profile": {
+      "enum": [
+        "fast",
+        "full"
+      ],
+      "title": "Profile",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "seed": {
+      "minimum": 0,
+      "title": "Seed",
+      "type": "integer"
+    },
+    "strategy_dir": {
+      "title": "Strategy Dir",
+      "type": "string"
+    },
+    "test_window": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScoreWindow"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "train_end": {
+      "anyOf": [
+        {
+          "format": "date",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Train End"
+    },
+    "trials": {
+      "$ref": "#/$defs/TrialDeclaration"
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "client",
+    "strategy_dir",
+    "data",
+    "trials",
+    "seed",
+    "profile"
+  ],
+  "title": "Submission",
+  "type": "object"
+}

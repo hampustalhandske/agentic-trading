@@ -1,0 +1,999 @@
+{
+ "contract": "lakehouse-contract-v2",
+ "frozen_on": "2026-11-10",
+ "supersedes": "lakehouse-contract-v1",
+ "sha256": "45cacd57cc76a2a513bd0b8549201f818e0a08d348ca4fa69f3ae3b787eeb342",
+ "views": {
+  "bis_observations": {
+   "dataflow": "VARCHAR",
+   "series_key": "VARCHAR",
+   "period": "VARCHAR",
+   "date": "DATE",
+   "ref_area": "VARCHAR",
+   "freq": "VARCHAR",
+   "value": "DOUBLE",
+   "obs_status": "VARCHAR",
+   "pre_break_value": "DOUBLE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "cftc_cot_disaggregated": {
+   "cftc_contract_market_code": "VARCHAR",
+   "contract_market_name": "VARCHAR",
+   "report_date": "DATE",
+   "open_interest_all": "BIGINT",
+   "producer_merchant_long": "BIGINT",
+   "producer_merchant_short": "BIGINT",
+   "swap_dealer_long": "BIGINT",
+   "swap_dealer_short": "BIGINT",
+   "swap_dealer_spread": "BIGINT",
+   "managed_money_long": "BIGINT",
+   "managed_money_short": "BIGINT",
+   "managed_money_spread": "BIGINT",
+   "other_reportable_long": "BIGINT",
+   "other_reportable_short": "BIGINT",
+   "other_reportable_spread": "BIGINT",
+   "total_reportable_long": "BIGINT",
+   "total_reportable_short": "BIGINT",
+   "nonreportable_long": "BIGINT",
+   "nonreportable_short": "BIGINT",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "cftc_cot_publication": {
+   "report_date": "DATE",
+   "published_date": "DATE",
+   "published_at": "TIMESTAMP WITH TIME ZONE",
+   "rule_date": "DATE",
+   "basis": "VARCHAR",
+   "source_url": "VARCHAR",
+   "note": "VARCHAR",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "cftc_cot_tff": {
+   "cftc_contract_market_code": "VARCHAR",
+   "contract_market_name": "VARCHAR",
+   "report_date": "DATE",
+   "open_interest_all": "BIGINT",
+   "dealer_long": "BIGINT",
+   "dealer_short": "BIGINT",
+   "dealer_spread": "BIGINT",
+   "asset_manager_long": "BIGINT",
+   "asset_manager_short": "BIGINT",
+   "asset_manager_spread": "BIGINT",
+   "leveraged_funds_long": "BIGINT",
+   "leveraged_funds_short": "BIGINT",
+   "leveraged_funds_spread": "BIGINT",
+   "other_reportable_long": "BIGINT",
+   "other_reportable_short": "BIGINT",
+   "other_reportable_spread": "BIGINT",
+   "total_reportable_long": "BIGINT",
+   "total_reportable_short": "BIGINT",
+   "nonreportable_long": "BIGINT",
+   "nonreportable_short": "BIGINT",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "crypto_klines_1m": {
+   "symbol": "VARCHAR",
+   "open_time": "TIMESTAMP",
+   "open": "DOUBLE",
+   "high": "DOUBLE",
+   "low": "DOUBLE",
+   "close": "DOUBLE",
+   "volume": "DOUBLE",
+   "quote_volume": "DOUBLE",
+   "n_trades": "BIGINT",
+   "taker_buy_base_volume": "DOUBLE",
+   "taker_buy_quote_volume": "DOUBLE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "dolthub_earnings_calendar": {
+   "act_symbol": "VARCHAR",
+   "date": "DATE",
+   "when": "VARCHAR",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "dolthub_eps_history": {
+   "act_symbol": "VARCHAR",
+   "period_end_date": "DATE",
+   "reported": "DOUBLE",
+   "estimate": "DOUBLE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "dolthub_option_chain": {
+   "underlying": "VARCHAR",
+   "date": "DATE",
+   "expiration": "DATE",
+   "option_type": "VARCHAR",
+   "strike": "DOUBLE",
+   "bid": "DOUBLE",
+   "ask": "DOUBLE",
+   "implied_volatility": "DOUBLE",
+   "delta": "DOUBLE",
+   "gamma": "DOUBLE",
+   "theta": "DOUBLE",
+   "vega": "DOUBLE",
+   "rho": "DOUBLE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "equity_adjustment_factors": {
+   "ticker": "VARCHAR",
+   "effective_date": "DATE",
+   "split_factor": "DOUBLE",
+   "dividend_factor": "DOUBLE",
+   "cum_factor": "DOUBLE",
+   "source": "VARCHAR",
+   "verified": "BOOLEAN",
+   "verification_n_days": "BIGINT",
+   "verification_median_abs_pct_diff": "DOUBLE",
+   "verification_pct_days_within_tolerance": "DOUBLE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "split_sources": "VARCHAR",
+   "dividend_sources": "VARCHAR",
+   "security_id": "BIGINT",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "equity_daily_from_bars": {
+   "ticker": "VARCHAR",
+   "date": "DATE",
+   "open": "DOUBLE",
+   "high": "DOUBLE",
+   "low": "DOUBLE",
+   "close": "DOUBLE",
+   "volume": "DOUBLE",
+   "n_bars": "INTEGER",
+   "security_id": "BIGINT",
+   "official_close": "DOUBLE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "source": "VARCHAR",
+   "yahoo_ticker": "VARCHAR",
+   "ticker_basis": "VARCHAR",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "equity_distributions": {
+   "ticker": "VARCHAR",
+   "ex_date": "DATE",
+   "amount_as_traded": "DOUBLE",
+   "amount_split_adjusted": "DOUBLE",
+   "prior_close_as_traded": "DOUBLE",
+   "yield_on_prior_close": "DOUBLE",
+   "distribution_type": "VARCHAR",
+   "type_evidence": "VARCHAR",
+   "sources": "VARCHAR",
+   "basis_evidence": "VARCHAR",
+   "applied": "BOOLEAN",
+   "applied_evidence": "VARCHAR",
+   "observed_move": "DOUBLE",
+   "yahoo_amount": "DOUBLE",
+   "yahoo_split_factor": "DOUBLE",
+   "dolthub_amount": "DOUBLE",
+   "dolthub_basis": "VARCHAR",
+   "source_ticker": "VARCHAR",
+   "security_id": "BIGINT",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "famafrench_returns": {
+   "dataset": "VARCHAR",
+   "frequency": "VARCHAR",
+   "date": "DATE",
+   "portfolio": "VARCHAR",
+   "value": "DOUBLE",
+   "weighting": "VARCHAR",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "finra_short_interest": {
+   "symbol": "VARCHAR",
+   "issue_name": "VARCHAR",
+   "settlement_date": "DATE",
+   "dissemination_date": "DATE",
+   "current_short_position": "BIGINT",
+   "previous_short_position": "BIGINT",
+   "average_daily_volume": "BIGINT",
+   "days_to_cover": "DOUBLE",
+   "change_percent": "DOUBLE",
+   "change_previous_number": "BIGINT",
+   "market_class_code": "VARCHAR",
+   "exchange_code": "VARCHAR",
+   "revision_flag": "VARCHAR",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "fred_vintages": {
+   "series_id": "VARCHAR",
+   "date": "DATE",
+   "realtime_start": "DATE",
+   "value": "DOUBLE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "futures_continuous_daily": {
+   "root": "VARCHAR",
+   "date": "DATE",
+   "front_contract": "VARCHAR",
+   "unadjusted_close": "DOUBLE",
+   "ratio_adjusted_close": "DOUBLE",
+   "diff_adjusted_close": "DOUBLE",
+   "is_roll_day": "BOOLEAN",
+   "roll_return": "DOUBLE",
+   "roll_gap_known": "BOOLEAN",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "instrument_prices": {
+   "ticker": "VARCHAR",
+   "asset_class": "VARCHAR",
+   "date": "DATE",
+   "open": "DOUBLE",
+   "high": "DOUBLE",
+   "low": "DOUBLE",
+   "close": "DOUBLE",
+   "adj_close": "DOUBLE",
+   "volume": "BIGINT",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "option_chain_history": {
+   "underlying": "VARCHAR",
+   "option_symbol": "VARCHAR",
+   "expiration": "DATE",
+   "option_type": "VARCHAR",
+   "strike": "DOUBLE",
+   "bid": "DOUBLE",
+   "ask": "DOUBLE",
+   "bid_size": "BIGINT",
+   "ask_size": "BIGINT",
+   "mark": "DOUBLE",
+   "implied_volatility": "DOUBLE",
+   "open_interest": "BIGINT",
+   "volume": "BIGINT",
+   "delta": "DOUBLE",
+   "gamma": "DOUBLE",
+   "vega": "DOUBLE",
+   "theta": "DOUBLE",
+   "rho": "DOUBLE",
+   "last_trade_price": "DOUBLE",
+   "snapshot_date": "DATE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "sec_company_facts": {
+   "ticker": "VARCHAR",
+   "cik": "BIGINT",
+   "concept": "VARCHAR",
+   "unit": "VARCHAR",
+   "period_start": "DATE",
+   "period_end": "DATE",
+   "value": "DOUBLE",
+   "fiscal_year": "BIGINT",
+   "fiscal_period": "VARCHAR",
+   "form": "VARCHAR",
+   "accession_number": "VARCHAR",
+   "filed_date": "DATE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "sec_filings": {
+   "cik": "BIGINT",
+   "ticker": "VARCHAR",
+   "accession_number": "VARCHAR",
+   "form": "VARCHAR",
+   "filing_date": "DATE",
+   "report_date": "DATE",
+   "accepted_at": "TIMESTAMP WITH TIME ZONE",
+   "items": "VARCHAR",
+   "primary_document": "VARCHAR",
+   "primary_doc_description": "VARCHAR",
+   "size": "BIGINT",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "sec_insider_transactions": {
+   "issuer_ticker": "VARCHAR",
+   "issuer_cik": "BIGINT",
+   "owner_cik": "BIGINT",
+   "owner_name": "VARCHAR",
+   "is_officer": "BOOLEAN",
+   "officer_title": "\"NULL\"",
+   "is_director": "BOOLEAN",
+   "is_ten_percent_owner": "BOOLEAN",
+   "transaction_date": "DATE",
+   "security_title": "VARCHAR",
+   "transaction_code": "VARCHAR",
+   "shares": "DOUBLE",
+   "price_per_share": "DOUBLE",
+   "acquired_disposed": "VARCHAR",
+   "shares_owned_after": "DOUBLE",
+   "ownership_nature": "VARCHAR",
+   "accession_number": "VARCHAR",
+   "filed_date": "DATE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "sec_sic_classification": {
+   "ticker": "VARCHAR",
+   "cik": "BIGINT",
+   "company_name": "VARCHAR",
+   "sic": "VARCHAR",
+   "sic_description": "VARCHAR",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "sp500_member_count": {
+   "date": "DATE",
+   "member_lines": "INTEGER",
+   "nominal_members": "INTEGER",
+   "shortfall": "INTEGER",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "sp500_membership": {
+   "ticker": "VARCHAR",
+   "start_date": "DATE",
+   "end_date": "DATE",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "renamed_from": "VARCHAR",
+   "renamed_to": "VARCHAR",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "sp500_price_coverage": {
+   "ticker": "VARCHAR",
+   "start_date": "DATE",
+   "end_date": "DATE",
+   "security_id": "BIGINT",
+   "piece_start": "DATE",
+   "piece_end": "DATE",
+   "piece_sessions": "INTEGER",
+   "within_piece_share": "DOUBLE",
+   "within_piece_share_bars": "DOUBLE",
+   "first_bar_date": "DATE",
+   "last_bar_date": "DATE",
+   "n_bar_days": "INTEGER",
+   "sessions_last_bar_to_removal": "INTEGER",
+   "covered_through_removal": "BOOLEAN",
+   "yahoo_has_removal_window": "BOOLEAN",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "span_sessions": "INTEGER",
+   "within_span_share": "DOUBLE",
+   "within_span_share_bars": "DOUBLE",
+   "first_price_date": "DATE",
+   "first_yahoo_date": "DATE",
+   "history_before_entry_days": "INTEGER",
+   "listing_origin": "VARCHAR",
+   "listing_evidence": "VARCHAR",
+   "identity": "VARCHAR",
+   "identity_classification": "VARCHAR",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  },
+  "yahoo_split_close_basis": {
+   "ticker": "VARCHAR",
+   "ex_date": "DATE",
+   "ratio": "DOUBLE",
+   "in_close_basis": "BOOLEAN",
+   "c0": "DOUBLE",
+   "c1": "DOUBLE",
+   "observed_move": "DOUBLE",
+   "evidence": "VARCHAR",
+   "scraped_at": "TIMESTAMP WITH TIME ZONE",
+   "distribution_amount": "DOUBLE",
+   "dt": "DATE",
+   "table": "VARCHAR"
+  }
+ },
+ "tables": {
+  "bis_observations": {
+   "kind": "current",
+   "keys": [
+    "dataflow",
+    "series_key",
+    "period"
+   ],
+   "tie_order": [
+    "date",
+    "ref_area",
+    "freq",
+    "value",
+    "obs_status",
+    "pre_break_value"
+   ]
+  },
+  "cftc_cot_disaggregated": {
+   "kind": "current",
+   "keys": [
+    "cftc_contract_market_code",
+    "report_date"
+   ],
+   "tie_order": [
+    "contract_market_name",
+    "open_interest_all",
+    "producer_merchant_long",
+    "producer_merchant_short",
+    "swap_dealer_long",
+    "swap_dealer_short",
+    "swap_dealer_spread",
+    "managed_money_long",
+    "managed_money_short",
+    "managed_money_spread",
+    "other_reportable_long",
+    "other_reportable_short",
+    "other_reportable_spread",
+    "total_reportable_long",
+    "total_reportable_short",
+    "nonreportable_long",
+    "nonreportable_short"
+   ]
+  },
+  "cftc_cot_publication": {
+   "kind": "rebuilt_whole",
+   "keys": [
+    "report_date"
+   ],
+   "tie_order": null
+  },
+  "cftc_cot_tff": {
+   "kind": "current",
+   "keys": [
+    "cftc_contract_market_code",
+    "report_date"
+   ],
+   "tie_order": [
+    "contract_market_name",
+    "open_interest_all",
+    "dealer_long",
+    "dealer_short",
+    "dealer_spread",
+    "asset_manager_long",
+    "asset_manager_short",
+    "asset_manager_spread",
+    "leveraged_funds_long",
+    "leveraged_funds_short",
+    "leveraged_funds_spread",
+    "other_reportable_long",
+    "other_reportable_short",
+    "other_reportable_spread",
+    "total_reportable_long",
+    "total_reportable_short",
+    "nonreportable_long",
+    "nonreportable_short"
+   ]
+  },
+  "crypto_klines_1m": {
+   "kind": "append_only",
+   "keys": [
+    "symbol",
+    "open_time"
+   ],
+   "tie_order": null
+  },
+  "dolthub_earnings_calendar": {
+   "kind": "current",
+   "keys": [
+    "act_symbol",
+    "date"
+   ],
+   "tie_order": [
+    "when"
+   ]
+  },
+  "dolthub_eps_history": {
+   "kind": "current",
+   "keys": [
+    "act_symbol",
+    "period_end_date"
+   ],
+   "tie_order": [
+    "reported",
+    "estimate"
+   ]
+  },
+  "dolthub_option_chain": {
+   "kind": "current",
+   "keys": [
+    "underlying",
+    "date",
+    "expiration",
+    "strike",
+    "option_type"
+   ],
+   "tie_order": [
+    "bid",
+    "ask",
+    "implied_volatility",
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "rho"
+   ]
+  },
+  "equity_adjustment_factors": {
+   "kind": "rebuilt_whole",
+   "keys": [
+    "ticker",
+    "effective_date"
+   ],
+   "tie_order": null
+  },
+  "equity_daily_from_bars": {
+   "kind": "rebuilt_whole",
+   "keys": [
+    "ticker",
+    "date"
+   ],
+   "tie_order": null
+  },
+  "equity_distributions": {
+   "kind": "rebuilt_whole",
+   "keys": [
+    "ticker",
+    "ex_date"
+   ],
+   "tie_order": null
+  },
+  "famafrench_returns": {
+   "kind": "current",
+   "keys": [
+    "dataset",
+    "frequency",
+    "portfolio",
+    "weighting",
+    "date"
+   ],
+   "tie_order": [
+    "value"
+   ]
+  },
+  "finra_short_interest": {
+   "kind": "current",
+   "keys": [
+    "symbol",
+    "settlement_date"
+   ],
+   "tie_order": [
+    "issue_name",
+    "dissemination_date",
+    "current_short_position",
+    "previous_short_position",
+    "average_daily_volume",
+    "days_to_cover",
+    "change_percent",
+    "change_previous_number",
+    "market_class_code",
+    "exchange_code",
+    "revision_flag"
+   ]
+  },
+  "fred_vintages": {
+   "kind": "current",
+   "keys": [
+    "series_id",
+    "date",
+    "realtime_start"
+   ],
+   "tie_order": [
+    "value"
+   ]
+  },
+  "futures_continuous_daily": {
+   "kind": "current",
+   "keys": [
+    "root",
+    "date"
+   ],
+   "tie_order": [
+    "front_contract",
+    "unadjusted_close",
+    "ratio_adjusted_close",
+    "diff_adjusted_close",
+    "is_roll_day",
+    "roll_return",
+    "roll_gap_known"
+   ]
+  },
+  "instrument_prices": {
+   "kind": "current",
+   "keys": [
+    "ticker",
+    "date"
+   ],
+   "tie_order": [
+    "asset_class",
+    "open",
+    "high",
+    "low",
+    "close",
+    "adj_close",
+    "volume"
+   ]
+  },
+  "option_chain_history": {
+   "kind": "current",
+   "keys": [
+    "option_symbol",
+    "snapshot_date"
+   ],
+   "tie_order": [
+    "underlying",
+    "expiration",
+    "option_type",
+    "strike",
+    "bid",
+    "ask",
+    "bid_size",
+    "ask_size",
+    "mark",
+    "implied_volatility",
+    "open_interest",
+    "volume",
+    "delta",
+    "gamma",
+    "vega",
+    "theta",
+    "rho",
+    "last_trade_price"
+   ]
+  },
+  "sec_company_facts": {
+   "kind": "current",
+   "keys": [
+    "ticker",
+    "concept",
+    "accession_number",
+    "period_end"
+   ],
+   "tie_order": [
+    "cik",
+    "unit",
+    "period_start",
+    "value",
+    "fiscal_year",
+    "fiscal_period",
+    "form",
+    "filed_date"
+   ]
+  },
+  "sec_filings": {
+   "kind": "current",
+   "keys": [
+    "cik",
+    "accession_number"
+   ],
+   "tie_order": [
+    "ticker",
+    "form",
+    "filing_date",
+    "report_date",
+    "accepted_at",
+    "items",
+    "primary_document",
+    "primary_doc_description",
+    "size"
+   ]
+  },
+  "sec_insider_transactions": {
+   "kind": "current",
+   "keys": [
+    "owner_cik",
+    "accession_number",
+    "transaction_date",
+    "security_title",
+    "transaction_code"
+   ],
+   "tie_order": [
+    "issuer_ticker",
+    "issuer_cik",
+    "owner_name",
+    "is_officer",
+    "officer_title",
+    "is_director",
+    "is_ten_percent_owner",
+    "shares",
+    "price_per_share",
+    "acquired_disposed",
+    "shares_owned_after",
+    "ownership_nature",
+    "filed_date"
+   ]
+  },
+  "sec_sic_classification": {
+   "kind": "current",
+   "keys": [
+    "ticker"
+   ],
+   "tie_order": [
+    "cik",
+    "company_name",
+    "sic",
+    "sic_description"
+   ]
+  },
+  "sp500_member_count": {
+   "kind": "rebuilt_whole",
+   "keys": [
+    "date"
+   ],
+   "tie_order": null
+  },
+  "sp500_membership": {
+   "kind": "current",
+   "keys": [
+    "ticker",
+    "start_date"
+   ],
+   "tie_order": [
+    "end_date",
+    "renamed_from",
+    "renamed_to"
+   ]
+  },
+  "sp500_price_coverage": {
+   "kind": "rebuilt_whole",
+   "keys": [
+    "ticker",
+    "start_date",
+    "piece_start"
+   ],
+   "tie_order": null
+  },
+  "yahoo_split_close_basis": {
+   "kind": "rebuilt_whole",
+   "keys": [
+    "ticker",
+    "ex_date"
+   ],
+   "tie_order": null
+  }
+ },
+ "schemas": {
+  "table_entry": {
+   "description": "One entry of GET /v1/tables and the body of GET /v1/tables/{table} (the fields named here; more may appear).",
+   "type": "object",
+   "required": [
+    "table",
+    "kind",
+    "keys",
+    "tie_order"
+   ],
+   "properties": {
+    "table": {
+     "type": "string"
+    },
+    "kind": {
+     "type": "string"
+    },
+    "keys": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "tie_order": {
+     "type": [
+      "array",
+      "null"
+     ],
+     "items": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "freeze_state": {
+   "description": "The `freeze` and `holds` fields of GET /v1/health and GET /v1/status.",
+   "type": "object",
+   "required": [
+    "freeze",
+    "holds"
+   ],
+   "properties": {
+    "freeze": {
+     "type": "object",
+     "required": [
+      "writes",
+      "reads"
+     ],
+     "properties": {
+      "writes": {
+       "type": "object",
+       "required": [
+        "active",
+        "reason",
+        "since"
+       ],
+       "properties": {
+        "active": {
+         "type": "boolean"
+        },
+        "reason": {
+         "type": [
+          "string",
+          "null"
+         ]
+        },
+        "since": {
+         "type": [
+          "string",
+          "null"
+         ]
+        }
+       }
+      },
+      "reads": {
+       "type": "object",
+       "required": [
+        "active",
+        "reason",
+        "since",
+        "allowed"
+       ],
+       "properties": {
+        "active": {
+         "type": "boolean"
+        },
+        "reason": {
+         "type": [
+          "string",
+          "null"
+         ]
+        },
+        "since": {
+         "type": [
+          "string",
+          "null"
+         ]
+        },
+        "allowed": {
+         "type": "boolean"
+        }
+       }
+      }
+     }
+    },
+    "holds": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "name",
+       "reason",
+       "since"
+      ],
+      "properties": {
+       "name": {
+        "type": "string"
+       },
+       "reason": {
+        "type": "string"
+       },
+       "since": {
+        "type": [
+         "string",
+         "null"
+        ]
+       }
+      }
+     }
+    }
+   }
+  },
+  "write_times": {
+   "description": "The `status` and `write_times` fields of GET /v1/health. `write_times.tables` has an entry per append-only table with a recorded write-time start M (`since`), and one with `ok` false and `since` null for an append-only table that needs an M and has none; `problems` names the Parquet files modified after M that hold rows without scraped_at (at most 20; `unstamped_files` counts them). `status` is \"degraded\" when `write_times.ok` is false. A consumer refuses to read a table whose entry has `ok` false.",
+   "type": "object",
+   "required": [
+    "status",
+    "write_times"
+   ],
+   "properties": {
+    "status": {
+     "enum": [
+      "ok",
+      "degraded"
+     ]
+    },
+    "write_times": {
+     "type": "object",
+     "required": [
+      "ok",
+      "tables"
+     ],
+     "properties": {
+      "ok": {
+       "type": "boolean"
+      },
+      "tables": {
+       "type": "object",
+       "additionalProperties": {
+        "type": "object",
+        "required": [
+         "ok",
+         "since",
+         "stamped",
+         "problems"
+        ],
+        "properties": {
+         "ok": {
+          "type": "boolean"
+         },
+         "since": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "stamped": {
+          "type": "boolean"
+         },
+         "problems": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "unstamped_files": {
+          "type": "integer"
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  }
+ },
+ "guarantees": [
+  {
+   "id": "views.stable",
+   "text": "A view, column or type in `views` is not renamed, removed or retyped without a compatibility view and a CHANGELOG.md entry first. New views and columns may appear at any time."
+  },
+  {
+   "id": "current_row.order",
+   "text": "`<table>` returns, per key in `keys`, the `<table>_log` row that `ORDER BY scraped_at DESC, <each column of tie_order> ASC NULLS LAST` puts first. A table rebuilt whole returns its current build; an append-only table every row."
+  },
+  {
+   "id": "arrow.end_of_stream",
+   "text": "A complete `format: arrow` answer of POST /v1/sql ends with the Arrow IPC end-of-stream marker (FF FF FF FF 00 00 00 00), also with no rows. An answer cut by a failure or the query deadline ends the connection without it: a body without the marker is a cut answer."
+  },
+  {
+   "id": "write_times.gate",
+   "text": "GET /v1/health `write_times.tables[<table>].ok` is false while a Parquet file of the table modified after its write-time start M holds rows without `scraped_at`, or while the table needs an M and has none; `status` is then \"degraded\". A consumer that reads `<table>` or `<table>_at(T)` refuses to run while that entry is false; a table with no entry needs no M."
+  },
+  {
+   "id": "freeze.reads",
+   "text": "While `freeze.reads.active` is true, POST /v1/sql, GET /v1/tables, GET /v1/tables/{table}, POST /v1/ask and /mcp answer a client that is not allowed HTTP 423 with the reason. GET /v1/health (no token, no query slot) and GET /v1/status report the state (`schemas.freeze_state`). The write freeze does not stop reads. A consumer refuses to read while reads are frozen and it is not allowed, and treats an answer without these fields as a refusal."
+  },
+  {
+   "id": "pin.at",
+   "text": "`SELECT ... FROM <table>_at(T)` (T a TIMESTAMPTZ, a literal or a parameter) returns the table as it stood at lake time T, and the same rows on every later read: for a deduplicated table the current-row order over the `<table>_log` rows written at or before T (`scraped_at <= T`); for a table rebuilt whole the newest build written at or before T; for an append-only table the rows written at or before T. The bound is inclusive for every kind: a row or build written at exactly T is part of the table at T. It raises an error naming the table, instead of returning a result, when T is before the oldest build kept, when the build current at T is no longer kept, or when T is before the time an append-only table's rows got a write time. Builds are kept 30 days and at most 10 per table, and longer while a pin names them. `<table>` and `<table>_log` keep their meaning."
+  }
+ ]
+}

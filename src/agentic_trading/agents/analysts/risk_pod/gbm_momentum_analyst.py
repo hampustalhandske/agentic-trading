@@ -1,12 +1,13 @@
 # gbm_momentum_analyst.py
 
+import math
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 from quantcore.core.sde_solver import simulate_gbm_paths
 
-from agentic_trading.agents._market_math import clamp, market_slice
+from agentic_trading.agents._market_math import clamp, derived_seed, market_slice
 from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
@@ -20,7 +21,9 @@ TRADING_DAYS_PER_YEAR = 252
 class GBMMomentumAnalyst(AnalystAgent):
     """Simulates the asset forward under GBM using its own trailing drift
     and volatility, and reads direction off the simulated probability that
-    the terminal price ends up above today's price."""
+    the terminal price ends up above today's price. Unavailable with fewer
+    than two returns, no close, or a trailing volatility that is not a
+    positive finite number: there is then no distribution to simulate."""
 
     agent_id: str = "gbm_momentum_analyst"
 
@@ -49,6 +52,13 @@ class GBMMomentumAnalyst(AnalystAgent):
 
         mu = float(np.mean(returns))
         sigma = float(np.std(returns, ddof=1))
+        if not (math.isfinite(sigma) and sigma > 0.0):
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"trailing volatility {sigma} is not a positive finite number — "
+                "no GBM distribution to simulate",
+            )
         # simulate_gbm_paths takes annualized drift/volatility over
         # time_to_maturity in years — mu/sigma above are daily-scale
         # statistics of daily log returns and must be annualized before
@@ -60,7 +70,7 @@ class GBMMomentumAnalyst(AnalystAgent):
             self._time_to_maturity,
             self._num_steps,
             self._num_paths,
-            seed=42,
+            seed=derived_seed(self.agent_id, asset, as_of_date.date()),
         )[:, -1]
         probability_up = float(np.mean(terminal_prices > slice_.close))
 

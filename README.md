@@ -86,8 +86,8 @@ universe; the others are scoped to their asset class.
 ## Data
 
 Every run reads only the lakehouse (`data/loaders/lakehouse_loader.py`,
-a parquet lake maintained by a separate scraping project, path in
-`LAKE_DIR`): prices (dividend-adjusted, with the open scaled to the same
+a lake maintained by a separate scraping project, read through its
+HTTP API with `LAKEHOUSE_API_URL` and `LAKEHOUSE_API_TOKEN`): prices (dividend-adjusted, with the open scaled to the same
 basis), option chains (11 underlyings, three expiries per snapshot),
 dividends, CFTC COT positioning, earnings surprises, SIC codes, S&P 500
 membership, FRED series, Ken French factors, FINRA short interest, SEC
@@ -110,7 +110,7 @@ Sharpe, cuts a pod 75% at a 10% drawdown until it recovers to 3%, gives
 the tail hedge a fixed 2%, and clips the combined book to a 25%
 single-name cap, 4× gross and a 2% one-day 95% VaR. The engine charges
 5 bps commission, 5 bps slippage, 50 bps annual stock borrow on shorts
-and risk-free plus 150 bps on borrowed cash. `KNOWN_LIMITATIONS.md`
+and risk-free plus 150 bps on borrowed cash. `docs/LIMITATIONS.md`
 lists what still departs from a production desk.
 
 ## Constants and per-run overrides
@@ -127,7 +127,7 @@ uv run agentic-trading-experiment AAPL MSFT ... \
 ```
 
 `config.temporary_overrides({...})` does the same inside a sweep script.
-Overrides are recorded in the experiment JSON.
+Overrides are recorded in the experiment JSON, and both `agentic-trading-cli` and `agentic-trading-experiment` print a `provenance` block (git sha and dirty flag, quantcore sha, full settings, CLI arguments, roster ids, lake version).
 
 ## Running it
 
@@ -189,7 +189,7 @@ tests/unit/                    # mirrors src/
 - Every cross-component structure is a Pydantic `BaseModel`; no raw
   dicts across module boundaries.
 - `quantcore` owns the math. A missing primitive is a quantcore task;
-  `KNOWN_LIMITATIONS.md` §5 lists the ones currently bridged with a
+  `docs/LIMITATIONS.md` §5 lists the ones currently bridged with a
   minimal local fallback.
 - Point-in-time discipline is structural: loaders gate on availability
   dates, the engine slices with `get_point_in_time_data`.

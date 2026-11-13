@@ -1,0 +1,14 @@
+[
+  {
+    "market": "ABC",
+    "outcome": null,
+    "resolution_source": "ABC",
+    "resolved_at": "2020-01-02T21:00:00Z"
+  },
+  {
+    "market": "ABD",
+    "outcome": 1,
+    "resolution_source": "ABC",
+    "resolved_at": "2020-01-03T21:00:00Z"
+  }
+]

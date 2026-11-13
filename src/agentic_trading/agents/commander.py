@@ -1,8 +1,9 @@
 # commander.py
 
-from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
+import math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
-from typing import Literal, cast
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -20,8 +21,12 @@ from agentic_trading.agents.base import ManagerAgent
 from agentic_trading.agents.schemas import (
     MAX_LEVERAGE,
     ManagerSignal,
+    ManagerState,
     OptionContract,
+    PodState,
+    PodTarget,
     PortfolioDecision,
+    SizingDiagnostics,
 )
 from agentic_trading.config import settings
 from agentic_trading.data.loaders import option_marks
@@ -42,18 +47,32 @@ logger = get_logger(__name__)
 TAIL_HEDGE_MANAGER_ID = "tail_hedge_manager"
 
 
+class NonFiniteRiskMeasureError(RuntimeError):
+    """The firm's one-day VaR or stressed loss on a book is not a finite
+    number, so the book cannot be held to `settings.firm.max_daily_var` or
+    `settings.firm.max_stress_loss`. Raised rather than passing the book
+    through unscaled; it stops the run."""
+
+
 class CommanderRiskState(BaseModel):
     """Everything stateful a `Commander` carries between simulated days
     that isn't recoverable from `market_data` alone: which pods the
     drawdown breaker currently has cut, each pod's trailing realized
-    return series, and each pod's most recent target-weight vector (what
-    tomorrow's pod return is measured against). Serializable through
+    return series, each pod's most recent target-weight vector (what
+    tomorrow's pod return is measured against), and each manager's own
+    carried state keyed by its `agent_id` (`manager_states`; empty in a
+    payload written before managers carried any), and each instrument's
+    last decided pod targets (`last_targets`: asset, or an option's
+    contract id, to its `PodTarget`s), which a day without the
+    instrument's bar carries forward. Serializable through
     `model_dump(mode="json")`/`model_validate` so a run can be
     checkpointed and resumed with `Commander.restore_risk_state`."""
 
     tripped_pods: list[str] = Field(default_factory=list)
     pod_return_history: dict[str, list[tuple[date, float]]] = Field(default_factory=dict)
     last_pod_weights: dict[str, dict[str, float]] = Field(default_factory=dict)
+    manager_states: dict[str, ManagerState] = Field(default_factory=dict)
+    last_targets: dict[str, list[PodTarget]] = Field(default_factory=dict)
 
 
 def _construct_pod_portfolio(
@@ -62,10 +81,36 @@ def _construct_pod_portfolio(
     market_data: pd.DataFrame,
     as_of_date: pd.Timestamp,
     scoreboard: PerformanceScoreboard,
-) -> tuple[str, list[PortfolioDecision]]:
-    return manager.agent_id, manager.construct_portfolio(
-        assets, market_data, as_of_date, scoreboard
-    )
+    carried: dict[str, list[ManagerSignal]],
+) -> tuple[str, list[PortfolioDecision], SizingDiagnostics | None]:
+    """Runs one pod's `construct_portfolio` and returns its id, decisions
+    and sizing diagnostics together, so one call per pod can run on a
+    worker thread. `carried` (the pod's signals for each asset without a
+    bar today) is passed only when it names an asset."""
+    if carried:
+        decisions = manager.construct_portfolio(
+            assets, market_data, as_of_date, scoreboard, carried=carried
+        )
+    else:
+        decisions = manager.construct_portfolio(assets, market_data, as_of_date, scoreboard)
+    return manager.agent_id, decisions, manager.last_sizing_diagnostics()
+
+
+def _pod_state(decisions: list[PortfolioDecision]) -> PodState:
+    """A pod's state from its decisions: "holding" when any target weight,
+    option rows included, is nonzero; otherwise "unavailable" when no
+    decision carries an active signal (including no decisions), and
+    "no_position" when one does. The idle states are exactly the pods
+    `idle_pod_share` counts."""
+    if any(decision.target_weight != 0.0 for decision in decisions):
+        return "holding"
+    if not any(
+        signal.status == "active"
+        for decision in decisions
+        for signal in decision.contributing_signals
+    ):
+        return "unavailable"
+    return "no_position"
 
 
 def _today_log_returns(market_data: pd.DataFrame, as_of_date: pd.Timestamp) -> dict[str, float]:
@@ -178,17 +223,38 @@ def _cross_pod_risk_parity_weights(
     shrinks it with `ledoit_wolf_shrinkage`, and sizes with
     `risk_parity_weights` — the same two functions each pod's own
     `PortfolioConstructor` already uses one layer down, reused here
-    *across* pods. Returns `None` (caller falls back to the simpler
-    per-pod inverse-vol mechanism) if there are fewer than 2 qualifying
-    pods, or if there isn't strictly more overlapping history (`T`) than
-    qualifying pods (`k`) — `ledoit_wolf_shrinkage`'s own `T > k`
-    requirement, same threshold shape as `PortfolioConstructor`'s
-    `MIN_OBSERVATIONS_FOR_COVARIANCE` check one layer down."""
+    *across* pods. A pod whose overlapping returns do not vary at all
+    (every day the same, e.g. a pod holding nothing) has no measurable
+    risk: it is left out, with a log line, and has no key in the result.
+    Returns `None` (caller falls back to the simpler per-pod inverse-vol
+    mechanism) if there are fewer than 2 qualifying pods, if there isn't
+    strictly more overlapping history (`T`) than qualifying pods (`k`) —
+    `ledoit_wolf_shrinkage`'s own `T > k` requirement, same threshold
+    shape as `PortfolioConstructor`'s `MIN_OBSERVATIONS_FOR_COVARIANCE`
+    check one layer down — or if fewer than 2 pods with varying returns
+    remain."""
     if len(qualifying) < 2:
         return None
-    overlapping = pd.DataFrame({m: pod_return_history[m] for m in qualifying}).dropna()
+    # Sorted so the covariance matrix has one column order whatever the set's iteration order;
+    # the shrinkage and the optimizer are only bit-stable for a fixed order.
+    overlapping = pd.DataFrame({m: pod_return_history[m] for m in sorted(qualifying)}).dropna()
     if len(overlapping) <= len(qualifying):
         return None
+    flat_pods = [
+        manager_id
+        for manager_id in overlapping.columns
+        if bool(np.all(overlapping[manager_id] == overlapping[manager_id].iloc[0]))
+    ]
+    if flat_pods:
+        logger.info(
+            "Commander: %s have no return variation over %d overlapping day(s) — left out "
+            "of cross-pod risk parity.",
+            flat_pods,
+            len(overlapping),
+        )
+        overlapping = overlapping.drop(columns=flat_pods)
+        if overlapping.shape[1] < 2:
+            return None
     cov_matrix = ledoit_wolf_shrinkage(overlapping.to_numpy(dtype=np.float64))
     weights = risk_parity_weights(cov_matrix)
     return dict(zip(overlapping.columns, weights.tolist(), strict=True))
@@ -214,8 +280,11 @@ def _risk_budget_weights(
     already uses one layer down. A pod with no trailing history at all
     yet gets `weighting_strategy`'s own trailing-performance weight
     directly, in both cases — a per-pod bootstrap, not an all-or-nothing
-    gate. Every pod that produces any real signal at all ends up with a
-    nonzero share; the whole allocation is normalized together so gross
+    gate. A qualifying pod that risk parity leaves out for having no
+    return variation is sized as an average risk-parity pod: its
+    trailing-performance weight times `1 / (pods in risk parity)`. Every
+    pod that produces any real signal at all ends
+    up with a nonzero share; the whole allocation is normalized together so gross
     weight still sums to 1.0. Returns `{}` only if every pod's weight
     comes out exactly zero (e.g. a fully untested `weighting_strategy`),
     the signal `Commander.decide()` uses as a last-resort equal-weight
@@ -230,9 +299,10 @@ def _risk_budget_weights(
 
     risk_parity = _cross_pod_risk_parity_weights(pod_return_history, qualifying)
     if risk_parity is not None:
+        average_share = 1.0 / len(risk_parity)
         raw_weights = {
             manager_id: (
-                risk_parity[manager_id] * bootstrap.get(manager_id, 0.0)
+                risk_parity.get(manager_id, average_share) * bootstrap.get(manager_id, 0.0)
                 if manager_id in qualifying
                 else bootstrap.get(manager_id, 0.0)
             )
@@ -371,7 +441,8 @@ def _apply_firm_limits(
     risk estimate worth acting on. Step (d) is additionally skipped on
     its own, independent of history depth, whenever `market_data` carries
     no SPY close/log_return series in this run's frame at all. Every
-    binding limit is logged."""
+    binding limit is logged. Raises `NonFiniteRiskMeasureError` when the
+    VaR of step (c) or the stressed loss of step (e) is not finite."""
     firm = settings.firm
     limited = {
         asset: max(min(weight, firm.max_single_name_weight), -firm.max_single_name_weight)
@@ -422,6 +493,11 @@ def _apply_firm_limits(
         mean=0.0,
         volatility=portfolio_std,
     )
+    if not math.isfinite(var):
+        raise NonFiniteRiskMeasureError(
+            f"{as_of_date.date()}: firm one-day var is {var} for the book over {traded}; "
+            "the VaR limit cannot be applied"
+        )
     if var > firm.max_daily_var:
         scale = firm.max_daily_var / var
         limited = {asset: weight * scale for asset, weight in limited.items()}
@@ -484,7 +560,15 @@ def _apply_firm_limits(
                 )
 
     variances = np.diag(cov_matrix)
-    corr_matrix = cov_matrix / np.sqrt(np.outer(variances, variances))
+    # A zero-variance asset has zero stressed variance, so its correlations
+    # never enter the stressed covariance; they are 0 rather than 0 / 0.
+    volatility_products = np.sqrt(np.outer(variances, variances))
+    corr_matrix = np.divide(
+        cov_matrix,
+        volatility_products,
+        out=np.zeros_like(cov_matrix),
+        where=volatility_products > 0.0,
+    )
     shocked_corr = np.sign(corr_matrix) * np.maximum(
         np.abs(corr_matrix), firm.stress_correlation_shock
     )
@@ -502,6 +586,11 @@ def _apply_firm_limits(
         mean=0.0,
         volatility=stressed_portfolio_std,
     )
+    if not math.isfinite(stressed_loss):
+        raise NonFiniteRiskMeasureError(
+            f"{as_of_date.date()}: firm stress one-day loss is {stressed_loss} for the book over "
+            f"{traded}; the stress limit cannot be applied"
+        )
     if stressed_loss > firm.max_stress_loss:
         scale = firm.max_stress_loss / stressed_loss
         limited = {asset: weight * scale for asset, weight in limited.items()}
@@ -522,20 +611,59 @@ def _apply_firm_limits(
     return limited
 
 
+def _assets_with_close(
+    market_data: pd.DataFrame, as_of_date: pd.Timestamp, assets: list[str]
+) -> list[str]:
+    """`assets` without each one whose `close` on `as_of_date` is missing
+    (NaN): the instruments with a bar that day, which the pods are asked
+    about. An asset whose frame has no `close` column, or a frame without
+    an `as_of_date` row, is kept."""
+    if as_of_date not in market_data.index:
+        return assets
+    return [
+        asset
+        for asset in assets
+        if (asset, "close") not in market_data.columns
+        or pd.notna(market_data.loc[as_of_date, (asset, "close")])
+    ]
+
+
+# An option's (delta, underlying spot, mid) on one day, from its mark.
+type _DeltaMark = tuple[float, float, float, date | None]
+
+
+def _delta_mark(
+    contract: OptionContract, market_data: pd.DataFrame, as_of_date: pd.Timestamp
+) -> _DeltaMark | None:
+    """`contract`'s delta, its underlying's raw spot, its mid on
+    `as_of_date` and the date of the option-chain snapshot the mark rests
+    on; `None` when the underlying has no spot or the contract no mark with
+    a positive mid."""
+    spot = raw_spot(market_data, as_of_date, contract.underlying)
+    mark = (
+        option_marks.load_option_mark(contract, as_of_date.date(), spot)
+        if spot is not None and spot > 0.0
+        else None
+    )
+    if mark is None or mark.mid <= 0.0 or spot is None:
+        return None
+    return mark.delta, spot, mark.mid, mark.snapshot_date
+
+
 def _delta_equivalent_book(
     equity_weight: dict[str, float],
     option_rows: dict[str, tuple[OptionContract, float]],
-    market_data: pd.DataFrame,
+    delta_marks: dict[str, _DeltaMark | None],
     as_of_date: pd.Timestamp,
 ) -> dict[str, float]:
     """The combined book in equity-equivalent weights: each option row's
     premium weight contributes `weight x delta x spot / mid` (its delta
-    exposure as a fraction of NAV) to its underlying, or the premium
-    weight itself when no mark or spot is available. An option on an
-    underlying outside `equity_weight` has no equity row to load and is
-    left out."""
+    exposure as a fraction of NAV) to its underlying, from its entry in
+    `delta_marks`, or the premium weight itself when it has none. An
+    option on an underlying outside `equity_weight` has no equity row to
+    load and is left out."""
     book = dict(equity_weight)
-    for contract, weight in option_rows.values():
+    for contract_id, (contract, weight) in option_rows.items():
         underlying = contract.underlying
         if underlying not in book:
             logger.debug(
@@ -544,16 +672,12 @@ def _delta_equivalent_book(
                 contract.contract_id,
             )
             continue
-        spot = raw_spot(market_data, as_of_date, underlying)
-        mark = (
-            option_marks.load_option_mark(contract, as_of_date.date(), spot)
-            if spot is not None and spot > 0.0
-            else None
-        )
-        if mark is None or mark.mid <= 0.0 or spot is None:
+        delta_mark = delta_marks.get(contract_id)
+        if delta_mark is None:
             book[underlying] += weight
         else:
-            book[underlying] += weight * mark.delta * spot / mark.mid
+            delta, spot, mid, _ = delta_mark
+            book[underlying] += weight * delta * spot / mid
     return book
 
 
@@ -615,7 +739,6 @@ class Commander:
         weighting_strategy: "WeightingStrategy",
         pod_returns_lookback_days: int | None = None,
         parallel_workers: int = 1,
-        parallel_backend: Literal["thread", "process"] = "thread",
         drawdown_breaker: "_DrawdownBreaker | None" = None,
     ) -> None:
         if parallel_workers < 1:
@@ -626,21 +749,25 @@ class Commander:
         self.weighting_strategy = weighting_strategy
         self.pod_returns_lookback_days = pod_returns_lookback_days
         self.parallel_workers = parallel_workers
-        self.parallel_backend = parallel_backend
-        self._executor: Executor | None = None
+        self._executor: ThreadPoolExecutor | None = None
+        self._idle_pod_share: float | None = None
+        self._unavailable_pod_share: float | None = None
+        self._no_position_pod_share: float | None = None
+        self._pod_states: dict[str, PodState] = {}
+        self._sizing_diagnostics: list[SizingDiagnostics] = []
+        self._pod_contributions: dict[str, dict[str, float]] = {}
+        self._pod_targets: list[PodTarget] = []
+        self._last_targets: dict[str, list[PodTarget]] = {}
         self._pod_return_tracker = _PodReturnTracker(pod_returns_lookback_days)
         self.drawdown_breaker = (
             drawdown_breaker if drawdown_breaker is not None else _DrawdownBreaker()
         )
 
-    def _get_executor(self) -> Executor | None:
+    def _get_executor(self) -> ThreadPoolExecutor | None:
         if self.parallel_workers == 1:
             return None
         if self._executor is None:
-            executor_type = (
-                ProcessPoolExecutor if self.parallel_backend == "process" else ThreadPoolExecutor
-            )
-            self._executor = executor_type(max_workers=self.parallel_workers)
+            self._executor = ThreadPoolExecutor(max_workers=self.parallel_workers)
         return self._executor
 
     def close(self) -> None:
@@ -648,16 +775,134 @@ class Commander:
             self._executor.shutdown(wait=True)
             self._executor = None
 
+    def idle_pod_share(self) -> float | None:
+        """The share of firm capital allocated to idle pods on the most
+        recent `decide()` call, or `None` before any call. A pod is idle
+        when every decision it produced that day, option rows included,
+        has a zero target weight, or when it produced none. The share is
+        the sum of the idle pods' final allocations, after the tail-hedge
+        carve-out and the drawdown-breaker multipliers.
+
+        It equals `unavailable_pod_share() + no_position_pod_share()`.
+        Both kinds of idle pod keep their allocation as cash earning the
+        risk-free rate; neither is re-allocated to the other pods. An
+        unavailable pod's data or analysts could not produce a signal; a
+        no-position pod's signals produced no position."""
+        return self._idle_pod_share
+
+    def unavailable_pod_share(self) -> float | None:
+        """The share of firm capital allocated to unavailable pods on the
+        most recent `decide()` call, or `None` before any call. A pod is
+        unavailable when every decision has a zero target weight and none
+        carries an active `ManagerSignal`, including when it produced no
+        decisions. The allocation stays as cash and is not re-allocated."""
+        return self._unavailable_pod_share
+
+    def no_position_pod_share(self) -> float | None:
+        """The share of firm capital allocated to no-position pods on the
+        most recent `decide()` call, or `None` before any call. A pod has
+        no position when it has at least one active signal but every
+        decision, option rows included, has a zero target weight. The
+        allocation stays as cash and is not re-allocated."""
+        return self._no_position_pod_share
+
+    def pod_states(self) -> dict[str, PodState]:
+        """Each pod's state on the most recent `decide()` call, in manager
+        order; empty before any call."""
+        return dict(self._pod_states)
+
+    def sizing_diagnostics(self) -> list[SizingDiagnostics]:
+        """The sizing diagnostics from the most recent `decide()` call, one
+        per pod that recorded one, in manager order, each tagged with its
+        pod's `manager_id`. Empty before any call."""
+        return list(self._sizing_diagnostics)
+
+    def pod_contributions(self) -> dict[str, dict[str, float]]:
+        """Each pod's contribution to every asset it decided on in the most
+        recent `decide()` call, keyed by pod id then asset (option rows by
+        contract id): the pod's final allocation times its target weight,
+        before firm limits, the short-premium cap and the leverage clamp. A
+        tail-hedge option row counts at its target weight, the face value
+        the firm book takes it at. Several rows of one pod for one asset
+        are summed. Empty before any call."""
+        return {pod_id: dict(weights) for pod_id, weights in self._pod_contributions.items()}
+
+    def pod_targets(self) -> list[PodTarget]:
+        """Each pod's part of every final target weight of the most recent
+        `decide()` call: one `PodTarget` per pod and asset the pod decided
+        on (option rows by contract id), in manager order, then in the order
+        of the pod's decisions; empty before any call.
+
+        A pod's target is its contribution (`pod_contributions`) after the
+        firm's limits, split pro rata: the firm limits scale every core
+        pod's contribution to an instrument by the one factor they applied
+        to that instrument (for an option, its underlying's factor times
+        the short-premium cap's), the tail-hedge pod's contributions pass at
+        face value as the Commander books them, and the leverage clamp
+        scales every pod's target for a clamped instrument by the same
+        factor. A core pod's row for a contract the tail-hedge pod also
+        holds is 0, since the Commander books that contract at the
+        tail-hedge row. The targets of an instrument therefore sum to its
+        `PortfolioDecision.target_weight`, up to floating-point rounding.
+
+        On a day an instrument has no bar, each pod's contribution to it is
+        its last decided target (`carried`), so the targets equal the last
+        decided ones unless a firm limit binds that day."""
+        return [target.model_copy(deep=True) for target in self._pod_targets]
+
     def risk_state(self) -> CommanderRiskState:
         return CommanderRiskState(
             tripped_pods=sorted(self.drawdown_breaker.tripped),
             pod_return_history=self._pod_return_tracker.history,
             last_pod_weights=self._pod_return_tracker.last_weights,
+            manager_states={manager.agent_id: manager.manager_state() for manager in self.managers},
+            last_targets={
+                asset: [target.model_copy(deep=True) for target in targets]
+                for asset, targets in sorted(self._last_targets.items())
+            },
         )
 
     def restore_risk_state(self, state: CommanderRiskState) -> None:
+        """Restores the breaker, the pod return tracker and each manager
+        named in `state.manager_states`; a manager not named keeps its
+        state. Raises `ValueError`, before restoring anything, when
+        `state.manager_states` names an `agent_id` this Commander does not
+        run."""
+        managers = {manager.agent_id: manager for manager in self.managers}
+        unknown = sorted(set(state.manager_states) - set(managers))
+        if unknown:
+            raise ValueError(f"checkpoint carries state for unknown managers: {unknown}")
         self.drawdown_breaker.restore(set(state.tripped_pods))
         self._pod_return_tracker.restore(state.pod_return_history, state.last_pod_weights)
+        self._last_targets = {
+            asset: [target.model_copy(deep=True) for target in targets]
+            for asset, targets in state.last_targets.items()
+        }
+        for agent_id, manager_state in state.manager_states.items():
+            managers[agent_id].restore_manager_state(manager_state)
+
+    def _remember_targets(self, assets: list[str]) -> None:
+        """Stores the day's pod targets as each instrument's last decided
+        ones: for every asset of `assets` its rows (possibly none), and the
+        nonzero option rows on it, replacing what was stored for them."""
+        decided = set(assets)
+        kept = {
+            key: targets
+            for key, targets in self._last_targets.items()
+            if key not in decided
+            and not any(
+                target.instrument is not None and target.instrument.underlying in decided
+                for target in targets
+            )
+        }
+        for asset in assets:
+            kept[asset] = []
+        for target in self._pod_targets:
+            if target.instrument is None:
+                kept[target.asset].append(target.model_copy(deep=True))
+            elif target.target_weight != 0.0:
+                kept.setdefault(target.asset, []).append(target.model_copy(deep=True))
+        self._last_targets = kept
 
     def decide(
         self,
@@ -674,14 +919,60 @@ class Commander:
         individual position's sizing math itself. Every `ManagerSignal`
         that fed into any pod's decision for an asset is carried forward
         onto the combined decision, so the result stays fully auditable.
+
+        An idle pod (one holding nothing today) keeps its allocation; its
+        share of capital stays as cash earning the risk-free rate, and it
+        is not re-allocated to the active pods. Re-allocating would make
+        firm risk scale with the number of idle pods. This holds for both
+        kinds of idle pod: an unavailable pod (its data or analysts could
+        not produce a signal) and a no-position pod (its signals produced
+        no position). `pod_states()`, `unavailable_pod_share()` and
+        `no_position_pod_share()` report the split; `idle_pod_share()`
+        reports their sum.
+
+        An asset whose close on `as_of_date` is missing (no bar that day)
+        and that has a decided target is carried: no analyst is asked about
+        it, each pod sizes its other assets with the asset at its last
+        signals and keeps its own previous weight for it
+        (`ManagerAgent.construct_portfolio`'s `carried`), and the firm book
+        holds each pod's last decided target for it (option rows on it
+        included) while the firm limits run, so the limits count it. Its
+        decision is that carried target, which the engine fills at the next
+        session with a bar. An asset without a bar and without any decided
+        target (one not yet listed) gets no decision.
         """
+        self._sizing_diagnostics = []
+        self._pod_contributions = {}
+        self._pod_targets = []
         if market_data.empty or not self.managers:
             return []
 
         if isinstance(market_data.columns, pd.MultiIndex):
-            assets = list(dict.fromkeys(market_data.columns.get_level_values(0)))
+            frame_assets = list(dict.fromkeys(market_data.columns.get_level_values(0)))
+            priced = set(_assets_with_close(market_data, as_of_date, frame_assets))
+            assets = [
+                asset for asset in frame_assets if asset in priced or asset in self._last_targets
+            ]
         else:
             assets = [single_asset_from_attrs(market_data)]
+            priced = set(assets)
+        carried_assets = {asset for asset in assets if asset not in priced}
+        # Each carried instrument's last pod targets, and the option rows
+        # on a carried underlying, keyed by pod then asset.
+        carried_targets: dict[str, dict[str, PodTarget]] = {}
+        for key, targets in self._last_targets.items():
+            for target in targets:
+                underlying = target.instrument.underlying if target.instrument is not None else key
+                if underlying in carried_assets:
+                    carried_targets.setdefault(target.pod_id, {})[key] = target
+        carried_signals = {
+            manager_id: {
+                asset: list(target.contributing_signals)
+                for asset, target in targets.items()
+                if target.instrument is None
+            }
+            for manager_id, targets in carried_targets.items()
+        }
 
         manager_ids = [manager.agent_id for manager in self.managers]
         # See ManagerAgent.evaluate()'s comment: scoring/ is keyed by plain
@@ -690,24 +981,60 @@ class Commander:
 
         executor = self._get_executor()
         if executor is None:
-            pod_decisions = [
-                (
-                    manager.agent_id,
-                    manager.construct_portfolio(assets, market_data, as_of_date, scoreboard),
+            pod_results = [
+                _construct_pod_portfolio(
+                    manager,
+                    assets,
+                    market_data,
+                    as_of_date,
+                    scoreboard,
+                    carried_signals.get(manager.agent_id, {}),
                 )
                 for manager in self.managers
             ]
         else:
             futures = [
                 executor.submit(
-                    _construct_pod_portfolio, manager, assets, market_data, as_of_date, scoreboard
+                    _construct_pod_portfolio,
+                    manager,
+                    assets,
+                    market_data,
+                    as_of_date,
+                    scoreboard,
+                    carried_signals.get(manager.agent_id, {}),
                 )
                 for manager in self.managers
             ]
-            pod_decisions = [future.result() for future in futures]
+            pod_results = [future.result() for future in futures]
+        pod_decisions = [(manager_id, decisions) for manager_id, decisions, _ in pod_results]
+        self._sizing_diagnostics = [
+            diagnostics for _, _, diagnostics in pod_results if diagnostics is not None
+        ]
 
+        # Each pod's own sized weights of yesterday: a weight it keeps
+        # unchanged is a target it holds rather than sets.
+        previous_pod_weights = self._pod_return_tracker.last_weights
+        # A pod's option legs on an underlying without a bar today stand as
+        # they were: the tracker keeps them at the pod's weight of
+        # yesterday, so the pod's next return counts their P&L.
+        tracked_decisions: list[tuple[str, list[PortfolioDecision]]] = []
+        for manager_id, decisions in pod_decisions:
+            decided = {decision.asset for decision in decisions}
+            legs = [
+                PortfolioDecision(
+                    asset=contract_id,
+                    as_of_date=as_of,
+                    target_weight=previous_pod_weights.get(manager_id, {}).get(contract_id, 0.0),
+                    contributing_signals=list(target.contributing_signals),
+                    instrument=target.instrument,
+                    hold_contracts=target.hold_contracts,
+                )
+                for contract_id, target in carried_targets.get(manager_id, {}).items()
+                if target.instrument is not None and contract_id not in decided
+            ]
+            tracked_decisions.append((manager_id, decisions + legs))
         pod_return_history = self._pod_return_tracker.record_and_get_history(
-            pod_decisions, market_data, as_of_date, instrument_returns
+            tracked_decisions, market_data, as_of_date, instrument_returns
         )
 
         # The tail-hedge pod (if present) gets a fixed, protected budget
@@ -753,6 +1080,24 @@ class Commander:
         ).items():
             pod_allocations[manager_id] = pod_allocations.get(manager_id, 0.0) * multiplier
 
+        pod_states = {manager_id: _pod_state(decisions) for manager_id, decisions in pod_decisions}
+        self._pod_states = pod_states
+        self._unavailable_pod_share = sum(
+            pod_allocations.get(manager_id, 0.0)
+            for manager_id, state in pod_states.items()
+            if state == "unavailable"
+        )
+        self._no_position_pod_share = sum(
+            pod_allocations.get(manager_id, 0.0)
+            for manager_id, state in pod_states.items()
+            if state == "no_position"
+        )
+        self._idle_pod_share = sum(
+            pod_allocations.get(manager_id, 0.0)
+            for manager_id, decisions in pod_decisions
+            if all(decision.target_weight == 0.0 for decision in decisions)
+        )
+
         # The tail-hedge pod's book is kept aside while the firm limits
         # run on everything else, then added back: its fixed insurance
         # budget must not be scaled away by a gross/VaR breach the rest
@@ -760,49 +1105,163 @@ class Commander:
         # by contract id. A core pod's option row is scaled by the pod's
         # allocation like its equity rows; the tail-hedge pod sizes its
         # put premium against firm NAV from the same budget fraction its
-        # allocation is, so its option rows pass through at face value.
-        # MAX_LEVERAGE stays the final backstop.
+        # allocation is, so its option rows pass through at face value,
+        # each with its own `hold_contracts` flag. MAX_LEVERAGE stays the
+        # final backstop.
         core_weight: dict[str, float] = dict.fromkeys(assets, 0.0)
         hedge_weight: dict[str, float] = dict.fromkeys(assets, 0.0)
         core_options: dict[str, tuple[OptionContract, float]] = {}
         hedge_options: dict[str, tuple[OptionContract, float]] = {}
+        hedge_holds: dict[str, bool] = {}
         combined_signals: dict[str, list[ManagerSignal]] = {asset: [] for asset in assets}
+        pod_signals: dict[str, dict[str, list[ManagerSignal]]] = {}
+        instruments: dict[str, OptionContract] = {}
+        held_rows: set[tuple[str, str]] = set()
         for manager_id, decisions in pod_decisions:
             allocation = pod_allocations.get(manager_id, 0.0)
             is_hedge = manager_id == TAIL_HEDGE_MANAGER_ID
             book = hedge_weight if is_hedge else core_weight
             option_book = hedge_options if is_hedge else core_options
+            contributions = self._pod_contributions.setdefault(manager_id, {})
+            signals_by_asset = pod_signals.setdefault(manager_id, {})
             for decision in decisions:
                 combined_signals.setdefault(decision.asset, []).extend(
                     decision.contributing_signals
                 )
-                if decision.instrument is None:
-                    book[decision.asset] += allocation * decision.target_weight
+                signals_by_asset.setdefault(decision.asset, []).extend(
+                    decision.contributing_signals
+                )
+                if decision.instrument is not None:
+                    instruments[decision.asset] = decision.instrument
+                previous = previous_pod_weights.get(manager_id, {}).get(decision.asset)
+                if decision.target_weight != 0.0 and decision.target_weight == previous:
+                    held_rows.add((manager_id, decision.asset))
+                if decision.instrument is None and decision.asset in carried_assets:
+                    # A carried instrument stays at the pod's last decided
+                    # target, not today's allocation of the pod's weight.
+                    last = carried_targets.get(manager_id, {}).get(decision.asset)
+                    weight = last.target_weight if last is not None else 0.0
+                    book[decision.asset] += weight
+                elif decision.instrument is None:
+                    weight = allocation * decision.target_weight
+                    book[decision.asset] += weight
+                else:
+                    weight = (
+                        decision.target_weight if is_hedge else allocation * decision.target_weight
+                    )
+                    _, held = option_book.get(decision.asset, (decision.instrument, 0.0))
+                    option_book[decision.asset] = (decision.instrument, held + weight)
+                    if is_hedge:
+                        hedge_holds[decision.asset] = decision.hold_contracts
+                contributions[decision.asset] = contributions.get(decision.asset, 0.0) + weight
+        # The option rows on a carried underlying stand at their last
+        # decided targets; no pod re-sized them today.
+        for manager_id, pod_carried in carried_targets.items():
+            is_hedge = manager_id == TAIL_HEDGE_MANAGER_ID
+            option_book = hedge_options if is_hedge else core_options
+            for contract_id, target in pod_carried.items():
+                if target.instrument is None:
                     continue
-                weight = decision.target_weight if is_hedge else allocation * decision.target_weight
-                _, held = option_book.get(decision.asset, (decision.instrument, 0.0))
-                option_book[decision.asset] = (decision.instrument, held + weight)
+                _, held = option_book.get(contract_id, (target.instrument, 0.0))
+                option_book[contract_id] = (target.instrument, held + target.target_weight)
+                if is_hedge:
+                    hedge_holds[contract_id] = target.hold_contracts
+                instruments[contract_id] = target.instrument
+                combined_signals.setdefault(contract_id, []).extend(target.contributing_signals)
+                pod_signals.setdefault(manager_id, {}).setdefault(contract_id, []).extend(
+                    target.contributing_signals
+                )
+                contributions = self._pod_contributions.setdefault(manager_id, {})
+                contributions[contract_id] = (
+                    contributions.get(contract_id, 0.0) + target.target_weight
+                )
 
         # Firm limits run on the delta-equivalent book; whatever scaling
-        # they impose on an underlying applies to its option rows too.
-        equivalent = _delta_equivalent_book(core_weight, core_options, market_data, as_of_date)
+        # they impose on an underlying applies to its option rows too. The
+        # tail hedge's option marks are read only for its rows' delta.
+        delta_marks: dict[str, _DeltaMark | None] = {
+            contract_id: _delta_mark(contract, market_data, as_of_date)
+            for contract_id, (contract, _) in core_options.items()
+            if contract.underlying in core_weight
+        }
+        for contract_id, (contract, _) in hedge_options.items():
+            if contract_id not in delta_marks:
+                delta_marks[contract_id] = _delta_mark(contract, market_data, as_of_date)
+        equivalent = _delta_equivalent_book(core_weight, core_options, delta_marks, as_of_date)
         limited = _apply_firm_limits(equivalent, market_data, as_of_date)
         scale = {
             asset: limited[asset] / equivalent[asset] if equivalent[asset] != 0.0 else 1.0
             for asset in assets
         }
         limited_core = {asset: core_weight[asset] * scale[asset] for asset in assets}
-        limited_options = _apply_short_premium_cap(
-            {
-                contract_id: (contract, weight * scale.get(contract.underlying, 1.0))
-                for contract_id, (contract, weight) in core_options.items()
-            },
-            as_of_date,
-        )
+        scaled_options = {
+            contract_id: (contract, weight * scale.get(contract.underlying, 1.0))
+            for contract_id, (contract, weight) in core_options.items()
+        }
+        limited_options = _apply_short_premium_cap(scaled_options, as_of_date)
         combined_weight = {asset: limited_core[asset] + hedge_weight[asset] for asset in assets}
 
         def _clamp(weight: float) -> float:
             return max(min(weight, MAX_LEVERAGE), -MAX_LEVERAGE)
+
+        # The factor the firm limits and the short-premium cap applied to
+        # each instrument of the core book.
+        core_factor = dict(scale)
+        for contract_id, (contract, scaled) in scaled_options.items():
+            capped = limited_options[contract_id][1]
+            core_factor[contract_id] = scale.get(contract.underlying, 1.0) * (
+                capped / scaled if scaled != 0.0 else 1.0
+            )
+        final_weight = {
+            **combined_weight,
+            **{contract_id: weight for contract_id, (_, weight) in limited_options.items()},
+            **{contract_id: weight for contract_id, (_, weight) in hedge_options.items()},
+        }
+        for manager_id, contributions in self._pod_contributions.items():
+            is_hedge = manager_id == TAIL_HEDGE_MANAGER_ID
+            for asset, contribution in contributions.items():
+                if is_hedge:
+                    weight = contribution
+                elif asset in hedge_options:
+                    weight = 0.0
+                else:
+                    weight = contribution * core_factor.get(asset, 1.0)
+                unclamped = final_weight.get(asset, 0.0)
+                if unclamped != 0.0 and _clamp(unclamped) != unclamped:
+                    weight *= _clamp(unclamped) / unclamped
+                instrument = instruments.get(asset)
+                delta_mark = delta_marks.get(asset) if instrument is not None else None
+                underlying = instrument.underlying if instrument is not None else asset
+                is_carried = underlying in carried_assets
+                last = carried_targets.get(manager_id, {}).get(asset)
+                # A carried target a firm limit scaled is a new decision.
+                kept_carried = is_carried and last is not None and weight == last.target_weight
+                hold_contracts = is_hedge and hedge_holds.get(asset, False)
+                self._pod_targets.append(
+                    PodTarget(
+                        pod_id=manager_id,
+                        asset=asset,
+                        as_of_date=as_of,
+                        target_weight=weight,
+                        contributing_signals=pod_signals[manager_id].get(asset, []),
+                        instrument=instrument,
+                        delta_equiv_weight=(
+                            None
+                            if delta_mark is None
+                            else weight * delta_mark[0] * delta_mark[1] / delta_mark[2]
+                        ),
+                        mark_as_of=None if delta_mark is None else delta_mark[3],
+                        mark_mid=None if delta_mark is None else delta_mark[2],
+                        held=(
+                            kept_carried
+                            if is_carried
+                            else hold_contracts or (manager_id, asset) in held_rows
+                        ),
+                        carried=is_carried,
+                        hold_contracts=hold_contracts,
+                    )
+                )
+        self._remember_targets(assets)
 
         return [
             PortfolioDecision(
@@ -819,6 +1278,7 @@ class Commander:
                 target_weight=_clamp(weight),
                 contributing_signals=combined_signals.get(contract_id, []),
                 instrument=contract,
+                hold_contracts=hedge_holds.get(contract_id, False),
             )
             for contract_id, (contract, weight) in {**limited_options, **hedge_options}.items()
         ]

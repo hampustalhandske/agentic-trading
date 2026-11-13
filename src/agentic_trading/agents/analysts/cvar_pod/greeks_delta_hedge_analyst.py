@@ -5,13 +5,15 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 
-from agentic_trading.agents._market_math import clamp, market_slice
+from agentic_trading.agents._market_math import clamp, market_slice, raw_spot
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
+    chain_snapshot_date,
+    options_chain_requirements,
     real_atm_options_by_expiration,
 )
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal, SignalStatus
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
@@ -40,9 +42,11 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
     snapshot (`_options_data.real_atm_options_by_expiration`).
 
     The intensity g = S * gamma * sqrt(DTE / 252) is a DTE-normalised ATM
-    dollar gamma. Without open interest, ATM gamma is a deterministic
-    function of spot, implied vol and time to expiry, so g says nothing
-    about dealer positioning by itself; the only information is how it
+    dollar gamma, with S the unadjusted close (`_market_math.raw_spot`) —
+    the basis the chain's strikes and gamma are quoted on. Without open
+    interest, ATM gamma is a deterministic function of spot, implied vol
+    and time to expiry, so g says nothing about dealer positioning by
+    itself; the only information is how it
     compares to its own history. Each distinct snapshot's log g is kept
     in-process per asset and z-scored against the trailing
     `settings.analysts.gamma_history_window` points once at least
@@ -52,9 +56,19 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
     low z (gamma-light regime) follows it; a 5-day move smaller than a
     fraction of its own 60-day sigma is neither. Confidence scales with
     |z| beyond `settings.analysts.gamma_zscore_threshold`, capped at
-    `MAX_CONFIDENCE`."""
+    `MAX_CONFIDENCE`. A move inside the noise floor or a z inside the
+    threshold abstains (active, flat, confidence 0).
+
+    Every active signal's `source_as_of`, an abstention included, is the
+    date of the day's chain snapshot (`_options_data.chain_snapshot_date`),
+    the newest of the snapshots whose gamma the z-score is computed over.
+    It is the snapshot's own date rather than the later decision date the
+    publication lag first makes it visible on."""
 
     agent_id: str = "greeks_delta_hedge_analyst"
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=options_chain_requirements
+    )
 
     _log_gamma_history: dict[str, dict[date, float]] = PrivateAttr(default_factory=dict)
 
@@ -87,14 +101,14 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        slice_ = market_slice(market_data, as_of_date, asset)
-        returns = slice_.log_returns[-MOMENTUM_VOL_WINDOW:]
-        if slice_.close is None or returns.size < MIN_RETURN_OBSERVATIONS:
+        returns = market_slice(market_data, as_of_date, asset).log_returns[-MOMENTUM_VOL_WINDOW:]
+        spot = raw_spot(market_data, as_of_date, asset)
+        if spot is None or returns.size < MIN_RETURN_OBSERVATIONS:
             return self._flat(
                 asset, as_of_date, "insufficient history for gamma-regime read", "unavailable"
             )
 
-        real_options = real_atm_options_by_expiration(asset, as_of_date, slice_.close)
+        real_options = real_atm_options_by_expiration(asset, as_of_date, spot)
         if real_options is None or real_options.empty:
             return self._flat(
                 asset,
@@ -112,14 +126,13 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
             )
         near = front.iloc[0]
         dte = int(near["days_to_expiration"])
-        gamma_intensity = (
-            slice_.close * float(near["gamma"]) * float(np.sqrt(dte / TRADING_DAYS_PER_YEAR))
-        )
+        gamma_intensity = spot * float(near["gamma"]) * float(np.sqrt(dte / TRADING_DAYS_PER_YEAR))
         if not np.isfinite(gamma_intensity) or gamma_intensity <= 0.0:
             return self._flat(
                 asset, as_of_date, "non-positive ATM gamma in the snapshot", "unavailable"
             )
         log_gamma = float(np.log(gamma_intensity))
+        source_as_of = chain_snapshot_date(real_options)
         self._record_log_gamma(asset, as_of_date, log_gamma)
 
         history = list(self._log_gamma_history[asset].values())
@@ -141,11 +154,12 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
             MOMENTUM_NOISE_FRACTION * float(np.std(returns, ddof=1)) * float(np.sqrt(MOMENTUM_DAYS))
         )
         if abs(momentum) < noise_floor:
-            return self._flat(
+            return self.abstain_signal(
                 asset,
                 as_of_date,
                 f"no move to fade/follow ({MOMENTUM_DAYS}-day momentum {momentum:+.4f} "
                 f"within noise {noise_floor:.4f}; g={gamma_intensity:.4f}, z={zscore:+.2f})",
+                source_as_of=source_as_of,
             )
         momentum_direction: Literal["long", "short"] = "long" if momentum > 0.0 else "short"
         against_momentum: Literal["long", "short"] = (
@@ -153,7 +167,11 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
         )
 
         threshold = settings.analysts.gamma_zscore_threshold
-        direction: Literal["long", "short", "flat"]
+        reading = (
+            f"{MOMENTUM_DAYS}-day momentum {momentum:+.4f}; "
+            f"ATM gamma intensity g={gamma_intensity:.4f} at {dte} DTE, z={zscore:+.2f}"
+        )
+        direction: Literal["long", "short"]
         if zscore > threshold:
             direction = against_momentum
             regime = "pinning regime: fading"
@@ -161,13 +179,10 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
             direction = momentum_direction
             regime = "gamma-light regime: following"
         else:
-            direction = "flat"
-            regime = "no gamma regime"
-        confidence = (
-            clamp((abs(zscore) - threshold) / CONFIDENCE_ZSCORE_SPAN, 0.0, MAX_CONFIDENCE)
-            if direction != "flat"
-            else 0.0
-        )
+            return self.abstain_signal(
+                asset, as_of_date, f"no gamma regime {reading}", source_as_of=source_as_of
+            )
+        confidence = clamp((abs(zscore) - threshold) / CONFIDENCE_ZSCORE_SPAN, 0.0, MAX_CONFIDENCE)
 
         return AgentSignal(
             agent_id=self.agent_id,
@@ -175,8 +190,6 @@ class GreeksDeltaHedgeAnalyst(AnalystAgent):
             as_of_date=as_of_date.date(),
             direction=direction,
             confidence=confidence,
-            rationale=(
-                f"{regime} {MOMENTUM_DAYS}-day momentum {momentum:+.4f}; "
-                f"ATM gamma intensity g={gamma_intensity:.4f} at {dte} DTE, z={zscore:+.2f}"
-            ),
+            rationale=f"{regime} {reading}",
+            source_as_of=source_as_of,
         )

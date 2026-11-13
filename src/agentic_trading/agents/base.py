@@ -4,16 +4,32 @@
 Contains the abstract base classes for all agents in the system, both analysts and managers.
 """
 
+import copy
+import io
+import math
+import pickle
 from abc import ABC, abstractmethod
-from collections.abc import Callable
-from typing import Literal
+from collections.abc import Callable, Mapping
+from datetime import date
+from typing import Any, Literal
 
 import pandas as pd
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr
 
 from agentic_trading.agents._market_math import wide_log_returns
+from agentic_trading.agents._stable_value import qualified_name, stable_value
 from agentic_trading.agents.portfolio_construction import PodView, PortfolioConstructor
-from agentic_trading.agents.schemas import AgentSignal, ManagerSignal, PortfolioDecision
+from agentic_trading.agents.schemas import (
+    AgentSignal,
+    ManagerSignal,
+    ManagerState,
+    PortfolioDecision,
+    SignalStatus,
+    SizingDiagnostics,
+    VolatilityEstimator,
+)
+from agentic_trading.config import settings
+from agentic_trading.data.lake_errors import LakeReadError
 from agentic_trading.logging_config import get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
 from agentic_trading.scoring.weighting import WeightingStrategy
@@ -45,6 +61,27 @@ def _pod_information_coefficient(
     return max(0.0, sum(shrunk_ic(signal.source_agent_id) for signal in active) / len(active))
 
 
+def _rebuilt_exception(cls: type[BaseException], args: tuple[Any, ...]) -> BaseException:
+    """An instance of exception class `cls` with `args`, made without
+    calling `cls.__init__`; its other attributes are set by unpickling."""
+    exception = cls.__new__(cls, *args)
+    exception.args = args
+    return exception
+
+
+class _CarriedStatePickler(pickle.Pickler):
+    """Pickles exceptions by class, `args` and attributes rather than by
+    calling the class with `args`, so an exception whose `__init__` takes
+    more than its message (quantcore's `ConvergenceError`, which a
+    `RefitCache` holds as a non-converged fit) unpickles. Quantcore gap:
+    `ConvergenceError` defines no `__reduce__` of its own."""
+
+    def reducer_override(self, obj: Any) -> Any:
+        if isinstance(obj, BaseException):
+            return _rebuilt_exception, (type(obj), obj.args), obj.__dict__ or None
+        return NotImplemented
+
+
 class Agent(BaseModel, ABC):
     """Shared base for every agent in the system — analysts and managers alike"""
 
@@ -52,6 +89,54 @@ class Agent(BaseModel, ABC):
 
     model_config = {"arbitrary_types_allowed": True}
     # Needed for concrete subclasses that will eventually hold non-Pydantic
+
+    # `built_parameters()`, recorded once the instance is built.
+    _built_parameters: dict[str, Any] = PrivateAttr(default_factory=dict)
+
+    def model_post_init(self, context: Any, /) -> None:
+        cls = type(self)
+        self._built_parameters = {
+            "agent_id": self.agent_id,
+            "class": qualified_name(cls),
+            "parameters": {name: stable_value(getattr(self, name)) for name in cls.model_fields},
+        }
+
+    def built_parameters(self) -> dict[str, Any]:
+        """This agent as it was built, as JSON values: its `agent_id`, its
+        class as `<module>.<qualname>` and every field (`stable_value`), a
+        non-pydantic value such as a `PortfolioConstructor` by its class and
+        public attributes. Read at construction, so later changes to the
+        instance's fields or their contents do not reach it. A copy."""
+        return copy.deepcopy(self._built_parameters)
+
+    def carried_state(self) -> bytes:
+        """An opaque snapshot of every pydantic private attribute this
+        instance holds (`__pydantic_private__`, `None` for a class with
+        none), as it stands now; later changes to the instance do not
+        reach it. The bytes are a pickle: pass them only to
+        `restore_carried_state`, and only from a checkpoint this program
+        wrote, never from untrusted input."""
+        buffer = io.BytesIO()
+        _CarriedStatePickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(
+            self.__pydantic_private__
+        )
+        return buffer.getvalue()
+
+    def restore_carried_state(self, state: bytes) -> None:
+        """Replaces this instance's private attributes with a fresh copy of
+        those in `state`, a `carried_state()` snapshot of an instance of
+        the same class. `state` is unpickled: it must come from a
+        checkpoint this program wrote, never from untrusted input. Raises
+        `ValueError` when the snapshot names other private attributes than
+        this instance has."""
+        private = pickle.loads(state)
+        expected = set(self.__pydantic_private__ or {})
+        if set(private or {}) != expected:
+            raise ValueError(
+                f"{self.agent_id}: carried state holds private attributes "
+                f"{sorted(private or {})}, this instance holds {sorted(expected)}"
+            )
+        object.__setattr__(self, "__pydantic_private__", private)
 
 
 # Bond/credit/index ETFs traded by the Rates/Credit/Tail-Hedge pods
@@ -91,7 +176,14 @@ class DataRequirement(BaseModel):
     `asset_scoped=False` means the requirement doesn't vary by ticker
     (e.g. one FRED series every asset's analyst call shares); `True`
     means it must be checked per run ticker, with `identifier` as a
-    `"{ticker}"` template the preflight substitutes."""
+    `"{ticker}"` template the preflight substitutes.
+
+    `lookback_days` is how many calendar days before a decision date the
+    analyst reads this source, so the preflight requires coverage from
+    `start_date - lookback_days`; `0` means only data dated on or before
+    each decision date itself. `None` means the analyst reads the source
+    as far back as the run's price history, so coverage is required from
+    the start of the run's warm-up."""
 
     source: Literal[
         "fred",
@@ -99,21 +191,125 @@ class DataRequirement(BaseModel):
         "sec_edgar_facts",
         "finra_short_interest",
         "sec_insider_transactions",
+        "options_chain",
+        "cftc_cot",
+        "earnings",
+        "dividends",
+        "sp500_membership",
+        "sec_sic",
     ]
     identifier: str
     asset_scoped: bool
     description: str
+    lookback_days: int | None = Field(default=None, ge=0)
+
+
+def calendar_days_for_sessions(sessions: int) -> int:
+    """Calendar days spanned by `sessions` trading sessions (or business-day
+    observations, such as a daily FRED series), at
+    `settings.firm.trading_days_per_year` sessions per 365.25-day year,
+    rounded up — the `lookback_days` of a requirement read as a trailing
+    window of `sessions` observations."""
+    return math.ceil(sessions * 365.25 / settings.firm.trading_days_per_year)
 
 
 class AnalystAgent(Agent):
     """Layer-1 analyst agent scaffold, every concrete analyst implements this"""
 
-    # Declarative real-data dependencies beyond `market_data`. Empty for
-    # any analyst that only reads `market_data` or an already-graceful
-    # lakehouse table (price, options, dividends, COT, earnings, SIC —
-    # all `None`-on-miss with no live-API cost) — only analysts reading
-    # a source that can be genuinely missing for a given run declare one.
+    # Declarative real-data dependencies beyond `market_data`: every lake
+    # source the analyst reads other than prices, which the backtest's own
+    # price load already guarantees. Empty for an analyst that reads only
+    # `market_data`.
     data_requirements: tuple[DataRequirement, ...] = ()
+
+    def covers_asset(self, asset: str) -> bool:
+        """Whether this instance produces a real signal for `asset`. The
+        preflight checks an `asset_scoped` requirement only against run
+        tickers for which this is True. True for every asset unless an
+        analyst limits an instance to a set of assets and overrides it."""
+        return True
+
+    def _status_signal(
+        self,
+        status: SignalStatus,
+        asset: str,
+        as_of_date: pd.Timestamp,
+        rationale: str,
+        source_as_of: date | None,
+        sample_count: int | None,
+        volatility_estimator: VolatilityEstimator | None = None,
+    ) -> AgentSignal:
+        return AgentSignal(
+            agent_id=self.agent_id,
+            asset=asset,
+            as_of_date=as_of_date.date(),
+            direction="flat",
+            confidence=0.0,
+            rationale=rationale,
+            status=status,
+            source_as_of=source_as_of,
+            sample_count=sample_count,
+            volatility_estimator=volatility_estimator,
+        )
+
+    def unavailable_signal(
+        self,
+        asset: str,
+        as_of_date: pd.Timestamp,
+        rationale: str,
+        *,
+        source_as_of: date | None = None,
+        sample_count: int | None = None,
+    ) -> AgentSignal:
+        """A flat, 0-confidence signal with status "unavailable", for when the
+        data the analyst needs is not there: no coverage, too little history,
+        no bar. `source_as_of` and `sample_count` are the provenance of
+        whatever data was read, when known."""
+        return self._status_signal(
+            "unavailable", asset, as_of_date, rationale, source_as_of, sample_count
+        )
+
+    def abstain_signal(
+        self,
+        asset: str,
+        as_of_date: pd.Timestamp,
+        rationale: str,
+        *,
+        source_as_of: date | None = None,
+        sample_count: int | None = None,
+        volatility_estimator: VolatilityEstimator | None = None,
+    ) -> AgentSignal:
+        """A flat, 0-confidence signal with status "active", for when the model
+        has the data and declines to bet on it: no serial dependence, a
+        degenerate or misspecified fit, a signal under its threshold.
+        `source_as_of`, `sample_count` and `volatility_estimator` are the
+        provenance of the data and volatility read the model declined on."""
+        return self._status_signal(
+            "active",
+            asset,
+            as_of_date,
+            rationale,
+            source_as_of,
+            sample_count,
+            volatility_estimator,
+        )
+
+    def error_signal(
+        self,
+        asset: str,
+        as_of_date: pd.Timestamp,
+        rationale: str,
+        *,
+        source_as_of: date | None = None,
+        sample_count: int | None = None,
+    ) -> AgentSignal:
+        """A flat, 0-confidence signal with status "error", for when the model
+        or a loader fails, a non-converged fit included. `source_as_of` and
+        `sample_count` are the provenance of the data read before the
+        failure, when known."""
+        return self._status_signal(
+            "error", asset, as_of_date, rationale, source_as_of, sample_count
+        )
 
     @abstractmethod
     def generate_signal(
@@ -161,11 +357,24 @@ class ManagerAgent(Agent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> list["AgentSignal"]:
-        """Gathers one AgentSignal from every analyst this manager owns"""
+        """Gathers one AgentSignal from every analyst this manager owns.
+        When `asset` has a missing close (NaN) on some row of a
+        (ticker, field) `market_data`, each analyst sees only the rows on
+        which `asset` has a close, every column kept, so no signal on
+        `asset` rests on a row without its bar. An analyst's exception
+        becomes a flat, zero-confidence signal with status `error`, except
+        a `LakeReadError` (the lake read itself failed), which propagates
+        and stops the run."""
+        if (asset, "close") in market_data.columns:
+            closes = market_data[(asset, "close")]
+            if bool(closes.isna().any()):
+                market_data = market_data.loc[closes.notna()]
         signals = []
         for analyst in self.managed_analysts:
             try:
                 signals.append(analyst.generate_signal(asset, market_data, as_of_date))
+            except LakeReadError:
+                raise
             except Exception:
                 logger.warning(
                     "Analyst %s failed to generate a signal for %s on %s — defaulting to "
@@ -213,7 +422,9 @@ class ManagerAgent(Agent):
         weighting_strategy, evaluated against `scoreboard` to reflect each
         source analyst's trailing track record. Concrete managers
         implement scale_factor, not evaluate — this method is the same
-        mechanical wiring for every manager type.
+        mechanical wiring for every manager type. A scale_factor() that
+        raises contributes a 0 factor with status `error`, except a
+        `LakeReadError` (the lake read itself failed), which propagates.
         """
         # WeightingStrategy/PerformanceScoreboard/TrackRecord are all keyed by
         # plain `date` (see scoring/), while `as_of_date` here is a
@@ -227,6 +438,8 @@ class ManagerAgent(Agent):
             status = signal.status
             try:
                 factor = self.scale_factor(signal, market_data, as_of_date)
+            except LakeReadError:
+                raise
             except Exception:
                 logger.warning(
                     "Manager %s's scale_factor() failed for %s's signal on %s (%s) — "
@@ -255,6 +468,7 @@ class ManagerAgent(Agent):
                     status=status,
                     source_as_of=signal.source_as_of,
                     sample_count=signal.sample_count,
+                    volatility_estimator=signal.volatility_estimator,
                 )
             )
         return scaled
@@ -265,6 +479,8 @@ class ManagerAgent(Agent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
         scoreboard: "PerformanceScoreboard",
+        *,
+        carried: Mapping[str, list["ManagerSignal"]] | None = None,
     ) -> list["PortfolioDecision"]:
         """Turns this pod's own analysts' signals into a complete,
         risk-managed set of per-asset target weights — this manager's own
@@ -287,7 +503,14 @@ class ManagerAgent(Agent):
         no contributing signals, the same shape an insufficient-history
         day already produces, so an asset-class-scoped pod (see
         `self.assets`' own docstring) never runs its analysts against an
-        instrument it was never built for."""
+        instrument it was never built for.
+
+        `carried` maps each asset of `assets` without a bar on `as_of_date`
+        to the signals this pod's decision on it last carried. No analyst
+        is asked about such an asset: those signals form its view, so the
+        constructor sizes the other assets as it would with the asset
+        present, and its target is this pod's previous sized weight for it
+        (0 without one), carried forward into tomorrow's previous weights."""
         scoped_assets = (
             [asset for asset in assets if asset in self.assets]
             if self.assets is not None
@@ -309,9 +532,15 @@ class ManagerAgent(Agent):
 
         views: dict[str, PodView] = {}
         signals_by_asset: dict[str, list[ManagerSignal]] = {}
+        carried = carried or {}
         for asset in scoped_assets:
-            analyst_signals = self.collect_signals(asset, market_data, as_of_date)
-            manager_signals = self.evaluate(analyst_signals, market_data, as_of_date, scoreboard)
+            if asset in carried:
+                manager_signals = list(carried[asset])
+            else:
+                analyst_signals = self.collect_signals(asset, market_data, as_of_date)
+                manager_signals = self.evaluate(
+                    analyst_signals, market_data, as_of_date, scoreboard
+                )
             signals_by_asset[asset] = manager_signals
             active = [
                 signal
@@ -331,9 +560,13 @@ class ManagerAgent(Agent):
             )
 
         returns_history = wide_log_returns(scoped_assets, market_data)
+        self.portfolio_constructor.manager_id = self.agent_id
         sized_weights = self.portfolio_constructor.construct(
             views, returns_history, as_of_date, self._previous_weights
         )
+        for asset in scoped_assets:
+            if asset in carried:
+                sized_weights[asset] = self._previous_weights.get(asset, 0.0)
         self._previous_weights = dict(sized_weights)
 
         return [
@@ -345,3 +578,37 @@ class ManagerAgent(Agent):
             )
             for asset in assets
         ]
+
+    def last_sizing_diagnostics(self) -> SizingDiagnostics | None:
+        """The per-stage volatility diagnostics of this pod's most recent
+        `portfolio_constructor.construct()` call, with `manager_id` set to
+        this manager's `agent_id`; `None` before any call or when the
+        constructor recorded none. Describes the equity book the constructor
+        sized, before any option rows a subclass adds."""
+        diagnostics = self.portfolio_constructor.last_diagnostics()
+        if diagnostics is None:
+            return None
+        return diagnostics.model_copy(update={"manager_id": self.agent_id})
+
+    def manager_state(self) -> ManagerState:
+        """A copy of what this manager carries between days: yesterday's
+        sized weights and its portfolio constructor's state, with
+        `tail_hedge` `None`."""
+        return ManagerState(
+            previous_weights=dict(self._previous_weights),
+            constructor=self.portfolio_constructor.state(),
+        )
+
+    def restore_manager_state(self, state: ManagerState) -> None:
+        """Replaces this manager's carried state with a copy of `state`.
+        Raises `ValueError` when `state` carries tail-hedge state, which
+        only the tail-hedge manager holds."""
+        if state.tail_hedge is not None:
+            raise ValueError(f"{self.agent_id} holds no tail-hedge state")
+        self._restore_shared_state(state)
+
+    def _restore_shared_state(self, state: ManagerState) -> None:
+        """Restores the state every manager carries: yesterday's sized
+        weights and the constructor's state."""
+        self._previous_weights = dict(state.previous_weights)
+        self.portfolio_constructor.restore_state(state.constructor)

@@ -1,5 +1,7 @@
 # short_interest_squeeze_analyst.py
 
+import math
+
 import numpy as np
 import pandas as pd
 from quantcore.statistics.cointegration import spread_zscore
@@ -8,12 +10,17 @@ from agentic_trading.agents._market_math import clamp
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, is_likely_equity
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
-from agentic_trading.data.loaders.lakehouse_loader import load_short_interest_from_lakehouse
+from agentic_trading.data.loaders.lakehouse_loader import (
+    FINRA_SETTLEMENTS_PER_YEAR,
+    load_short_interest_from_lakehouse,
+)
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 MAX_CONFIDENCE = 0.7
+# Settlements in the days-to-cover z-score window.
+DEFAULT_Z_WINDOW = 6
 
 
 class ShortInterestSqueezeAnalyst(AnalystAgent):
@@ -26,13 +33,17 @@ class ShortInterestSqueezeAnalyst(AnalystAgent):
 
     agent_id: str = "short_interest_squeeze_analyst"
 
-    z_window: int = 6
+    z_window: int = DEFAULT_Z_WINDOW
+    # `DEFAULT_Z_WINDOW + 1` disseminated settlements, which span that many
+    # semimonthly settlement periods before the decision date; an instance
+    # changing `z_window` should also override this.
     data_requirements: tuple[DataRequirement, ...] = (
         DataRequirement(
             source="finra_short_interest",
             identifier="{ticker}",
             asset_scoped=True,
             description="FINRA short interest",
+            lookback_days=math.ceil((DEFAULT_Z_WINDOW + 1) * 365.25 / FINRA_SETTLEMENTS_PER_YEAR),
         ),
     )
 
@@ -75,10 +86,20 @@ class ShortInterestSqueezeAnalyst(AnalystAgent):
                 status="unavailable",
             )
 
-        sorted_history = history.sort_values("settlement_date")
+        # Stable, so a settlement's unrevised row stays before its revised one as loaded.
+        sorted_history = history.sort_values("settlement_date", kind="stable")
         days_to_cover = sorted_history["days_to_cover"].to_numpy(dtype=np.float64)
         current_z = float(spread_zscore(days_to_cover, min(self.z_window, days_to_cover.size))[-1])
         latest_dissemination = sorted_history["dissemination_date"].max().date()
+
+        if not math.isfinite(current_z):
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                "days-to-cover constant over the z window — no z-score",
+                source_as_of=latest_dissemination,
+                sample_count=len(history),
+            )
 
         if current_z <= 0:
             return AgentSignal(

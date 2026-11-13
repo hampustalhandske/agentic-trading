@@ -21,13 +21,18 @@ from quantcore.performance.metrics import component_var
 from quantcore.portfolio.black_litterman import black_litterman
 from quantcore.portfolio.covariance import ledoit_wolf_shrinkage
 from quantcore.portfolio.optimization import (
-    min_variance_weights,
     risk_parity_weights,
     unconstrained_mean_variance_weights,
 )
 
-from agentic_trading.agents.schemas import MAX_LEVERAGE
+from agentic_trading.agents.schemas import (
+    MAX_LEVERAGE,
+    ConstructorState,
+    SizingDiagnostics,
+    SizingStage,
+)
 from agentic_trading.config import settings
+from agentic_trading.execution_costs import expected_fill_cost_fraction
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -57,13 +62,15 @@ class PodView(BaseModel):
 # lives in `config.settings.portfolio`, with the reasoning for each value
 # there. Constructor arguments left as `None` resolve to it at build time.
 
+_METHODS = ("mean_variance", "risk_parity")
+
 
 class PortfolioConstructor:
     """Eight-stage pipeline turning one pod's raw analyst views into a sized
     book: covariance estimate (Ledoit-Wolf shrinkage) -> equilibrium prior
     (`implied_equilibrium_returns`) -> Black-Litterman posterior using the
-    pod's own views -> a risk budget (`method` selects min_variance/
-    mean_variance/risk_parity, default mean_variance) -> volatility-targeting
+    pod's own views -> a risk budget (`method` selects mean_variance or
+    risk_parity, default mean_variance) -> volatility-targeting
     leverage (lever the whole book so its own realized annualized vol
     tracks `target_annualized_vol`, hard-clipped to `leverage_cap` as a
     sanity backstop, not the primary sizing lever — this is the
@@ -81,13 +88,11 @@ class PortfolioConstructor:
     component-VaR risk report (logged only, computed on the truly final
     weights).
 
-    `method` matters more than a tuning knob: `min_variance` sizes purely
-    off `cov_matrix`, discarding the Black-Litterman posterior this class
-    just spent four stages building from the pod's own views —
-    `mean_variance` is the only one that reads `expected_returns`.
-    `min_variance`/`mean_variance` are both called with `allow_short=True`
-    (a quantcore-level parameter): a bearish enough view can size to a
-    genuine negative weight, not just floor at zero, matching
+    `method` matters more than a tuning knob: `mean_variance` is the only
+    one that reads `expected_returns`, the Black-Litterman posterior built
+    from the pod's own views. It is unconstrained long/short: a bearish
+    enough view can size to a genuine negative weight, not just floor at
+    zero, matching
     `PortfolioDecision.target_weight`'s own `[-MAX_LEVERAGE, MAX_LEVERAGE]`
     bounds and `AgentSignal.direction`'s first-class "short".
     `risk_parity` never reads `expected_returns` either, but it does read
@@ -112,13 +117,9 @@ class PortfolioConstructor:
         net_leverage_cap: float | None = None,
         kelly_fraction_weight: float = 0.0,
         kelly_lookback_days: int | None = None,
-        transaction_cost_bps: float | None = None,
         no_trade_buffer: float | None = None,
     ) -> None:
         defaults = settings.portfolio
-        transaction_cost_bps = (
-            defaults.transaction_cost_bps if transaction_cost_bps is None else transaction_cost_bps
-        )
         no_trade_buffer = defaults.no_trade_buffer if no_trade_buffer is None else no_trade_buffer
         risk_aversion = defaults.risk_aversion if risk_aversion is None else risk_aversion
         tau = defaults.tau if tau is None else tau
@@ -139,6 +140,8 @@ class PortfolioConstructor:
             raise ValueError(f"net_leverage_cap must be within [0, {leverage_cap}]")
         if not 0.0 <= kelly_fraction_weight <= 1.0:
             raise ValueError("kelly_fraction_weight must be within [0, 1]")
+        if method not in _METHODS:
+            raise ValueError(f"method must be one of {_METHODS}, got {method!r}")
         self.method = method
         self.risk_aversion = risk_aversion
         self.tau = tau
@@ -148,7 +151,6 @@ class PortfolioConstructor:
         self.net_leverage_cap = leverage_cap if net_leverage_cap is None else net_leverage_cap
         self.kelly_fraction_weight = kelly_fraction_weight
         self.kelly_lookback_days = kelly_lookback_days
-        self.transaction_cost_bps = transaction_cost_bps
         self.no_trade_buffer = no_trade_buffer
         # This pod's own realized daily returns, from yesterday's sized
         # weights against today's real asset returns — same
@@ -161,6 +163,63 @@ class PortfolioConstructor:
         # (one `construct()` call each) since that last full rebalance.
         self._last_rebalance_date: pd.Timestamp | None = None
         self._days_since_last_rebalance: int = 0
+        # The owning manager's `agent_id`, set by `ManagerAgent` before each
+        # `construct()` call; `None` for a constructor no manager runs.
+        self.manager_id: str | None = None
+        self._last_diagnostics: SizingDiagnostics | None = None
+
+    def last_diagnostics(self) -> SizingDiagnostics | None:
+        """The per-stage volatility diagnostics of the most recent
+        `construct()` call. `None` before any call, and after a call that
+        sized nothing (no views, or `returns_history` missing an asset)."""
+        return self._last_diagnostics
+
+    def state(self) -> ConstructorState:
+        """A copy of what this constructor carries between `construct()`
+        calls: its own realised return history and its rebalance clock."""
+        return ConstructorState(
+            own_return_history=[(day.date(), value) for day, value in self._own_return_history],
+            last_rebalance_date=(
+                None if self._last_rebalance_date is None else self._last_rebalance_date.date()
+            ),
+            days_since_last_rebalance=self._days_since_last_rebalance,
+        )
+
+    def restore_state(self, state: ConstructorState) -> None:
+        """Replaces this constructor's carried state with a copy of `state`."""
+        self._own_return_history = [
+            (pd.Timestamp(day), value) for day, value in state.own_return_history
+        ]
+        self._last_rebalance_date = (
+            None if state.last_rebalance_date is None else pd.Timestamp(state.last_rebalance_date)
+        )
+        self._days_since_last_rebalance = state.days_since_last_rebalance
+
+    @staticmethod
+    def _annualized_vol(weights: np.ndarray, cov_matrix: np.ndarray) -> float:
+        """Ex-ante annualised volatility `sqrt(w' Sigma w * trading_days_per_year)`
+        of `weights` under the daily covariance `cov_matrix`."""
+        daily_variance = float(weights @ cov_matrix @ weights)
+        return math.sqrt(max(daily_variance, 0.0) * settings.firm.trading_days_per_year)
+
+    @staticmethod
+    def _binding_stage(
+        target_vol: float, vol_after: dict[SizingStage, float]
+    ) -> SizingStage | None:
+        """The stage in `vol_after` whose vol fell furthest below the vol
+        before it (`target_vol` before the first stage); the earliest such
+        stage on a tie. `None` when no stage lowered vol by more than
+        `1e-9 * target_vol`."""
+        threshold = 1e-9 * target_vol
+        binding: SizingStage | None = None
+        largest_drop = threshold
+        previous_vol = target_vol
+        for stage, vol in vol_after.items():
+            drop = previous_vol - vol
+            if drop > largest_drop:
+                binding, largest_drop = stage, drop
+            previous_vol = vol
+        return binding
 
     @staticmethod
     def _conviction_z_scores(assets: list[str], views: dict[str, PodView]) -> np.ndarray:
@@ -192,15 +251,12 @@ class PortfolioConstructor:
         # pod that is net short in its views is net short in its book, and
         # an asset with no view gets no weight. Gross exposure is set
         # afterwards by vol targeting and the leverage caps, not here.
-        # `min_variance` keeps quantcore's
-        # fully-invested, view-free solution. `risk_parity` starts from
-        # quantcore's equal-risk-contribution budget and tilts each asset's
+        # `risk_parity` starts from quantcore's equal-risk-contribution
+        # budget and tilts each asset's
         # share by `risk_parity_view_tilt` x its conviction (|z| clipped to
         # 1), taking the view's sign, so a short view becomes a short risk
         # budget and a no-view asset keeps its plain long budget; gross is
         # renormalised to 1 so vol targeting sees the same scale.
-        if self.method == "min_variance":
-            return np.asarray(min_variance_weights(cov_matrix, allow_short=True))
         if self.method == "mean_variance":
             if not np.any(expected_returns):
                 return np.zeros(len(expected_returns))
@@ -244,6 +300,32 @@ class PortfolioConstructor:
             else 0.0
             for asset in views
         }
+
+    def _view_direction_diagnostics(self, as_of_date: pd.Timestamp) -> SizingDiagnostics:
+        """Diagnostics for a book sized by `_view_direction_book`: no
+        covariance to measure vol with, so no per-stage vols."""
+        return SizingDiagnostics(
+            as_of_date=as_of_date.date(),
+            manager_id=self.manager_id,
+            path="view_direction",
+            target_vol=self.target_annualized_vol,
+            unlevered_vol=None,
+            vol_after={},
+            final_vol=None,
+            binding_stage=None,
+        )
+
+    def _view_direction_book(
+        self, assets: list[str], views: dict[str, PodView]
+    ) -> dict[str, float]:
+        """`_bootstrap_weights_from_views` followed by the net-leverage trim:
+        the whole book this pod runs when it has no covariance it can
+        risk-budget with."""
+        bootstrap_weights = self._bootstrap_weights_from_views(views)
+        trimmed = self._apply_net_leverage_trim(
+            np.array([bootstrap_weights[asset] for asset in assets])
+        )
+        return dict(zip(assets, trimmed.tolist(), strict=True))
 
     def _record_own_realized_return(
         self,
@@ -490,8 +572,16 @@ class PortfolioConstructor:
         asset at weight 0.0 (never omits a key) if `returns_history` is
         missing an asset entirely (a real data gap, not just a
         not-enough-history-yet timing issue) — the caller still needs
-        one `PortfolioDecision` per asset regardless."""
+        one `PortfolioDecision` per asset regardless.
+
+        An asset whose returns do not vary at all over `returns_history`
+        (every observation equal, e.g. a flat price series) has no
+        measurable risk: it is sized at 0.0, with a warning, and left out
+        of the covariance estimate and every stage after it. When no asset
+        varies, the whole book is sized off view direction alone, as with
+        too little history."""
         assets = list(views.keys())
+        self._last_diagnostics = None
         if not assets:
             return {}
 
@@ -520,15 +610,46 @@ class PortfolioConstructor:
                 min_observations,
                 len(assets),
             )
-            bootstrap_weights = self._bootstrap_weights_from_views(views)
-            trimmed = self._apply_net_leverage_trim(
-                np.array([bootstrap_weights[asset] for asset in assets])
+            self._last_diagnostics = self._view_direction_diagnostics(as_of_date)
+            return self._view_direction_book(assets, views)
+
+        returns_matrix = returns_history[assets].to_numpy(dtype=np.float64)
+        flat_assets = [
+            asset
+            for asset, column in zip(assets, returns_matrix.T, strict=True)
+            if np.all(column == column[0])
+        ]
+        if len(flat_assets) == len(assets):
+            logger.warning(
+                "PortfolioConstructor: no asset in %s has any return variation over %d "
+                "observation(s) as of %s — no covariance to risk-budget with, sizing off "
+                "view direction alone.",
+                assets,
+                len(returns_history),
+                as_of_date.date(),
             )
-            return dict(zip(assets, trimmed.tolist(), strict=True))
+            self._last_diagnostics = self._view_direction_diagnostics(as_of_date)
+            return self._view_direction_book(assets, views)
+        if flat_assets:
+            logger.warning(
+                "PortfolioConstructor: %s have no return variation over %d observation(s) as "
+                "of %s — sized at 0.0 and left out of the covariance estimate.",
+                flat_assets,
+                len(returns_history),
+                as_of_date.date(),
+            )
+            # Every remaining asset varies, so this nested call runs the full
+            # pipeline below exactly once for the reduced book.
+            varying_weights = self.construct(
+                {asset: view for asset, view in views.items() if asset not in flat_assets},
+                returns_history,
+                as_of_date,
+                previous_weights,
+            )
+            return {asset: varying_weights.get(asset, 0.0) for asset in assets}
 
         self._record_own_realized_return(previous_weights, returns_history, as_of_date)
 
-        returns_matrix = returns_history[assets].to_numpy(dtype=np.float64)
         cov_matrix = ledoit_wolf_shrinkage(returns_matrix)
         posterior_returns = self._black_litterman_expected_returns(assets, views, cov_matrix)
 
@@ -560,22 +681,30 @@ class PortfolioConstructor:
         )
         leverage = self.target_annualized_vol / portfolio_annualized_vol
         leverage = max(0.0, min(leverage, self.leverage_cap))
+        # Ex-ante annualised vol of the book after each stage below, for
+        # `last_diagnostics()`; reads the weights, never changes them.
+        vol_after: dict[SizingStage, float] = {
+            "vol_target_cap": self._annualized_vol(risk_budgeted_weights * leverage, cov_matrix)
+        }
 
         kelly_scalar = self._kelly_overlay_scalar()
         leverage = leverage * kelly_scalar
 
         final_weights = risk_budgeted_weights * leverage
+        vol_after["kelly"] = self._annualized_vol(final_weights, cov_matrix)
         gross_leverage = float(np.sum(np.abs(final_weights)))
         if gross_leverage > self.leverage_cap and gross_leverage > 0:
             final_weights = final_weights * (self.leverage_cap / gross_leverage)
+        vol_after["gross_cap"] = self._annualized_vol(final_weights, cov_matrix)
 
         final_weights = self._apply_net_leverage_trim(final_weights)
+        vol_after["net_trim"] = self._annualized_vol(final_weights, cov_matrix)
 
-        if previous_weights and (self.transaction_cost_bps > 0.0 or self.no_trade_buffer > 0.0):
-            cost_derived_min_move = (
-                settings.portfolio.cost_clearance_multiplier * self.transaction_cost_bps / 10_000.0
-            )
-            min_move = max(self.no_trade_buffer, cost_derived_min_move)
+        min_move = max(
+            self.no_trade_buffer,
+            settings.portfolio.cost_clearance_multiplier * expected_fill_cost_fraction(),
+        )
+        if previous_weights and min_move > 0.0:
             final_weights = np.array(
                 [
                     previous_weights.get(asset, 0.0)
@@ -584,24 +713,42 @@ class PortfolioConstructor:
                     for asset, w in zip(assets, final_weights, strict=True)
                 ]
             )
+        vol_after["no_trade_band"] = self._annualized_vol(final_weights, cov_matrix)
 
         # component_var (quantcore.performance.metrics) returns an all-zero
         # vector rather than dividing by zero when portfolio_std is ~0 —
         # e.g. the no-trade buffer legitimately leaving every asset at
         # 0.0 — so both calls below can run unconditionally.
         final_weights = self._apply_component_var_cap(assets, final_weights, cov_matrix)
+        vol_after["component_var_cap"] = self._annualized_vol(final_weights, cov_matrix)
         final_weights = self._apply_rebalance_calendar(
             assets, final_weights, previous_weights, as_of_date
         )
+        vol_after["rebalance_calendar"] = self._annualized_vol(final_weights, cov_matrix)
 
         risk_report = component_var(final_weights, cov_matrix, self.var_confidence_level)
         logger.info(
-            "PortfolioConstructor (%s) leverage=%.2f kelly_scalar=%.3f component VaR as of %s: %s",
+            "PortfolioConstructor (%s) manager=%s leverage=%.2f kelly_scalar=%.3f component "
+            "VaR as of %s: %s",
             self.method,
+            self.manager_id,
             leverage,
             kelly_scalar,
             as_of_date.date(),
             dict(zip(assets, risk_report.tolist(), strict=True)),
+        )
+
+        clipped_weights = np.clip(final_weights, -self.leverage_cap, self.leverage_cap)
+        vol_after["final_clip"] = self._annualized_vol(clipped_weights, cov_matrix)
+        self._last_diagnostics = SizingDiagnostics(
+            as_of_date=as_of_date.date(),
+            manager_id=self.manager_id,
+            path="full",
+            target_vol=self.target_annualized_vol,
+            unlevered_vol=self._annualized_vol(risk_budgeted_weights, cov_matrix),
+            vol_after=vol_after,
+            final_vol=vol_after["final_clip"],
+            binding_stage=self._binding_stage(self.target_annualized_vol, vol_after),
         )
 
         return {

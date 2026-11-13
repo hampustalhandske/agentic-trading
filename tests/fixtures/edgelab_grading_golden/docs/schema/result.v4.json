@@ -1,0 +1,2518 @@
+{
+  "$defs": {
+    "Assessment": {
+      "additionalProperties": false,
+      "description": "A run's grade with the numbers behind it.\n\nAttributes:\n    grade: One of the five grades.\n    label: The grade's display name.\n    next_step: One sentence: what the evidence supports and what would settle the question.\n    blocking: The non-green gates that keep the run from the next grade up, in gate order.\n    sharpe_upper_95: `(hac_t + 1.645) / sqrt(years)`; `None` without a `hac_t` value.\n    years: Years of data the significance tests ran on.\n    years_needed: Years at the observed Sharpe for the t-statistic to reach `min_hac_t`;\n        `None` unless the Sharpe is positive.\n    legacy_label: The three-label verdict this grade maps to.",
+      "properties": {
+        "blocking": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Blocking",
+          "type": "array"
+        },
+        "grade": {
+          "enum": [
+            "not_assessable",
+            "no_edge",
+            "inconclusive",
+            "promising",
+            "supported"
+          ],
+          "title": "Grade",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "legacy_label": {
+          "enum": [
+            "Reject",
+            "Not assessable",
+            "Insufficient evidence",
+            "Provisionally supported \u2014 paper trade next"
+          ],
+          "title": "Legacy Label",
+          "type": "string"
+        },
+        "next_step": {
+          "title": "Next Step",
+          "type": "string"
+        },
+        "sharpe_upper_95": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Sharpe Upper 95"
+        },
+        "years": {
+          "title": "Years",
+          "type": "number"
+        },
+        "years_needed": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Years Needed"
+        }
+      },
+      "required": [
+        "grade",
+        "label",
+        "next_step",
+        "blocking",
+        "sharpe_upper_95",
+        "years",
+        "years_needed",
+        "legacy_label"
+      ],
+      "title": "Assessment",
+      "type": "object"
+    },
+    "BetRow": {
+      "additionalProperties": false,
+      "description": "One settled prediction-market bet.\n\nAttributes:\n    entry_ts: When the position was opened (ISO 8601), or `None` if not recorded.\n    settled_ts: When the market resolved (ISO 8601).\n    symbol: The market id.\n    side: `\"yes\"` or `\"no\"`, from the sign of the settled position.\n    stake: Capital committed at entry, in the base currency.\n    market_price: The Yes-equivalent entry price.\n    forecast: The model's Yes probability at entry.\n    outcome: `1.0` if Yes resolved true, else `0.0`.\n    pnl: Realised P&L net of fees.\n    book_source: `\"real\"` (venue's quoted book) or `\"synthetic\"` (modelled from trade bars) for\n        the entry fill; `None` if it cannot be traced to a fill.",
+      "properties": {
+        "book_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Book Source"
+        },
+        "entry_ts": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Entry Ts"
+        },
+        "forecast": {
+          "title": "Forecast",
+          "type": "number"
+        },
+        "market_price": {
+          "title": "Market Price",
+          "type": "number"
+        },
+        "outcome": {
+          "title": "Outcome",
+          "type": "number"
+        },
+        "pnl": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pnl"
+        },
+        "settled_ts": {
+          "title": "Settled Ts",
+          "type": "string"
+        },
+        "side": {
+          "title": "Side",
+          "type": "string"
+        },
+        "stake": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stake"
+        },
+        "symbol": {
+          "title": "Symbol",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_ts",
+        "settled_ts",
+        "symbol",
+        "side",
+        "stake",
+        "market_price",
+        "forecast",
+        "outcome",
+        "pnl"
+      ],
+      "title": "BetRow",
+      "type": "object"
+    },
+    "BookFillSummary": {
+      "additionalProperties": false,
+      "description": "How a prediction-market book's fills split between a real and a modelled order book.\n\nAttributes:\n    by_source: Filled or partially filled order count per `book_source`.\n    total: Sum of `by_source`'s values.\n    real: Fills booked against a real order book.\n    label: One sentence summarising the split; says plainly when every fill was synthetic.",
+      "properties": {
+        "by_source": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "By Source",
+          "type": "object"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "real": {
+          "title": "Real",
+          "type": "integer"
+        },
+        "total": {
+          "title": "Total",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "by_source",
+        "total",
+        "real",
+        "label"
+      ],
+      "title": "BookFillSummary",
+      "type": "object"
+    },
+    "CalibrationBin": {
+      "additionalProperties": false,
+      "description": "One bin of a prediction-market reliability diagram (settled bets by model forecast).\n\nAttributes:\n    lo: Lower forecast edge.\n    hi: Upper forecast edge.\n    n: Settled bets in the bin.\n    mean_forecast: Mean model forecast of those bets.\n    mean_market_price: Mean Yes-equivalent entry price.\n    outcome_rate: Share whose market resolved Yes.",
+      "properties": {
+        "hi": {
+          "title": "Hi",
+          "type": "number"
+        },
+        "lo": {
+          "title": "Lo",
+          "type": "number"
+        },
+        "mean_forecast": {
+          "title": "Mean Forecast",
+          "type": "number"
+        },
+        "mean_market_price": {
+          "title": "Mean Market Price",
+          "type": "number"
+        },
+        "n": {
+          "title": "N",
+          "type": "integer"
+        },
+        "outcome_rate": {
+          "title": "Outcome Rate",
+          "type": "number"
+        }
+      },
+      "required": [
+        "lo",
+        "hi",
+        "n",
+        "mean_forecast",
+        "mean_market_price",
+        "outcome_rate"
+      ],
+      "title": "CalibrationBin",
+      "type": "object"
+    },
+    "Caveat": {
+      "additionalProperties": false,
+      "description": "One stated limit of a run.\n\nAttributes:\n    id: Stable identifier of the rule.\n    text: One or two plain sentences stating the limit and the figures behind it.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "text"
+      ],
+      "title": "Caveat",
+      "type": "object"
+    },
+    "ChargedCosts": {
+      "additionalProperties": false,
+      "description": "The cost rates one instrument was charged and the section they came from.\n\nAttributes:\n    kind: The instrument's kind.\n    section: `\"kind\"` when the instrument was charged its kind's rates, else the cost section:\n        `\"etf\"`, `\"futures_roots\"`, `\"fx_pairs\"`, `\"crypto_pairs\"` or `\"options\"`.\n    key: The section key the instrument resolved to (after aliases); `None` for the kind.\n    commission_bps: Commission, in bps of notional.\n    half_spread_bps: Half spread, in bps of notional.\n    slippage_bps: Slippage, in bps of notional.\n    exchange_fee_bps: Exchange fee, in bps of notional.\n    commission_per_contract: Commission per contract and side, in the contract's currency.\n    half_spread_per_contract_usd: Half spread per contract and side, in USD; futures sections.\n    slippage_per_contract_usd: Slippage per contract and side, in USD; futures sections.\n    exchange_fee_per_contract_usd: Exchange and regulatory fees per contract and side, in USD;\n        futures and options sections.\n    spread_fraction_paid: Fraction of the quoted spread an option order pays; options\n        sections.",
+      "properties": {
+        "commission_bps": {
+          "title": "Commission Bps",
+          "type": "number"
+        },
+        "commission_per_contract": {
+          "title": "Commission Per Contract",
+          "type": "number"
+        },
+        "exchange_fee_bps": {
+          "title": "Exchange Fee Bps",
+          "type": "number"
+        },
+        "exchange_fee_per_contract_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exchange Fee Per Contract Usd"
+        },
+        "half_spread_bps": {
+          "title": "Half Spread Bps",
+          "type": "number"
+        },
+        "half_spread_per_contract_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Half Spread Per Contract Usd"
+        },
+        "key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Key"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "section": {
+          "title": "Section",
+          "type": "string"
+        },
+        "slippage_bps": {
+          "title": "Slippage Bps",
+          "type": "number"
+        },
+        "slippage_per_contract_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Slippage Per Contract Usd"
+        },
+        "spread_fraction_paid": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Spread Fraction Paid"
+        }
+      },
+      "required": [
+        "kind",
+        "section",
+        "commission_bps",
+        "half_spread_bps",
+        "slippage_bps",
+        "exchange_fee_bps",
+        "commission_per_contract"
+      ],
+      "title": "ChargedCosts",
+      "type": "object"
+    },
+    "ClaimRow": {
+      "additionalProperties": false,
+      "description": "One claimed figure next to edgelab's.\n\nAttributes:\n    metric: The figure.\n    paper_value: As printed in the paper.\n    paper_se: The paper's standard error, if printed.\n    edgelab_value: edgelab's figure under the paper's conventions; `None` if not computable.\n    diff: `edgelab_value - paper_value`.\n    rel_diff: `diff / |paper_value|`; `None` when the paper value is zero.\n    within_tolerance: Whether `diff` lies inside the claim's stated tolerance.\n    status: `\"match\"` inside tolerance, `\"differ\"` outside, `\"not_comparable\"` when edgelab\n        could not produce the figure or the run does not cover the paper's sample.\n    note: The claim's note, plus the reason when not comparable.",
+      "properties": {
+        "diff": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Diff"
+        },
+        "edgelab_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Edgelab Value"
+        },
+        "metric": {
+          "enum": [
+            "annual_return",
+            "annual_vol",
+            "sharpe",
+            "t_stat",
+            "max_drawdown",
+            "hit_rate",
+            "turnover",
+            "alpha_annual",
+            "beta",
+            "n_obs"
+          ],
+          "title": "Metric",
+          "type": "string"
+        },
+        "note": {
+          "title": "Note",
+          "type": "string"
+        },
+        "paper_se": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Paper Se"
+        },
+        "paper_value": {
+          "title": "Paper Value",
+          "type": "number"
+        },
+        "rel_diff": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Rel Diff"
+        },
+        "status": {
+          "enum": [
+            "match",
+            "differ",
+            "not_comparable"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "within_tolerance": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Within Tolerance"
+        }
+      },
+      "required": [
+        "metric",
+        "paper_value",
+        "paper_se",
+        "edgelab_value",
+        "diff",
+        "rel_diff",
+        "within_tolerance",
+        "status",
+        "note"
+      ],
+      "title": "ClaimRow",
+      "type": "object"
+    },
+    "ClientRef": {
+      "additionalProperties": false,
+      "description": "The client project and revision a submission comes from.\n\nAttributes:\n    project: Plain project name, lower-case letters, digits and hyphens.\n    git_sha: Commit of the client repository the strategy code was taken from (7 to 40 hex\n        characters).\n    hypothesis_id: The client's identifier of the hypothesis under test.",
+      "properties": {
+        "git_sha": {
+          "description": "Client commit, 7 to 40 hex characters.",
+          "title": "Git Sha",
+          "type": "string"
+        },
+        "hypothesis_id": {
+          "description": "The client's hypothesis identifier.",
+          "minLength": 1,
+          "title": "Hypothesis Id",
+          "type": "string"
+        },
+        "project": {
+          "description": "Client project name: lower-case letters, digits, hyphens.",
+          "title": "Project",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "git_sha",
+        "hypothesis_id"
+      ],
+      "title": "ClientRef",
+      "type": "object"
+    },
+    "ConclusionRow": {
+      "additionalProperties": false,
+      "description": "The paper's conclusion next to edgelab's verdict, mapped to the same three labels.\n\nAttributes:\n    paper: The paper's conclusion.\n    edgelab: edgelab's verdict mapped to `edge` / `no_edge` / `mixed`.\n    edgelab_overall: The verdict label as edgelab printed it.\n    agree: Whether the two labels coincide.",
+      "properties": {
+        "agree": {
+          "title": "Agree",
+          "type": "boolean"
+        },
+        "edgelab": {
+          "enum": [
+            "edge",
+            "no_edge",
+            "mixed"
+          ],
+          "title": "Edgelab",
+          "type": "string"
+        },
+        "edgelab_overall": {
+          "title": "Edgelab Overall",
+          "type": "string"
+        },
+        "paper": {
+          "enum": [
+            "edge",
+            "no_edge",
+            "mixed"
+          ],
+          "title": "Paper",
+          "type": "string"
+        }
+      },
+      "required": [
+        "paper",
+        "edgelab",
+        "edgelab_overall",
+        "agree"
+      ],
+      "title": "ConclusionRow",
+      "type": "object"
+    },
+    "CostBreakdownRow": {
+      "additionalProperties": false,
+      "description": "One cost component's total, mirroring `edgelab.engine.result.CostBreakdownItem`.\n\nAttributes:\n    component: Cost component name (e.g. `\"commission\"`, `\"spread\"`, `\"impact\"`).\n    currency: Total cost of this component over the run, in the base currency.\n    bps: Total cost of this component in basis points of average NAV.",
+      "properties": {
+        "bps": {
+          "title": "Bps",
+          "type": "number"
+        },
+        "component": {
+          "title": "Component",
+          "type": "string"
+        },
+        "currency": {
+          "title": "Currency",
+          "type": "number"
+        }
+      },
+      "required": [
+        "component",
+        "currency",
+        "bps"
+      ],
+      "title": "CostBreakdownRow",
+      "type": "object"
+    },
+    "DataProvenance": {
+      "additionalProperties": false,
+      "description": "Data vintage and provenance caveats a reader should check before trusting the numbers.\n\nAttributes:\n    lake_freshness: The audit's `lake_freshness` detail (each lakehouse table's last write and\n        coverage end), or `\"not recorded\"`.\n    lake_freshness_ok: Whether every table the lake reports was fresh.\n    truncated_futures_roots: Futures roots truncated to the available front-month history; empty\n        if none.\n    survivorship_coverage: Fraction of an index universe's ex-members with price history through\n        their removal, or `None` if not applicable or not recorded.\n    adjustment_verification: The audit's detail on tickers whose split/dividend adjustment\n        factors are unverified or absent, or `\"not recorded\"`.\n    adjustment_verification_ok: Whether every ticker's adjustment factors are verified.\n    unexplained_ends: Held positions closed at their last traded close with no delisting row.",
+      "properties": {
+        "adjustment_verification": {
+          "title": "Adjustment Verification",
+          "type": "string"
+        },
+        "adjustment_verification_ok": {
+          "title": "Adjustment Verification Ok",
+          "type": "boolean"
+        },
+        "lake_freshness": {
+          "title": "Lake Freshness",
+          "type": "string"
+        },
+        "lake_freshness_ok": {
+          "title": "Lake Freshness Ok",
+          "type": "boolean"
+        },
+        "survivorship_coverage": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Survivorship Coverage"
+        },
+        "truncated_futures_roots": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Truncated Futures Roots",
+          "type": "array"
+        },
+        "unexplained_ends": {
+          "title": "Unexplained Ends",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "lake_freshness",
+        "lake_freshness_ok",
+        "truncated_futures_roots",
+        "survivorship_coverage",
+        "adjustment_verification",
+        "adjustment_verification_ok",
+        "unexplained_ends"
+      ],
+      "title": "DataProvenance",
+      "type": "object"
+    },
+    "DateWindow": {
+      "additionalProperties": false,
+      "description": "A closed date range, `start <= end`.\n\nAttributes:\n    start: First day.\n    end: Last day, inclusive.",
+      "properties": {
+        "end": {
+          "format": "date",
+          "title": "End",
+          "type": "string"
+        },
+        "start": {
+          "format": "date",
+          "title": "Start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "title": "DateWindow",
+      "type": "object"
+    },
+    "EventTotal": {
+      "additionalProperties": false,
+      "description": "Count and net cash flow of one event kind over the run.\n\nAttributes:\n    event: The event kind, e.g. `\"funding\"` or `\"option_expiry\"`.\n    count: Number of events.\n    cash: Sum of the events' signed cash flows, in the base currency.",
+      "properties": {
+        "cash": {
+          "title": "Cash",
+          "type": "number"
+        },
+        "count": {
+          "title": "Count",
+          "type": "integer"
+        },
+        "event": {
+          "title": "Event",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "count",
+        "cash"
+      ],
+      "title": "EventTotal",
+      "type": "object"
+    },
+    "EvidenceGroup": {
+      "additionalProperties": false,
+      "description": "One of the six questions the verdict gates answer.\n\nAttributes:\n    key: Stable identifier, e.g. `\"significance\"`.\n    question: The question, e.g. \"Is it statistically significant?\".\n    status: `red` if any gate is red, else `amber` if any is amber, else `green` if any is\n        green,\n        else `not_evaluated`.\n    headline_label: Label of the group's key figure.\n    headline_value: The key figure, or `None` if its gate was not evaluated.\n    headline_unit: Unit of the key figure.\n    gates: The gates in the group, with their explanations.",
+      "properties": {
+        "gates": {
+          "items": {
+            "$ref": "#/$defs/GateResultModel"
+          },
+          "title": "Gates",
+          "type": "array"
+        },
+        "headline_label": {
+          "title": "Headline Label",
+          "type": "string"
+        },
+        "headline_unit": {
+          "enum": [
+            "pct",
+            "ratio",
+            "bars",
+            "count",
+            "multiple",
+            "currency",
+            "hours"
+          ],
+          "title": "Headline Unit",
+          "type": "string"
+        },
+        "headline_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Headline Value"
+        },
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "question": {
+          "title": "Question",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "green",
+            "amber",
+            "red",
+            "not_evaluated"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "question",
+        "status",
+        "headline_label",
+        "headline_value",
+        "headline_unit",
+        "gates"
+      ],
+      "title": "EvidenceGroup",
+      "type": "object"
+    },
+    "FamilyEvaluationsModel": {
+      "additionalProperties": false,
+      "description": "The multiple-testing disclosure plus what each counted hypothesis was evaluated under.\n\nThe summary's multiple-testing block: the scorecard's disclosure with the family stage's\nrecord of repeated evaluations.\n\nAttributes:\n    measurement_versions: Per counted hypothesis, keyed by hypothesis key, the name of every\n        measurement (published grading policy or custom grading block) it was evaluated\n        under. A hypothesis counts once for all its published policies and once more per\n        custom measurement.\n    data_snapshots: Per the same hypotheses, every data snapshot id it was evaluated on.\n    reported_hypothesis: The key of the hypothesis the run reports, or `None`.",
+      "properties": {
+        "data_snapshots": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "title": "Data Snapshots",
+          "type": "object"
+        },
+        "discarded": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Discarded",
+          "type": "array"
+        },
+        "effective_n_clustered": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Effective N Clustered"
+        },
+        "effective_n_eigen": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Effective N Eigen"
+        },
+        "how_chosen": {
+          "title": "How Chosen",
+          "type": "string"
+        },
+        "measurement_versions": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "title": "Measurement Versions",
+          "type": "object"
+        },
+        "n_failed": {
+          "title": "N Failed",
+          "type": "integer"
+        },
+        "n_grid": {
+          "title": "N Grid",
+          "type": "integer"
+        },
+        "n_lineage": {
+          "title": "N Lineage",
+          "type": "integer"
+        },
+        "n_trials": {
+          "title": "N Trials",
+          "type": "integer"
+        },
+        "pre_registration_note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pre Registration Note"
+        },
+        "reported_hypothesis": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reported Hypothesis"
+        }
+      },
+      "required": [
+        "n_trials",
+        "n_grid",
+        "n_lineage",
+        "n_failed",
+        "how_chosen",
+        "effective_n_eigen",
+        "effective_n_clustered",
+        "discarded"
+      ],
+      "title": "FamilyEvaluationsModel",
+      "type": "object"
+    },
+    "GateResultModel": {
+      "additionalProperties": false,
+      "description": "One evidence gate's rendered verdict (mirrors `edgelab.verdict.gates.GateResult`).",
+      "properties": {
+        "explanation": {
+          "title": "Explanation",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "green",
+            "amber",
+            "red",
+            "not_evaluated"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "threshold": {
+          "title": "Threshold",
+          "type": "number"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "name",
+        "status",
+        "value",
+        "threshold",
+        "explanation"
+      ],
+      "title": "GateResultModel",
+      "type": "object"
+    },
+    "GroupRow": {
+      "additionalProperties": false,
+      "description": "The settled bets (else closed round trips) of one group of a submission's groups file.\n\nAttributes:\n    group: The group name, or `UNGROUPED`.\n    n: Settled bets, or closed round trips for a book without bets.\n    pnl: Their summed net P&L.\n    mean_return: Mean P&L per unit staked for bets, or mean round-trip return; `None` when\n        undefined.\n    hit_rate: Share with positive P&L; `None` when undefined.",
+      "properties": {
+        "group": {
+          "title": "Group",
+          "type": "string"
+        },
+        "hit_rate": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Hit Rate"
+        },
+        "mean_return": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Mean Return"
+        },
+        "n": {
+          "title": "N",
+          "type": "integer"
+        },
+        "pnl": {
+          "title": "Pnl",
+          "type": "number"
+        }
+      },
+      "required": [
+        "group",
+        "n",
+        "pnl",
+        "mean_return",
+        "hit_rate"
+      ],
+      "title": "GroupRow",
+      "type": "object"
+    },
+    "HeadlineRow": {
+      "additionalProperties": false,
+      "description": "One measurement, for the strategy and (where it applies) the benchmark.\n\nAttributes:\n    key: Stable identifier, e.g. `\"cagr\"`.\n    label: Display label.\n    unit: How to format the values.\n    strategy: The strategy's value, or `None` if undefined on this sample.\n    benchmark: The benchmark's value, or `None` if none or not applicable (e.g. trade counts).\n    difference: `strategy - benchmark` where both exist and it is meaningful.",
+      "properties": {
+        "benchmark": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Benchmark"
+        },
+        "difference": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Difference"
+        },
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "strategy": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Strategy"
+        },
+        "unit": {
+          "enum": [
+            "pct",
+            "ratio",
+            "bars",
+            "count",
+            "multiple",
+            "currency",
+            "hours"
+          ],
+          "title": "Unit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "unit",
+        "strategy"
+      ],
+      "title": "HeadlineRow",
+      "type": "object"
+    },
+    "LeadBlock": {
+      "additionalProperties": false,
+      "description": "The lead of a result, items in reading order.\n\nAttributes:\n    effect: `estimate`, `ci_low`, `ci_high` of the primary metric on the test window.\n    detectability: `mde`, `sample_needed`, `years_needed`.\n    costs: Breakeven multiple and gross against net (betting: margin paid).\n    risk: Maximum drawdown and its length, worst month, CVaR 1%.\n    stability: Sign by third, leave-one-group-out, top contributors' share.\n    capacity: Capacity where measured.\n    counts: N used, counted, declared, effective, whether declared N was verified, and the\n        rung at N = 1 and at the N used.\n    holdout: The holdout state.\n    caveats: Caveats shown with the result.\n    not_measured: What was not measured.",
+      "properties": {
+        "capacity": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "const": "not measured",
+              "type": "string"
+            }
+          ],
+          "title": "Capacity"
+        },
+        "caveats": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Caveats",
+          "type": "array"
+        },
+        "costs": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "const": "not measured",
+              "type": "string"
+            }
+          ],
+          "title": "Costs"
+        },
+        "counts": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "const": "not measured",
+              "type": "string"
+            }
+          ],
+          "title": "Counts"
+        },
+        "detectability": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "const": "not measured",
+              "type": "string"
+            }
+          ],
+          "title": "Detectability"
+        },
+        "effect": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "const": "not measured",
+              "type": "string"
+            }
+          ],
+          "title": "Effect"
+        },
+        "holdout": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "const": "not measured",
+              "type": "string"
+            }
+          ],
+          "title": "Holdout"
+        },
+        "not_measured": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Not Measured",
+          "type": "array"
+        },
+        "risk": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "const": "not measured",
+              "type": "string"
+            }
+          ],
+          "title": "Risk"
+        },
+        "stability": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "const": "not measured",
+              "type": "string"
+            }
+          ],
+          "title": "Stability"
+        }
+      },
+      "required": [
+        "effect",
+        "detectability",
+        "costs",
+        "risk",
+        "stability",
+        "capacity",
+        "counts",
+        "holdout",
+        "caveats",
+        "not_measured"
+      ],
+      "title": "LeadBlock",
+      "type": "object"
+    },
+    "PriorExposure": {
+      "additionalProperties": false,
+      "description": "Earlier looks of this strategy family at the data, which the trial count did not see.\n\nAttributes:\n    note: What the earlier looks were.\n    windows: The date windows the earlier runs of this family (its variants) were evaluated on.\n    min_count: The known lower bound of those uncounted earlier runs.",
+      "properties": {
+        "min_count": {
+          "minimum": 0,
+          "title": "Min Count",
+          "type": "integer"
+        },
+        "note": {
+          "minLength": 1,
+          "title": "Note",
+          "type": "string"
+        },
+        "windows": {
+          "items": {
+            "$ref": "#/$defs/DateWindow"
+          },
+          "minItems": 1,
+          "title": "Windows",
+          "type": "array"
+        }
+      },
+      "required": [
+        "note",
+        "windows",
+        "min_count"
+      ],
+      "title": "PriorExposure",
+      "type": "object"
+    },
+    "ReplayBlock": {
+      "additionalProperties": false,
+      "description": "What a decision-file replay reports besides its P&L.\n\nAttributes:\n    status_shares: Per instrument, the share of its rows in each `status` (`active`,\n        `unavailable`, `error`; a row without a status is `active`).\n    non_session_decision_dates: Decision dates that are not sessions of the calendar; never\n        traded.\n    missing_fill_bars: `(decision date, instrument)` pairs with a nonzero target and no bar on\n        the next session; never filled.\n    label: How the replay was graded (`REPLAY_LABEL`).",
+      "properties": {
+        "label": {
+          "default": "graded from recorded decisions; look-ahead checked on declared source times",
+          "title": "Label",
+          "type": "string"
+        },
+        "missing_fill_bars": {
+          "title": "Missing Fill Bars",
+          "type": "integer"
+        },
+        "non_session_decision_dates": {
+          "title": "Non Session Decision Dates",
+          "type": "integer"
+        },
+        "status_shares": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object"
+          },
+          "title": "Status Shares",
+          "type": "object"
+        }
+      },
+      "required": [
+        "status_shares",
+        "non_session_decision_dates",
+        "missing_fill_bars"
+      ],
+      "title": "ReplayBlock",
+      "type": "object"
+    },
+    "ReplicationReport": {
+      "additionalProperties": false,
+      "description": "The full comparison for one paper against one run.\n\nAttributes:\n    source_title: The paper's title.\n    source_table: Which table the claims came from.\n    rows: One row per claim, in the spec's order.\n    conclusion: The conclusion comparison.\n    n_match: Rows with status `\"match\"`.\n    n_differ: Rows with status `\"differ\"`.\n    n_not_comparable: Rows with status `\"not_comparable\"`.\n    sample_covered: Whether the run's returns span the paper's sample window.\n    notes: The replication spec's notes.",
+      "properties": {
+        "conclusion": {
+          "$ref": "#/$defs/ConclusionRow"
+        },
+        "n_differ": {
+          "title": "N Differ",
+          "type": "integer"
+        },
+        "n_match": {
+          "title": "N Match",
+          "type": "integer"
+        },
+        "n_not_comparable": {
+          "title": "N Not Comparable",
+          "type": "integer"
+        },
+        "notes": {
+          "title": "Notes",
+          "type": "string"
+        },
+        "rows": {
+          "items": {
+            "$ref": "#/$defs/ClaimRow"
+          },
+          "title": "Rows",
+          "type": "array"
+        },
+        "sample_covered": {
+          "title": "Sample Covered",
+          "type": "boolean"
+        },
+        "source_table": {
+          "title": "Source Table",
+          "type": "string"
+        },
+        "source_title": {
+          "title": "Source Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_title",
+        "source_table",
+        "rows",
+        "conclusion",
+        "n_match",
+        "n_differ",
+        "n_not_comparable",
+        "sample_covered",
+        "notes"
+      ],
+      "title": "ReplicationReport",
+      "type": "object"
+    },
+    "RunMeta": {
+      "additionalProperties": false,
+      "description": "What was run, on what, with what.\n\nAttributes:\n    schema_version: Version of the summary layout, `SUMMARY_SCHEMA_VERSION` for a run saved now;\n        0 for a summary saved without the field.\n    bars_per_year: Bars in a year on the strategy's schedule.\n    asset_class: The book's primary asset class (first kind of a mixed book).\n    benchmark: Human-readable benchmark description, or `None`.\n    universe: The traded symbols (empty for index or filter universes).\n    live_start: First bar the strategy was invested or eligible to be (after warm-up).\n    live_end: Last bar of the evaluated period.\n    n_bars: Number of live bars.\n    holdout_start: Close of the locked holdout's first bar (ISO 8601, UTC), from\n        `edgelab.validation.holdout.search_range_for`; every bar of the run closes before it.\n        `None` when the data range holds no holdout bar. A summary saved before it was\n        recorded may hold a date.\n    holdout_evaluated: Whether this run evaluated the holdout: true only when the holdout was\n        unlocked and produced a result, false for a locked holdout.\n    edgelab_sha: HEAD commit of the edgelab checkout the run executed from (`\"unknown\"`\n        outside a git checkout); `None` for a summary saved without it.\n    client: The client project, commit and hypothesis of a submission run; `None` for a\n        library run.\n    seed: The seed of every stochastic step of the run; `None` for a summary saved without it.\n    lake_time: The lake state the run read, as a UTC timestamp; `None` when no lake was read.\n    lake_version: The lake version the run read (`X-Lakehouse-Version` as received); `None`\n        when no lake was read.\n    lake_current_tables: The tables the run read without a log, at the lake version rather\n        than at `lake_time`; `None` when no lake was read.\n    train_end: The last date the client used to design or fit the strategy, as declared;\n        `None` when not declared.\n    test_window: The window the client declared the evidence is scored on, as declared;\n        `None` when not declared.\n    edgelab_dirty: Whether tracked edgelab sources differed from `edgelab_sha`; `None` if\n        unknown or not recorded.\n    strategy_dirty: Whether the strategy folder's defining files were untracked or differed\n        from HEAD; `None` if unknown or not recorded.\n    strategy_files_sha256: Hash of the strategy folder's defining files; `None` if not recorded.\n    provenance: `\"committed\"` when both dirty flags are false, `\"uncommitted code\"` when\n        either is true, `\"unknown\"` when either is unknown; `None` if not recorded. Only a\n        committed run counts as a grade.\n    profile: Sample-size profile the run used, when known.\n    overall: The three-label verdict (the assessment's `legacy_label` when there is one).\n    costs: One line describing the transaction costs charged.\n    cost_rates_charged: For a strategy-class run, the rates each traded instrument was charged\n        and the cost section they came from, by instrument id; `None` for a summary saved\n        without it.\n    cost_table_sha256: The registered sha256 of the cost table the grading block's policy\n        carries; `None` when the measurement carries no table.\n    setup: How the strategy trades.\n    strategy_class: For a strategy-class run, `StrategyConfig.strategy`; else `None`.\n    strategy_fields: For a strategy-class run, `(field name, JSON value)` for every value the\n        class was instantiated with, sorted by name; else `None`.\n    grading_policy_version: For a strategy-class run, the measurement the `grading:` block is:\n        a published policy version, or `custom:<digest>` when it equals none (the name the\n        ledger records); else `None`.\n    grading_diffs: For a strategy-class run, one line per value differing from the published\n        version above (for a custom block, the newest published version), e.g.\n        `\"gates.min_psr: 0.95 -> 0.9\"`; empty if equal; else `None`.\n    grading_custom_fields: For a custom grading block, the dotted paths of the fields that\n        differ from the newest published version (e.g. `gates.min_psr`); empty otherwise.\n    data_fit_note: For a strategy-class run, the data-fit gate's disclosure of the weakest\n        annual\n        Sharpe the history and trial count could confirm; else `None`.\n    live_validation: Whether the run made the live-validation checks; when `False`, CPCV,\n        walk-forward, the random-entry placebo and the re-running robustness checks are\n        reported as \"not run: live validation off\".\n    evidence_basis: `\"stated_hypothesis\"` for a run whose figures were measured on the basis\n        the pipeline now uses (a pre-stated hypothesis, risk-free-adjusted Sharpe, versioned\n        measurements); `None` for a run saved before that, which the library calls an earlier\n        run.",
+      "properties": {
+        "asset_class": {
+          "default": "equity",
+          "enum": [
+            "equity",
+            "prediction_market",
+            "option",
+            "future",
+            "crypto",
+            "fx"
+          ],
+          "title": "Asset Class",
+          "type": "string"
+        },
+        "bars_per_year": {
+          "title": "Bars Per Year",
+          "type": "integer"
+        },
+        "benchmark": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Benchmark"
+        },
+        "client": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "cost_rates_charged": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/ChargedCosts"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cost Rates Charged"
+        },
+        "cost_table_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cost Table Sha256"
+        },
+        "costs": {
+          "title": "Costs",
+          "type": "string"
+        },
+        "data_fit_note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Data Fit Note"
+        },
+        "data_provider": {
+          "title": "Data Provider",
+          "type": "string"
+        },
+        "edgelab_dirty": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Edgelab Dirty"
+        },
+        "edgelab_sha": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Edgelab Sha"
+        },
+        "edgelab_version": {
+          "title": "Edgelab Version",
+          "type": "string"
+        },
+        "evidence_basis": {
+          "anyOf": [
+            {
+              "const": "stated_hypothesis",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evidence Basis"
+        },
+        "frequency": {
+          "title": "Frequency",
+          "type": "string"
+        },
+        "grading_custom_fields": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Grading Custom Fields",
+          "type": "array"
+        },
+        "grading_diffs": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Grading Diffs"
+        },
+        "grading_policy_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Grading Policy Version"
+        },
+        "holdout_evaluated": {
+          "title": "Holdout Evaluated",
+          "type": "boolean"
+        },
+        "holdout_start": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Holdout Start"
+        },
+        "lake_current_tables": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lake Current Tables"
+        },
+        "lake_time": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lake Time"
+        },
+        "lake_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lake Version"
+        },
+        "live_end": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Live End"
+        },
+        "live_start": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Live Start"
+        },
+        "live_validation": {
+          "default": false,
+          "title": "Live Validation",
+          "type": "boolean"
+        },
+        "n_bars": {
+          "title": "N Bars",
+          "type": "integer"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "overall": {
+          "title": "Overall",
+          "type": "string"
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "enum": [
+                "committed",
+                "uncommitted code",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provenance"
+        },
+        "quantcore_sha": {
+          "title": "Quantcore Sha",
+          "type": "string"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 0,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "seed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Seed"
+        },
+        "setup": {
+          "$ref": "#/$defs/RunSetup"
+        },
+        "snapshot_id": {
+          "title": "Snapshot Id",
+          "type": "string"
+        },
+        "spec_hash": {
+          "title": "Spec Hash",
+          "type": "string"
+        },
+        "strategy_class": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Strategy Class"
+        },
+        "strategy_dirty": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Strategy Dirty"
+        },
+        "strategy_fields": {
+          "anyOf": [
+            {
+              "items": {
+                "maxItems": 2,
+                "minItems": 2,
+                "prefixItems": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "type": "array"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Strategy Fields"
+        },
+        "strategy_files_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Strategy Files Sha256"
+        },
+        "test_window": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScoreWindow"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "train_end": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Train End"
+        },
+        "universe": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Universe",
+          "type": "array"
+        }
+      },
+      "required": [
+        "run_id",
+        "spec_hash",
+        "name",
+        "frequency",
+        "bars_per_year",
+        "benchmark",
+        "universe",
+        "data_provider",
+        "snapshot_id",
+        "live_start",
+        "live_end",
+        "n_bars",
+        "holdout_start",
+        "holdout_evaluated",
+        "edgelab_version",
+        "quantcore_sha",
+        "overall",
+        "costs",
+        "setup"
+      ],
+      "title": "RunMeta",
+      "type": "object"
+    },
+    "RunSeries": {
+      "additionalProperties": false,
+      "description": "Chart data, aligned on the live bars.\n\nAttributes:\n    ts: Bar-close timestamps (ISO 8601, UTC).\n    strategy_growth: Growth of 1 invested at the start of the live period.\n    benchmark_growth: The same for the benchmark, or `None`.\n    strategy_drawdown: Drawdown from the running peak, as a positive fraction.\n    benchmark_drawdown: The same for the benchmark, or `None`.\n    rolling_sharpe: Rolling annualised Sharpe over `rolling_window_bars`; `None` until full.\n    rolling_window_bars: Window length, three years of bars.\n    rolling_excess_return: Rolling annualised mean excess over the benchmark; `None` until full\n        and without a benchmark.\n    annual: `{\"year\", \"strategy\", \"benchmark\"}` calendar-year returns.\n    monthly: `{\"year\", \"month\", \"strategy\", \"benchmark\"}` calendar-month returns.\n    decades: `{\"decade\", \"strategy_cagr\", \"benchmark_cagr\", \"difference\", \"n_bars\"}` per decade\n        (its first year), partial decades included.",
+      "properties": {
+        "annual": {
+          "items": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object"
+          },
+          "title": "Annual",
+          "type": "array"
+        },
+        "benchmark_drawdown": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Benchmark Drawdown"
+        },
+        "benchmark_growth": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Benchmark Growth"
+        },
+        "decades": {
+          "items": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object"
+          },
+          "title": "Decades",
+          "type": "array"
+        },
+        "monthly": {
+          "items": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object"
+          },
+          "title": "Monthly",
+          "type": "array"
+        },
+        "rolling_excess_return": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Rolling Excess Return",
+          "type": "array"
+        },
+        "rolling_sharpe": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Rolling Sharpe",
+          "type": "array"
+        },
+        "rolling_window_bars": {
+          "title": "Rolling Window Bars",
+          "type": "integer"
+        },
+        "strategy_drawdown": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Strategy Drawdown",
+          "type": "array"
+        },
+        "strategy_growth": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Strategy Growth",
+          "type": "array"
+        },
+        "ts": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Ts",
+          "type": "array"
+        }
+      },
+      "required": [
+        "ts",
+        "strategy_growth",
+        "benchmark_growth",
+        "strategy_drawdown",
+        "benchmark_drawdown",
+        "rolling_sharpe",
+        "rolling_window_bars",
+        "annual",
+        "monthly",
+        "rolling_excess_return",
+        "decades"
+      ],
+      "title": "RunSeries",
+      "type": "object"
+    },
+    "RunSetup": {
+      "additionalProperties": false,
+      "description": "How the strategy trades: bar length, rebalance cadence, execution, sizing and signal.\n\nAttributes:\n    bar: Bar length in words, e.g. `\"Monthly\"`.\n    rebalance: How often positions are re-evaluated and traded.\n    order_type: `\"market\"` or `\"limit\"`.\n    fill_rule: `\"next_open\"`, `\"next_close\"` or `\"vwap_proxy\"`.\n    lag_bars: Bars between the decision bar and the earliest fill bar.\n    execution: One sentence combining the three fields above.\n    sizing: Sizing rule kind, e.g. `\"equal_weight\"`.\n    signal: The signal's registered name or `path.py:function` reference.\n    universe: One line describing the universe, e.g. \"10 fixed symbols\".\n    instrument: The instrument kind(s) traded, e.g. `\"mixed: equity, option\"`.\n    fills_at_decision_close_share: Of the reported trial's `signal` fills, the share whose\n        price before costs equals the instrument's close on the decision bar (relative\n        tolerance 1e-12). A share of 1 means no fill took a price later than the decision.\n        `None` when there is no such fill, the instrument kind has no bars (prediction\n        markets), or the run did not record it.",
+      "properties": {
+        "bar": {
+          "title": "Bar",
+          "type": "string"
+        },
+        "execution": {
+          "title": "Execution",
+          "type": "string"
+        },
+        "fill_rule": {
+          "title": "Fill Rule",
+          "type": "string"
+        },
+        "fills_at_decision_close_share": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fills At Decision Close Share"
+        },
+        "instrument": {
+          "default": "equity",
+          "title": "Instrument",
+          "type": "string"
+        },
+        "lag_bars": {
+          "title": "Lag Bars",
+          "type": "integer"
+        },
+        "order_type": {
+          "title": "Order Type",
+          "type": "string"
+        },
+        "rebalance": {
+          "title": "Rebalance",
+          "type": "string"
+        },
+        "signal": {
+          "title": "Signal",
+          "type": "string"
+        },
+        "sizing": {
+          "title": "Sizing",
+          "type": "string"
+        },
+        "universe": {
+          "title": "Universe",
+          "type": "string"
+        }
+      },
+      "required": [
+        "bar",
+        "rebalance",
+        "order_type",
+        "fill_rule",
+        "lag_bars",
+        "execution",
+        "sizing",
+        "signal",
+        "universe"
+      ],
+      "title": "RunSetup",
+      "type": "object"
+    },
+    "Rung": {
+      "additionalProperties": false,
+      "description": "A graded rung.\n\nAttributes:\n    level: The rung.\n    label: For L1 only: `no_edge`, `inconclusive` or `diagnostic`; otherwise `None`.\n    reasons: Why the rung is what it is, one string per cause.\n    years_needed: On L1, the years the primary test needs at the observed effect.\n    red_flags: Names of the flags whose status is `red`.",
+      "properties": {
+        "label": {
+          "anyOf": [
+            {
+              "enum": [
+                "no_edge",
+                "inconclusive",
+                "diagnostic"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Label"
+        },
+        "level": {
+          "enum": [
+            "not_assessable",
+            "L1",
+            "L2",
+            "L3"
+          ],
+          "title": "Level",
+          "type": "string"
+        },
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reasons",
+          "type": "array"
+        },
+        "red_flags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Red Flags",
+          "type": "array"
+        },
+        "years_needed": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Years Needed"
+        }
+      },
+      "required": [
+        "level",
+        "label",
+        "reasons",
+        "years_needed",
+        "red_flags"
+      ],
+      "title": "Rung",
+      "type": "object"
+    },
+    "ScoreWindow": {
+      "additionalProperties": false,
+      "description": "The window the evidence is scored on, `start < end`.\n\nAttributes:\n    start: First day.\n    end: Last day, strictly after `start`.",
+      "properties": {
+        "end": {
+          "format": "date",
+          "title": "End",
+          "type": "string"
+        },
+        "start": {
+          "format": "date",
+          "title": "Start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "title": "ScoreWindow",
+      "type": "object"
+    },
+    "SummaryTables": {
+      "additionalProperties": false,
+      "description": "The full tables the inline previews are cut from; the tables are authoritative.\n\nAttributes:\n    trades: Every closed round trip, with the columns of `RunSummary.trades_preview`.\n    bets: Every settled bet, with the columns of `BetRow`; 0 rows without bets.",
+      "properties": {
+        "bets": {
+          "$ref": "#/$defs/TableRef"
+        },
+        "trades": {
+          "$ref": "#/$defs/TableRef"
+        }
+      },
+      "required": [
+        "trades",
+        "bets"
+      ],
+      "title": "SummaryTables",
+      "type": "object"
+    },
+    "TableRef": {
+      "additionalProperties": false,
+      "description": "A table stored beside `summary.json` as a Parquet file.\n\nAttributes:\n    path: The file, relative to the run folder.\n    rows: The file's row count.\n    sha256: The file's SHA-256 hash.",
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "rows": {
+          "title": "Rows",
+          "type": "integer"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "rows",
+        "sha256"
+      ],
+      "title": "TableRef",
+      "type": "object"
+    },
+    "TradeSummary": {
+      "additionalProperties": false,
+      "description": "Statistics of the closed round trips of the best trial.\n\nA round trip's return is its net P&L as a fraction of NAV at the entry bar. The round trips\nthemselves are in `RunSummary.trades_preview` (the newest 500) and in the trades table.\n\nAttributes:\n    n_round_trips: Number of closed round trips.\n    win_rate: Share with positive net P&L.\n    avg_return: Mean round-trip return, as a fraction of NAV at entry.\n    best_return: Largest round-trip return.\n    worst_return: Smallest round-trip return.\n    avg_bars_held: Mean holding period, in bars.",
+      "properties": {
+        "avg_bars_held": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Avg Bars Held"
+        },
+        "avg_return": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Avg Return"
+        },
+        "best_return": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Best Return"
+        },
+        "n_round_trips": {
+          "title": "N Round Trips",
+          "type": "integer"
+        },
+        "win_rate": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Win Rate"
+        },
+        "worst_return": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Worst Return"
+        }
+      },
+      "required": [
+        "n_round_trips",
+        "win_rate",
+        "avg_return",
+        "best_return",
+        "worst_return",
+        "avg_bars_held"
+      ],
+      "title": "TradeSummary",
+      "type": "object"
+    },
+    "TrialsBlock": {
+      "additionalProperties": false,
+      "description": "The trial count the run was judged with and what the client declared.\n\nAttributes:\n    edgelab_n: The N the Deflated Sharpe Ratio used, or edgelab's own count when the client's\n        declared N was larger and set the DSR's N.\n    declared_family: The client's trial family name; `None` for a library run.\n    declared_n: The client's declared N; `None` for a library run.\n    ledger_ref: The client's ledger reference, as given.\n    declared_status: `\"declared_unverified\"` for a submission's declaration, `\"none\"` for a\n        library run. An overlap of the test window with a declared prior-exposure window keeps\n        it `\"declared_unverified\"`.\n    test_keys: The client's test keys, as given.\n    ledger_export_path: The client's ledger export path, as given.\n    prior_exposure: The earlier looks at the data the client declared, as given.\n    exposure_overlap: Whether `[meta.live_start, meta.live_end]` shares at least one day\n        (ends inclusive) with a declared prior-exposure window. Only this strategy family's\n        own declared exposure counts.",
+      "properties": {
+        "declared_family": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Declared Family"
+        },
+        "declared_n": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Declared N"
+        },
+        "declared_status": {
+          "default": "none",
+          "enum": [
+            "none",
+            "declared_unverified"
+          ],
+          "title": "Declared Status",
+          "type": "string"
+        },
+        "edgelab_n": {
+          "title": "Edgelab N",
+          "type": "integer"
+        },
+        "exposure_overlap": {
+          "default": false,
+          "title": "Exposure Overlap",
+          "type": "boolean"
+        },
+        "ledger_export_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ledger Export Path"
+        },
+        "ledger_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ledger Ref"
+        },
+        "prior_exposure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PriorExposure"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "test_keys": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Test Keys"
+        }
+      },
+      "required": [
+        "edgelab_n"
+      ],
+      "title": "TrialsBlock",
+      "type": "object"
+    }
+  },
+  "$id": "urn:edgelab:schema:result.v4",
+  "additionalProperties": false,
+  "description": "Everything the terminal view and the strategy report need for one run.\n\nAttributes:\n    meta: What was run.\n    rung: The graded rung; `None` for a summary saved before the rung.\n    lead: The lead block (the eight items, caveats and what was not measured); `None` for a\n        summary saved before the rung.\n    headline: The measurement table.\n    class_metrics: Asset-class measurements of a non-equity book (empty for equity).\n    calibration: The reliability diagram of a prediction-market book (else empty).\n    bets_preview: The newest 500 settled bets of a prediction-market book (else empty), for\n        the viewer. The bets table is authoritative; its total is `tables.bets.rows`.\n    book_fills: Real-versus-modelled book split for prediction markets, else `None`.\n    events: Count and cash per discrete event kind.\n    evidence: The six evidence questions.\n    series: Chart data.\n    trades: Round-trip statistics.\n    trades_preview: The newest 500 closed round trips (`symbol`, `side`, `entry_ts`,\n        `exit_ts`, `return`, `bars_held`), newest first, for the viewer. The trades table is\n        authoritative; its total is `tables.trades.rows`.\n    trials: The trial count the run used and the client's declaration; `None` for a summary\n        saved before schema 3.\n    replay: Status shares and gap counts of a decision-file replay; `None` for any other run.\n    tables: The full trades and bets tables; `None` for a summary saved without them.\n    groups: Results per group of a submission's groups file; empty without one.\n    costs: Cost components in currency and in bps of average NAV.\n    robustness: The cost and delay sweeps and robustness scalars, as the stage wrote them.\n    validation: CPCV and random-entry distributions and the holdout fields.\n    attribution: Factor-regression result.\n    capacity: Capacity result.\n    multiple_testing: How many trials the family counts, how they were chosen, and which\n        measurement versions and data snapshots each counted hypothesis was evaluated under.\n    metrics: Every registered metric's value (`def_name`, `group`, `estimate`, `reason`).\n    diagnostics: Return-distribution diagnosis.\n    replication: The paper-versus-edgelab table, when the spec names a paper.\n    provenance: Data and code provenance.\n    data_provenance: Data vintage and quality caveats.\n    caveats: The limits of the model the run was produced under; they change no gate.\n    assessment: The run's five-grade assessment; `None` for a run saved without one.",
+  "properties": {
+    "assessment": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Assessment"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "attribution": {
+      "additionalProperties": true,
+      "title": "Attribution",
+      "type": "object"
+    },
+    "bets_preview": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/BetRow"
+      },
+      "title": "Bets Preview",
+      "type": "array"
+    },
+    "book_fills": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BookFillSummary"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "calibration": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/CalibrationBin"
+      },
+      "title": "Calibration",
+      "type": "array"
+    },
+    "capacity": {
+      "additionalProperties": true,
+      "title": "Capacity",
+      "type": "object"
+    },
+    "caveats": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Caveat"
+      },
+      "title": "Caveats",
+      "type": "array"
+    },
+    "class_metrics": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/HeadlineRow"
+      },
+      "title": "Class Metrics",
+      "type": "array"
+    },
+    "costs": {
+      "items": {
+        "$ref": "#/$defs/CostBreakdownRow"
+      },
+      "title": "Costs",
+      "type": "array"
+    },
+    "data_provenance": {
+      "$ref": "#/$defs/DataProvenance"
+    },
+    "diagnostics": {
+      "additionalProperties": true,
+      "title": "Diagnostics",
+      "type": "object"
+    },
+    "events": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/EventTotal"
+      },
+      "title": "Events",
+      "type": "array"
+    },
+    "evidence": {
+      "items": {
+        "$ref": "#/$defs/EvidenceGroup"
+      },
+      "title": "Evidence",
+      "type": "array"
+    },
+    "groups": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/GroupRow"
+      },
+      "title": "Groups",
+      "type": "array"
+    },
+    "headline": {
+      "items": {
+        "$ref": "#/$defs/HeadlineRow"
+      },
+      "title": "Headline",
+      "type": "array"
+    },
+    "lead": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LeadBlock"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "meta": {
+      "$ref": "#/$defs/RunMeta"
+    },
+    "metrics": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Metrics",
+      "type": "array"
+    },
+    "multiple_testing": {
+      "$ref": "#/$defs/FamilyEvaluationsModel"
+    },
+    "provenance": {
+      "additionalProperties": true,
+      "title": "Provenance",
+      "type": "object"
+    },
+    "replay": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReplayBlock"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "replication": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReplicationReport"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "robustness": {
+      "additionalProperties": true,
+      "title": "Robustness",
+      "type": "object"
+    },
+    "rung": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Rung"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "series": {
+      "$ref": "#/$defs/RunSeries"
+    },
+    "tables": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SummaryTables"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "trades": {
+      "$ref": "#/$defs/TradeSummary"
+    },
+    "trades_preview": {
+      "default": [],
+      "items": {
+        "additionalProperties": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": "object"
+      },
+      "title": "Trades Preview",
+      "type": "array"
+    },
+    "trials": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TrialsBlock"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "validation": {
+      "additionalProperties": true,
+      "title": "Validation",
+      "type": "object"
+    }
+  },
+  "required": [
+    "meta",
+    "headline",
+    "evidence",
+    "series",
+    "trades",
+    "costs",
+    "robustness",
+    "validation",
+    "attribution",
+    "capacity",
+    "multiple_testing",
+    "metrics",
+    "diagnostics",
+    "replication",
+    "provenance"
+  ],
+  "title": "RunSummary",
+  "type": "object"
+}

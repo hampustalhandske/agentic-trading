@@ -7,16 +7,30 @@ A contract is marked from the latest chain snapshot on or before the
 mark date within `settings.options.max_snapshot_age_days`. A same-day
 snapshot is used as quoted; an older one is re-marked with quantcore
 Black-Scholes at the snapshot's implied volatility and today's spot,
-keeping the snapshot's relative bid/ask spread. On or after expiry the
-mark is intrinsic value. Chain queries are cached in-process per
+keeping the snapshot's relative bid/ask spread. A contract the snapshot
+no longer lists is marked from its own last quote, re-marked at the
+volatility interpolated from the snapshot's surface. On or after expiry the
+mark is intrinsic value against the underlying's close on the last
+session on or before the expiry. Chain queries are cached in-process per
 (underlying, as_of_date) so marking several contracts on one underlying
-costs one lakehouse query per day.
+costs one lakehouse query per day. Every cache holds reads made at one
+lake time (the open `lake_session`'s, or unpinned inside
+`unpinned_lake_reads`) and is emptied when reads move to another, so no
+mark reuses a read from a different lake time.
+
+Marks read the chain as of the mark date. Contract selection
+(`select_expiry`, `nearest_strike`, `list_expiries`) reads it as of
+whatever date the caller passes; a decision-time caller passes
+`published_chain_date(day)` so it only sees chains already published,
+and `after=day` so it never picks an expiry on or before its decision
+day.
 """
 
 import math
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Literal
 
+import numpy as np
 import pandas as pd
 from pydantic import BaseModel
 from quantcore.pricing.black_scholes import black_scholes_call, black_scholes_put
@@ -26,9 +40,12 @@ from quantcore.pricing.options_positions import option_roll_schedule
 from agentic_trading.agents.schemas import OptionContract
 from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import (
+    STRIKE_MATCH_TOLERANCE,
+    current_lake_time,
     load_fred_series_from_lakehouse,
     load_option_quote_from_lakehouse,
     load_options_snapshot_from_lakehouse,
+    load_raw_close_from_lakehouse,
 )
 from agentic_trading.logging_config import get_logger
 
@@ -36,11 +53,25 @@ logger = get_logger(__name__)
 
 _RATE_SERIES_ID = "DGS3MO"
 _DAYS_PER_YEAR = 365.0
+# An expiry settles against the last close at most this many calendar days
+# before it: an expiry falling on a holiday or a long market closure still
+# finds the prior session, while a ticker whose prices stopped weeks
+# earlier falls back to the caller's spot instead of a stale print.
+SETTLEMENT_CLOSE_LOOKBACK_DAYS = 10
 
-# Latest chain snapshot per (underlying, as_of_date); only the most recent
-# as_of_date per underlying is kept, since a backtest walks forward.
+# Latest chain snapshot per (underlying, as_of_date). A backtest walks
+# forward, reading each day's chain for marks and the published (lagged)
+# chain for selection, so querying a new as_of_date drops that
+# underlying's entries more than the publication lag older than it; a
+# day's selection then reuses the chain cached by an earlier day's marks.
 _CHAIN_CACHE: dict[tuple[str, date], pd.DataFrame | None] = {}
 _RATE_CACHE: dict[date, float] = {}
+# Settlement close per (underlying, expiry); `None` when the lake has none.
+_SETTLEMENT_CLOSE_CACHE: dict[tuple[str, date], float | None] = {}
+# The lake time the cached entries were read at (`None` for unpinned
+# reads), or `_NO_READS` before the first read.
+_NO_READS = object()
+_cache_lake_time: object = _NO_READS
 
 
 class OptionMark(BaseModel):
@@ -68,6 +99,24 @@ def clear_cache() -> None:
     _QUOTE_CACHE.clear()
     _CHAIN_CACHE.clear()
     _RATE_CACHE.clear()
+    _SETTLEMENT_CLOSE_CACHE.clear()
+
+
+def _use_caches_at_current_lake_time() -> None:
+    """Empties every cache when the current lake time (`current_lake_time()`,
+    `None` outside a session) differs from the one the cached entries were
+    read at, and records it as the caches' lake time."""
+    global _cache_lake_time
+    lake_time = current_lake_time()
+    if _cache_lake_time is _NO_READS or _cache_lake_time != lake_time:
+        clear_cache()
+        _cache_lake_time = lake_time
+
+
+def published_chain_date(day: date) -> date:
+    """The latest chain snapshot date an agent deciding on `day` can see:
+    `day` minus `settings.options.publication_lag_days` calendar days."""
+    return day - timedelta(days=settings.options.publication_lag_days)
 
 
 def _query_chain(underlying: str, as_of_date: date) -> pd.DataFrame | None:
@@ -79,18 +128,24 @@ def _query_chain(underlying: str, as_of_date: date) -> pd.DataFrame | None:
 
 
 def _query_rate(as_of_date: date) -> float:
-    """Continuously-compounded-style annual risk-free rate from the latest
-    DGS3MO observation on or before `as_of_date`; 0.0 when none exists."""
+    """Annual risk-free rate as a fraction, from the latest DGS3MO
+    observation known before `as_of_date`.
+
+    Raises `ValueError` naming the series and `as_of_date` when no such
+    observation exists."""
     series = load_fred_series_from_lakehouse(_RATE_SERIES_ID, as_of_date)
-    if series is None:
-        return 0.0
-    series = series.dropna()
-    if series.empty:
-        return 0.0
+    if series is not None:
+        series = series.dropna()
+    if series is None or series.empty:
+        raise ValueError(
+            f"lakehouse has no FRED {_RATE_SERIES_ID} observation known before "
+            f"{as_of_date.isoformat()}; option marks need a risk-free rate"
+        )
     return float(series.iloc[-1]) / 100.0
 
 
 def _rate(as_of_date: date) -> float:
+    _use_caches_at_current_lake_time()
     if as_of_date not in _RATE_CACHE:
         _RATE_CACHE.clear()
         _RATE_CACHE[as_of_date] = _query_rate(as_of_date)
@@ -99,10 +154,14 @@ def _rate(as_of_date: date) -> float:
 
 def _snapshot(underlying: str, as_of_date: date) -> pd.DataFrame | None:
     """The cached latest snapshot for `underlying` as of `as_of_date`,
-    `None` when there is none or it is older than the age window."""
+    `None` when there is none or it is older than the age window. Each
+    call returns its own copy-on-write copy of the cached frame, so a
+    caller changing it never changes the cache."""
+    _use_caches_at_current_lake_time()
     key = (underlying, as_of_date)
     if key not in _CHAIN_CACHE:
-        for stale_key in [k for k in _CHAIN_CACHE if k[0] == underlying]:
+        oldest_kept = published_chain_date(as_of_date)
+        for stale_key in [k for k in _CHAIN_CACHE if k[0] == underlying and k[1] < oldest_kept]:
             del _CHAIN_CACHE[stale_key]
         frame = _query_chain(underlying, as_of_date)
         if frame is not None and not frame.empty:
@@ -119,7 +178,7 @@ def _snapshot(underlying: str, as_of_date: date) -> pd.DataFrame | None:
     age = (as_of_date - snapshot_date).days
     if age < 0 or age > settings.options.max_snapshot_age_days:
         return None
-    return frame
+    return frame.copy(deep=False)
 
 
 def _finite(value: Any, default: float) -> float:
@@ -135,8 +194,24 @@ def _intrinsic(contract: OptionContract, spot: float) -> float:
     return max(contract.strike - spot, 0.0)
 
 
+def _settlement_close(underlying: str, expiry: date) -> float | None:
+    """The cached unadjusted close of `underlying` on its last session on
+    or before `expiry` within `SETTLEMENT_CLOSE_LOOKBACK_DAYS`, or `None`."""
+    _use_caches_at_current_lake_time()
+    key = (underlying, expiry)
+    if key not in _SETTLEMENT_CLOSE_CACHE:
+        _SETTLEMENT_CLOSE_CACHE[key] = load_raw_close_from_lakehouse(
+            underlying, expiry, SETTLEMENT_CLOSE_LOOKBACK_DAYS
+        )
+    return _SETTLEMENT_CLOSE_CACHE[key]
+
+
 def _expired_mark(contract: OptionContract, as_of_date: date, spot: float) -> OptionMark:
-    intrinsic = _intrinsic(contract, spot)
+    """Intrinsic value (bid = ask = mid, zero greeks, untradeable) against
+    the settlement close from `_settlement_close`, or against `spot` when
+    the lake has no close near the expiry."""
+    settlement = _settlement_close(contract.underlying, contract.expiry)
+    intrinsic = _intrinsic(contract, spot if settlement is None else settlement)
     return OptionMark(
         contract=contract,
         as_of_date=as_of_date,
@@ -156,14 +231,61 @@ def _expired_mark(contract: OptionContract, as_of_date: date, spot: float) -> Op
 
 
 def _contract_row(snapshot: pd.DataFrame, contract: OptionContract) -> pd.Series | None:
+    """The first `snapshot` row with `contract`'s expiration and option
+    type and a strike within `STRIKE_MATCH_TOLERANCE` of its strike, or
+    `None` when no row matches."""
     rows = snapshot[
         (snapshot["expiration"] == pd.Timestamp(contract.expiry))
         & (snapshot["option_type"] == contract.option_type)
-        & ((snapshot["strike"] - contract.strike).abs() < 1e-9)
+        & ((snapshot["strike"] - contract.strike).abs() < STRIKE_MATCH_TOLERANCE)
     ]
     if rows.empty:
         return None
     return rows.iloc[0]
+
+
+def _surface_volatility(snapshot: pd.DataFrame, contract: OptionContract) -> float | None:
+    """Implied volatility for `contract` read off `snapshot`'s surface of
+    the same option type, or `None` when that surface has no row with a
+    finite positive implied volatility and an expiry after the snapshot.
+
+    Within each listed expiry the volatility is linear in strike and flat
+    beyond the quoted strikes. Across expiries total variance
+    `iv**2 * tau` (tau in years from the snapshot date) is linear in tau
+    and the volatility is `sqrt(w / tau)` at the contract's tau; outside
+    the listed tenor range the nearest expiry's volatility is used flat."""
+    snapshot_date = snapshot["date"].max()
+    rows = snapshot[
+        (snapshot["option_type"] == contract.option_type)
+        & (snapshot["expiration"] > snapshot_date)
+        & np.isfinite(snapshot["strike"].astype(float))
+        & np.isfinite(snapshot["implied_volatility"].astype(float))
+        & (snapshot["implied_volatility"].astype(float) > 0.0)
+    ]
+    if rows.empty:
+        return None
+    tenors: list[float] = []
+    volatilities: list[float] = []
+    for expiration, smile in rows.groupby("expiration", sort=True):
+        by_strike = smile.groupby("strike")["implied_volatility"].mean().sort_index()
+        tenors.append((pd.Timestamp(expiration) - snapshot_date).days / _DAYS_PER_YEAR)
+        volatilities.append(
+            float(
+                np.interp(
+                    contract.strike,
+                    by_strike.index.to_numpy(dtype=float),
+                    by_strike.to_numpy(dtype=float),
+                )
+            )
+        )
+    tenor = (pd.Timestamp(contract.expiry) - snapshot_date).days / _DAYS_PER_YEAR
+    if tenor <= tenors[0]:
+        return volatilities[0]
+    if tenor >= tenors[-1]:
+        return volatilities[-1]
+    total_variances = [vol**2 * tau for vol, tau in zip(volatilities, tenors, strict=True)]
+    total_variance = float(np.interp(tenor, tenors, total_variances))
+    return math.sqrt(total_variance / tenor)
 
 
 def _model_mark(
@@ -215,7 +337,10 @@ _QUOTE_CACHE: dict[tuple[str, date], pd.Series | None] = {}
 def _last_quote_row(contract: OptionContract, as_of_date: date) -> pd.Series | None:
     """The contract's own latest quote within `settings.options.max_mark_age_days`
     when the latest snapshot no longer lists its expiry (the historical
-    chain carries three expiries per snapshot and rotates the near ones)."""
+    chain carries three expiries per snapshot and rotates the near ones).
+    Each call returns its own copy of the cached row, so a caller changing
+    it never changes what a later call reads."""
+    _use_caches_at_current_lake_time()
     key = (contract.contract_id, as_of_date)
     if key not in _QUOTE_CACHE:
         if len(_QUOTE_CACHE) > 4096:
@@ -228,31 +353,50 @@ def _last_quote_row(contract: OptionContract, as_of_date: date) -> pd.Series | N
             as_of_date,
             settings.options.max_mark_age_days,
         )
-        _QUOTE_CACHE[key] = None if frame is None or frame.empty else frame.iloc[0]
-    return _QUOTE_CACHE[key]
+        _QUOTE_CACHE[key] = None if frame is None or frame.empty else frame.iloc[0].copy()
+    row = _QUOTE_CACHE[key]
+    return None if row is None else row.copy()
 
 
 def load_option_mark(contract: OptionContract, as_of_date: date, spot: float) -> OptionMark | None:
     """`contract`'s mark on `as_of_date` at underlying price `spot`.
 
-    On or after `contract.expiry` the mark is intrinsic value (no chain
-    lookup). Otherwise the contract is looked up in the latest snapshot
+    On or after `contract.expiry` the mark is intrinsic value against the
+    underlying's close on the last session on or before the expiry,
+    falling back to `spot` when the lake has none (no chain lookup).
+    Otherwise the contract is looked up in the latest snapshot
     within the age window: a same-day snapshot is used as quoted, an
     older one is re-marked with Black-Scholes at the snapshot's implied
-    volatility and today's `spot`. `None` when no snapshot in the window
-    quotes the contract."""
+    volatility and today's `spot`. When that snapshot does not list the
+    contract, its own last quote (`_last_quote_row`) supplies the bid/ask
+    and is re-marked at the volatility interpolated from the snapshot's
+    surface (`_surface_volatility`), or at the quote's own implied
+    volatility when there is no snapshot or no usable surface. Such a
+    mark keeps the quote's date as `snapshot_date` and is untradeable
+    once that date is older than `settings.options.max_snapshot_age_days`.
+    `None` when neither the snapshot nor the contract's own quotes
+    within `settings.options.max_mark_age_days` price the contract."""
     if as_of_date >= contract.expiry:
         return _expired_mark(contract, as_of_date, spot)
     snapshot = _snapshot(contract.underlying, as_of_date)
     row = _contract_row(snapshot, contract) if snapshot is not None else None
+    surface_volatility: float | None = None
     if row is None:
         row = _last_quote_row(contract, as_of_date)
+        if row is not None and snapshot is not None:
+            surface_date = snapshot["date"].max().date()
+            if pd.Timestamp(row["date"]).date() < surface_date:
+                surface_volatility = _surface_volatility(snapshot, contract)
     if row is None:
         return None
     snapshot_date = pd.Timestamp(row["date"]).date()
     bid = max(_finite(row["bid"], 0.0), 0.0)
     ask = max(_finite(row["ask"], bid), bid)
-    implied_volatility = _finite(row["implied_volatility"], 0.0)
+    implied_volatility = (
+        _finite(row["implied_volatility"], 0.0)
+        if surface_volatility is None
+        else surface_volatility
+    )
     if snapshot_date < as_of_date and implied_volatility > 0.0 and spot > 0.0:
         mark = _model_mark(contract, as_of_date, spot, snapshot_date, implied_volatility, bid, ask)
         # A quote older than the trading window still marks the position
@@ -278,14 +422,16 @@ def load_option_mark(contract: OptionContract, as_of_date: date, spot: float) ->
     )
 
 
-def list_expiries(underlying: str, as_of_date: date) -> list[date]:
-    """Expiries after `as_of_date` listed in the latest snapshot within
-    the age window, ascending; empty when there is no usable snapshot."""
+def list_expiries(underlying: str, as_of_date: date, after: date | None = None) -> list[date]:
+    """Expiries strictly after `after` (default `as_of_date`) listed in
+    the latest snapshot on or before `as_of_date` within the age window,
+    ascending; empty when there is no usable snapshot."""
     snapshot = _snapshot(underlying, as_of_date)
     if snapshot is None:
         return []
+    earliest_excluded = as_of_date if after is None else after
     expiries = {pd.Timestamp(value).date() for value in snapshot["expiration"].unique()}
-    return sorted(expiry for expiry in expiries if expiry > as_of_date)
+    return sorted(expiry for expiry in expiries if expiry > earliest_excluded)
 
 
 def nearest_strike(
@@ -311,11 +457,15 @@ def nearest_strike(
     return _finite(rows.loc[distance.idxmin(), "strike"], target_strike)
 
 
-def select_expiry(underlying: str, as_of_date: date, target_tenor_days: int) -> date | None:
+def select_expiry(
+    underlying: str, as_of_date: date, target_tenor_days: int, after: date | None = None
+) -> date | None:
     """The listed expiry nearest `as_of_date + target_tenor_days`
-    (quantcore `option_roll_schedule` over `list_expiries`), or `None`
-    when nothing is listed."""
-    expiries = list_expiries(underlying, as_of_date)
+    (quantcore `option_roll_schedule` over `list_expiries`) among those
+    strictly after `after` (default `as_of_date`), or `None` when nothing
+    qualifies. A caller reading a lagged chain passes its decision day as
+    `after` so a contract expiring on or before that day is never chosen."""
+    expiries = list_expiries(underlying, as_of_date, after)
     if not expiries:
         return None
     selected = option_roll_schedule(as_of_date, target_tenor_days, expiries)

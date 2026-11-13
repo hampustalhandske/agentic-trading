@@ -1,0 +1,33 @@
+{
+  "bogus": 1,
+  "declared_starts": {},
+  "equity_coverage": null,
+  "is_demo": false,
+  "is_synthetic": false,
+  "lake_current_tables": null,
+  "lake_time": null,
+  "lake_version": null,
+  "point_in_time_membership": false,
+  "prices_adjusted": false,
+  "provider": "parquet",
+  "quality_counts": [],
+  "request": {
+    "calendar": "XNYS",
+    "frequency": "1d",
+    "instrument_kind": "equity",
+    "params": {},
+    "provider": "parquet",
+    "range": {
+      "end": "2020-12-31",
+      "start": "2020-01-02"
+    },
+    "seed": 0,
+    "symbols": [
+      "AAA",
+      "BBB"
+    ]
+  },
+  "survivorship_free": false,
+  "untraded_symbols": [],
+  "warnings": []
+}

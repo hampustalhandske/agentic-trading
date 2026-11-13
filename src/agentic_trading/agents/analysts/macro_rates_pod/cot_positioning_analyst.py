@@ -6,20 +6,20 @@ import numpy as np
 import pandas as pd
 
 from agentic_trading.agents._market_math import clamp
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
-from agentic_trading.data.loaders.lakehouse_loader import load_cot_positioning_from_lakehouse
+from agentic_trading.data.instruments import ACCOUNT_CURRENCY, currency_pair
+from agentic_trading.data.loaders.lakehouse_loader import (
+    DEFAULT_COT_LOOKBACK_DAYS,
+    DEFAULT_COT_TICKER_BY_ASSET,
+    load_cot_reports_from_lakehouse,
+)
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 _RISK_WINDOW = 52  # ~1 year of weekly COT reports
 _MIN_OBSERVATIONS = 12
-# COT's `ticker` column already matches this project's own convention for
-# commodities and FX/rate futures (e.g. GC=F, EURUSD=X) — only Treasury
-# ETFs need remapping to the futures contract COT actually tracks
-# positioning for (no COT category exists for a bond ETF itself).
-DEFAULT_COT_TICKER_BY_ASSET: dict[str, str] = {"SHY": "ZT=F", "IEF": "ZN=F", "TLT": "ZB=F"}
 
 
 class COTPositioningAnalyst(AnalystAgent):
@@ -27,24 +27,54 @@ class COTPositioningAnalyst(AnalystAgent):
     macro/commodity desks build from CFTC Commitment of Traders reports:
     z-scores net speculative positioning (managed-money net for
     commodities, leveraged-funds net for FX/rate futures, as a fraction
-    of open interest — see `load_cot_positioning_from_lakehouse`) against
+    of open interest — see `load_cot_reports_from_lakehouse`) against
     its own trailing window. Extreme net-long positioning is treated as
     contrarian-bearish (a crowded long is exposed to unwind risk), extreme
     net-short as contrarian-bullish — not a trend-following read.
 
+    An FX pair's COT market is the CME future on its non-USD currency,
+    long that currency against USD. For a USD-quoted pair (EURUSD=X) a
+    long future is long the pair; for a USD-base pair (USDJPY=X, read from
+    the long-JPY future) it is short the pair, so the z-score's sign is
+    flipped before it sets the direction.
+
     `cot_ticker_by_asset` remaps `asset` to whatever ticker COT actually
     tracks positioning for (only needed for the Rates pod's Treasury
     ETFs, which have no COT category of their own — see
-    `DEFAULT_COT_TICKER_BY_ASSET`); defaults to `asset` itself, which
-    already matches COT's own ticker convention for commodities and FX."""
+    `lakehouse_loader.DEFAULT_COT_TICKER_BY_ASSET`, the mapping the
+    preflight coverage check also resolves through); defaults to `asset`
+    itself, which already matches COT's own ticker convention for
+    commodities and FX.
+
+    An asset outside `covered_assets`, no COT coverage, or too few reports
+    is unavailable. Zero trailing variance in net positioning leaves no
+    z-score, so the analyst abstains (active, flat, confidence 0).
+
+    Every active signal's `source_as_of`, an abstention included, is the
+    CFTC release date of the newest report in the trailing window, the
+    date the report was published rather than the possibly later date it
+    became usable."""
 
     agent_id: str = "cot_positioning_analyst"
+    data_requirements: tuple[DataRequirement, ...] = (
+        DataRequirement(
+            source="cftc_cot",
+            identifier="{ticker}",
+            asset_scoped=True,
+            description="CFTC Commitment of Traders positioning",
+            lookback_days=DEFAULT_COT_LOOKBACK_DAYS,
+        ),
+    )
 
     cot_ticker_by_asset: dict[str, str] = DEFAULT_COT_TICKER_BY_ASSET
     # Restricts this instance to one asset class so two instances in the
     # same pod (commodities and FX) never read the same COT series twice;
     # `None` covers whatever the pod hands it.
     covered_assets: tuple[str, ...] | None = None
+
+    def covers_asset(self, asset: str) -> bool:
+        """True when `covered_assets` is `None` or lists `asset`."""
+        return self.covered_assets is None or asset in self.covered_assets
 
     def generate_signal(
         self,
@@ -53,62 +83,53 @@ class COTPositioningAnalyst(AnalystAgent):
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
         cot_ticker = self.cot_ticker_by_asset.get(asset, asset)
-        if self.covered_assets is not None and asset not in self.covered_assets:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=f"{asset} is outside this instance's COT asset class",
-                status="unavailable",
+        if not self.covers_asset(asset):
+            return self.unavailable_signal(
+                asset, as_of_date, f"{asset} is outside this instance's COT asset class"
             )
-        series = load_cot_positioning_from_lakehouse(cot_ticker, as_of_date.date())
-        if series is None:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=f"no COT positioning coverage for {cot_ticker}",
-                status="unavailable",
+        reports = load_cot_reports_from_lakehouse(cot_ticker, as_of_date.date())
+        if reports is None:
+            return self.unavailable_signal(
+                asset, as_of_date, f"no COT positioning coverage for {cot_ticker}"
             )
 
-        window = series.to_numpy(dtype=np.float64)[-_RISK_WINDOW:]
+        used = reports.iloc[-_RISK_WINDOW:]
+        window = used["net_positioning_ratio"].to_numpy(dtype=np.float64)
         if window.size < _MIN_OBSERVATIONS:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="insufficient COT history for a positioning z-score",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient COT history for a positioning z-score"
             )
 
+        source_as_of = used["published_date"].max().date()
         mean = float(np.mean(window))
         std = float(np.std(window, ddof=1))
         if std <= 0.0:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="zero trailing variance in COT net positioning",
-                status="unavailable",
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                "zero trailing variance in COT net positioning",
+                source_as_of=source_as_of,
             )
 
         z_score = (float(window[-1]) - mean) / std
+        # The currency future of an FX pair is long the pair's non-USD
+        # currency against USD: long a USD-quoted pair, short a USD-base one.
+        pair = currency_pair(asset)
+        inverted = pair is not None and pair.base == ACCOUNT_CURRENCY
+        pair_z_score = -z_score if inverted else z_score
         direction: Literal["long", "short", "flat"]
-        if z_score > 0.0:
+        if pair_z_score > 0.0:
             direction = "short"  # crowded long -> contrarian bearish
-        elif z_score < 0.0:
+        elif pair_z_score < 0.0:
             direction = "long"  # crowded short -> contrarian bullish
         else:
             direction = "flat"
         confidence = clamp(abs(z_score) / 3.0)
+        inversion = (
+            f"; the future is long {pair.quote}, so {asset} reads it inverted"
+            if pair is not None and inverted
+            else ""
+        )
 
         return AgentSignal(
             agent_id=self.agent_id,
@@ -118,6 +139,7 @@ class COTPositioningAnalyst(AnalystAgent):
             confidence=confidence,
             rationale=(
                 f"COT net positioning z-score={z_score:.2f} for {cot_ticker} "
-                f"vs its own {_RISK_WINDOW}-report trailing window"
+                f"vs its own {_RISK_WINDOW}-report trailing window{inversion}"
             ),
+            source_as_of=source_as_of,
         )

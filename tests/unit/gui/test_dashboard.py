@@ -17,10 +17,13 @@ so pre-seeding only `backtest_result`/`scoreboard` no longer exercises any
 tab's real content — see render_dashboard()'s own `desk_run is None` guard.
 """
 
+import dataclasses
 import json
 from datetime import date
+from typing import Any
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -915,8 +918,34 @@ def _find_multiselect(at: AppTest, key: str) -> Multiselect:
     raise AssertionError(f"no multiselect with key {key!r} was rendered")
 
 
+def _price_table(tickers: list[str]) -> pd.DataFrame:
+    """Deterministic business-day prices for `tickers`, covering the
+    dashboard's default window plus its warm-up."""
+    days = pd.bdate_range("2020-01-01", "2024-04-01")
+    frames = []
+    for offset, ticker in enumerate(tickers):
+        rng = np.random.default_rng(offset)
+        close = 100.0 * np.exp(np.cumsum(rng.normal(0.0003, 0.01, len(days))))
+        frames.append(
+            pd.DataFrame(
+                {
+                    "ticker": ticker,
+                    "date": days.date,
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "adj_close": close,
+                    "volume": 1_000_000.0,
+                }
+            )
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
 def test_ticker_multiselect_changes_the_basket_that_runs(
     monkeypatch: pytest.MonkeyPatch,
+    preflight_lake: Any,
 ) -> None:
     """Editing the ticker multiselect beyond the preset group's symbols must
     change the resolved ticker list the desk actually runs on"""
@@ -936,6 +965,15 @@ def test_ticker_multiselect_changes_the_basket_that_runs(
         )
 
     monkeypatch.setattr(dashboard_module, "_load_basket_data", _explicit_test_data)
+    # The app runs as a fresh script that imports the loader at run time,
+    # so the stub goes on the loader's own module.
+    monkeypatch.setattr(
+        "agentic_trading.data.loaders.macro_loader.load_risk_free_rate_series", lambda _s, _e: None
+    )
+    preflight_lake.add(
+        "instrument_prices",
+        _price_table([*dashboard_module.TICKER_GROUPS[0].symbols, "NVDA"]),
+    )
 
     at = AppTest.from_file(dashboard_module.__file__)
     at.run(timeout=30)
@@ -1034,3 +1072,20 @@ def test_manual_step_while_playing_advances_by_exactly_one_not_two() -> None:
     _find_button(at, "Step backward").click().run(timeout=30)
     assert not at.exception
     assert at.session_state["current_day_index"] == index_before_backward - 1
+
+
+def test_desk_run_refuses_a_result_with_a_history_horizon() -> None:
+    """AT-140: a result from a horizon run holds only its last days' decisions, so the dashboard
+    refuses it rather than show a partial history."""
+    desk_run = _fake_desk_run()
+    bounded = desk_run.backtest_result.model_copy(update={"history_horizon_days": 300})
+
+    with pytest.raises(ValueError, match="300-day history horizon"):
+        dataclasses.replace(desk_run, backtest_result=bounded)
+
+
+@pytest.mark.parametrize(("value", "text"), [(None, "n/a"), (1.234, "1.23"), (-0.5, "-0.50")])
+def test_ratio_text_shows_an_undefined_ratio_as_not_available(
+    value: float | None, text: str
+) -> None:
+    assert dashboard_module._ratio_text(value) == text
