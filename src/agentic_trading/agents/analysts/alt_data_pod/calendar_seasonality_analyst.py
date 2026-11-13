@@ -39,8 +39,10 @@ class CalendarSeasonalityAnalyst(AnalystAgent):
     literature treats those as distinct, typically stronger effects;
     otherwise falls back to the day-of-week mean. Requires at least
     `MIN_SAMPLES` historical observations of the matched regime, else
-    holds flat — a calendar effect estimated from a handful of days isn't
-    a real signal, only noise that happens to have a label."""
+    holds flat as unavailable — a calendar effect estimated from a
+    handful of days isn't a real signal, only noise that happens to have
+    a label. A matched regime whose returns have zero variance has no
+    t-statistic, so the analyst abstains (active, flat, confidence 0)."""
 
     agent_id: str = "calendar_seasonality_analyst"
 
@@ -73,14 +75,8 @@ class CalendarSeasonalityAnalyst(AnalystAgent):
     ) -> AgentSignal:
         history = _asset_history(market_data, as_of_date, asset)
         if "log_return" not in history.columns:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="no price history available — holding.",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset, as_of_date, "no price history available — holding."
             )
 
         returns = history["log_return"].dropna()
@@ -90,24 +86,26 @@ class CalendarSeasonalityAnalyst(AnalystAgent):
         sample_count = len(matched)
 
         if sample_count < MIN_SAMPLES:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=(
-                    f"only {sample_count} historical {regime_name} observations — "
-                    f"below the {MIN_SAMPLES} required — holding."
-                ),
-                status="unavailable",
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"only {sample_count} historical {regime_name} observations — "
+                f"below the {MIN_SAMPLES} required — holding.",
                 sample_count=sample_count,
             )
 
         values = matched.to_numpy(dtype=np.float64)
         mean = float(np.mean(values))
         std = float(np.std(values, ddof=1))
-        t_stat = 0.0 if std == 0.0 else mean / (std / np.sqrt(sample_count))
+        if std == 0.0:
+            return self.abstain_signal(
+                asset,
+                as_of_date,
+                f"{regime_name} log-returns have zero variance over {sample_count} historical "
+                "observations — no t-statistic, holding.",
+                sample_count=sample_count,
+            )
+        t_stat = mean / (std / np.sqrt(sample_count))
 
         direction: Literal["long", "short", "flat"] = (
             "long" if mean > 0.0 else "short" if mean < 0.0 else "flat"

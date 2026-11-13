@@ -8,11 +8,14 @@ lookback_days) -> float signature PerformanceScoreboard exposes.
 """
 
 import math
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
-from agentic_trading.scoring.weighting import EqualWeight, Hedge, ShrinkageWeight
+from agentic_trading.agents.schemas import PerformanceRecord
+from agentic_trading.scoring.scoreboard import PerformanceScoreboard
+from agentic_trading.scoring.track_record import TrackRecord
+from agentic_trading.scoring.weighting import EqualWeight, Hedge, SharpeWeight, ShrinkageWeight
 
 
 class _FixedScoreboard:
@@ -201,3 +204,73 @@ def test_shrinkage_weight_handles_empty_source_ids() -> None:
     shrinkage = ShrinkageWeight(base=Hedge())
 
     assert shrinkage.get_weights(scoreboard, [], AS_OF_DATE) == {}
+
+
+def _scoreboard(returns_by_source: dict[str, list[float]]) -> PerformanceScoreboard:
+    """A real scoreboard holding each source's daily attributable returns, the last on
+    AS_OF_DATE."""
+    track_record = TrackRecord()
+    for source_id, returns in returns_by_source.items():
+        for offset, value in enumerate(returns):
+            day = AS_OF_DATE - timedelta(days=len(returns) - 1 - offset)
+            track_record.record(
+                PerformanceRecord(
+                    source_id=source_id,
+                    source_type="analyst",
+                    asset="AAPL",
+                    as_of_date=day,
+                    attributable_return=value,
+                    raw_attributable_return=value,
+                )
+            )
+    return PerformanceScoreboard(track_record)
+
+
+_GOOD = [0.01, 0.02, 0.015, 0.03, 0.005]
+_BAD = [-0.01, -0.02, -0.015, 0.001, -0.005]
+
+
+@pytest.mark.parametrize("value", [0.0, 0.01])
+def test_sharpe_weight_gives_an_undefined_sharpe_the_floor(value: float) -> None:
+    """A source with a constant track record has an undefined Sharpe: it weighs at the floor,
+    never above a source with a measured Sharpe, however poor."""
+    scoreboard = _scoreboard({"good": _GOOD, "bad": _BAD, "constant": [value] * 5})
+    strategy = SharpeWeight(lookback_days=10, floor=0.25)
+
+    weights = strategy.get_weights(scoreboard, ["good", "bad", "constant"], AS_OF_DATE)
+
+    raw = {
+        source_id: max(0.25, 1.0 + scoreboard.sharpe_ratio(source_id, AS_OF_DATE, 10) / 3.0)
+        for source_id in ("good", "bad")
+    }
+    raw["constant"] = 0.25
+    average = sum(raw.values()) / 3
+    assert weights == pytest.approx(
+        {source_id: value / average for source_id, value in raw.items()}
+    )
+    assert weights["constant"] <= min(weights["good"], weights["bad"])
+
+
+def test_sharpe_weight_keeps_the_ratio_between_sources_with_a_track_record() -> None:
+    """Adding a source with an undefined Sharpe leaves the relative weights of the others."""
+    alone = SharpeWeight(lookback_days=10).get_weights(
+        _scoreboard({"good": _GOOD, "bad": _BAD}), ["good", "bad"], AS_OF_DATE
+    )
+    joined = SharpeWeight(lookback_days=10).get_weights(
+        _scoreboard({"good": _GOOD, "bad": _BAD, "constant": [0.0] * 5}),
+        ["good", "bad", "constant"],
+        AS_OF_DATE,
+    )
+
+    assert joined["good"] / joined["bad"] == pytest.approx(alone["good"] / alone["bad"])
+
+
+def test_sharpe_weight_keeps_the_neutral_weight_without_a_track_record() -> None:
+    """Fewer than two observations is no track record yet, not an undefined one: neutral 1.0
+    before normalising."""
+    scoreboard = _scoreboard({"good": _GOOD, "new": [0.01]})
+
+    weights = SharpeWeight(lookback_days=10).get_weights(scoreboard, ["good", "new"], AS_OF_DATE)
+
+    good_raw = max(0.25, 1.0 + scoreboard.sharpe_ratio("good", AS_OF_DATE, 10) / 3.0)
+    assert weights["new"] == pytest.approx(1.0 / ((good_raw + 1.0) / 2))

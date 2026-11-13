@@ -143,13 +143,16 @@ def test_constructor_defaults_read_commission_and_slippage_from_settings() -> No
     )
 
 
-def test_apply_financing_charges_nothing_when_flat_with_positive_cash() -> None:
+def test_apply_financing_only_credits_interest_when_long_with_positive_cash() -> None:
+    """A long-only book with positive cash pays nothing and earns the
+    risk-free rate on its cash, so the net charge is the negative credit."""
     portfolio = _portfolio(cash=10_000.0, positions={"AAPL": 10.0})
 
     cost = portfolio.apply_financing({"AAPL": 100.0}, risk_free_rate_annual=0.05, days_held=3)
 
-    assert cost == pytest.approx(0.0)
-    assert portfolio.cash == pytest.approx(10_000.0)
+    credit = 10_000.0 * 0.05 * 3 / 365.0
+    assert cost == pytest.approx(-credit)
+    assert portfolio.cash == pytest.approx(10_000.0 + credit)
 
 
 def test_apply_financing_charges_stock_borrow_on_short_notional() -> None:
@@ -479,7 +482,8 @@ def test_apply_financing_charges_margin_interest_on_short_option_margin() -> Non
         )
 
     margin = 5 * (4.0 + 0.2 * 180.0) * 100
-    expected = margin * (0.04 + 0.015) * 3 / 365.0
+    cash_credit = 10_000.0 * 0.04 * 3 / 365.0
+    expected = margin * (0.04 + 0.015) * 3 / 365.0 - cash_credit
     assert cost == pytest.approx(expected)
     assert portfolio.cash == pytest.approx(10_000.0 - expected)
 
@@ -498,7 +502,8 @@ def test_apply_financing_takes_the_underlying_spot_from_prices_when_spots_is_omi
     ):
         cost = portfolio.apply_financing({"AAPL": 100.0}, risk_free_rate_annual=0.05, days_held=1)
 
-    assert cost == pytest.approx((4.0 + 20.0) * 100 * 0.05 / 365.0)
+    cash_credit = 10_000.0 * 0.05 / 365.0
+    assert cost == pytest.approx((4.0 + 20.0) * 100 * 0.05 / 365.0 - cash_credit)
 
 
 def test_option_fill_respects_rebalance_band_and_side_aware_quotes() -> None:

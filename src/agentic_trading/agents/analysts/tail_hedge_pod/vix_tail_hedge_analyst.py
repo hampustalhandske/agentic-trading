@@ -7,6 +7,7 @@ from agentic_trading.agents.base import AnalystAgent
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
 from agentic_trading.data.loaders.lakehouse_loader import load_price_history_from_lakehouse
+from agentic_trading.data.trading_calendar import sessions_between
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -16,7 +17,8 @@ VIX_TICKER = "^VIX"
 
 class VixTailHedgeAnalyst(AnalystAgent):
     """A systematic tail-risk insurance signal, not a directional call.
-    Reads `^VIX`'s own trailing price history directly from the
+    Reads `^VIX`'s own trailing price history, the last
+    `settings.analysts.vix_lookback_days` NYSE sessions, directly from the
     lakehouse — independent of whatever asset it's asked about, the
     same cross-asset lookup pattern `FamaMacbethAnalyst` already uses
     for its factor universe — and produces a `short` signal on the
@@ -39,7 +41,13 @@ class VixTailHedgeAnalyst(AnalystAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
-        window_start = (as_of_date - pd.Timedelta(days=settings.analysts.vix_lookback_days)).date()
+        lookback = settings.analysts.vix_lookback_days
+        # Twice the lookback in calendar days, plus slack for holidays, always holds
+        # `lookback` sessions; the window starts on the `lookback`-th session back.
+        sessions = sessions_between(
+            (as_of_date - pd.Timedelta(days=2 * lookback + 10)).date(), as_of_date.date()
+        )
+        window_start = sessions[-lookback]
         frame = load_price_history_from_lakehouse([VIX_TICKER], window_start, as_of_date.date())
         if frame is None or VIX_TICKER not in frame.columns.get_level_values(0):
             return AgentSignal(
@@ -52,7 +60,7 @@ class VixTailHedgeAnalyst(AnalystAgent):
                 status="unavailable",
             )
 
-        vix_close = frame[(VIX_TICKER, "close")].dropna()
+        vix_close = frame[(VIX_TICKER, "close")].dropna().tail(lookback)
         if vix_close.size < settings.analysts.min_vix_observations:
             return AgentSignal(
                 agent_id=self.agent_id,

@@ -92,11 +92,11 @@ equilibrium exists for that basket:**
   systematic insurance sleeve — vix_tail_hedge_analyst reads `^VIX`'s
   own price history and produces a short-SPY signal scaled by how
   elevated VIX is. Funded by a fixed, protected Commander-level budget
-  carve-out (`commander.TAIL_HEDGE_BUDGET_FRACTION`) rather than the
+  carve-out (`commander.tail_hedge_budget_fraction`) rather than the
   normal trailing-Sharpe risk-budgeting every other pod gets, since a
   hedge that gets defunded by its own performance during a calm stretch
-  defeats its own purpose. A linear proxy, not real convex options
-  protection — see KNOWN_LIMITATIONS.md.
+  defeats its own purpose. The sleeve buys SPY puts and falls back to
+  a short SPY weight with no usable chain; see docs/LIMITATIONS.md §2.
 
 Every pod's own `leverage_cap`/`net_leverage_cap`/`target_annualized_vol`/
 `kelly_fraction_weight` is set per-strategy (research-grounded real-desk
@@ -107,6 +107,10 @@ carries the reasoning for that pod's row.
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import date
+from types import MappingProxyType
 
 from agentic_trading.agents.analysts import (
     ARIMAForecastAnalyst,
@@ -202,6 +206,120 @@ STAT_ARB_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
         "regime_hmm_analyst",
     }
 )
+# Analysts the registered firm (registry id agentic-firm-v1) runs without,
+# passed as `build_default_analysts(excluded_analyst_ids=...)`. Both trade
+# pairs seeded from `_COINTEGRATED_PAIRS`, which were screened on
+# 2017-04..2018-03 data, so on any earlier decision day the pair choice
+# looks ahead; StatArb keeps ou_mean_reversion and regime_hmm.
+FIRM_V1_EXCLUDED_ANALYST_IDS: frozenset[str] = frozenset(
+    {
+        "pairs_cointegration_analyst",
+        "kalman_hedge_ratio_analyst",
+    }
+)
+# The registered firm's (agentic-firm-v1) equities: the 30 S&P 500 members on
+# 2009-12-31 with the highest average daily dollar volume over the 2009 XNYS
+# sessions, using only data known by 2009-12-31, as selected by
+# scripts/select_firm_v1_equities.py; in its rank order, by their tickers on
+# 2009-12-31.
+FIRM_V1_EQUITIES: tuple[str, ...] = (
+    "BAC",
+    "AAPL",
+    "GS",
+    "JPM",
+    "WFC",
+    "XOM",
+    "C",
+    "GOOGL",
+    "GE",
+    "MSFT",
+    "INTC",
+    "CSCO",
+    "WMT",
+    "FCX",
+    "PFE",
+    "IBM",
+    "CVX",
+    "MS",
+    "AMZN",
+    "QCOM",
+    "JNJ",
+    "T",
+    "PG",
+    "HPQ",
+    "ORCL",
+    "AIG",
+    "COP",
+    "MON",
+    "V",
+    "FSLR",
+)
+# The lake `security_id` of each of `FIRM_V1_EQUITIES`, in the same order: the
+# ids scripts/select_firm_v1_equities.py selected from the S&P 500 membership
+# on 2009-12-31. The firm record prices these equities from
+# `equity_daily_from_bars` by these ids, never by ticker. 25819 is Alphabet
+# class A, named GOOGL in the rows.
+FIRM_V1_EQUITY_SECURITY_IDS: Mapping[str, int] = MappingProxyType(
+    {
+        "BAC": 5797,
+        "AAPL": 147,
+        "GS": 26556,
+        "JPM": 32841,
+        "WFC": 64020,
+        "XOM": 65558,
+        "C": 15348,
+        "GOOGL": 25819,
+        "GE": 24532,
+        "MSFT": 39307,
+        "INTC": 30948,
+        "CSCO": 14140,
+        "WMT": 64494,
+        "FCX": 21280,
+        "PFE": 45694,
+        "IBM": 29477,
+        "CVX": 14919,
+        "MS": 39946,
+        "AMZN": 3103,
+        "QCOM": 48703,
+        "JNJ": 32693,
+        "T": 51927,
+        "PG": 45937,
+        "HPQ": 28491,
+        "ORCL": 44165,
+        "AIG": 1969,
+        "COP": 13266,
+        "MON": 38786,
+        "V": 63531,
+        "FSLR": 23082,
+    }
+)
+# The registered firm's whole universe: `FIRM_V1_EQUITIES`, then the fixed
+# instruments the registration names (index, bond and credit ETFs, futures,
+# FX pairs and crypto).
+FIRM_V1_UNIVERSE: tuple[str, ...] = (
+    *FIRM_V1_EQUITIES,
+    "SPY",
+    "SHY",
+    "IEF",
+    "TLT",
+    "HYG",
+    "LQD",
+    "GC=F",
+    "CL=F",
+    "SI=F",
+    "NG=F",
+    "HG=F",
+    "EURUSD=X",
+    "GBPUSD=X",
+    "USDJPY=X",
+    "AUDUSD=X",
+    "BTC-USD",
+    "ETH-USD",
+)
+# The registered firm's (agentic-firm-v1) decision window: the first and last
+# XNYS sessions of 2010 through 2017.
+FIRM_V1_WINDOW_START = date(2010, 1, 4)
+FIRM_V1_WINDOW_END = date(2017, 12, 29)
 MACRO_RATES_MANAGER_ANALYST_IDS: frozenset[str] = frozenset(
     {
         "egarch_asymmetric_vol_analyst",

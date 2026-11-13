@@ -52,6 +52,11 @@ from agentic_trading.data.loader import (
     DEFAULT_BACKTEST_WARMUP_DAYS,
     load_price_history_with_fallback,
 )
+from agentic_trading.data.loaders.lakehouse_loader import lake_session
+from agentic_trading.data.loaders.macro_loader import (
+    load_fx_policy_rates,
+    load_risk_free_rate_series,
+)
 from agentic_trading.data.ticker_catalog import TICKER_GROUPS, TickerGroup, tickers_by_asset_class
 from agentic_trading.logging_config import configure_logging, get_logger
 from agentic_trading.scoring.scoreboard import PerformanceScoreboard
@@ -67,12 +72,26 @@ SP500_TICKER = "^GSPC"
 AUTOPLAY_INTERVAL_SECONDS = 0.9
 
 
+def _require_whole_decision_history(backtest_result: BacktestResult) -> None:
+    """Raises `ValueError` for a result whose engine ran with a history
+    horizon: its `decisions_by_day` holds only the last days, and every
+    view of the dashboard reads every day's decisions."""
+    if backtest_result.history_horizon_days is not None:
+        raise ValueError(
+            "the dashboard needs every day's decisions, but this backtest ran with a "
+            f"{backtest_result.history_horizon_days}-day history horizon and its result "
+            "holds only the last days' decisions; run it without a horizon"
+        )
+
+
 @dataclass(slots=True)
 class DeskRun:
     """Everything one simulation run produced: the multi-asset backtest
     itself (via the shared `BacktestEngine` — see `_simulate_desk`, there is
     no separate GUI-only simulation loop) plus the two benchmarks it's
-    judged against throughout the GUI."""
+    judged against throughout the GUI. Raises `ValueError` for a
+    `backtest_result` from a run with a history horizon, which lacks most
+    days' decisions."""
 
     tickers: list[str]
     group_name: str
@@ -87,6 +106,9 @@ class DeskRun:
     scoreboard: PerformanceScoreboard
     sp500_benchmark: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     basket_benchmark: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+
+    def __post_init__(self) -> None:
+        _require_whole_decision_history(self.backtest_result)
 
     @property
     def decisions_by_day(self) -> dict[date, list[PortfolioDecision]]:
@@ -275,12 +297,14 @@ def _load_basket_data(
     warmup_days: int = 0,
 ) -> tuple[pd.DataFrame, str]:
     """Thin wrapper around the shared `data.loader.load_price_history_with_fallback`
-    — the exact same, lakehouse-only function the CLI uses."""
+    — the exact same, lakehouse-only function the CLI uses, on the rows where
+    every ticker has a close, as the backtest engine needs."""
     return load_price_history_with_fallback(
         list(tickers),
         start,
         end,
         warmup_days=warmup_days,
+        align="intersection",
     )
 
 
@@ -521,7 +545,9 @@ def _simulate_desk(
     fetches fresh market data and runs a fresh backtest for whatever
     tickers/dates/manager mode are currently selected. `on_day_complete`, if
     given, is forwarded straight to `BacktestEngine.run()` to drive a live
-    progress display — see `_run_simulation_with_progress()`.
+    progress display — see `_run_simulation_with_progress()`. Every lake
+    read the desk makes (prices, the engine run and the benchmarks) happens
+    inside one lake session at the default lake time.
 
     Each pod manager always sizes its own book via its own
     `PortfolioConstructor` (risk parity + volatility targeting) — no
@@ -529,50 +555,54 @@ def _simulate_desk(
     if start > end:
         start, end = end, start
 
-    analysts = _build_analysts()
-    managers = _build_managers(manager_mode, analysts)
-    commander = Commander(
-        managers=managers, weighting_strategy=ShrinkageWeight(Hedge()), parallel_workers=4
-    )
-    portfolio = Portfolio(cash=initial_cash, positions={})
-    track_record = TrackRecord()
-    market_data, source_label = _load_basket_data(
-        tuple(tickers),
-        start,
-        end,
-        warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
-    )
+    with lake_session():
+        analysts = _build_analysts()
+        managers = _build_managers(manager_mode, analysts)
+        commander = Commander(
+            managers=managers, weighting_strategy=ShrinkageWeight(Hedge()), parallel_workers=4
+        )
+        portfolio = Portfolio(cash=initial_cash, positions={})
+        track_record = TrackRecord()
+        market_data, source_label = _load_basket_data(
+            tuple(tickers),
+            start,
+            end,
+            warmup_days=DEFAULT_BACKTEST_WARMUP_DAYS,
+        )
 
-    engine = BacktestEngine(
-        commander=commander,
-        portfolio=portfolio,
-        track_record=track_record,
-        data_loader=lambda _assets, _start, _end: market_data,
-        start_date=start,
-        end_date=end,
-        assets=tickers,
-        market_data_source=source_label,
-        execution_lag_days=settings.firm.execution_lag_days,
-    )
-    backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
+        engine = BacktestEngine(
+            commander=commander,
+            portfolio=portfolio,
+            track_record=track_record,
+            data_loader=lambda _assets, _start, _end: market_data,
+            start_date=start,
+            end_date=end,
+            assets=tickers,
+            market_data_source=source_label,
+            execution_lag_days=settings.firm.execution_lag_days,
+            risk_free_rate_series=load_risk_free_rate_series(start, end),
+            policy_rates=load_fx_policy_rates(tickers, start, end),
+        )
+        backtest_result = engine.run(on_day_complete=on_day_complete)  # type: ignore[arg-type]
+        _require_whole_decision_history(backtest_result)
 
-    return DeskRun(
-        tickers=tickers,
-        group_name=group_name,
-        manager_mode=manager_mode,
-        source_label=source_label,
-        manager_ids=[manager.agent_id for manager in managers],
-        analyst_ids=[analyst.agent_id for analyst in analysts],
-        price_history=market_data,
-        trade_blotter=_build_trade_blotter(
-            backtest_result.trade_log, backtest_result.decisions_by_day
-        ),
-        backtest_result=backtest_result,
-        track_record=track_record,
-        scoreboard=PerformanceScoreboard(track_record),
-        sp500_benchmark=_sp500_benchmark(start, end),
-        basket_benchmark=_basket_index_benchmark(market_data, tickers, start),
-    )
+        return DeskRun(
+            tickers=tickers,
+            group_name=group_name,
+            manager_mode=manager_mode,
+            source_label=source_label,
+            manager_ids=[manager.agent_id for manager in managers],
+            analyst_ids=[analyst.agent_id for analyst in analysts],
+            price_history=market_data,
+            trade_blotter=_build_trade_blotter(
+                backtest_result.trade_log, backtest_result.decisions_by_day
+            ),
+            backtest_result=backtest_result,
+            track_record=track_record,
+            scoreboard=PerformanceScoreboard(track_record),
+            sp500_benchmark=_sp500_benchmark(start, end),
+            basket_benchmark=_basket_index_benchmark(market_data, tickers, start),
+        )
 
 
 def _run_simulation_with_progress(
@@ -1039,6 +1069,7 @@ def _trust_panel_frame(desk_run: DeskRun, source_ids: list[str], as_of_date: dat
     weights = Hedge().get_weights(desk_run.scoreboard, source_ids, as_of_date)
     rows = []
     for source_id in source_ids:
+        sharpe: float | None
         try:
             sharpe = desk_run.scoreboard.sharpe_ratio(source_id, as_of_date, 30)
         except ValueError:
@@ -1171,6 +1202,12 @@ def _saved_run_pod_frame(source_performance: dict[str, dict[str, float]]) -> pd.
     return frame.sort_values("cumulative_return") if not frame.empty else frame
 
 
+def _ratio_text(value: float | None) -> str:
+    """A run-summary ratio to two decimals, or "n/a" when it is undefined
+    on the run (`None`)."""
+    return "n/a" if value is None else f"{value:.2f}"
+
+
 def _render_saved_run_tab() -> None:
     """A saved, already-completed run's results (loaded via the sidebar's
     "Load a saved run" panel), independent of the live desk simulation the
@@ -1204,12 +1241,12 @@ def _render_saved_run_tab() -> None:
         f" ({len(period_data['portfolio_value_history'])} trading days)"
     )
     metric_cols = st.columns(6)
-    metric_cols[0].metric("Sharpe", f"{period_data['final_sharpe_ratio']:.2f}")
-    metric_cols[1].metric("Sortino", f"{period_data['final_sortino_ratio']:.2f}")
-    metric_cols[2].metric("Calmar", f"{period_data['final_calmar_ratio']:.2f}")
+    metric_cols[0].metric("Sharpe", _ratio_text(period_data["final_sharpe_ratio"]))
+    metric_cols[1].metric("Sortino", _ratio_text(period_data["final_sortino_ratio"]))
+    metric_cols[2].metric("Calmar", _ratio_text(period_data["final_calmar_ratio"]))
     metric_cols[3].metric("Max drawdown", f"{period_data['final_max_drawdown']:.1%}")
     metric_cols[4].metric("Hit rate", f"{period_data['final_hit_rate']:.1%}")
-    metric_cols[5].metric("Profit factor", f"{period_data['final_profit_factor']:.2f}")
+    metric_cols[5].metric("Profit factor", _ratio_text(period_data["final_profit_factor"]))
 
     st.markdown("##### Equity curve")
     equity_frame = pd.DataFrame(
@@ -1372,7 +1409,7 @@ def _render_overview_tab() -> None:
             f"${current_value:,.2f}",
             f"{daily_change:,.2f} / {daily_change_pct:.2f}%",
         )
-        metric_mid.metric("Sharpe", f"{backtest_result.final_sharpe_ratio:.2f}")
+        metric_mid.metric("Sharpe", _ratio_text(backtest_result.final_sharpe_ratio))
         metric_right.metric("Max drawdown", f"{backtest_result.final_max_drawdown:,.2f}")
         metric_far.metric("Desk date", current_date.isoformat())
 

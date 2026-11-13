@@ -4,7 +4,11 @@ helpers used by every pod manager's construct_portfolio()."""
 import pandas as pd
 import pytest
 
-from agentic_trading.agents._market_math import single_asset_from_attrs, wide_log_returns
+from agentic_trading.agents._market_math import clamp, single_asset_from_attrs, wide_log_returns
+from agentic_trading.agents.base import AnalystAgent, ManagerAgent
+from agentic_trading.agents.portfolio_construction import PortfolioConstructor
+from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.scoring.weighting import Hedge
 
 
 def _multi_index_market_data() -> pd.DataFrame:
@@ -50,3 +54,62 @@ def test_single_asset_from_attrs_raises_when_unset() -> None:
 
     with pytest.raises(ValueError, match="attrs"):
         single_asset_from_attrs(market_data)
+
+
+def test_clamp_bounds_a_finite_value() -> None:
+    assert clamp(1.7) == 1.0
+    assert clamp(-0.3) == 0.0
+    assert clamp(0.4) == 0.4
+    assert clamp(0.9, 0.0, 0.5) == 0.5
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_clamp_raises_on_a_non_finite_value(value: float) -> None:
+    """A non-finite value has no place in [lower, upper]; clamping it
+    would hand a NaN confidence the upper bound."""
+    with pytest.raises(ValueError, match="finite"):
+        clamp(value)
+
+
+class _NanConfidenceAnalyst(AnalystAgent):
+    """An analyst whose confidence comes out of `clamp` on an undefined
+    statistic."""
+
+    agent_id: str = "nan_confidence_analyst"
+
+    def generate_signal(
+        self, asset: str, market_data: pd.DataFrame, as_of_date: pd.Timestamp
+    ) -> AgentSignal:
+        return AgentSignal(
+            agent_id=self.agent_id,
+            asset=asset,
+            as_of_date=as_of_date.date(),
+            direction="long",
+            confidence=clamp(float("nan")),
+            rationale="confidence from an undefined statistic",
+        )
+
+
+class _UnitManager(ManagerAgent):
+    agent_id: str = "unit_manager"
+
+    def scale_factor(
+        self, signal: AgentSignal, market_data: pd.DataFrame, as_of_date: pd.Timestamp
+    ) -> float:
+        return 1.0
+
+
+def test_an_analyst_clamping_nan_reports_an_error_signal() -> None:
+    manager = _UnitManager(
+        managed_analysts=[_NanConfidenceAnalyst()],
+        weighting_strategy=Hedge(),
+        portfolio_constructor=PortfolioConstructor(),
+    )
+    as_of = pd.Timestamp("2024-01-02")
+    market_data = pd.DataFrame({"close": [100.0]}, index=pd.to_datetime(["2024-01-02"]))
+
+    (signal,) = manager.collect_signals("AAPL", market_data, as_of)
+
+    assert signal.status == "error"
+    assert signal.direction == "flat"
+    assert signal.confidence == 0.0

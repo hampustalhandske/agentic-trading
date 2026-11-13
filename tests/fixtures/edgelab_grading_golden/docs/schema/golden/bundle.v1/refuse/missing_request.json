@@ -1,0 +1,16 @@
+{
+  "declared_starts": {},
+  "equity_coverage": null,
+  "is_demo": false,
+  "is_synthetic": false,
+  "lake_current_tables": null,
+  "lake_time": null,
+  "lake_version": null,
+  "point_in_time_membership": false,
+  "prices_adjusted": false,
+  "provider": "parquet",
+  "quality_counts": [],
+  "survivorship_free": false,
+  "untraded_symbols": [],
+  "warnings": []
+}

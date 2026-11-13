@@ -13,6 +13,7 @@ every other module in the codebase depends on.
 """
 
 import logging
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -244,3 +245,46 @@ def test_get_logger_returns_a_logger_named_after_its_argument(_reset_logging_sta
     logger = get_logger("agentic_trading.some.module")
 
     assert logger.name == "agentic_trading.some.module"
+
+
+def _stdout_handlers() -> list[logging.Handler]:
+    """Handlers on the shared "agentic_trading" logger that write to sys.stdout."""
+    return [
+        handler
+        for handler in logging.getLogger("agentic_trading").handlers
+        if getattr(handler, "stream", None) is sys.stdout
+    ]
+
+
+def test_default_configuration_attaches_a_stdout_console_handler(
+    _reset_logging_state: Path,
+) -> None:
+    configure_logging()
+
+    assert len(_stdout_handlers()) == 1
+
+
+def test_console_false_attaches_no_stdout_handler_but_keeps_the_file_and_gui_buffer(
+    _reset_logging_state: Path,
+) -> None:
+    """console=False (an entry point that prints machine-readable output on
+    stdout) still writes the log file and the GUI buffer."""
+    log_dir = _reset_logging_state
+    configure_logging(console=False)
+    get_logger("agentic_trading.test_logging_config").info("experiment started")
+
+    handlers = logging.getLogger("agentic_trading").handlers
+    assert _stdout_handlers() == []
+    assert any(isinstance(handler, logging.FileHandler) for handler in handlers)
+    assert "experiment started" in _read_log_file(log_dir)
+    assert any("experiment started" in line for line in recent_gui_log_lines())
+
+
+def test_disable_wins_over_console_false(_reset_logging_state: Path) -> None:
+    log_dir = _reset_logging_state
+
+    configure_logging(console=False, disable=True)
+    get_logger("agentic_trading.test_logging_config").error("should not appear anywhere")
+
+    assert not log_dir.exists()
+    assert recent_gui_log_lines() == []

@@ -12,10 +12,11 @@ from agentic_trading.agents._market_math import (
     RefitCache,
     clamp,
     conditional_daily_volatility,
+    derived_seed,
     market_slice,
 )
 from agentic_trading.agents.base import AnalystAgent
-from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.agents.schemas import AgentSignal, VolatilityProvenance
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -33,7 +34,10 @@ class MonteCarloValuationAnalyst(AnalystAgent):
     market price — proposes long when fair value exceeds market price,
     short when market price exceeds fair value. The GARCH fit is only
     re-run at most once every `_refit_cache.refit_interval_days` simulated
-    days per asset — see `RefitCache`'s docstring."""
+    days per asset — see `RefitCache`'s docstring. Every simulated
+    signal's `volatility_estimator` names the estimator that volatility
+    came from (`_market_math.conditional_daily_volatility`: "garch_11", or
+    "ewma" when the fit is unusable)."""
 
     agent_id: str = "monte_carlo_valuation_analyst"
 
@@ -62,8 +66,9 @@ class MonteCarloValuationAnalyst(AnalystAgent):
             )
 
         mean_return = float(returns.mean())
+        volatility_read = VolatilityProvenance()
         volatility = conditional_daily_volatility(
-            returns, self._refit_cache, asset, as_of_date, self.agent_id
+            returns, self._refit_cache, asset, as_of_date, self.agent_id, provenance=volatility_read
         )
 
         # simulate_gbm_paths takes annualized rate/volatility over
@@ -77,7 +82,7 @@ class MonteCarloValuationAnalyst(AnalystAgent):
             self._time_to_maturity,
             self._num_steps,
             self._num_paths,
-            seed=42,
+            seed=derived_seed(self.agent_id, asset, as_of_date.date()),
         )[:, -1]
         fair_value = float(terminal_prices.mean())
         relative_edge = (fair_value - slice_.close) / slice_.close
@@ -89,6 +94,7 @@ class MonteCarloValuationAnalyst(AnalystAgent):
             as_of_date=as_of_date.date(),
             direction=direction,
             confidence=confidence,
+            volatility_estimator=volatility_read.estimator,
             rationale=(
                 f"quantcore Monte Carlo fair value {fair_value:.4f} vs spot {slice_.close:.4f}"
             ),

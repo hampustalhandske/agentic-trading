@@ -1,0 +1,22 @@
+[
+  {
+    "ask_price": 0.5,
+    "ask_size": 0.5,
+    "bid_price": 0.5,
+    "bid_size": 0.5,
+    "level": "abc",
+    "market": "ABC",
+    "source": "real",
+    "ts": "2020-01-02T21:00:00Z"
+  },
+  {
+    "ask_price": 0.5,
+    "ask_size": 0.5,
+    "bid_price": 0.5,
+    "bid_size": 0.5,
+    "level": 2,
+    "market": "ABD",
+    "source": "real",
+    "ts": "2020-01-03T21:00:00Z"
+  }
+]

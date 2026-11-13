@@ -1,0 +1,76 @@
+{
+  "author": "edgelab",
+  "capital": 100000.0,
+  "created": "2026-09-30",
+  "data": {
+    "frequency": "1d",
+    "params": {
+      "path": "root/golden-probe/data",
+      "prices_adjusted": true,
+      "survivorship_free": true
+    },
+    "provider": "parquet",
+    "range": {
+      "end": "2026-06-30",
+      "start": "1926-08-01"
+    }
+  },
+  "hypothesis": {
+    "alpha": 0.05,
+    "alternative_hypothesis": "mean monthly net excess return > 0",
+    "benchmark": {
+      "kind": "universe_equal_weight"
+    },
+    "null_hypothesis": "mean monthly net excess return <= 0",
+    "primary_metric": "sharpe",
+    "rationale": "TODO: the economic rationale, written before any data was touched -- who is on the other side of the trade, and why the effect should persist.\n",
+    "sided": "one",
+    "threshold": 0.0
+  },
+  "name": "<Author year short title>",
+  "parameters": {
+    "grid": {
+      "lookback_bars": [
+        126,
+        252
+      ]
+    },
+    "selected": {
+      "lookback_bars": 252
+    }
+  },
+  "params": {
+    "on_capacity_shortfall": "drop_remainder",
+    "on_delisting": "exit_at_last_price",
+    "on_missing_data": "hold",
+    "order_timing": "open",
+    "price_basis_for_signals": "total_return",
+    "rebalance_band": 0.0,
+    "risk_limits": {
+      "max_gross": 1.0,
+      "max_net": 1.0,
+      "max_weight_per_instrument": 0.5
+    },
+    "schedule": {
+      "bars_per_year": 252,
+      "calendar": "XNYS",
+      "decision_time": null,
+      "frequency": "1d",
+      "rebalance": "monthly"
+    },
+    "share_rounding": "fractional",
+    "shorting": "not_allowed",
+    "universe": {
+      "kind": "static",
+      "symbols": [
+        "<SYMBOL1>",
+        "<SYMBOL2>"
+      ]
+    }
+  },
+  "replication": "root/golden-probe/replication.yaml",
+  "seed": 7,
+  "strategy": "root/golden-probe/strategy.py:GoldenProbe",
+  "unexpected": 1,
+  "version": "1.0.0"
+}

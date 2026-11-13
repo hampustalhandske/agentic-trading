@@ -1,23 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 
-from agentic_trading.data.loaders.lakehouse_loader import load_price_history_from_lakehouse
-from agentic_trading.data.point_in_time import get_point_in_time_data
+from agentic_trading.agents.schemas import VolatilityProvenance
+from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
-
-# A fixed, far-past start so the universe price query returns full
-# history; safely predates any realistic backtest start date.
-_UNIVERSE_HISTORY_START = date(2000, 1, 1)
 
 
 @dataclass(frozen=True)
@@ -46,6 +44,35 @@ def _slice_history(
     return sliced.copy()
 
 
+def _log_return_series(history: pd.DataFrame) -> pd.Series:
+    """Date-indexed log returns of a single-asset `history`: its own
+    `log_return` column when present, otherwise log differences of
+    `close`/`Close`; empty when it has neither."""
+    if "log_return" in history.columns:
+        return history["log_return"].dropna()
+    for field in ("close", "Close"):
+        if field in history.columns:
+            close_series = history[field].dropna()
+            if close_series.empty:
+                break
+            return pd.Series(
+                np.log(close_series / close_series.shift(1)), index=close_series.index
+            ).dropna()
+    return pd.Series(dtype=float)
+
+
+def log_return_series(
+    market_data: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    asset: str | None = None,
+) -> pd.Series:
+    """Date-indexed log returns of `asset` on bars at or before
+    `as_of_date` — the same values as `market_slice(...).log_returns`,
+    keeping the dates so a caller can join them to another dated source
+    instead of aligning by position."""
+    return _log_return_series(_slice_history(market_data, as_of_date, asset))
+
+
 def market_slice(
     market_data: pd.DataFrame,
     as_of_date: pd.Timestamp,
@@ -54,69 +81,55 @@ def market_slice(
     history = _slice_history(market_data, as_of_date, asset)
 
     close: float | None = None
-    if "close" in history.columns:
-        close_series = history["close"].dropna()
-        if not close_series.empty:
-            close = float(close_series.iloc[-1])
-    elif "Close" in history.columns:
-        close_series = history["Close"].dropna()
-        if not close_series.empty:
-            close = float(close_series.iloc[-1])
+    for field in ("close", "Close"):
+        if field in history.columns:
+            close_series = history[field].dropna()
+            if not close_series.empty:
+                close = float(close_series.iloc[-1])
+            break
 
-    if "log_return" in history.columns:
-        return_series: pd.Series = history["log_return"].dropna()
-    elif close is not None and "close" in history.columns:
-        close_series = history["close"].dropna()
-        return_series = pd.Series(
-            np.log(close_series / close_series.shift(1)), index=close_series.index
-        ).dropna()
-    elif close is not None and "Close" in history.columns:
-        close_series = history["Close"].dropna()
-        return_series = pd.Series(
-            np.log(close_series / close_series.shift(1)), index=close_series.index
-        ).dropna()
-    else:
-        return_series = pd.Series(dtype=float)
-
+    return_series = _log_return_series(history)
     return MarketSlice(close=close, log_returns=return_series.to_numpy(dtype=np.float64))
 
 
 def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    """`value` bounded to [`lower`, `upper`]. Raises `ValueError` on a
+    non-finite `value`: an undefined statistic has no place in the band,
+    so an analyst that reaches here with one reports `error` through
+    `ManagerAgent.collect_signals`."""
+    if not math.isfinite(value):
+        raise ValueError(f"clamp needs a finite value, got {value!r}")
     return float(max(lower, min(upper, value)))
 
 
-def load_fixed_universe_returns(
-    universe: tuple[str, ...], as_of_date: pd.Timestamp
-) -> dict[str, np.ndarray]:
-    """Point-in-time-safe log returns for a fixed cross-sectional `universe`
-    a few analysts need for their own methodology (e.g. a Fama-MacBeth
-    cross-sectional regression, a lead-lag correlation graph) — fetched
-    independently of whatever assets the current backtest's own
-    `market_data` happens to include, via the lakehouse, not
-    `market_slice()`.
+def derived_seed(analyst_id: str, asset: str, as_of: date) -> int:
+    """A reproducible 32-bit seed for one analyst's simulation of `asset`
+    on `as_of`: the first 16 hex digits of the sha256 of
+    `"{settings.analysts.mc_seed}|{analyst_id}|{asset}|{YYYY-MM-DD}"`,
+    reduced modulo 2**32. A `datetime` or `pd.Timestamp` counts as its
+    calendar date. The base seed is read on every call, so an override of
+    `analysts.mc_seed` takes effect immediately."""
+    day = as_of.date() if isinstance(as_of, datetime) else as_of
+    key = f"{settings.analysts.mc_seed}|{analyst_id}|{asset}|{day.isoformat()}"
+    return int(hashlib.sha256(key.encode()).hexdigest()[:16], 16) % 2**32
 
-    Using `market_data` instead would silently fail for any universe ticker
-    not in the backtest's own asset list: `market_slice()` returns an empty
-    series rather than raising when a ticker isn't a `market_data` column,
-    which would read as "insufficient history" regardless of how much real
-    history the other universe tickers had.
 
-    Lakehouse-only, like every other price read in this project — a
-    universe ticker the lakehouse doesn't cover is simply omitted from
-    the result, the same shape a genuine data gap already produces for
-    callers, rather than falling back to a live price API."""
-    raw = load_price_history_from_lakehouse(
-        list(universe), _UNIVERSE_HISTORY_START, as_of_date.date()
-    )
-    if raw is None:
-        return {}
-    filtered = get_point_in_time_data(raw, as_of_date)
-    tickers_present = set(filtered.columns.get_level_values(0))
-    return {
-        ticker: filtered[ticker]["log_return"].dropna().to_numpy(dtype=np.float64)
-        for ticker in universe
-        if ticker in tickers_present
-    }
+def balanced_panel(
+    universe: tuple[str, ...],
+    universe_returns: dict[str, pd.Series],
+    reference_dates: pd.Index,
+) -> pd.DataFrame:
+    """Returns of every `universe` ticker that has a value on each of
+    `reference_dates`, one column per kept ticker in `universe` order,
+    indexed by `reference_dates`. A ticker missing any of those dates is
+    dropped whole, so one gappy or recently listed name never removes a
+    date from the other names."""
+    columns = {}
+    for ticker in universe:
+        values = universe_returns[ticker].reindex(reference_dates)
+        if not values.isna().any():
+            columns[ticker] = values
+    return pd.DataFrame(columns, index=reference_dates)
 
 
 def single_asset_from_attrs(market_data: pd.DataFrame) -> str:
@@ -243,6 +256,7 @@ def conditional_daily_volatility(
     cache_key: str,
     as_of_date: pd.Timestamp,
     agent_id: str,
+    provenance: VolatilityProvenance | None = None,
 ) -> float:
     """One-step-ahead daily conditional volatility of `returns`: a
     GARCH(1,1) fit (`quantcore.risk.fit_garch_11`, refit through
@@ -250,8 +264,14 @@ def conditional_daily_volatility(
     persistence `alpha + beta` in (0, `settings.analysts.max_garch_persistence`],
     and unconditional vol within 0.3x-3x of the sample vol — otherwise
     the RiskMetrics EWMA (`settings.managers.ewma_lambda`) volatility,
-    which needs no estimation and cannot degenerate."""
-    from quantcore.risk import fit_garch_11, garch_11_variance
+    which needs no estimation and cannot degenerate.
+
+    `provenance`, when given, has its `estimator` set to "garch_11" or
+    "ewma", whichever gave the value. A fallback on a call that ran the
+    fit (the refit day, and every call while the fit raises, since a
+    raising fit is not cached) logs a WARNING naming `agent_id` and
+    `cache_key`; a call that reuses a cached unusable fit logs at DEBUG."""
+    from quantcore.risk import fit_garch_11, garch_11_variance, variance_backcast
     from quantcore.risk.egarch import ewma_variance
 
     from agentic_trading.config import settings
@@ -261,10 +281,15 @@ def conditional_daily_volatility(
     ewma_volatility = float(
         np.sqrt(max(float(ewma_variance(centered, settings.managers.ewma_lambda)[-1]), 0.0))
     )
+    refitted = False
+
+    def _refit() -> Any:
+        nonlocal refitted
+        refitted = True
+        return fit_garch_11(returns)
+
     try:
-        omega, alpha, beta = refit_cache.get_or_refit(
-            cache_key, as_of_date, lambda: fit_garch_11(returns)
-        )
+        omega, alpha, beta = refit_cache.get_or_refit(cache_key, as_of_date, _refit)
         persistence = alpha + beta
         if not 0.0 < persistence <= settings.analysts.max_garch_persistence:
             raise ValueError(f"persistence {persistence:.4f} outside (0, max]")
@@ -272,10 +297,15 @@ def conditional_daily_volatility(
         low, high = _GARCH_UNCONDITIONAL_VOL_BAND
         if not low <= unconditional_ratio <= high:
             raise ValueError(f"unconditional vol {unconditional_ratio:.2f}x sample vol")
-        variance_path = garch_11_variance(centered, omega, alpha, beta)
+        variance_path = garch_11_variance(
+            centered, omega, alpha, beta, presample_variance=variance_backcast(returns)
+        )
+        if provenance is not None:
+            provenance.estimator = "garch_11"
         return float(np.sqrt(max(float(variance_path[-1]), 0.0)))
     except (RuntimeError, ValueError) as exc:
-        logger.debug(
+        logger.log(
+            logging.WARNING if refitted else logging.DEBUG,
             "%s: GARCH(1,1) unusable for %s on %s (%s) — using EWMA volatility %.4f.",
             agent_id,
             cache_key,
@@ -283,6 +313,8 @@ def conditional_daily_volatility(
             exc,
             ewma_volatility,
         )
+        if provenance is not None:
+            provenance.estimator = "ewma"
         return ewma_volatility
 
 

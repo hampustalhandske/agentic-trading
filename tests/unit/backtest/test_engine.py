@@ -12,6 +12,9 @@ richer `BacktestResult` fields (`decisions_by_day`, `trade_log`) both front ends
 """
 
 import itertools
+import logging
+import math
+from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
 
@@ -27,6 +30,7 @@ from agentic_trading.agents.schemas import (
     PortfolioDecision,
     TradeRecord,
 )
+from agentic_trading.backtest import engine as engine_module
 from agentic_trading.backtest.engine import BacktestEngine
 from agentic_trading.backtest.portfolio import OptionPosition, Portfolio
 from agentic_trading.config import settings, temporary_overrides
@@ -133,6 +137,7 @@ class _FakeCommander:
 class _FakePortfolio:
     def __init__(self, total_values: list[float]) -> None:
         self._total_values = total_values
+        self.cash = 0.0
         self.total_value_calls: list[dict[str, float]] = []
         self.apply_decision_calls: list[tuple[PortfolioDecision, float, float]] = []
         self.option_positions: dict[str, OptionPosition] = {}
@@ -759,6 +764,10 @@ def _option_engine(
 @pytest.fixture
 def option_marks_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("agentic_trading.backtest.engine.load_option_mark", _fake_load_option_mark)
+    monkeypatch.setattr(
+        "agentic_trading.backtest.engine.lakehouse_loader.split_adjustment_factor",
+        lambda *_args: 1.0,
+    )
 
 
 def test_run_fills_marks_and_settles_an_option_decision(option_marks_stub: None) -> None:
@@ -868,3 +877,139 @@ def test_run_skips_an_option_decision_with_no_mark(monkeypatch: pytest.MonkeyPat
     assert [value for _, value in result.portfolio_value_history] == pytest.approx(
         [10_000.0] * len(SIMULATED_DAYS)
     )
+
+
+_RATIO_FIELDS = (
+    "final_sharpe_ratio",
+    "final_sortino_ratio",
+    "final_calmar_ratio",
+    "final_profit_factor",
+    "final_information_ratio",
+)
+
+
+@pytest.fixture
+def engine_warnings(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """Routes the engine's logger (the package logger does not propagate) into `caplog`."""
+    engine_logger = logging.getLogger("agentic_trading.backtest.engine")
+    engine_logger.addHandler(caplog.handler)
+    previous_level = engine_logger.level
+    engine_logger.setLevel(logging.WARNING)
+    yield caplog
+    engine_logger.setLevel(previous_level)
+    engine_logger.removeHandler(caplog.handler)
+
+
+def _warned_metrics(caplog: pytest.LogCaptureFixture) -> str:
+    return " ".join(
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    )
+
+
+def _engine_over(
+    total_values: list[float], benchmark_returns: pd.Series | None = None
+) -> BacktestEngine:
+    """The fixture engine with the portfolio valued at `total_values`, one per simulated day."""
+    return BacktestEngine(
+        commander=_FakeCommander(_decisions_by_day()),  # type: ignore[arg-type]
+        portfolio=_FakePortfolio(list(total_values)),  # type: ignore[arg-type]
+        track_record=_FakeTrackRecord(),  # type: ignore[arg-type]
+        data_loader=_FakeDataLoader(_price_frame()),
+        start_date=START_DATE,
+        end_date=END_DATE,
+        benchmark_returns=benchmark_returns,
+    )
+
+
+def test_a_flat_run_reports_no_ratios_and_numeric_drawdown_and_hit_rate() -> None:
+    """A run whose value never moves has no return variance: every ratio is undefined (None),
+    while max drawdown and hit rate are 0.0."""
+    result = _engine_over([10_000.0] * 5).run()
+
+    for field in _RATIO_FIELDS:
+        assert getattr(result, field) is None, field
+    assert result.final_max_drawdown == 0.0
+    assert result.final_hit_rate == 0.0
+
+
+def test_each_summary_metric_is_reported_on_its_own(
+    engine_warnings: pytest.LogCaptureFixture,
+) -> None:
+    """A run that only rises has a Sharpe but no downside and no drawdown: Sortino, Calmar and
+    the profit factor are undefined (None) and each is named in a warning; the others stay."""
+    result = _engine_over([10_000.0, 10_100.0, 10_150.0, 10_300.0, 10_310.0]).run()
+
+    assert result.final_sharpe_ratio is not None and math.isfinite(result.final_sharpe_ratio)
+    assert result.final_sortino_ratio is None
+    assert result.final_calmar_ratio is None
+    assert result.final_profit_factor is None
+    assert result.final_max_drawdown == 0.0
+    assert result.final_hit_rate == 1.0
+    warned = _warned_metrics(engine_warnings)
+    for name in ("sortino", "calmar", "profit factor"):
+        assert name in warned, name
+    assert "sharpe" not in warned
+
+
+def test_an_undefined_information_ratio_is_none(
+    engine_warnings: pytest.LogCaptureFixture,
+) -> None:
+    """A benchmark identical to the run's own returns has zero tracking error."""
+    values = list(_TOTAL_VALUES)
+    own = pd.Series(
+        [(current - previous) / previous for previous, current in itertools.pairwise(values)],
+        index=pd.to_datetime(SIMULATED_DAYS[1:]),
+    )
+
+    result = _engine_over(values, benchmark_returns=own).run()
+
+    assert result.final_information_ratio is None
+    assert result.final_sharpe_ratio is not None
+    assert "information ratio" in _warned_metrics(engine_warnings)
+
+
+@pytest.mark.parametrize(
+    ("metric", "field"),
+    [
+        ("sharpe_ratio", "final_sharpe_ratio"),
+        ("sortino_ratio", "final_sortino_ratio"),
+        ("calmar_ratio", "final_calmar_ratio"),
+        ("profit_factor", "final_profit_factor"),
+    ],
+)
+@pytest.mark.parametrize(
+    "failure", [ValueError("undefined result"), ZeroDivisionError("division by zero")]
+)
+def test_a_failing_metric_is_none_and_leaves_the_others(
+    monkeypatch: pytest.MonkeyPatch,
+    engine_warnings: pytest.LogCaptureFixture,
+    metric: str,
+    field: str,
+    failure: Exception,
+) -> None:
+    def _raise(*_args: object, **_kwargs: object) -> float:
+        raise failure
+
+    monkeypatch.setattr(engine_module, metric, _raise)
+
+    result = _engine_over(list(_TOTAL_VALUES)).run()
+
+    assert getattr(result, field) is None
+    for other in ("final_sharpe_ratio", "final_sortino_ratio", "final_calmar_ratio"):
+        if other != field:
+            assert getattr(result, other) is not None, other
+    assert isinstance(result.final_max_drawdown, float)
+    assert isinstance(result.final_hit_rate, float)
+    assert str(failure) in _warned_metrics(engine_warnings)
+
+
+def test_a_non_finite_metric_is_none(
+    monkeypatch: pytest.MonkeyPatch, engine_warnings: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(engine_module, "sharpe_ratio", lambda *_a, **_k: float("inf"))
+
+    result = _engine_over(list(_TOTAL_VALUES)).run()
+
+    assert result.final_sharpe_ratio is None
+    assert result.final_sortino_ratio is not None
+    assert "sharpe" in _warned_metrics(engine_warnings)

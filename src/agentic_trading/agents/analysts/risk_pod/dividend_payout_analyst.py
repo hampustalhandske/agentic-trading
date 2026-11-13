@@ -5,7 +5,7 @@ from typing import Literal
 import pandas as pd
 
 from agentic_trading.agents._market_math import clamp
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.data.loaders.lakehouse_loader import load_dividends_from_lakehouse
 from agentic_trading.logging_config import get_logger
@@ -22,15 +22,32 @@ class DividendPayoutAnalyst(AnalystAgent):
     a raise is a real positive statement about a board's confidence in
     forward earnings — both are decisions company management makes with
     money, not signals derived from price action. Compares the two most
-    recent real dividend payments (`dolthub_stock_dividends`, via
-    `data/loaders/lakehouse_loader.py`) for `asset`: a cut signals short,
-    a raise signals long, an unchanged payout is flat. This is
+    recent regular cash dividends (`equity_distributions`, split-adjusted,
+    via `data/loaders/lakehouse_loader.py::load_dividends_from_lakehouse`)
+    for `asset`, so a stock split never reads as a cut and a special
+    distribution never reads as a raise: a cut signals short,
+    a raise signals long, an unchanged payout abstains (active, flat,
+    confidence 0). This is
     independent of `adj_close` already reflecting dividends in realized
     returns (a separate, existing correctness property) — this analyst
     is the first place in the roster that reads the payout itself as a
-    signal rather than only its price impact."""
+    signal rather than only its price impact.
+
+    Every active signal's `source_as_of`, an abstention included, is the
+    ex-date of the newer of the two payouts compared, the date
+    `load_dividends_from_lakehouse` first admits it."""
 
     agent_id: str = "dividend_payout_analyst"
+    # No `lookback_days`: the two most recent payouts are read whatever
+    # their age, so there is no fixed window short of the warm-up.
+    data_requirements: tuple[DataRequirement, ...] = (
+        DataRequirement(
+            source="dividends",
+            identifier="all",
+            asset_scoped=False,
+            description="Regular cash dividend history",
+        ),
+    )
 
     def generate_signal(
         self,
@@ -50,6 +67,7 @@ class DividendPayoutAnalyst(AnalystAgent):
                 status="unavailable",
             )
 
+        source_as_of = pd.Timestamp(series.index[-1]).date()
         latest = float(series.iloc[-1])
         previous = float(series.iloc[-2])
         if previous <= 0.0:
@@ -64,13 +82,17 @@ class DividendPayoutAnalyst(AnalystAgent):
             )
 
         change_ratio = (latest - previous) / previous
-        direction: Literal["long", "short", "flat"]
+        rationale = (
+            f"dividend payout changed {change_ratio:+.1%} "
+            f"({previous:.4f} -> {latest:.4f} per share)"
+        )
+        direction: Literal["long", "short"]
         if change_ratio > 0.0:
             direction = "long"
         elif change_ratio < 0.0:
             direction = "short"
         else:
-            direction = "flat"
+            return self.abstain_signal(asset, as_of_date, rationale, source_as_of=source_as_of)
         confidence = clamp(abs(change_ratio) / _MIN_CUT_SEVERITY_FOR_FULL_CONFIDENCE)
 
         return AgentSignal(
@@ -79,8 +101,6 @@ class DividendPayoutAnalyst(AnalystAgent):
             as_of_date=as_of_date.date(),
             direction=direction,
             confidence=confidence,
-            rationale=(
-                f"dividend payout changed {change_ratio:+.1%} "
-                f"({previous:.4f} -> {latest:.4f} per share)"
-            ),
+            rationale=rationale,
+            source_as_of=source_as_of,
         )

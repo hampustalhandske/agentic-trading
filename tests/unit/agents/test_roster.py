@@ -14,6 +14,7 @@ from agentic_trading.agents.roster import (
     CVAR_MANAGER_ANALYST_IDS,
     EVENT_CREDIT_MANAGER_ANALYST_IDS,
     FACTOR_MANAGER_ANALYST_IDS,
+    FIRM_V1_EXCLUDED_ANALYST_IDS,
     MACRO_RATES_MANAGER_ANALYST_IDS,
     RATES_MANAGER_ANALYST_IDS,
     RISK_MANAGER_ANALYST_IDS,
@@ -109,3 +110,24 @@ def test_build_default_analysts_returns_thirty_one_uniquely_identified_analysts(
 
     assert len(analysts) == 38
     assert len({a.agent_id for a in analysts}) == 38
+
+
+def test_firm_v1_runs_stat_arb_without_the_pairs_analysts() -> None:
+    """The registered firm's exclusions are the two pairs analysts, both in the default roster;
+    excluding them leaves the StatArb pod OU and HMM and every other pod unchanged."""
+    default_ids = {analyst.agent_id for analyst in build_default_analysts()}
+    firm = build_default_managers(
+        build_default_analysts(excluded_analyst_ids=FIRM_V1_EXCLUDED_ANALYST_IDS)
+    )
+    stat_arb = next(manager for manager in firm if manager.agent_id == "stat_arb_manager")
+
+    assert FIRM_V1_EXCLUDED_ANALYST_IDS == {
+        "pairs_cointegration_analyst",
+        "kalman_hedge_ratio_analyst",
+    }
+    assert FIRM_V1_EXCLUDED_ANALYST_IDS <= default_ids
+    assert {analyst.agent_id for analyst in stat_arb.managed_analysts} == {
+        "ou_mean_reversion_analyst",
+        "regime_hmm_analyst",
+    }
+    assert sum(len(manager.managed_analysts) for manager in firm) == len(default_ids) - 2

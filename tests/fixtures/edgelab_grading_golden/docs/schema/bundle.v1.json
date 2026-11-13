@@ -1,0 +1,351 @@
+{
+  "$defs": {
+    "DataRequest": {
+      "additionalProperties": false,
+      "description": "A frozen, hashable description of exactly what data to load.\n\nAttributes:\n    provider: Identifier of the data provider, e.g. `\"synthetic\"`.\n    symbols: Symbols to load, sorted and unique; empty when the provider resolves an index or\n        filter universe (see `params[\"universe_kind\"]`).\n    range: Calendar date range to load.\n    frequency: Finest bar frequency to load.\n    calendar: Exchange calendar used to interpret the range and frequency.\n    instrument_kind: The kind of instrument the request is for.\n    seed: Seed for any stochastic provider.\n    params: Provider-specific settings. An unresolved universe is passed through the reserved\n        keys `\"universe_kind\"` and (for an index) `\"universe_index\"`.",
+      "properties": {
+        "calendar": {
+          "description": "Exchange calendar identifier used to interpret range/frequency.",
+          "minLength": 1,
+          "title": "Calendar",
+          "type": "string"
+        },
+        "frequency": {
+          "$ref": "#/$defs/Frequency",
+          "description": "Finest bar frequency to load."
+        },
+        "instrument_kind": {
+          "$ref": "#/$defs/InstrumentKind",
+          "description": "The kind of instrument the request is for."
+        },
+        "params": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ParamValue"
+          },
+          "description": "Provider-specific settings.",
+          "title": "Params",
+          "type": "object"
+        },
+        "provider": {
+          "description": "Identifier of the data provider to load from.",
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        },
+        "range": {
+          "$ref": "#/$defs/DateRange",
+          "description": "Calendar date range to load."
+        },
+        "seed": {
+          "description": "Seed for any stochastic provider.",
+          "minimum": 0,
+          "title": "Seed",
+          "type": "integer"
+        },
+        "symbols": {
+          "description": "Symbols to load, sorted and unique; empty when the provider must resolve them.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Symbols",
+          "type": "array"
+        }
+      },
+      "required": [
+        "provider",
+        "symbols",
+        "range",
+        "frequency",
+        "calendar",
+        "instrument_kind",
+        "seed"
+      ],
+      "title": "DataRequest",
+      "type": "object"
+    },
+    "DateRange": {
+      "additionalProperties": false,
+      "description": "An inclusive calendar date range used for data windows and search windows.\n\nAttributes:\n    start: First date included in the range.\n    end: Last date included in the range.",
+      "properties": {
+        "end": {
+          "description": "Last date included in the range.",
+          "format": "date",
+          "title": "End",
+          "type": "string"
+        },
+        "start": {
+          "description": "First date included in the range.",
+          "format": "date",
+          "title": "Start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "title": "DateRange",
+      "type": "object"
+    },
+    "EquityCoverage": {
+      "additionalProperties": false,
+      "description": "How completely the lake covers one equity ticker over a load's range.\n\nAttributes:\n    source_gap_sessions: Expected sessions inside a membership span of `sp500_price_coverage`\n        with no bar: the lake should hold them and does not.\n    by_construction_sessions: Expected sessions outside every membership span with no bar (the\n        lake holds a member's bars only during membership plus its fill windows).\n    yahoo_daily_share: Share of the ticker's bars whose `equity_daily_from_bars.source` is\n        `yahoo_daily`.",
+      "properties": {
+        "by_construction_sessions": {
+          "description": "Missing sessions outside every membership span.",
+          "minimum": 0,
+          "title": "By Construction Sessions",
+          "type": "integer"
+        },
+        "source_gap_sessions": {
+          "description": "Missing sessions inside a span.",
+          "minimum": 0,
+          "title": "Source Gap Sessions",
+          "type": "integer"
+        },
+        "yahoo_daily_share": {
+          "description": "Share of bars filled from Yahoo daily.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Yahoo Daily Share",
+          "type": "number"
+        }
+      },
+      "required": [
+        "source_gap_sessions",
+        "by_construction_sessions",
+        "yahoo_daily_share"
+      ],
+      "title": "EquityCoverage",
+      "type": "object"
+    },
+    "Frequency": {
+      "description": "Bar frequency at which a schedule decides or data is sampled.\n\nMembers are ordered from finest to coarsest. The string value (e.g. ``\"1d\"``) is what appears in\nYAML/JSON specs and in the JSON Schema.",
+      "enum": [
+        "1min",
+        "5min",
+        "15min",
+        "30min",
+        "1h",
+        "1d",
+        "1w",
+        "1M"
+      ],
+      "title": "Frequency",
+      "type": "string"
+    },
+    "InstrumentKind": {
+      "enum": [
+        "equity",
+        "future",
+        "option",
+        "fx",
+        "crypto",
+        "prediction_market"
+      ],
+      "type": "string"
+    },
+    "ParamValue": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
+    "QualityCount": {
+      "additionalProperties": false,
+      "description": "One structured data-quality action a provider took while building a bundle.\n\nAttributes:\n    rule: The invariant the rows violated, e.g. `\"ohlc_consistency\"`, `\"non_positive_price\"`.\n    action: `\"dropped\"` (removed) or `\"repaired\"` (kept, values clipped or filled).\n    n_rows: How many rows the action touched.\n    frame: The bundle frame the rows belong to (`\"bars\"`, `\"option_chains\"`, ...).",
+      "properties": {
+        "action": {
+          "description": "What happened to the rows.",
+          "enum": [
+            "dropped",
+            "repaired"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "frame": {
+          "default": "bars",
+          "description": "Bundle frame concerned.",
+          "minLength": 1,
+          "title": "Frame",
+          "type": "string"
+        },
+        "n_rows": {
+          "description": "Number of rows the action touched.",
+          "minimum": 0,
+          "title": "N Rows",
+          "type": "integer"
+        },
+        "rule": {
+          "description": "The violated invariant.",
+          "minLength": 1,
+          "title": "Rule",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule",
+        "action",
+        "n_rows"
+      ],
+      "title": "QualityCount",
+      "type": "object"
+    }
+  },
+  "$id": "urn:edgelab:schema:bundle.v1",
+  "additionalProperties": false,
+  "description": "Provenance and guarantees of a `DataBundle`, separate from the data itself.\n\nOnly `request` (not these fields) enters `snapshot_id`.\n\nAttributes:\n    provider: Name of the provider that produced the bundle.\n    request: The request that was fulfilled.\n    is_demo: Whether the provider is demo-only (survivorship-biased, no point-in-time\n        membership, vendor-adjusted).\n    is_synthetic: Whether the data is generated, not observed, so a comparison with real\n        market series (factor returns, a risk-free rate) has no meaning.\n    warnings: Human-readable caveats about this bundle.\n    survivorship_free: Whether delisted names remain in the universe.\n    point_in_time_membership: Whether index membership reflects each historical date.\n    prices_adjusted: Whether `bars.close` is already split-adjusted (provider-declared, not\n        verified), so a close-to-close ratio near a split ratio is not an unadjusted split.\n    quality_counts: Structured counts of rows dropped or repaired while building (the audit's\n        `ohlc_consistency` check echoes the OHLC entries).\n    untraded_symbols: `BARS.symbol` values loaded only as benchmark or reference series, never\n        traded; a futures bundle exempts them from the every-symbol-has-a-contract rule.\n    declared_starts: Per symbol the provider could not serve from the requested start, the first\n        date it has data (e.g. a truncated futures root); empty otherwise.\n    lake_time: The lake time T the bundle was read as of (ISO 8601, UTC); `None` for a bundle\n        not read from the lake.\n    lake_version: The lake's `X-Lakehouse-Version` as received (a `-dirty` suffix is kept);\n        `None` for a bundle not read from the lake.\n    lake_current_tables: Tables read without a log, so at the lake version rather than at\n        `lake_time`; `None` for a bundle not read from the lake.\n    equity_coverage: Per equity ticker with a membership span, its missing sessions split into\n        source gaps and by-construction stops, and its Yahoo share; `None` when not measured.",
+  "properties": {
+    "declared_starts": {
+      "additionalProperties": {
+        "format": "date",
+        "type": "string"
+      },
+      "description": "Per request.symbols entry, the first date the provider states it has data for, when it could not serve the requested start.",
+      "title": "Declared Starts",
+      "type": "object"
+    },
+    "equity_coverage": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/EquityCoverage"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Per equity ticker: source-gap and by-construction sessions, Yahoo share.",
+      "title": "Equity Coverage"
+    },
+    "is_demo": {
+      "default": false,
+      "description": "Whether the provider is demo-only, e.g. yfinance_demo.",
+      "title": "Is Demo",
+      "type": "boolean"
+    },
+    "is_synthetic": {
+      "default": false,
+      "description": "Whether the data is generated rather than observed, e.g. the synthetic provider.",
+      "title": "Is Synthetic",
+      "type": "boolean"
+    },
+    "lake_current_tables": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Tables read without a log (at the lake version, not at lake_time).",
+      "title": "Lake Current Tables"
+    },
+    "lake_time": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Lake time T the bundle was read as of (ISO 8601, UTC).",
+      "title": "Lake Time"
+    },
+    "lake_version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The lake's X-Lakehouse-Version as received.",
+      "title": "Lake Version"
+    },
+    "point_in_time_membership": {
+      "default": false,
+      "description": "Whether index membership reflects each historical date.",
+      "title": "Point In Time Membership",
+      "type": "boolean"
+    },
+    "prices_adjusted": {
+      "default": false,
+      "description": "Whether bars.close is already adjusted for splits.",
+      "title": "Prices Adjusted",
+      "type": "boolean"
+    },
+    "provider": {
+      "description": "Name of the provider that produced the bundle.",
+      "minLength": 1,
+      "title": "Provider",
+      "type": "string"
+    },
+    "quality_counts": {
+      "default": [],
+      "description": "Rows the provider dropped or repaired, by rule and action.",
+      "items": {
+        "$ref": "#/$defs/QualityCount"
+      },
+      "title": "Quality Counts",
+      "type": "array"
+    },
+    "request": {
+      "$ref": "#/$defs/DataRequest",
+      "description": "The request that was fulfilled."
+    },
+    "survivorship_free": {
+      "default": false,
+      "description": "Whether delisted/failed names remain in the universe.",
+      "title": "Survivorship Free",
+      "type": "boolean"
+    },
+    "untraded_symbols": {
+      "default": [],
+      "description": "BARS symbols loaded as benchmarks only, never traded.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Untraded Symbols",
+      "type": "array"
+    },
+    "warnings": {
+      "default": [],
+      "description": "Human-readable caveats about this specific bundle.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Warnings",
+      "type": "array"
+    }
+  },
+  "required": [
+    "provider",
+    "request"
+  ],
+  "title": "BundleMeta",
+  "type": "object"
+}

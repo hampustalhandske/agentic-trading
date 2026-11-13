@@ -21,6 +21,7 @@ import pytest
 from agentic_trading.agents.analysts.cvar_pod._options_data import (
     real_atm_options_by_expiration,
 )
+from agentic_trading.config import temporary_overrides
 
 
 def _chain_frame() -> pd.DataFrame:
@@ -59,7 +60,8 @@ def test_real_atm_options_converts_timestamp_to_date_before_the_lakehouse_call(
         _fake_loader,
     )
 
-    result = real_atm_options_by_expiration("AAPL", pd.Timestamp("2024-04-01"), spot=180.0)
+    with temporary_overrides({"options.publication_lag_days": 0}):
+        result = real_atm_options_by_expiration("AAPL", pd.Timestamp("2024-04-01"), spot=180.0)
 
     assert seen["as_of_date_type"] is date
     assert seen["as_of_date"] == date(2024, 4, 1)
@@ -79,3 +81,53 @@ def test_real_atm_options_returns_none_without_a_snapshot(
     result = real_atm_options_by_expiration("AAPL", pd.Timestamp("2024-04-01"), spot=180.0)
 
     assert result is None
+
+
+def _clamped_chain(descending: bool) -> pd.DataFrame:
+    """A snapshot on 2024-04-01 with 17 expirations on or before the next day, all clamped to
+    `days_to_expiration` 1, each quoted at its own implied volatility, then one 25 days out;
+    rows in ascending or descending expiration order."""
+    snapshot = pd.Timestamp("2024-04-01")
+    expirations = [snapshot - pd.Timedelta(days=offset) for offset in range(-1, 16)]
+    expirations.append(snapshot + pd.Timedelta(days=25))
+    rows = [
+        {
+            "date": snapshot,
+            "expiration": expiration,
+            "option_type": option_type,
+            "strike": 180.0,
+            "bid": 5.0,
+            "ask": 5.2,
+            "implied_volatility": 0.20 + 0.01 * number,
+            "delta": 0.5 if option_type == "call" else -0.5,
+            "gamma": 0.01,
+        }
+        for number, expiration in enumerate(expirations)
+        for option_type in ("call", "put")
+    ]
+    frame = pd.DataFrame(rows).sort_values("expiration", ascending=not descending)
+    return frame.reset_index(drop=True)
+
+
+@pytest.mark.parametrize("descending", [False, True])
+def test_real_atm_options_orders_clamped_expirations_by_expiration(
+    monkeypatch: pytest.MonkeyPatch, descending: bool
+) -> None:
+    """Expirations that all clamp to `days_to_expiration` 1 come in expiration order, whatever
+    the order of the chain's rows, so the first row is the earliest expiration's."""
+    chain = _clamped_chain(descending)
+    monkeypatch.setattr(
+        "agentic_trading.agents.analysts.cvar_pod._options_data."
+        "load_options_snapshot_from_lakehouse",
+        lambda _ticker, _as_of_date: chain,
+    )
+
+    with temporary_overrides({"options.publication_lag_days": 0}):
+        result = real_atm_options_by_expiration("AAPL", pd.Timestamp("2024-04-01"), spot=180.0)
+
+    assert result is not None
+    expected = sorted(chain["expiration"].unique())
+    assert list(result["expiration"]) == expected
+    assert result["days_to_expiration"].tolist() == [1] * 17 + [25]
+    assert result.iloc[0]["expiration"] == expected[0]
+    assert result.iloc[0]["implied_volatility"] == pytest.approx(0.20 + 0.01 * 16)

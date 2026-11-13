@@ -56,6 +56,13 @@ ALL_ANALYST_CLASSES = (
 )
 
 
+def _fred_vintages(values: pd.Series) -> pd.DataFrame:
+    """`values` as `load_fred_vintages_from_lakehouse` returns them, each observation first
+    published the day after its date."""
+    published = values.index + pd.Timedelta(days=1)
+    return pd.DataFrame({"value": values, "realtime_start": published, "known_at": published})
+
+
 def test_analysts_imports() -> None:
     for analyst_cls in ALL_ANALYST_CLASSES:
         assert analyst_cls.__name__
@@ -83,8 +90,8 @@ def test_macro_var_spillover_drops_non_finite_rows(monkeypatch) -> None:
 
     monkeypatch.setattr(
         "agentic_trading.agents.analysts.macro_rates_pod.macro_var_spillover_analyst."
-        "load_fred_series_from_lakehouse",
-        lambda _series_id, _as_of_date: macro,
+        "load_fred_vintages_from_lakehouse",
+        lambda _series_id, _as_of_date: _fred_vintages(macro),
     )
     signal = MacroVarSpilloverAnalyst(use_yield_curve_slope=False).generate_signal(
         "AAPL", market_data, dates[-1]
@@ -112,7 +119,9 @@ def test_newey_west_current_predictor_uses_todays_window_not_yesterdays(monkeypa
     monkeypatch.setattr(
         mod, "ols", lambda _y, _x: (np.array([0.0, 1.0]), np.zeros(_x.shape[0]), 1.0)
     )
-    monkeypatch.setattr(mod, "newey_west_cov", lambda *_args: np.array([[0.0, 0.0], [0.0, 0.01]]))
+    monkeypatch.setattr(
+        mod, "newey_west_cov", lambda *_args, **_kwargs: np.array([[0.0, 0.0], [0.0, 0.01]])
+    )
 
     signal = mod.NeweyWestSignificanceAnalyst().generate_signal("AAPL", market_data, dates[-1])
 
@@ -129,21 +138,27 @@ def test_sec_fundamentals_t_stat_matches_classical_ols_standard_error(monkeypatc
 
     rng = np.random.default_rng(0)
     values = 2.0 + 0.3 * np.arange(8) + rng.normal(0.0, 0.05, 8)
-    filed_dates = pd.date_range("2022-01-01", periods=8, freq="90D")
+    period_ends = pd.date_range("2022-03-31", periods=8, freq="91D")
+    filed_dates = period_ends + pd.Timedelta(days=30)
     facts = pd.DataFrame(
         {
             "concept": ["EarningsPerShareDiluted"] * 8,
+            "unit": "USD/shares",
+            "period_start": period_ends - pd.Timedelta(days=90),
+            "period_end": period_ends,
             "filed": filed_dates,
+            "available_date": filed_dates,
             "value": values,
         }
     )
     monkeypatch.setattr(mod, "load_company_facts_from_lakehouse", lambda _asset, _as_of: facts)
+    monkeypatch.setattr(mod, "load_split_ex_dates", lambda _asset, _as_of: [])
 
     signal = mod.SecFundamentalsAnalyst().generate_signal(
         "AAPL", pd.DataFrame(), pd.Timestamp(filed_dates[-1]) + pd.Timedelta(days=1)
     )
 
-    periods = np.arange(8, dtype=np.float64)
+    periods = np.asarray((period_ends - period_ends[0]).days, dtype=np.float64) / 91.3125
     design_matrix = np.column_stack([np.ones(8), periods])
     coefs, _, _, _ = np.linalg.lstsq(design_matrix, values, rcond=None)
     residuals = values - design_matrix @ coefs
@@ -242,9 +257,9 @@ def test_egarch_analyst_uses_real_mle_fitted_parameters(monkeypatch) -> None:
     captured: dict[str, float] = {}
     real_fn = mod.egarch_11_variance
 
-    def _spy(returns, omega, alpha, gamma, beta):
+    def _spy(returns, omega, alpha, gamma, beta, **kwargs):
         captured.update(omega=omega, alpha=alpha, gamma=gamma, beta=beta)
-        return real_fn(returns, omega, alpha, gamma, beta)
+        return real_fn(returns, omega, alpha, gamma, beta, **kwargs)
 
     monkeypatch.setattr(mod, "egarch_11_variance", _spy)
 
@@ -254,7 +269,6 @@ def test_egarch_analyst_uses_real_mle_fitted_parameters(monkeypatch) -> None:
     mod.EGARCHAsymmetricVolAnalyst().generate_signal("AAPL", market_data, dates[-1])
 
     fitted = mod.egarch_fit(returns[-settings.analysts.risk_window_garch :])
-    assert fitted.converged
     assert captured["omega"] == pytest.approx(fitted.omega)
     assert captured["alpha"] == pytest.approx(fitted.alpha)
     assert captured["gamma"] == pytest.approx(fitted.gamma)
@@ -270,9 +284,9 @@ def test_gjr_garch_analyst_uses_real_mle_fitted_parameters(monkeypatch) -> None:
     captured: dict[str, float] = {}
     real_fn = mod.gjr_garch_11_variance
 
-    def _spy(returns, omega, alpha, gamma, beta):
+    def _spy(returns, omega, alpha, gamma, beta, **kwargs):
         captured.update(omega=omega, alpha=alpha, gamma=gamma, beta=beta)
-        return real_fn(returns, omega, alpha, gamma, beta)
+        return real_fn(returns, omega, alpha, gamma, beta, **kwargs)
 
     monkeypatch.setattr(mod, "gjr_garch_11_variance", _spy)
 
@@ -282,7 +296,6 @@ def test_gjr_garch_analyst_uses_real_mle_fitted_parameters(monkeypatch) -> None:
     mod.GJRGARCHCrashRiskAnalyst().generate_signal("AAPL", market_data, dates[-1])
 
     fitted = mod.gjr_garch_fit(returns[-settings.analysts.risk_window_garch :])
-    assert fitted.converged
     assert captured["omega"] == pytest.approx(fitted.omega)
     assert captured["alpha"] == pytest.approx(fitted.alpha)
     assert captured["gamma"] == pytest.approx(fitted.gamma)
@@ -319,12 +332,19 @@ def test_garch_analysts_return_flat_below_minimum_observations(
 
 
 def test_egarch_analyst_returns_flat_on_non_convergent_fit(monkeypatch) -> None:
+    from quantcore.risk import ConvergenceError
+
     from agentic_trading.agents.analysts.macro_rates_pod import egarch_asymmetric_vol_analyst as mod
 
-    class _NonConvergent:
-        converged = False
+    def _non_convergent(returns):
+        raise ConvergenceError(
+            "no start converged",
+            params=(-0.05, 0.1, -0.05, 0.9),
+            log_likelihood=0.0,
+            optimizer_message="Iteration limit reached",
+        )
 
-    monkeypatch.setattr(mod, "egarch_fit", lambda returns: _NonConvergent())
+    monkeypatch.setattr(mod, "egarch_fit", _non_convergent)
     market_data, dates = _garch_market_data(_simulated_gjr_returns(1))
 
     signal = mod.EGARCHAsymmetricVolAnalyst().generate_signal("AAPL", market_data, dates[-1])
@@ -335,12 +355,19 @@ def test_egarch_analyst_returns_flat_on_non_convergent_fit(monkeypatch) -> None:
 
 
 def test_gjr_garch_analyst_returns_flat_on_non_convergent_fit(monkeypatch) -> None:
+    from quantcore.risk import ConvergenceError
+
     from agentic_trading.agents.analysts.macro_rates_pod import gjr_garch_crash_risk_analyst as mod
 
-    class _NonConvergent:
-        converged = False
+    def _non_convergent(returns):
+        raise ConvergenceError(
+            "no start converged",
+            params=(1e-6, 0.05, 0.1, 0.8),
+            log_likelihood=0.0,
+            optimizer_message="Iteration limit reached",
+        )
 
-    monkeypatch.setattr(mod, "gjr_garch_fit", lambda returns: _NonConvergent())
+    monkeypatch.setattr(mod, "gjr_garch_fit", _non_convergent)
     market_data, dates = _garch_market_data(_simulated_gjr_returns(1))
 
     signal = mod.GJRGARCHCrashRiskAnalyst().generate_signal("AAPL", market_data, dates[-1])
@@ -358,7 +385,7 @@ def test_egarch_analyst_returns_flat_on_over_persistent_fit(monkeypatch) -> None
     from agentic_trading.agents.analysts.macro_rates_pod import egarch_asymmetric_vol_analyst as mod
 
     over_persistent = EGARCHParams(
-        omega=-0.05, alpha=0.1, gamma=-0.05, beta=0.999, log_likelihood=0.0, converged=True
+        omega=-0.05, alpha=0.1, gamma=-0.05, beta=0.999, log_likelihood=0.0
     )
     monkeypatch.setattr(mod, "egarch_fit", lambda returns: over_persistent)
     monkeypatch.setattr(
@@ -382,7 +409,7 @@ def test_gjr_garch_analyst_returns_flat_on_over_persistent_fit(monkeypatch) -> N
     from agentic_trading.agents.analysts.macro_rates_pod import gjr_garch_crash_risk_analyst as mod
 
     over_persistent = GJRGARCHParams(
-        omega=1e-6, alpha=0.05, gamma=0.1, beta=0.9, log_likelihood=0.0, converged=True
+        omega=1e-6, alpha=0.05, gamma=0.1, beta=0.9, log_likelihood=0.0
     )
     monkeypatch.setattr(mod, "gjr_garch_fit", lambda returns: over_persistent)
     monkeypatch.setattr(
@@ -527,6 +554,7 @@ def test_vrp_analyst_is_flat_inside_the_premium_threshold(monkeypatch) -> None:
 def _real_options_frame(ivs: list[float], gammas: list[float]) -> pd.DataFrame:
     return pd.DataFrame(
         {
+            "snapshot_date": pd.Timestamp("2024-02-14"),
             "expiration": pd.to_datetime(["2024-03-15", "2024-04-19", "2024-06-21"][: len(ivs)]),
             "days_to_expiration": [30, 65, 128][: len(ivs)],
             "strike": [100.0] * len(ivs),
@@ -584,6 +612,15 @@ def test_greeks_delta_hedge_reaches_both_pinning_and_momentum_branches(monkeypat
     assert missing_signal.confidence == 0.0
 
 
+def _dgs3mo_known_before(as_of: pd.Timestamp) -> pd.DataFrame:
+    """One DGS3MO vintage of 5% observed and known the day before `as_of`."""
+    known = pd.DatetimeIndex([as_of - pd.Timedelta(days=1)])
+    return pd.DataFrame(
+        {"value": [5.0], "realtime_start": known, "known_at": known},
+        index=known,
+    )
+
+
 def test_black_scholes_valuation_edge_is_not_identically_zero(monkeypatch) -> None:
     """An ATM call-minus-put spread cancels to zero by put-call parity
     regardless of volatility — the edge must come from the call price
@@ -606,6 +643,9 @@ def test_black_scholes_valuation_edge_is_not_identically_zero(monkeypatch) -> No
         mod,
         "real_atm_options_by_expiration",
         lambda *_a, **_k: _real_options_frame([0.6, 0.55], [0.01, 0.01]),
+    )
+    monkeypatch.setattr(
+        mod, "load_fred_vintages_from_lakehouse", lambda *_a: _dgs3mo_known_before(dates[-1])
     )
     signal = mod.BlackScholesValuationAnalyst().generate_signal("AAPL", market_data, dates[-1])
     assert signal.confidence > 1e-6
@@ -658,8 +698,8 @@ def test_cir_rate_regime_falls_back_to_flat_on_trending_rates(monkeypatch) -> No
 
     monkeypatch.setattr(
         "agentic_trading.agents.analysts.macro_rates_pod.cir_rate_regime_analyst."
-        "load_fred_series_from_lakehouse",
-        lambda _series_id, _as_of_date: trending_rates,
+        "load_fred_vintages_from_lakehouse",
+        lambda _series_id, _as_of_date: _fred_vintages(trending_rates),
     )
     signal = CIRRateRegimeAnalyst().generate_signal("AAPL", market_data, dates[-1])
 
@@ -684,7 +724,9 @@ def test_cir_rate_regime_uses_real_mle_fitted_parameters(monkeypatch) -> None:
         3.0 + 0.3 * np.sin(np.linspace(0, 6 * np.pi, 60)) + rng.normal(0.0, 0.02, 60),
         index=dates,
     )
-    monkeypatch.setattr(mod, "load_fred_series_from_lakehouse", lambda *_: mean_reverting_rates)
+    monkeypatch.setattr(
+        mod, "load_fred_vintages_from_lakehouse", lambda *_: _fred_vintages(mean_reverting_rates)
+    )
 
     captured: dict[str, float] = {}
     real_fn = mod.simulate_cir_paths
@@ -830,8 +872,8 @@ def test_macro_var_spillover_handles_solver_failure(monkeypatch) -> None:
 
     monkeypatch.setattr(
         "agentic_trading.agents.analysts.macro_rates_pod.macro_var_spillover_analyst."
-        "load_fred_series_from_lakehouse",
-        lambda _series_id, _as_of_date: macro,
+        "load_fred_vintages_from_lakehouse",
+        lambda _series_id, _as_of_date: _fred_vintages(macro),
     )
     monkeypatch.setattr(
         "agentic_trading.agents.analysts.macro_rates_pod.macro_var_spillover_analyst.granger_causality_test",
@@ -861,7 +903,7 @@ def test_macro_var_spillover_selects_lag_order_via_aic_by_default(monkeypatch) -
         index=dates,
     )
     macro = pd.Series(rng.normal(20.0, 2.0, size=90), index=dates)
-    monkeypatch.setattr(mod, "load_fred_series_from_lakehouse", lambda *_: macro)
+    monkeypatch.setattr(mod, "load_fred_vintages_from_lakehouse", lambda *_: _fred_vintages(macro))
 
     captured: dict[str, int] = {}
     real_select = mod.select_var_lag_order

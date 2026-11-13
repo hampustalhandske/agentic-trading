@@ -1,8 +1,12 @@
+from datetime import date
+
 import numpy as np
 import pandas as pd
 
 from agentic_trading.agents.analysts.alt_data_pod import insider_cluster_buying_analyst as mod
 from agentic_trading.config import settings
+from agentic_trading.data.loaders import lakehouse_loader as ll
+from agentic_trading.stage_a.decisions import check_source_as_of, row_source
 
 
 def _market_data() -> pd.DataFrame:
@@ -64,3 +68,61 @@ def test_no_coverage_and_non_equity_are_unavailable(monkeypatch) -> None:
         analyst.generate_signal("GC=F", _market_data(), pd.Timestamp("2024-02-09")).status
         == "unavailable"
     )
+
+
+def _fetched_purchases(rows: list[tuple[int, str, str]]) -> pd.DataFrame:
+    """`_fetch_insider_transactions` rows of open-market purchases, one per
+    (owner_cik, filed date, America/New_York acceptance time)."""
+    filed = pd.to_datetime([r[1] for r in rows])
+    return pd.DataFrame(
+        {
+            "owner_cik": [r[0] for r in rows],
+            "owner_name": [f"OWNER {r[0]}" for r in rows],
+            "is_officer": True,
+            "is_director": False,
+            "is_ten_percent_owner": False,
+            "transaction_date": filed - pd.Timedelta(days=1),
+            "transaction_code": "P",
+            "shares": 100.0,
+            "price_per_share": 50.0,
+            "acquired_disposed": "A",
+            "filed_date": filed,
+            "accepted_at": [
+                pd.Timestamp(r[2], tz="America/New_York").tz_convert("UTC") for r in rows
+            ],
+        }
+    )
+
+
+def test_signal_from_loader_selection_passes_source_as_of_audit(monkeypatch) -> None:
+    """A Form 4 filed and accepted before the close on the decision day is not yet known, so
+    the signal's `source_as_of` passes the after-close audit of the analyst's declared source
+    on that day, and on the next session, when the filing counts."""
+    fetched = _fetched_purchases(
+        [
+            (1, "2017-08-17", "2017-08-17 11:00"),
+            (2, "2017-08-21", "2017-08-21 15:00"),
+            (3, "2017-08-22", "2017-08-22 10:00"),
+        ]
+    )
+    monkeypatch.setattr(
+        mod,
+        "load_insider_transactions_from_lakehouse",
+        lambda _ticker, as_of: ll._select_insider_transactions(fetched, as_of),
+    )
+    analyst = mod.InsiderClusterBuyingAnalyst()
+    source = row_source(analyst)
+    assert source == "sec_insider_transactions"
+
+    decision_day = pd.Timestamp("2017-08-22")
+    signal = analyst.generate_signal("AAPL", _market_data(), decision_day)
+    assert signal.status == "active"
+    assert signal.source_as_of == date(2017, 8, 21)
+    assert signal.sample_count == 2
+    check_source_as_of(signal.source_as_of, decision_day.date(), source)
+
+    next_session = pd.Timestamp("2017-08-23")
+    later = analyst.generate_signal("AAPL", _market_data(), next_session)
+    assert later.source_as_of == date(2017, 8, 22)
+    assert later.sample_count == 3
+    check_source_as_of(later.source_as_of, next_session.date(), source)

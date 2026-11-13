@@ -1,0 +1,78 @@
+{
+  "$id": "urn:edgelab:schema:frame.book_snapshots.v1",
+  "additionalProperties": false,
+  "description": "One row of the BOOK_SNAPSHOTS frame; the frame is an array of rows.",
+  "properties": {
+    "ask_price": {
+      "description": "rule: non_negative",
+      "minimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    },
+    "ask_size": {
+      "description": "rule: non_negative",
+      "minimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    },
+    "bid_price": {
+      "description": "rule: non_negative",
+      "minimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    },
+    "bid_size": {
+      "description": "rule: non_negative",
+      "minimum": 0,
+      "type": "number",
+      "x-dtype": "float"
+    },
+    "level": {
+      "type": "integer",
+      "x-dtype": "int"
+    },
+    "market": {
+      "type": "string",
+      "x-dtype": "str"
+    },
+    "source": {
+      "description": "may be omitted",
+      "enum": [
+        "real",
+        "synthetic",
+        null
+      ],
+      "type": [
+        "string",
+        "null"
+      ],
+      "x-dtype": "str"
+    },
+    "ts": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]00:00)$",
+      "type": "string",
+      "x-dtype": "datetime_utc"
+    }
+  },
+  "required": [
+    "ts",
+    "market",
+    "level",
+    "bid_price",
+    "bid_size",
+    "ask_price",
+    "ask_size"
+  ],
+  "title": "BOOK_SNAPSHOTS",
+  "type": "object",
+  "x-key": [
+    "market",
+    "ts",
+    "level"
+  ],
+  "x-sort-by": [
+    "market",
+    "ts",
+    "level"
+  ]
+}

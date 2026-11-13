@@ -1,0 +1,132 @@
+# test_split_adjustment.py
+"""Unit tests for agentic_trading.data.loaders.lakehouse_loader.split_adjustment_factor and
+load_split_ex_dates."""
+
+from datetime import date
+from typing import Any
+
+import pandas as pd
+import pytest
+
+from agentic_trading.data.loaders import lakehouse_loader
+
+pytestmark = pytest.mark.unpinned_lake_reads
+
+_COLUMNS = ["ticker", "ex_date", "ratio", "in_close_basis", "c0", "c1", "observed_move", "evidence"]
+
+_ROWS = [
+    ("AAPL", "2014-06-09", 0.142857, True),
+    ("AAPL", "2020-08-31", 0.25, True),
+    ("NVDA", "2021-07-20", 0.25, True),
+    ("NVDA", "2024-06-10", 0.10, True),
+    ("TSLA", "2020-08-31", 0.2, True),
+    ("TSLA", "2022-08-25", 1 / 3, True),
+    ("AVB", "2026-08-17", 0.358038, False),
+    ("SSP", "2015-04-01", 0.887311, True),
+    ("SSP", "2025-12-08", 0.751880, False),
+    ("XYZ", "2023-03-01", 0.5, None),
+]
+
+# Out of ex-date order, with a duplicated ex-date, a reverse split (ratio 2) and rows whose
+# ratio is 1, missing, zero or negative.
+_EX_DATE_ROWS = [
+    ("ZZSP", "2019-05-01", 0.5, True),
+    ("ZZSP", "2016-03-01", 0.25, True),
+    ("ZZSP", "2016-03-01", 0.5, True),
+    ("ZZSP", "2017-01-03", 1.0, True),
+    ("ZZSP", "2017-06-01", None, True),
+    ("ZZSP", "2018-01-02", 0.0, True),
+    ("ZZSP", "2018-06-01", -0.5, True),
+    ("ZZSP", "2021-01-04", 2.0, True),
+]
+
+
+def _load_splits(fake_lake: Any, rows: list[tuple]) -> None:
+    """Registers yahoo_split_close_basis with nullable ratio and in_close_basis columns."""
+    frame = pd.DataFrame(
+        [(t, d, r, b, None, None, None, None) for t, d, r, b in rows], columns=_COLUMNS
+    )
+    frame = frame.astype(
+        {
+            "ticker": "string",
+            "ratio": "Float64",
+            "in_close_basis": "boolean",
+            "c0": float,
+            "c1": float,
+            "observed_move": float,
+            "evidence": "string",
+        }
+    )
+    fake_lake.add("yahoo_split_close_basis", frame, date_columns=("ex_date",))
+
+
+@pytest.mark.parametrize(
+    ("ticker", "quote", "expected"),
+    [
+        ("AAPL", date(2020, 8, 28), 4.0),
+        ("AAPL", date(2020, 8, 31), 1.0),
+        ("AAPL", date(2014, 6, 6), 4 / 0.142857),
+        ("NVDA", date(2024, 6, 7), 10.0),
+        ("NVDA", date(2021, 7, 1), 40.0),
+        ("TSLA", date(2022, 8, 1), 3.0),
+        ("TSLA", date(2020, 8, 28), 15.0),
+    ],
+)
+def test_factor_is_product_of_inverse_ratios_after_quote_date(
+    fake_lake: Any, ticker: str, quote: date, expected: float
+) -> None:
+    """Only splits with ex_date strictly after the quote date contribute 1/ratio."""
+    _load_splits(fake_lake, _ROWS)
+    result = lakehouse_loader.split_adjustment_factor(ticker, quote)
+    assert result == pytest.approx(expected, rel=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("ticker", "quote", "expected"),
+    [
+        ("AVB", date(2026, 8, 14), 1.0),
+        ("SSP", date(2015, 3, 31), 1 / 0.887311),
+        ("SSP", date(2025, 12, 5), 1.0),
+        ("XYZ", date(2023, 2, 1), 2.0),
+    ],
+)
+def test_in_close_basis_false_never_counts_and_null_counts(
+    fake_lake: Any, ticker: str, quote: date, expected: float
+) -> None:
+    """Rows with in_close_basis false are excluded; true and null rows are included."""
+    _load_splits(fake_lake, _ROWS)
+    result = lakehouse_loader.split_adjustment_factor(ticker, quote)
+    assert result == pytest.approx(expected, rel=1e-6)
+
+
+def test_unknown_ticker_and_empty_table_return_one(fake_lake: Any) -> None:
+    """A ticker with no rows, or an empty table, yields a factor of 1.0."""
+    _load_splits(fake_lake, _ROWS)
+    assert lakehouse_loader.split_adjustment_factor("MSFT", date(2020, 1, 2)) == 1.0
+    _load_splits(fake_lake, [])
+    assert lakehouse_loader.split_adjustment_factor("AAPL", date(2020, 8, 28)) == 1.0
+
+
+def test_load_split_ex_dates(fake_lake: Any) -> None:
+    """Ex-dates up to as_of with a positive ratio other than 1, ascending
+    and unique, from the rows whose in_close_basis is true or null."""
+    _load_splits(fake_lake, _ROWS + _EX_DATE_ROWS)
+    load = lakehouse_loader.load_split_ex_dates
+
+    assert load("AAPL", date(2014, 6, 8)) == []
+    assert load("AAPL", date(2014, 6, 9)) == [date(2014, 6, 9)]
+    assert load("AAPL", date(2014, 8, 1)) == [date(2014, 6, 9)]
+    assert load("AAPL", date(2024, 1, 2)) == [date(2014, 6, 9), date(2020, 8, 31)]
+    assert load("ZZSP", date(2016, 2, 29)) == []
+    assert load("ZZSP", date(2021, 1, 3)) == [date(2016, 3, 1), date(2019, 5, 1)]
+    assert load("ZZSP", date(2021, 1, 4)) == [date(2016, 3, 1), date(2019, 5, 1), date(2021, 1, 4)]
+    assert load("MSFT", date(2024, 1, 2)) == []
+    assert load("AVB", date(2026, 12, 31)) == []
+    assert load("SSP", date(2026, 1, 2)) == [date(2015, 4, 1)]
+    assert load("XYZ", date(2023, 3, 1)) == [date(2023, 3, 1)]
+
+    for day in pd.date_range("2013-01-01", "2025-01-01", freq="QS").date:
+        for ticker in ("AAPL", "NVDA", "TSLA", "ZZSP"):
+            ex_dates = load(ticker, day)
+            assert all(type(ex_date) is date and ex_date <= day for ex_date in ex_dates)
+            assert ex_dates == sorted(set(ex_dates))

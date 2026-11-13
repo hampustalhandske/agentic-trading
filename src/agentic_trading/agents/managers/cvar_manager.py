@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import date
 from typing import Literal
 
@@ -129,13 +130,22 @@ class ConditionalValueAtRiskManager(ManagerAgent):
         market_data: pd.DataFrame,
         as_of_date: pd.Timestamp,
         scoreboard: PerformanceScoreboard,
+        *,
+        carried: Mapping[str, list[ManagerSignal]] | None = None,
     ) -> list[PortfolioDecision]:
-        decisions = super().construct_portfolio(assets, market_data, as_of_date, scoreboard)
+        decisions = super().construct_portfolio(
+            assets, market_data, as_of_date, scoreboard, carried=carried
+        )
         day = as_of_date.date()
         equity_rows: list[PortfolioDecision] = []
         option_rows: list[PortfolioDecision] = []
         for decision in decisions:
             asset = decision.asset
+            if carried and asset in carried:
+                # No bar today: its option legs are held as they stand,
+                # and the Commander carries their last targets.
+                equity_rows.append(decision)
+                continue
             held = self._held.get(asset, _HeldExpression())
             in_scope = self.assets is None or asset in self.assets
             spot = raw_spot(market_data, as_of_date, asset) if in_scope else None
@@ -263,8 +273,8 @@ class ConditionalValueAtRiskManager(ManagerAgent):
             # today's floating conviction score, even while holding the
             # same contract, is what turns a "hold until roll" position
             # into a stream of small, spread-crossing resizes every day
-            # the pod's underlying weight moves (see KNOWN_LIMITATIONS
-            # §6). Only opening a fresh contract (a first entry, a roll,
+            # the pod's underlying weight moves (see docs/LIMITATIONS.md
+            # §2). Only opening a fresh contract (a first entry, a roll,
             # or a confirmed side flip) re-sizes.
             return held_id, held.directional[held_id]
         fraction = min(abs(weight) * mark.mid / (abs(mark.delta) * spot), abs(weight))
@@ -334,10 +344,16 @@ class ConditionalValueAtRiskManager(ManagerAgent):
 def _select_contract(
     asset: str, option_type: Literal["call", "put"], target_strike: float, spot: float, day: date
 ) -> OptionContract | None:
-    expiry = option_marks.select_expiry(asset, day, settings.options.target_tenor_days)
+    """The `option_type` contract nearest `target_strike` at the listed
+    expiry after `day` nearest `day` plus the target tenor, both read from
+    the chain as published by `day` (`option_marks.published_chain_date`);
+    `None` when the chain lists no such expiry or no quoted strike."""
+    chain_day = option_marks.published_chain_date(day)
+    tenor_days = (day - chain_day).days + settings.options.target_tenor_days
+    expiry = option_marks.select_expiry(asset, chain_day, tenor_days, after=day)
     if expiry is None:
         return None
-    strike = option_marks.nearest_strike(asset, expiry, option_type, target_strike, day)
+    strike = option_marks.nearest_strike(asset, expiry, option_type, target_strike, chain_day)
     if strike is None:
         return None
     return OptionContract(underlying=asset, expiry=expiry, strike=strike, option_type=option_type)

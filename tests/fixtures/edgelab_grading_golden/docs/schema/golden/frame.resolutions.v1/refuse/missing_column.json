@@ -1,0 +1,12 @@
+[
+  {
+    "market": "ABC",
+    "outcome": 1,
+    "resolved_at": "2020-01-02T21:00:00Z"
+  },
+  {
+    "market": "ABD",
+    "outcome": 1,
+    "resolved_at": "2020-01-03T21:00:00Z"
+  }
+]

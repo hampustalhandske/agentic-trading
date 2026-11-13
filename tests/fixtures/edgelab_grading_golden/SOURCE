@@ -1,0 +1,6 @@
+repository: edgelab
+sha: 04d7c5c
+full_sha: 04d7c5c8869876f7a0b650c98eaea546d067f428
+subject: The top pod breaks a tie by pod id; the row-pick allowlist and the lake contract check cover the firm-book modules
+copied: docs/schema/ at that commit, byte for byte, to docs/schema/ here
+golden_sums: GOLDEN_SHA256SUMS holds the sha256 of each golden case, which edgelab's SHA256SUMS does not list

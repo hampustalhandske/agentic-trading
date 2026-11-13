@@ -3,6 +3,7 @@
 from typing import Literal
 
 import pandas as pd
+from pydantic import Field
 
 from agentic_trading.agents._market_math import clamp
 from agentic_trading.agents.base import AnalystAgent, DataRequirement, is_likely_equity
@@ -30,31 +31,17 @@ class InsiderClusterBuyingAnalyst(AnalystAgent):
 
     agent_id: str = "insider_cluster_buying_analyst"
 
-    data_requirements: tuple[DataRequirement, ...] = (
-        DataRequirement(
-            source="sec_insider_transactions",
-            identifier="{ticker}",
-            asset_scoped=True,
-            description="SEC Form 4 insider transactions",
-        ),
-    )
-
-    def _flat(
-        self,
-        asset: str,
-        as_of_date: pd.Timestamp,
-        rationale: str,
-        status: Literal["active", "unavailable", "error"],
-    ) -> AgentSignal:
-        return AgentSignal(
-            agent_id=self.agent_id,
-            asset=asset,
-            as_of_date=as_of_date.date(),
-            direction="flat",
-            confidence=0.0,
-            rationale=rationale,
-            status=status,
+    data_requirements: tuple[DataRequirement, ...] = Field(
+        default_factory=lambda: (
+            DataRequirement(
+                source="sec_insider_transactions",
+                identifier="{ticker}",
+                asset_scoped=True,
+                description="SEC Form 4 insider transactions",
+                lookback_days=settings.analysts.insider_window_days,
+            ),
         )
+    )
 
     def generate_signal(
         self,
@@ -63,14 +50,12 @@ class InsiderClusterBuyingAnalyst(AnalystAgent):
         as_of_date: pd.Timestamp,
     ) -> AgentSignal:
         if not is_likely_equity(asset):
-            return self._flat(
-                asset, as_of_date, "not an equity — Form 4 filings don't apply", "unavailable"
+            return self.unavailable_signal(
+                asset, as_of_date, "not an equity — Form 4 filings don't apply"
             )
         filings = load_insider_transactions_from_lakehouse(asset, as_of_date.date())
         if filings is None or filings.empty:
-            return self._flat(
-                asset, as_of_date, "no Form 4 coverage in the lakehouse", "unavailable"
-            )
+            return self.unavailable_signal(asset, as_of_date, "no Form 4 coverage in the lakehouse")
 
         window_start = as_of_date - pd.Timedelta(days=settings.analysts.insider_window_days)
         recent = filings[filings["filed_date"] > window_start]

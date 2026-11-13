@@ -16,9 +16,11 @@ Three ways to override without editing source:
   don't leak settings into each other.
 - Direct: `apply_overrides({...})` for a permanent process-wide change.
 
-The lakehouse location is the one value that also comes from the
-environment: `LAKEHOUSE_DIR` (process environment or the repo-root
-`.env`) seeds `data.lake_dir`.
+The lakehouse API location and token are not strategy constants: the
+loader reads `LAKEHOUSE_API_URL` and `LAKEHOUSE_API_TOKEN` from the
+process environment, else from the env file through `_env_value`: the file
+`AGENTIC_ENV_FILE` names when that variable is set (so a worktree can use
+the main checkout's file by its path), else the repo-root `.env`.
 
 Keys are dotted paths: `<group>.<field>`, or
 `pod_sizing.<manager_agent_id>.<field>` for the per-pod table. Values
@@ -37,26 +39,61 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _GROUP_CONFIG = ConfigDict(validate_assignment=True, extra="forbid")
 
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
-_LAKE_DIR_ENV_VAR = "LAKEHOUSE_DIR"
+# Names an env file to read in place of the repo-root `.env`.
+ENV_FILE_VARIABLE = "AGENTIC_ENV_FILE"
+
+
+class EnvFileMissingError(FileNotFoundError):
+    """`AGENTIC_ENV_FILE` names a file that does not exist."""
+
+
+# The first date the lake holds a single-name option chain (DoltHub's
+# `dolthub_option_chain`; before it only SPY, QQQ and IWM have chains).
+# Chain strikes are rescaled onto Yahoo's split-adjusted close, while a
+# ticker priced by security id has its traded `raw_close`, so
+# `data.loader.load_price_history_with_fallback` refuses to route an option
+# underlying by security id over a window reaching this date (AT-129). A
+# data fact, not a tunable, so it is no setting.
+SINGLE_NAME_OPTION_CHAINS_START = date(2019, 2, 1)
+
+
+def _env_file() -> Path | None:
+    """The env file `_env_value` reads: the path `AGENTIC_ENV_FILE` names
+    when it is set and non-empty, else the repo-root `.env`; `None` when
+    that `.env` does not exist. Raises `EnvFileMissingError` when
+    `AGENTIC_ENV_FILE` names a missing file, so a wrong path never falls
+    back to another file."""
+    named = os.environ.get(ENV_FILE_VARIABLE)
+    if named:
+        path = Path(named).expanduser()
+        if not path.is_file():
+            raise EnvFileMissingError(
+                f"{ENV_FILE_VARIABLE} names {path}, which is not a file; set it to the path "
+                "of an existing env file or unset it"
+            )
+        return path
+    return _ENV_FILE if _ENV_FILE.exists() else None
 
 
 def _env_value(name: str) -> str | None:
     """`name` from the process environment, else from a `KEY=VALUE` line in
-    the repo-root `.env` file (comments and blank lines ignored); `None`
-    when neither has it."""
+    the env file `_env_file` picks (comments and blank lines ignored);
+    `None` when neither has it."""
     if name in os.environ:
         return os.environ[name]
-    if not _ENV_FILE.exists():
+    env_file = _env_file()
+    if env_file is None:
         return None
-    for line in _ENV_FILE.read_text().splitlines():
+    for line in env_file.read_text().splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
@@ -64,18 +101,6 @@ def _env_value(name: str) -> str | None:
         if key.strip() == name:
             return value.strip().strip("'\"")
     return None
-
-
-class DataConfig(BaseModel):
-    model_config = _GROUP_CONFIG
-
-    # Root of the parquet lakehouse every run reads (`table=<name>/...`
-    # partitions). Comes from the `LAKEHOUSE_DIR` environment variable or
-    # the repo-root `.env`; the relative default keeps the location out of
-    # source on a machine that has neither set.
-    lake_dir: Path = Field(
-        default_factory=lambda: Path(_env_value(_LAKE_DIR_ENV_VAR) or "data/lake")
-    )
 
 
 class FirmConfig(BaseModel):
@@ -132,6 +157,33 @@ class FirmConfig(BaseModel):
     # fractional-percent option budget buys whole contracts (one SPY put
     # is ~$1,000 of premium); $10M is a small multi-strategy sleeve.
     starting_cash: float = Field(default=10_000_000.0, gt=0.0)
+    # The `seed` of a firm record's edgelab submission (submission.json and
+    # its strategy.yaml): edgelab seeds every stochastic step of grading
+    # (bootstraps, noise draws) from it, so one fixed value grades every
+    # rerun of a record on the same draws. The value itself is arbitrary.
+    edgelab_seed: int = Field(default=20100104, ge=0)
+    # (security_id, session) pairs the lake is known to lack a bar for at
+    # its source, which the firm record's price coverage preflight
+    # (`backtest.preflight.check_price_coverage`) accepts as missing inside
+    # its window: a firm equity on such a session holds under rule (c)
+    # instead of stopping the record. Each entry is a reviewed data fact;
+    # none is known, so it is empty.
+    known_price_gaps: list[tuple[int, date]] = Field(default_factory=list)
+    # A firm record flags an analyst whose share of available signals
+    # (active, flat at confidence 0 included, over all its signals) across
+    # the record falls below this: at under half, the analyst sat out most
+    # of the window on missing data or errors, so the record's evidence for
+    # its pod rests on far less of the window than it appears to.
+    low_availability_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Calendar days of track record a firm record keeps in memory, and the
+    # engine drops its older records each session; its decisions it keeps
+    # for the current and pending day only. The checkpoint keeps the whole
+    # history. 300 covers `portfolio.ic_lookback_days` (250), the longest
+    # trailing window any reader takes, so the record decides as an
+    # unbounded run does; a read reaching further back raises. It is part
+    # of the spec hash: the engine's BacktestResult holds the decisions of
+    # the retained days only.
+    history_horizon_days: int = Field(default=300, ge=1)
 
 
 class OptionsConfig(BaseModel):
@@ -152,6 +204,11 @@ class OptionsConfig(BaseModel):
     # stops carrying its expiry; the historical chain lists only three
     # expiries per snapshot and rotates the near ones weekly.
     max_mark_age_days: int = Field(default=45, ge=1)
+    # DoltHub publishes a chain dated t one to four days after t, so an
+    # agent deciding on day t only sees a snapshot dated on or before t
+    # minus this many calendar days. Applies to every decision and
+    # contract-selection read of the chain; marks and fills are not lagged.
+    publication_lag_days: int = Field(default=1, ge=0)
     # Reg-T style maintenance margin on a short option: premium plus this
     # fraction of underlying notional, financed at the margin rate.
     short_margin_fraction: float = Field(default=0.20, ge=0.0, le=1.0)
@@ -196,6 +253,11 @@ class OptionsConfig(BaseModel):
     # holds a fixed number of contracts rather than buying more.
     tail_hedge_notional_fraction: float = Field(default=1.0, gt=0.0)
     tail_hedge_target_protection: float = Field(default=0.10, gt=0.0, le=1.0)
+    # The tail-hedge pod commits at most this fraction of NAV to new puts
+    # over any trailing 365 days; 2% sits inside the 1-3% a year
+    # institutional tail-hedge programmes budget. Fixed before any run that
+    # uses it; a change is a new trial (see docs/prior_exposure.json).
+    tail_hedge_annual_premium_cap: float = Field(default=0.02, ge=0.0, le=1.0)
     # Short straddles on a rich variance risk premium need at least this
     # confidence from the VRP analyst; below it the view is expressed as a
     # long single leg only.
@@ -285,10 +347,9 @@ class PortfolioConstructionConfig(BaseModel):
     # analyst opinion reaches position size without abandoning the
     # covariance-based budget.
     risk_parity_view_tilt: float = Field(default=0.5, ge=0.0, le=1.0)
-    # Cost-aware sizing: a rebalance must move a weight by more than the
-    # no-trade band, and clear `cost_clearance_multiplier` x the round-trip
-    # cost, before it goes through. 5 bps matches the engine's slippage.
-    transaction_cost_bps: float = Field(default=5.0, ge=0.0)
+    # Cost-aware sizing: a rebalance must move a weight by more than this
+    # no-trade buffer, and by more than `cost_clearance_multiplier` x the
+    # expected fill cost fraction, before it goes through.
     no_trade_buffer: float = Field(default=0.005, ge=0.0)
     # Rebalance calendar: a pod only re-trades on a scheduled cadence, or
     # off-cycle when an asset's weight has drifted from its last executed
@@ -321,8 +382,11 @@ class PortfolioConstructionConfig(BaseModel):
     # The Kelly overlay ramps from 0 to the pod's target fraction over this
     # many trailing days; a Sharpe from a handful of points is noise.
     kelly_lookback_days: int = Field(default=60, ge=1)
-    # No-trade buffer's cost-derived minimum move = this x cost_bps / 10,000;
-    # a fixed economic-hurdle approximation, not a real impact model.
+    # The no-trade band's cost-derived minimum move is this multiple of
+    # `execution_costs.expected_fill_cost_fraction()` (commission plus
+    # slippage from `firm`, read at construct time): a weight change must
+    # earn several times its linear fill cost. Impact and option spreads
+    # are not in that fraction.
     cost_clearance_multiplier: float = Field(default=5.0, ge=0.0)
 
 
@@ -387,6 +451,10 @@ class AnalystConfig(BaseModel):
     pair_drop_half_life_days: float = Field(default=120.0, gt=0.0)
     pair_min_correlation: float = Field(default=0.5, ge=-1.0, le=1.0)
     max_pairs: int = Field(default=5, ge=1)
+    # OU analyst: a half-life beyond the fitted window is not identified by
+    # the data (the spread showed less than one half-life of reversion).
+    # The bound is this many fitted-spread lengths.
+    ou_max_half_life_windows: float = Field(default=1.0, gt=0.0)
     # Regime HMM: two Hamilton states on three years (a one-year window
     # rarely contains two regimes), monthly refit, act above 70% posterior.
     hmm_window: int = Field(default=750, ge=100)
@@ -427,25 +495,133 @@ class AnalystConfig(BaseModel):
     vol_jump_threshold: float = Field(default=1.5, gt=1.0)
     # VIX z-score that maps to full hedge confidence (policy choice).
     vix_zscore_full_confidence: float = Field(default=3.0, gt=0.0)
-    # One trading year of VIX history for its own z-score baseline.
+    # One trading year of VIX history, counted in NYSE sessions, for its own
+    # z-score baseline.
     vix_lookback_days: int = Field(default=252, ge=2)
     # Below this much VIX history the hedge stays flat rather than guessing.
     min_vix_observations: int = Field(default=30, ge=2)
     # The hedge sleeve is always on at this confidence so protection is
     # owned before a stress, not bought after VIX has already spiked.
     tail_hedge_base_confidence: float = Field(default=0.15, ge=0.0, le=1.0)
+    # Base seed for every Monte Carlo analyst's simulation; each simulation
+    # derives its own seed from this plus analyst, asset and date
+    # (`_market_math.derived_seed`), so runs are reproducible while paths
+    # differ across names and days. 42 is an arbitrary policy choice.
+    mc_seed: int = Field(default=42, ge=0)
+
+
+# The latest `stage_a.data_end` any run may use. The owner's ruling: the
+# holdout from 2025-01-02 onward is locked until the owner opens it, so no
+# override may move the cut past this date; opening the holdout means
+# changing this constant in source.
+HOLDOUT_LOCKED_DATA_END = date(2024, 12, 31)
+
+
+class StageAConfig(BaseModel):
+    """Stage (a) precompute: the holdout cut, window and warm-up every trial
+    is computed under, and the resource guard of `stage_a.runner.run_batch`.
+    Raises `ValidationError` when `data_end` is later than
+    `HOLDOUT_LOCKED_DATA_END`, on construction and on assignment, so no
+    override path (`--set`, `apply_overrides`, `temporary_overrides`) can
+    move the cut into the holdout."""
+
+    model_config = _GROUP_CONFIG
+
+    # Last date the signal compute may know (the `lake_session` data_end):
+    # the locked holdout cut, or an earlier date.
+    data_end: date = HOLDOUT_LOCKED_DATA_END
+    # First decision date of the stage (a) window: every round-1 instrument
+    # has bars before it (AT-110).
+    window_start: date = date(2010, 1, 4)
+    # exchange-calendars calendar whose sessions are the decision days and
+    # the rows prices are aligned on: the round-1 universe is priced at the
+    # US close, crypto included (one bar per NYSE session, AT-15).
+    session_calendar: str = "XNYS"
+    # Calendar days of history loaded before the window: it covers
+    # `analysts.risk_window_garch` (750) returns on the first decision day,
+    # and it is the start of the expanding samples some analysts fit on
+    # (calendar_seasonality, macro_var_spillover), so it changes signals and
+    # is hashed.
+    warmup_days: int = Field(default=1100, ge=1)
+    # The last three fields tune how a batch runs, not what it computes, so
+    # they are left out of the spec hash (`stage_a.spec.RUNTIME_SETTINGS_FIELDS`).
+    # A batch stops after its current day below this share of free system
+    # memory or this much free disk (GB) on the store's volume: AT-110's
+    # memory guard for heavy runs.
+    min_free_memory_pct: float = Field(default=20.0, ge=0.0, le=100.0)
+    min_free_disk_gb: float = Field(default=10.0, ge=0.0)
+    # Decision days between resource checks: the slowest round-1 analyst
+    # takes about 12 s a day, so a check comes every few minutes at most.
+    check_every_days: int = Field(default=20, ge=1)
+
+    @field_validator("data_end")
+    @classmethod
+    def _data_end_before_the_holdout(cls, value: date) -> date:
+        if value > HOLDOUT_LOCKED_DATA_END:
+            raise ValueError(
+                f"stage_a.data_end {value.isoformat()} is after "
+                f"{HOLDOUT_LOCKED_DATA_END.isoformat()}; the holdout stays locked until "
+                "the owner opens it"
+            )
+        return value
+
+
+class TrialsConfig(BaseModel):
+    """Where trials are recorded: the trial ledger, the registry files of
+    its hypotheses and the family they are counted in. Paths are relative
+    to the repository root. These say where a trial is recorded, not what
+    it computes, so they are left out of the spec hash
+    (`stage_a.spec.RUNTIME_SETTINGS_FIELDS`)."""
+
+    model_config = _GROUP_CONFIG
+
+    # The hash-chained DuckDB trial ledger (`trials.ledger.TrialLedger`),
+    # kept with the research record it counts trials for.
+    ledger_path: str = "research/ledger.duckdb"
+    # Directory of the hypotheses' registry files (`<id>.yaml`), beside the
+    # ledger that records their hashes.
+    registry_dir: str = "research/registry"
+    # The one family every hypothesis of this firm is counted in, so edgelab
+    # deflates each result by the firm's whole trial count. Policy choice.
+    firm_family: str = "agentic-firm"
+
+
+class LakeConfig(BaseModel):
+    """How the lake client paces its calls (`data.lakehouse_client`). It says
+    when a call may be sent, not what a trial computes, so it is left out of
+    the spec hash (`stage_a.spec.RUNTIME_SETTINGS_FIELDS`)."""
+
+    model_config = _GROUP_CONFIG
+
+    # Seconds after a lake request times out, or is left unfinished by a
+    # killed run, before the client sends any new lake call: the lake keeps
+    # working on such a request until its 300 s deadline, plus a 30 s margin.
+    # Policy choice.
+    request_quiet_seconds: float = Field(default=330.0, gt=0.0)
+    # Seconds one lake call keeps sending again after failures the lake
+    # recovers from (a 503 or a 502/504, connection refused or reset, a
+    # timeout) before it raises the last error: covers a launchd restart of
+    # the API, a query slot an abandoned request holds for up to 300 s, the
+    # quiet period after a timeout and lake load spikes. Policy choice.
+    retry_budget_seconds: float = Field(default=1800.0, ge=0.0)
+    # `/v1/sql` requests this process has in flight at most: the lake runs
+    # two query slots, so more only draw 503s (four pod threads otherwise
+    # would), and holding more starves the other projects reading the lake.
+    max_concurrent_queries: int = Field(default=2, ge=1)
 
 
 class StrategyConfig(BaseModel):
     model_config = _GROUP_CONFIG
 
-    data: DataConfig = Field(default_factory=DataConfig)
     firm: FirmConfig = Field(default_factory=FirmConfig)
     options: OptionsConfig = Field(default_factory=OptionsConfig)
     managers: ManagerRiskConfig = Field(default_factory=ManagerRiskConfig)
     commander: CommanderConfig = Field(default_factory=CommanderConfig)
     portfolio: PortfolioConstructionConfig = Field(default_factory=PortfolioConstructionConfig)
     analysts: AnalystConfig = Field(default_factory=AnalystConfig)
+    stage_a: StageAConfig = Field(default_factory=StageAConfig)
+    trials: TrialsConfig = Field(default_factory=TrialsConfig)
+    lake: LakeConfig = Field(default_factory=LakeConfig)
     # Per-pod sizing, keyed by manager `agent_id`; the research-grounded
     # reasoning for each row lives next to the manager in `roster.py`.
     pod_sizing: dict[str, PodSizingConfig] = Field(

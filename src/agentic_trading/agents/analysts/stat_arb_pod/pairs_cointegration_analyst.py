@@ -8,8 +8,8 @@ from pydantic import Field, PrivateAttr
 from quantcore.statistics.cointegration import spread_zscore
 
 from agentic_trading.agents._market_math import clamp, market_slice
-from agentic_trading.agents.base import AnalystAgent
-from agentic_trading.agents.schemas import AgentSignal, SignalStatus
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
+from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -75,30 +75,20 @@ class PairsCointegrationAnalyst(AnalystAgent):
     point of view. A pair without an entry falls back to a unit ratio."""
 
     agent_id: str = "pairs_cointegration_analyst"
+    data_requirements: tuple[DataRequirement, ...] = (
+        DataRequirement(
+            source="sec_sic",
+            identifier="{ticker}",
+            asset_scoped=True,
+            description="SEC industry classification (SIC code)",
+        ),
+    )
 
     partner_tickers_by_asset: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     hedge_ratio_by_pair: dict[tuple[str, str], float] = Field(default_factory=dict)
     _open_direction_by_asset: dict[str, Literal["long", "short"]] = PrivateAttr(
         default_factory=dict
     )
-
-    def _flat(
-        self,
-        asset: str,
-        as_of_date: pd.Timestamp,
-        rationale: str,
-        status: SignalStatus = "active",
-    ) -> AgentSignal:
-        self._open_direction_by_asset.pop(asset, None)
-        return AgentSignal(
-            agent_id=self.agent_id,
-            asset=asset,
-            as_of_date=as_of_date.date(),
-            direction="flat",
-            confidence=0.0,
-            rationale=rationale,
-            status=status,
-        )
 
     def generate_signal(
         self,
@@ -108,8 +98,9 @@ class PairsCointegrationAnalyst(AnalystAgent):
     ) -> AgentSignal:
         partner_tickers = self.partner_tickers_by_asset.get(asset, ())
         if not partner_tickers:
-            return self._flat(
-                asset, as_of_date, f"no partner ticker(s) configured for {asset}", "unavailable"
+            self._open_direction_by_asset.pop(asset, None)
+            return self.unavailable_signal(
+                asset, as_of_date, f"no partner ticker(s) configured for {asset}"
             )
 
         asset_returns = market_slice(market_data, as_of_date, asset).log_returns[
@@ -123,11 +114,9 @@ class PairsCointegrationAnalyst(AnalystAgent):
         ]
         length = min(asset_returns.size, *(series.size for series in partner_returns))
         if length < MIN_OVERLAP_DAYS:
-            return self._flat(
-                asset,
-                as_of_date,
-                "insufficient overlapping history for a cointegration spread",
-                "unavailable",
+            self._open_direction_by_asset.pop(asset, None)
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient overlapping history for a cointegration spread"
             )
 
         asset_prices = np.cumsum(asset_returns[-length:])

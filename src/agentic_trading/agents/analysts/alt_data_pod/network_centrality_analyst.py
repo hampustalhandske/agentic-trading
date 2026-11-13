@@ -5,31 +5,26 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import Field, PrivateAttr
+from pydantic import PrivateAttr
 
-from agentic_trading.agents._market_math import RefitCache, clamp, load_fixed_universe_returns
-from agentic_trading.agents.base import AnalystAgent
+from agentic_trading.agents._market_math import RefitCache, balanced_panel, clamp
+from agentic_trading.agents.base import AnalystAgent, DataRequirement
 from agentic_trading.agents.schemas import AgentSignal
+from agentic_trading.data.lake_errors import LakeReadError
 from agentic_trading.data.loaders.lakehouse_loader import (
-    load_price_history_from_lakehouse,
-    load_sp500_constituents_asof,
+    load_security_log_returns,
+    load_sp500_member_securities_asof,
 )
 from agentic_trading.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Emergency fallback only — used when the lakehouse (real, point-in-time
-# S&P 500 membership, hundreds of names) isn't reachable. A 5-name graph
-# is not a real cross-section for a network-centrality read and should
-# never be what actually runs once the lakehouse is available — see
-# `fama_macbeth_analyst.py`'s identical fallback for the same reasoning.
-DEFAULT_UNIVERSE: tuple[str, ...] = ("AAPL", "MSFT", "GOOGL", "AMZN", "JPM")
 WINDOW = 60
 LAG = 1
 RETURN_CAP = 0.05
 # A broad universe will always have some tickers fail to load on any
 # given day; below this many usable names the cross-section isn't broad
-# enough to be worth preferring over the fixed fallback.
+# enough for a network-centrality read.
 _MIN_UNIVERSE_SIZE = 30
 _UNIVERSE_HISTORY_DAYS = 250
 
@@ -48,55 +43,84 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
     by how strongly it historically leads `asset`). Distinct methodology
     from the factor_pod regressions: this is a graph/network-science read
     of the cross-sectional return structure, not a linear factor model.
+    The graph is built on one balanced, date-aligned panel: the reference
+    dates are `asset`'s own last `WINDOW + LAG` return dates, and only
+    universe names with a return on every one of them are kept — a name
+    missing a date is dropped, never the date. `sample_count` is the
+    number of reference dates; the rationale reports the names kept.
 
     The universe is resolved fresh each call (refit at
     `_universe_refit_cache.refit_interval_days`) as the real, point-in-time
-    S&P 500 membership plus `asset` — the same "real membership, fixed
-    list as an emergency fallback only" pattern `fama_macbeth_analyst.py`
-    uses, and for the same reason: a 5-name graph is not a real
-    cross-section. Falls back to the fixed `universe` field (via
-    `load_fixed_universe_returns()`, independent of whatever assets the
-    current backtest's own `market_data` happens to include) only when
-    the lakehouse can't resolve real membership or too few names have
-    usable history."""
+    S&P 500 membership, each member priced by its lake `security_id`
+    (`_load_broad_lakehouse_universe`), the same cross-section
+    `fama_macbeth_analyst.py` uses. A day with no membership in the lake,
+    or fewer than `_MIN_UNIVERSE_SIZE` members with usable history, is
+    unavailable, as is an `asset` outside that membership or too little
+    history to build the graph. A fetch that raises is an error.
+
+    An active signal's `source_as_of` is the latest reference date: S&P
+    500 membership changes are announced before they take effect, so the
+    newest data the graph rests on is its latest price bar."""
 
     agent_id: str = "lead_lag_network_centrality_analyst"
+    data_requirements: tuple[DataRequirement, ...] = (
+        DataRequirement(
+            source="sp500_membership",
+            identifier="all",
+            asset_scoped=False,
+            description="S&P 500 membership history",
+            lookback_days=0,
+        ),
+    )
 
-    universe: tuple[str, ...] = Field(default=DEFAULT_UNIVERSE)
     _universe_refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)
 
     def _load_broad_lakehouse_universe(
         self, as_of_date: pd.Timestamp
-    ) -> dict[str, np.ndarray] | None:
-        """Real, point-in-time S&P 500 membership plus a single batch
-        lakehouse query for all of their trailing returns — the expensive
-        fetch `_universe_refit_cache` gates, cached under one universe-
-        wide key so every asset this pod scores on the same day (and
-        within the same refit interval) shares one fetch, the same shape
-        `fama_macbeth_analyst.py`'s identical helper uses. Returns `None`
-        (not raises) on any failure or a too-thin resulting cross-section,
-        so a cache miss during a lakehouse outage degrades to the fixed-
-        universe fallback for `refit_interval_days` rather than retrying
-        daily. Deliberately does not force any specific asset into the
-        membership list — an asset real S&P membership doesn't include
-        is resolved by the caller falling back to the fixed universe for
-        that one asset, not by mutating the shared cached fetch."""
-        members = load_sp500_constituents_asof(as_of_date.date())
+    ) -> dict[str, pd.Series] | None:
+        """The expensive fetch `_universe_refit_cache` gates, cached under
+        one universe-wide key so every asset scored within a refit
+        interval shares it: the point-in-time S&P 500 members on
+        `as_of_date` as securities (`load_sp500_member_securities_asof`)
+        and one batch query for their trailing `_UNIVERSE_HISTORY_DAYS`
+        calendar days of split- and distribution-adjusted log returns by
+        `security_id` (`load_security_log_returns`), keyed by each
+        member's ticker on `as_of_date`.
+
+        A member needs at least `WINDOW + LAG` returns; members left out,
+        including those with no returns at all, are counted in one INFO
+        line. Returns `None` when the lake has no membership for the date
+        or fewer than `_MIN_UNIVERSE_SIZE` members qualify, which the
+        caller reports as unavailable for `refit_interval_days`. A failed
+        lake read (`LakeReadError`) propagates through `generate_signal`;
+        any other exception becomes an error signal there. Never adds `asset` to the membership: an
+        asset outside it is unavailable, leaving the shared cached fetch
+        intact."""
+        members = load_sp500_member_securities_asof(as_of_date.date())
         if members is None:
             return None
         window_start = (as_of_date - timedelta(days=_UNIVERSE_HISTORY_DAYS)).date()
-        frame = load_price_history_from_lakehouse(list(members), window_start, as_of_date.date())
-        if frame is None:
-            return None
-        candidate_returns = {
-            str(ticker): frame[(ticker, "log_return")].dropna().to_numpy()
-            for ticker in frame.columns.get_level_values(0).unique()
-        }
-        usable = {
-            ticker: series
-            for ticker, series in candidate_returns.items()
-            if series.size >= WINDOW + LAG
-        }
+        returns_by_security = load_security_log_returns(
+            [member.security_id for member in members], window_start, as_of_date.date()
+        )
+        min_returns = WINDOW + LAG
+        usable: dict[str, pd.Series] = {}
+        for member in members:
+            series = returns_by_security.get(member.security_id)
+            if series is not None and series.size >= min_returns:
+                usable[member.ticker] = series
+        excluded = len(members) - len(usable)
+        if excluded:
+            logger.info(
+                "%s: left %d of %d S&P 500 members on %s out of the universe for "
+                "fewer than %d returns since %s",
+                self.agent_id,
+                excluded,
+                len(members),
+                as_of_date.date(),
+                min_returns,
+                window_start,
+            )
         if len(usable) < _MIN_UNIVERSE_SIZE:
             return None
         return usable
@@ -113,69 +137,50 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
                 as_of_date,
                 lambda: self._load_broad_lakehouse_universe(as_of_date),
             )
+        except LakeReadError:
+            raise
         except (RuntimeError, ValueError) as exc:
-            logger.debug(
-                "%s: broad lakehouse universe fetch failed (%s) — falling back to the fixed "
-                "%d-name universe.",
+            logger.warning(
+                "%s: broad lakehouse universe fetch failed for %s on %s (%s).",
                 self.agent_id,
+                asset,
+                as_of_date.date(),
                 exc,
-                len(self.universe),
             )
-            broad = None
+            return self.error_signal(asset, as_of_date, "broad S&P 500 universe lookup failed")
 
-        if broad is not None and asset in broad:
-            universe = tuple(broad)
-            returns = broad
-        else:
-            universe = self.universe if asset in self.universe else (*self.universe, asset)
-            try:
-                returns = load_fixed_universe_returns(universe, as_of_date)
-            except Exception as exc:
-                logger.debug(
-                    "%s: universe price history download failed (%s) — holding.",
-                    self.agent_id,
-                    exc,
-                )
-                return AgentSignal(
-                    agent_id=self.agent_id,
-                    asset=asset,
-                    as_of_date=as_of_date.date(),
-                    direction="flat",
-                    confidence=0.0,
-                    rationale="universe price history lookup failed",
-                    status="error",
-                )
+        if broad is None:
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"no point-in-time S&P 500 cross-section of at least {_MIN_UNIVERSE_SIZE} "
+                "members with enough history",
+            )
+        if asset not in broad:
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"{asset} is not an S&P 500 member with enough history on {as_of_date.date()}",
+            )
+        universe = tuple(broad)
+        returns = broad
 
-            if len(returns) < len(universe):
-                return AgentSignal(
-                    agent_id=self.agent_id,
-                    asset=asset,
-                    as_of_date=as_of_date.date(),
-                    direction="flat",
-                    confidence=0.0,
-                    rationale=f"insufficient price history for part of universe {universe}",
-                    status="unavailable",
-                )
-
-        min_length = min(series.size for series in returns.values())
-        if min_length < WINDOW + LAG or asset not in returns:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale=(
-                    f"insufficient cross-sectional history across universe {universe} — holding."
-                ),
-                status="unavailable",
+        asset_returns = returns[asset].dropna() if asset in returns else pd.Series(dtype=float)
+        reference_dates = asset_returns.index[-(WINDOW + LAG) :]
+        if len(reference_dates) < WINDOW + LAG:
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                f"insufficient cross-sectional history across universe {universe} — holding.",
             )
 
-        aligned = {ticker: series[-(WINDOW + LAG) :] for ticker, series in returns.items()}
+        panel = balanced_panel(universe, returns, reference_dates)
+        kept = tuple(panel.columns)
+        aligned = {ticker: panel[ticker].to_numpy(dtype=np.float64) for ticker in kept}
         asset_current = aligned[asset][LAG:]
 
         lead_lag_corr: dict[str, float] = {}
-        for ticker in universe:
+        for ticker in kept:
             if ticker == asset:
                 continue
             leader_lagged = aligned[ticker][:-LAG]
@@ -184,14 +189,10 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
             lead_lag_corr[ticker] = 0.0 if np.isnan(corr) else corr
 
         if not lead_lag_corr:
-            return AgentSignal(
-                agent_id=self.agent_id,
-                asset=asset,
-                as_of_date=as_of_date.date(),
-                direction="flat",
-                confidence=0.0,
-                rationale="universe contains no other tickers to build a lead-lag graph — holding.",
-                status="unavailable",
+            return self.unavailable_signal(
+                asset,
+                as_of_date,
+                "universe contains no other tickers to build a lead-lag graph — holding.",
             )
 
         centrality = float(np.mean([abs(corr) for corr in lead_lag_corr.values()]))
@@ -212,7 +213,8 @@ class LeadLagNetworkCentralityAnalyst(AnalystAgent):
             confidence=confidence,
             rationale=(
                 f"lead-lag centrality={centrality:.3f}, predicted return={predicted_return:.5f} "
-                f"across universe {universe}"
+                f"across {len(kept)} of {len(universe)} universe names {kept}"
             ),
-            sample_count=min_length,
+            sample_count=len(reference_dates),
+            source_as_of=reference_dates[-1].date(),
         )

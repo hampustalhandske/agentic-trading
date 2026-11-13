@@ -1,10 +1,12 @@
 # arima_forecast_analyst.py
 
+import math
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 from pydantic import PrivateAttr
+from quantcore.errors import UndefinedResultError
 from quantcore.time_series.arima import (
     arima_fit,
     arima_forecast,
@@ -15,7 +17,7 @@ from quantcore.time_series.arima import (
 
 from agentic_trading.agents._market_math import RefitCache, clamp, market_slice
 from agentic_trading.agents.base import AnalystAgent
-from agentic_trading.agents.schemas import AgentSignal, SignalStatus
+from agentic_trading.agents.schemas import AgentSignal
 from agentic_trading.config import settings
 from agentic_trading.logging_config import get_logger
 
@@ -23,13 +25,13 @@ logger = get_logger(__name__)
 
 LJUNG_BOX_MAX_LAGS = 10
 LJUNG_BOX_SIGNIFICANCE = 0.05
-# CSS estimation needs roughly a year of daily returns for stable
-# low-order coefficient estimates.
+# Roughly a year of daily returns gives stable low-order coefficient
+# estimates.
 ARIMA_WINDOW = 250
 # Search grid for select_arima_order — small on purpose (a daily-return
 # series rarely needs higher-order AR/MA terms, and a wider grid mostly
 # just risks overfitting the trailing window's own noise). Every extra
-# grid cell costs a full CSS fit.
+# grid cell costs a full exact-likelihood fit.
 MAX_P = 2
 MAX_Q = 2
 # Log price is I(1) by construction (its first difference is the return
@@ -39,13 +41,23 @@ ORDER_SELECTION_CRITERION = "aic"
 
 
 class ARIMAForecastAnalyst(AnalystAgent):
-    """Fits a low-order ARIMA model on the last `ARIMA_WINDOW` trailing log
-    prices and forecasts `forecast_horizon` days ahead. Two Ljung-Box
-    gates bracket the fit: a pre-fit test on the return series (no serial
-    dependence means nothing to forecast) and a post-fit test on the CSS
-    residuals (`quantcore.time_series.arima.arima_residuals`; residual
+    """Fits a low-order ARIMA model by exact Gaussian maximum likelihood
+    (`quantcore.time_series.arima.arima_fit`'s default) on the last
+    `ARIMA_WINDOW` trailing log prices and forecasts `forecast_horizon`
+    days ahead. Two Ljung-Box gates bracket the fit: a pre-fit test on the
+    return series (no serial dependence means nothing to forecast) and a
+    post-fit test on the conditional (CSS) residuals at the fitted
+    coefficients (`quantcore.time_series.arima.arima_residuals`; residual
     autocorrelation means the order is misspecified and the forecast is
-    not trusted). The order is re-identified every
+    not trusted); failing either gate abstains (active, flat, confidence
+    0). Too little history or no close is unavailable, and so is a pretest
+    window with no range or a non-finite pretest p-value: Ljung-Box is
+    undefined there. An order selection or fit quantcore finds undefined
+    on the series (`UndefinedResultError`: every differenced series it
+    would fit has no range) is unavailable too. Any other failed order
+    selection or fit, a non-converged one included, is an error, and so are
+    residuals with no range or a
+    non-finite residual p-value. The order is re-identified every
     `settings.analysts.arima_order_reselect_days` on the return series
     with d fixed at 1 (log price is I(1) by construction) and p, q in
     {0..MAX_P}, and coefficients re-estimated every
@@ -65,23 +77,6 @@ class ARIMAForecastAnalyst(AnalystAgent):
     )
     _refit_cache: RefitCache = PrivateAttr(default_factory=RefitCache)
 
-    def _flat(
-        self,
-        asset: str,
-        as_of_date: pd.Timestamp,
-        rationale: str,
-        status: SignalStatus = "active",
-    ) -> AgentSignal:
-        return AgentSignal(
-            agent_id=self.agent_id,
-            asset=asset,
-            as_of_date=as_of_date.date(),
-            direction="flat",
-            confidence=0.0,
-            rationale=rationale,
-            status=status,
-        )
-
     def _select_order(self, returns: np.ndarray) -> tuple[int, int, int]:
         if self.p is not None and self.d is not None and self.q is not None:
             return self.p, self.d, self.q
@@ -97,19 +92,24 @@ class ARIMAForecastAnalyst(AnalystAgent):
         slice_ = market_slice(market_data, as_of_date, asset)
         returns = slice_.log_returns[-ARIMA_WINDOW:]
         if slice_.close is None or returns.size < 30:
-            return self._flat(
-                asset, as_of_date, "insufficient history for an ARIMA fit", "unavailable"
+            return self.unavailable_signal(
+                asset, as_of_date, "insufficient history for an ARIMA fit"
             )
 
         pretest_returns = returns[-settings.analysts.arima_pretest_window :]
+        if np.ptp(pretest_returns) == 0.0:
+            return self.unavailable_signal(
+                asset, as_of_date, "constant returns over the pretest window — Ljung-Box undefined"
+            )
         n_lags = min(LJUNG_BOX_MAX_LAGS, pretest_returns.size // 5)
-        _, p_value = ljung_box_test(pretest_returns, n_lags)
+        _, p_value = ljung_box_test(pretest_returns, n_lags, model_df=0)
+        if not math.isfinite(p_value):
+            return self.unavailable_signal(
+                asset, as_of_date, f"Ljung-Box pretest p-value undefined (p={p_value})"
+            )
         if p_value >= LJUNG_BOX_SIGNIFICANCE:
-            return self._flat(
-                asset,
-                as_of_date,
-                f"no serial dependence to forecast (Ljung-Box p={p_value:.3f})",
-                "unavailable",
+            return self.abstain_signal(
+                asset, as_of_date, f"no serial dependence to forecast (Ljung-Box p={p_value:.3f})"
             )
 
         log_prices = np.cumsum(returns)
@@ -121,6 +121,10 @@ class ARIMAForecastAnalyst(AnalystAgent):
             ar_coefs, ma_coefs, _sigma2 = self._refit_cache.get_or_refit(
                 asset, as_of_date, lambda: arima_fit(log_prices, p, d, q)
             )
+        except UndefinedResultError as exc:
+            return self.unavailable_signal(
+                asset, as_of_date, f"ARIMA order selection/fit undefined on this series: {exc}"
+            )
         except (RuntimeError, ValueError) as exc:
             logger.debug(
                 "%s: ARIMA order selection/fit failed for %s (%s) — returning flat.",
@@ -128,18 +132,29 @@ class ARIMAForecastAnalyst(AnalystAgent):
                 asset,
                 exc,
             )
-            return self._flat(asset, as_of_date, "ARIMA order selection/fit failed", "error")
+            return self.error_signal(asset, as_of_date, "ARIMA order selection/fit failed")
 
         residuals = arima_residuals(log_prices, ar_coefs, ma_coefs, d)
+        if np.ptp(residuals) == 0.0:
+            return self.error_signal(
+                asset,
+                as_of_date,
+                f"ARIMA({p},{d},{q}) residuals are constant — Ljung-Box undefined",
+            )
         residual_lags = min(LJUNG_BOX_MAX_LAGS, max(residuals.size // 5, 1))
-        _, residual_p_value = ljung_box_test(residuals, residual_lags)
+        _, residual_p_value = ljung_box_test(residuals, residual_lags, model_df=0)
+        if not math.isfinite(residual_p_value):
+            return self.error_signal(
+                asset,
+                as_of_date,
+                f"ARIMA({p},{d},{q}) residual Ljung-Box p-value undefined (p={residual_p_value})",
+            )
         if residual_p_value < LJUNG_BOX_SIGNIFICANCE:
-            return self._flat(
+            return self.abstain_signal(
                 asset,
                 as_of_date,
                 f"ARIMA({p},{d},{q}) residuals still autocorrelated "
                 f"(Ljung-Box p={residual_p_value:.3f}) — misspecified fit",
-                "unavailable",
             )
 
         forecast_path = arima_forecast(log_prices, ar_coefs, ma_coefs, d, self.forecast_horizon)
